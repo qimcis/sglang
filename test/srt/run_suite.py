@@ -108,6 +108,8 @@ suites = {
         TestFile("test_vlm_input_format.py", 300),
         TestFile("test_vision_openai_server_a.py", 584),
         TestFile("test_vision_openai_server_b.py", 620),
+        TestFile("test_vision_stress_testing.py", 100),
+        TestFile("test_audio_openai_server.py", 150),
         TestFile("test_w8a8_quantization.py", 46),
         TestFile("test_reasoning_parser.py", 5),
         TestFile("test_hybrid_attn_backend.py", 100),
@@ -165,6 +167,7 @@ suites = {
         TestFile("test_patch_torch.py", 19),
         TestFile("test_update_weights_from_distributed.py", 103),
         TestFile("test_release_memory_occupation.py", 127),
+        TestFile("test_vision_openai_server_tp2.py", 200),
     ],
     "per-commit-2-gpu-amd": [
         TestFile("models/lora/test_lora_tp.py", 116),
@@ -177,6 +180,7 @@ suites = {
         TestFile("test_local_attn.py", 250),
         TestFile("test_pp_single_node.py", 372),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
+        TestFile("test_vision_openai_server_tp4.py", 300),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("test_deepep_small.py", 531),
