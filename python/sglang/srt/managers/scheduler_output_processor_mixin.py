@@ -87,6 +87,21 @@ class SchedulerOutputProcessorMixin:
                 if req.is_chunked <= 0:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
+                    # Telemetry: record TTFT on the first emitted token once per request
+                    if (
+                        getattr(req, "queue_time_start", None) is not None
+                        and not getattr(req, "_ttft_recorded", False)
+                        and len(req.output_ids) == 1
+                    ):
+                        try:
+                            # Use perf_counter for monotonic measurement
+                            ttft = time.perf_counter() - req.queue_time_start
+                            # Delegate to scheduler to update TTFT rings/EWMA
+                            self._observe_ttft(ttft)
+                            req._ttft_recorded = True
+                        except Exception:
+                            # Best-effort; avoid impacting serving path
+                            pass
                     req.check_finished()
 
                     if req.finished():

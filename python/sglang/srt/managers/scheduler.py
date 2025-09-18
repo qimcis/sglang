@@ -1742,6 +1742,23 @@ class Scheduler(
 
     def get_num_allocatable_reqs(self, running_bs):
         res = global_server_args_dict["max_micro_batch_size"] - running_bs
+        # Apply decode soft cap on joiners when clamp is active
+        try:
+            if getattr(self, "_clamp_active", False):
+                baseline = (
+                    self._decode_capacity_baseline
+                    if getattr(self, "_decode_capacity_baseline", 0)
+                    else global_server_args_dict["max_micro_batch_size"]
+                )
+                if baseline is not None and baseline > 0:
+                    import math
+                    allowed_cap = max(
+                        baseline * self.server_args.decode_soft_cap_min_share,
+                        baseline * self.server_args.decode_soft_cap_factor,
+                    )
+                    res = min(res, int(math.floor(allowed_cap)) - running_bs)
+        except Exception:
+            pass
         if self.pp_size > 1:
             res = min(res, self.req_to_token_pool.available_size())
         return res
@@ -1750,6 +1767,47 @@ class Scheduler(
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
+
+        # KV headroom guard (projected) — optionally defer prefill when headroom is low
+        kv_guard_active = False
+        guard_chunk_cap_tokens = None
+        if self.server_args.kv_headroom_safety_pct is not None:
+            # Compute current headroom tokens
+            num_used, token_usage, available_size, evictable_size = self._get_token_info()
+            current_headroom_tokens = available_size + evictable_size
+            current_headroom_frac = current_headroom_tokens / max(1, self.max_total_num_tokens)
+            # Estimate projected prefill admission cost from top-N candidates in priority order
+            N_SCAN = 256
+            # Ensure queue is prioritized for a meaningful projection
+            self.policy.calc_priority(self.waiting_queue)
+            running_bs = len(self.running_batch.reqs)
+            allocatable = max(0, self.get_num_allocatable_reqs(running_bs))
+            scan_limit = min(len(self.waiting_queue), min(N_SCAN, allocatable))
+            page_sz = self.page_size if self.page_size is not None else 1
+
+            def _ceil_pages(x: int) -> int:
+                return ((max(0, x) + page_sz - 1) // page_sz) * page_sz
+
+            projected_prefill_tokens = 0
+            for i in range(scan_limit):
+                r = self.waiting_queue[i]
+                # Use prefix_indices computed by policy; fall back safely
+                prefix_len = len(getattr(r, "prefix_indices", [])) if hasattr(r, "prefix_indices") else 0
+                eff_tokens = len(r.origin_input_ids) - prefix_len
+                eff_tokens -= getattr(r, "host_hit_length", 0) or 0
+                projected_prefill_tokens += _ceil_pages(eff_tokens)
+            # Add a decode in-flight margin: new page allocations on next decode step
+            try:
+                decode_pages = self.running_batch.new_page_count_next_decode() * page_sz
+            except Exception:
+                decode_pages = 0
+
+            projected_headroom_tokens = current_headroom_tokens - (projected_prefill_tokens + decode_pages)
+            projected_headroom_frac = projected_headroom_tokens / max(1, self.max_total_num_tokens)
+            if projected_headroom_frac < self.server_args.kv_headroom_safety_pct:
+                kv_guard_active = True
+                if self.server_args.kv_guard_chunk_cap_pages and self.chunked_req is not None:
+                    guard_chunk_cap_tokens = self.server_args.kv_guard_chunk_cap_pages * page_sz
 
         if self.try_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -1782,6 +1840,14 @@ class Scheduler(
         self.policy.calc_priority(self.waiting_queue)
 
         # Prefill policy
+        # If KV guard is active and we allow only chunk progress, cap rem_chunk_tokens
+        capped_chunk_size = self.chunked_prefill_size
+        if kv_guard_active and guard_chunk_cap_tokens is not None:
+            if capped_chunk_size is None:
+                capped_chunk_size = guard_chunk_cap_tokens
+            else:
+                capped_chunk_size = min(capped_chunk_size, guard_chunk_cap_tokens)
+
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -1789,7 +1855,7 @@ class Scheduler(
             self.running_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
-            self.chunked_prefill_size,
+            capped_chunk_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
         )
@@ -1802,7 +1868,7 @@ class Scheduler(
             lora_set = set([req.lora_id for req in self.running_batch.reqs])
 
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for req in ([] if kv_guard_active else self.waiting_queue):
 
             if self.enable_lora and not self.tp_worker.can_run_lora_batch(
                 lora_set
@@ -2448,6 +2514,54 @@ class Scheduler(
             )
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
+
+        # Telemetry scaffolding: expose TTFT percentiles and decode step latency pcts
+        try:
+            ret["ttft_ms"] = {
+                "p50": float(self._ttft_ema_p50) if getattr(self, "_ttft_ema_p50", None) is not None else 0.0,
+                "p95": float(self._ttft_ema_p95) if getattr(self, "_ttft_ema_p95", None) is not None else 0.0,
+                "p99": float(self._ttft_ema_p99) if getattr(self, "_ttft_ema_p99", None) is not None else 0.0,
+            }
+            ret["decode_step_latency_ms"] = {
+                "p50": float(self._decode_step_p50) if hasattr(self, "_decode_step_p50") else 0.0,
+                "p95": float(self._decode_step_p95) if hasattr(self, "_decode_step_p95") else 0.0,
+            }
+            # Decode capacity baseline and underfill ratio
+            baseline = float(getattr(self, "_decode_capacity_baseline", 0) or 0)
+            bs = float(len(self.running_batch.reqs))
+            ret["decode_capacity_baseline"] = baseline
+            ret["batch_size_decode_actual"] = bs
+            ret["decode_underfill_ratio"] = (bs / baseline) if baseline > 0 else 0.0
+        except Exception:
+            pass
+
+        # KV headroom and projected headroom pages (quick estimation)
+        try:
+            num_used, token_usage, available_size, evictable_size = self._get_token_info()
+            headroom_tokens = available_size + evictable_size
+            ret["kv_headroom_pct"] = max(0.0, 1.0 - float(token_usage))
+            # Projected prefill pages for top-N
+            page_sz = self.page_size if self.page_size is not None else 1
+            def _ceil_pages(x: int):
+                return ((max(0, x) + page_sz - 1) // page_sz) * page_sz
+            # Ensure up-to-date priority
+            self.policy.calc_priority(self.waiting_queue)
+            N_SCAN = 128
+            allocatable = max(0, self.get_num_allocatable_reqs(len(self.running_batch.reqs)))
+            scan_limit = min(len(self.waiting_queue), min(N_SCAN, allocatable))
+            projected_prefill_tokens = 0
+            for i in range(scan_limit):
+                r = self.waiting_queue[i]
+                prefix_len = len(getattr(r, "prefix_indices", [])) if hasattr(r, "prefix_indices") else 0
+                eff_tokens = len(r.origin_input_ids) - prefix_len - (getattr(r, "host_hit_length", 0) or 0)
+                projected_prefill_tokens += _ceil_pages(eff_tokens)
+            try:
+                decode_pages = self.running_batch.new_page_count_next_decode() * page_sz
+            except Exception:
+                decode_pages = 0
+            ret["projected_kv_after_admit_pages"] = max(0, headroom_tokens - (projected_prefill_tokens + decode_pages)) // max(1, page_sz)
+        except Exception:
+            pass
 
         return GetInternalStateReqOutput(internal_state=ret)
 

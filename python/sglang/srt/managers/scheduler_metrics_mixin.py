@@ -49,6 +49,27 @@ class SchedulerMetricsMixin:
         self.cum_spec_accept_count = 0
         self.total_retracted_reqs = 0
         self.stats = SchedulerStats()
+        # Telemetry scaffolding: TTFT and decode-step latency rings and EWMA
+        from collections import deque
+        self._ttft_ring = deque(maxlen=(self.server_args.ttft_min_samples * 2))
+        self._ttft_ema_p50 = None
+        self._ttft_ema_p95 = None
+        self._ttft_ema_p99 = None
+        self._decode_step_ring = deque(maxlen=self.server_args.decode_lat_rolling_size)
+        self._decode_step_p50 = 0.0
+        self._decode_step_p95 = 0.0
+        # Baseline decode capacity used for underfill ratio; start from configured cap
+        self._decode_capacity_baseline = (
+            self.server_args.max_micro_batch_size
+            if self.server_args.max_micro_batch_size is not None
+            else 0
+        )
+        # Clamp state machine
+        self._clamp_active = False
+        self._clamp_breach_since = None
+        self._clamp_entered_at = None
+        self._clamp_last_state_change = 0.0
+        self._last_ratio_adjust_ts = 0.0
         if self.enable_metrics:
             engine_type = "unified"
             labels = {
@@ -154,6 +175,19 @@ class SchedulerMetricsMixin:
                     self.disagg_prefill_inflight_queue
                 )
 
+            # Telemetry scaffolding: also publish decode-step and TTFT gauges here
+            self.stats.decode_step_latency_p50_ms = self._decode_step_p50
+            self.stats.decode_step_latency_p95_ms = self._decode_step_p95
+            if self._decode_capacity_baseline:
+                self.stats.decode_capacity_baseline = float(self._decode_capacity_baseline)
+                self.stats.batch_size_decode_actual = float(running_bs)
+                self.stats.decode_underfill_ratio = (
+                    running_bs / float(self._decode_capacity_baseline)
+                )
+            self.stats.ttft_p50_ms = 0.0 if self._ttft_ema_p50 is None else float(self._ttft_ema_p50)
+            self.stats.ttft_p95_ms = 0.0 if self._ttft_ema_p95 is None else float(self._ttft_ema_p95)
+            self.stats.ttft_p99_ms = 0.0 if self._ttft_ema_p99 is None else float(self._ttft_ema_p99)
+
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
@@ -168,6 +202,15 @@ class SchedulerMetricsMixin:
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
+        # Update rolling decode step latency percentiles (ms)
+        step_ms = (gap_latency / max(1, self.server_args.decode_log_interval)) * 1000.0
+        self._decode_step_ring.append(step_ms)
+        if len(self._decode_step_ring) >= max(10, int(self.server_args.decode_lat_rolling_size * 0.25)):
+            arr = torch.tensor(list(self._decode_step_ring))
+            # torch.quantile requires float tensor
+            arr = arr.to(torch.float32)
+            self._decode_step_p50 = float(torch.quantile(arr, 0.5).item())
+            self._decode_step_p95 = float(torch.quantile(arr, 0.95).item())
         if self.is_hybrid:
             (
                 full_num_used,
@@ -231,6 +274,19 @@ class SchedulerMetricsMixin:
             self.stats.spec_accept_length = spec_accept_length
             self.stats.total_retracted_reqs = self.total_retracted_reqs
             self.stats.avg_request_queue_latency = 0.0
+            # Telemetry scaffolding: decode-step and TTFT gauges
+            self.stats.decode_step_latency_p50_ms = self._decode_step_p50
+            self.stats.decode_step_latency_p95_ms = self._decode_step_p95
+            if self._decode_capacity_baseline:
+                self.stats.decode_capacity_baseline = float(self._decode_capacity_baseline)
+                self.stats.batch_size_decode_actual = float(num_running_reqs)
+                self.stats.decode_underfill_ratio = (
+                    num_running_reqs / float(self._decode_capacity_baseline)
+                )
+            # TTFT percentiles (EWMA smoothed)
+            self.stats.ttft_p50_ms = 0.0 if self._ttft_ema_p50 is None else float(self._ttft_ema_p50)
+            self.stats.ttft_p95_ms = 0.0 if self._ttft_ema_p95 is None else float(self._ttft_ema_p95)
+            self.stats.ttft_p99_ms = 0.0 if self._ttft_ema_p99 is None else float(self._ttft_ema_p99)
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = len(
                     self.disagg_decode_prealloc_queue.queue
@@ -240,7 +296,91 @@ class SchedulerMetricsMixin:
                 )
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
+        # Evaluate clamp after updating step latencies
+        try:
+            self._maybe_update_ttft_clamp()
+        except Exception:
+            pass
         self._publish_kv_events()
+
+    # Telemetry helper: update TTFT rings and EWMA percentiles
+    def _observe_ttft(self: Scheduler, ttft_seconds: float):
+        ttft_ms = ttft_seconds * 1000.0
+        self._ttft_ring.append(ttft_ms)
+        # Only compute once a sufficient number of samples is available
+        if len(self._ttft_ring) >= self.server_args.ttft_min_samples:
+            vals = torch.tensor(list(self._ttft_ring), dtype=torch.float32)
+            p50 = float(torch.quantile(vals, 0.5).item())
+            p95 = float(torch.quantile(vals, 0.95).item())
+            p99 = float(torch.quantile(vals, 0.99).item())
+            a = self.server_args.ttft_ema_alpha
+            self._ttft_ema_p50 = p50 if self._ttft_ema_p50 is None else (a * p50 + (1 - a) * self._ttft_ema_p50)
+            self._ttft_ema_p95 = p95 if self._ttft_ema_p95 is None else (a * p95 + (1 - a) * self._ttft_ema_p95)
+            self._ttft_ema_p99 = p99 if self._ttft_ema_p99 is None else (a * p99 + (1 - a) * self._ttft_ema_p99)
+
+    # Clamp state machine based on TTFT and decode step latency
+    def _maybe_update_ttft_clamp(self: Scheduler):
+        if not self.server_args.enable_ttft_clamp:
+            return
+        now = time.perf_counter()
+        # Determine breach condition
+        ttft_ok = True
+        if len(self._ttft_ring) >= self.server_args.ttft_min_samples:
+            # Prefer p99 if configured, else p95
+            breached = False
+            if self.server_args.ttft_target_p99_ms is not None and self._ttft_ema_p99 is not None:
+                breached = self._ttft_ema_p99 > float(self.server_args.ttft_target_p99_ms)
+            if (not breached) and self.server_args.ttft_target_p95_ms is not None and self._ttft_ema_p95 is not None:
+                breached = self._ttft_ema_p95 > float(self.server_args.ttft_target_p95_ms)
+            ttft_ok = not breached
+        # Optional decode step guard
+        step_ok = True
+        if self.server_args.max_decode_step_p95_ms is not None and self._decode_step_p95:
+            step_ok = self._decode_step_p95 <= float(self.server_args.max_decode_step_p95_ms)
+
+        sustained = False
+        if not ttft_ok and (self._clamp_breach_since is None):
+            self._clamp_breach_since = now
+        if not ttft_ok and self._clamp_breach_since is not None:
+            sustained = (now - self._clamp_breach_since) * 1000.0 >= self.server_args.ttft_clamp_sustain_ms
+        if ttft_ok:
+            self._clamp_breach_since = None
+
+        # Enter clamp
+        if (
+            not self._clamp_active
+            and sustained
+            and (now - self._clamp_last_state_change) * 1000.0 >= self.server_args.ttft_clamp_cooldown_ms
+            and (not step_ok if self.server_args.max_decode_step_p95_ms is not None else True)
+        ):
+            self._clamp_active = True
+            self._clamp_entered_at = now
+            self._clamp_last_state_change = now
+
+        # Exit conditions: hysteresis, max duration
+        should_exit = False
+        # Hysteresis: drop below pct * target
+        hysteresis_ok = True
+        target = None
+        if self.server_args.ttft_target_p99_ms is not None and self._ttft_ema_p99 is not None:
+            target = float(self.server_args.ttft_target_p99_ms)
+            hysteresis_ok = (self._ttft_ema_p99 <= target * self.server_args.ttft_clamp_hysteresis_pct)
+        elif self.server_args.ttft_target_p95_ms is not None and self._ttft_ema_p95 is not None:
+            target = float(self.server_args.ttft_target_p95_ms)
+            hysteresis_ok = (self._ttft_ema_p95 <= target * self.server_args.ttft_clamp_hysteresis_pct)
+        if self._clamp_active and target is not None and hysteresis_ok:
+            should_exit = True
+        if self._clamp_active and self._clamp_entered_at is not None:
+            if (now - self._clamp_entered_at) * 1000.0 >= self.server_args.ttft_clamp_max_duration_ms:
+                should_exit = True
+
+        if self._clamp_active:
+            # Apply actions while clamped: soft cap first, then nudge new_token_ratio (once per decode-log tick)
+            self.new_token_ratio = min(self.new_token_ratio + 0.2, 0.95)
+            self._last_ratio_adjust_ts = now
+        if self._clamp_active and should_exit:
+            self._clamp_active = False
+            self._clamp_last_state_change = now
 
     def _emit_kv_metrics(self: Scheduler):
         kv_metrics = KvMetrics()

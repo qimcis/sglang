@@ -1839,6 +1839,35 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
     print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
     print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
+
+    # Best-effort: fetch scheduler-internal telemetry for underfill/headroom
+    try:
+        import requests as _requests
+        if args.backend == "sglang":
+            if args.base_url:
+                _url = args.base_url
+            else:
+                _port = args.port if args.port is not None else 30000
+                _url = f"http://{args.host}:{_port}"
+            _resp = _requests.get(_url + "/get_server_info").json()
+            _ist = _resp.get("internal_states", [{}])[0]
+            _ttft = _ist.get("ttft_ms", {})
+            _dsl = _ist.get("decode_step_latency_ms", {})
+            _under = _ist.get("decode_underfill_ratio", None)
+            _kvh = _ist.get("kv_headroom_pct", None)
+            print("-" * 50)
+            print("Scheduler Telemetry (internal):")
+            if _ttft:
+                print("{:<40} {:<10.2f}".format("TTFT p95 (ms):", _ttft.get("p95", 0.0)))
+                print("{:<40} {:<10.2f}".format("TTFT p99 (ms):", _ttft.get("p99", 0.0)))
+            if _dsl:
+                print("{:<40} {:<10.2f}".format("Decode step p95 (ms):", _dsl.get("p95", 0.0)))
+            if _under is not None:
+                print("{:<40} {:<10.2f}".format("Decode underfill ratio:", _under))
+            if _kvh is not None:
+                print("{:<40} {:<10.2f}".format("KV headroom pct:", _kvh))
+    except Exception:
+        pass
     print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
     print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
     print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))

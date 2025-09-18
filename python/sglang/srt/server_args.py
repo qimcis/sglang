@@ -187,6 +187,9 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    # KV guard
+    kv_headroom_safety_pct: Optional[float] = None
+    kv_guard_chunk_cap_pages: int = 0
 
     # Runtime options
     device: Optional[str] = None
@@ -227,6 +230,22 @@ class ServerArgs:
     gc_warning_threshold_secs: float = 0.0
     enable_trace: bool = False
     oltp_traces_endpoint: str = "localhost:4317"
+
+    # Telemetry scaffolding (TTFT/step latency rings)
+    ttft_ema_alpha: float = 0.2
+    ttft_min_samples: int = 200
+    decode_lat_rolling_size: int = 400
+    # TTFT clamp
+    enable_ttft_clamp: bool = False
+    ttft_target_p95_ms: Optional[int] = None
+    ttft_target_p99_ms: Optional[int] = None
+    max_decode_step_p95_ms: Optional[int] = None
+    decode_soft_cap_factor: float = 1.0
+    decode_soft_cap_min_share: float = 0.5
+    ttft_clamp_sustain_ms: int = 1000
+    ttft_clamp_hysteresis_pct: float = 0.85
+    ttft_clamp_cooldown_ms: int = 2000
+    ttft_clamp_max_duration_ms: int = 15000
 
     # API related
     api_key: Optional[str] = None
@@ -1178,7 +1197,7 @@ class ServerArgs:
             "--schedule-policy",
             type=str,
             default=ServerArgs.schedule_policy,
-            choices=["lpm", "random", "fcfs", "dfs-weight", "lof", "priority"],
+            choices=["lpm", "random", "fcfs", "dfs-weight", "lof", "priority", "wfq-short-first"],
             help="The scheduling policy of the requests.",
         )
         parser.add_argument(
@@ -1210,6 +1229,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.page_size,
             help="The number of tokens in a page.",
+        )
+        parser.add_argument(
+            "--kv-headroom-safety-pct",
+            type=float,
+            default=ServerArgs.kv_headroom_safety_pct,
+            help="If set, defer prefill admits when projected KV headroom falls below this fraction (e.g., 0.10 for 10%).",
+        )
+        parser.add_argument(
+            "--kv-guard-chunk-cap-pages",
+            type=int,
+            default=ServerArgs.kv_guard_chunk_cap_pages,
+            help="When KV guard is active, cap the allowed chunked prefill size to this many pages for the in-flight chunked request (0 disables cap).",
         )
         parser.add_argument(
             "--hybrid-kvcache-ratio",
@@ -1443,6 +1474,85 @@ class ServerArgs:
             type=int,
             default=ServerArgs.decode_log_interval,
             help="The log interval of decode batch.",
+        )
+        # Telemetry scaffolding flags
+        parser.add_argument(
+            "--ttft-ema-alpha",
+            type=float,
+            default=ServerArgs.ttft_ema_alpha,
+            help="EWMA alpha used to smooth TTFT percentiles for clamp/telemetry.",
+        )
+        parser.add_argument(
+            "--ttft-min-samples",
+            type=int,
+            default=ServerArgs.ttft_min_samples,
+            help="Minimum TTFT samples required before evaluating percentile-based triggers.",
+        )
+        parser.add_argument(
+            "--decode-lat-rolling-size",
+            type=int,
+            default=ServerArgs.decode_lat_rolling_size,
+            help="Rolling window size for decode step latency statistics.",
+        )
+        parser.add_argument(
+            "--enable-ttft-clamp",
+            action="store_true",
+            default=ServerArgs.enable_ttft_clamp,
+            help="Enable TTFT clamp state machine to bias scheduler under tail regressions.",
+        )
+        parser.add_argument(
+            "--ttft-target-p95-ms",
+            type=int,
+            default=ServerArgs.ttft_target_p95_ms,
+            help="Target TTFT p95 (ms) for clamp triggers.",
+        )
+        parser.add_argument(
+            "--ttft-target-p99-ms",
+            type=int,
+            default=ServerArgs.ttft_target_p99_ms,
+            help="Target TTFT p99 (ms) for clamp triggers.",
+        )
+        parser.add_argument(
+            "--max-decode-step-p95-ms",
+            type=int,
+            default=ServerArgs.max_decode_step_p95_ms,
+            help="Optional additional guard: maximum acceptable decode step latency p95 (ms).",
+        )
+        parser.add_argument(
+            "--decode-soft-cap-factor",
+            type=float,
+            default=ServerArgs.decode_soft_cap_factor,
+            help="When clamped, limit decode joiners to this fraction of baseline capacity (0.5-1.0).",
+        )
+        parser.add_argument(
+            "--decode-soft-cap-min-share",
+            type=float,
+            default=ServerArgs.decode_soft_cap_min_share,
+            help="Minimum share of baseline decode capacity to allow when clamped.",
+        )
+        parser.add_argument(
+            "--ttft-clamp-sustain-ms",
+            type=int,
+            default=ServerArgs.ttft_clamp_sustain_ms,
+            help="Breach must be sustained for at least this many milliseconds before clamp activates.",
+        )
+        parser.add_argument(
+            "--ttft-clamp-hysteresis-pct",
+            type=float,
+            default=ServerArgs.ttft_clamp_hysteresis_pct,
+            help="Hysteresis factor to consider clamp exit (e.g., 0.85).",
+        )
+        parser.add_argument(
+            "--ttft-clamp-cooldown-ms",
+            type=int,
+            default=ServerArgs.ttft_clamp_cooldown_ms,
+            help="Cooldown period (ms) after clamp exit before it can re-enter.",
+        )
+        parser.add_argument(
+            "--ttft-clamp-max-duration-ms",
+            type=int,
+            default=ServerArgs.ttft_clamp_max_duration_ms,
+            help="Maximum duration (ms) a single clamp episode can last.",
         )
         parser.add_argument(
             "--enable-request-time-stats-logging",

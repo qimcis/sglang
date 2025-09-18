@@ -172,6 +172,16 @@ class SchedulerStats:
     engine_startup_time: float = 0.0
     engine_load_weights_time: float = 0.0
 
+    # New telemetry scaffolding fields
+    ttft_p50_ms: float = 0.0
+    ttft_p95_ms: float = 0.0
+    ttft_p99_ms: float = 0.0
+    decode_step_latency_p50_ms: float = 0.0
+    decode_step_latency_p95_ms: float = 0.0
+    decode_capacity_baseline: float = 0.0
+    batch_size_decode_actual: float = 0.0
+    decode_underfill_ratio: float = 0.0
+
 
 class SchedulerMetricsCollector:
 
@@ -185,6 +195,55 @@ class SchedulerMetricsCollector:
         self.num_running_reqs = Gauge(
             name="sglang:num_running_reqs",
             documentation="The number of running requests.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        # New telemetry gauges
+        self.ttft_p50_ms = Gauge(
+            name="sglang:ttft_p50_ms",
+            documentation="Smoothed TTFT p50 (ms) computed at scheduler.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.ttft_p95_ms = Gauge(
+            name="sglang:ttft_p95_ms",
+            documentation="Smoothed TTFT p95 (ms) computed at scheduler.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.ttft_p99_ms = Gauge(
+            name="sglang:ttft_p99_ms",
+            documentation="Smoothed TTFT p99 (ms) computed at scheduler.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.decode_step_latency_p50_ms = Gauge(
+            name="sglang:decode_step_latency_p50_ms",
+            documentation="Rolling decode step latency p50 (ms).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.decode_step_latency_p95_ms = Gauge(
+            name="sglang:decode_step_latency_p95_ms",
+            documentation="Rolling decode step latency p95 (ms).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.decode_capacity_baseline = Gauge(
+            name="sglang:decode_capacity_baseline",
+            documentation="Baseline decode capacity used for underfill ratio (batch size).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.batch_size_decode_actual = Gauge(
+            name="sglang:batch_size_decode_actual",
+            documentation="Actual decode batch size this interval.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.decode_underfill_ratio = Gauge(
+            name="sglang:decode_underfill_ratio",
+            documentation="Actual decode batch size / baseline capacity.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -551,6 +610,19 @@ class SchedulerMetricsCollector:
         )
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
         self._log_gauge(self.avg_request_queue_latency, stats.avg_request_queue_latency)
+        # New telemetry
+        self._log_gauge(self.ttft_p50_ms, stats.ttft_p50_ms)
+        self._log_gauge(self.ttft_p95_ms, stats.ttft_p95_ms)
+        self._log_gauge(self.ttft_p99_ms, stats.ttft_p99_ms)
+        self._log_gauge(
+            self.decode_step_latency_p50_ms, stats.decode_step_latency_p50_ms
+        )
+        self._log_gauge(
+            self.decode_step_latency_p95_ms, stats.decode_step_latency_p95_ms
+        )
+        self._log_gauge(self.decode_capacity_baseline, stats.decode_capacity_baseline)
+        self._log_gauge(self.batch_size_decode_actual, stats.batch_size_decode_actual)
+        self._log_gauge(self.decode_underfill_ratio, stats.decode_underfill_ratio)
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)

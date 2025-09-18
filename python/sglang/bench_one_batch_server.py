@@ -230,6 +230,11 @@ def run_one_case(
     server_info = requests.get(url + "/get_server_info").json()
     acc_length = server_info["internal_states"][0].get("avg_spec_accept_length", None)
     last_gen_throughput = server_info["internal_states"][0]["last_gen_throughput"]
+    # New telemetry fields (best effort)
+    ttft_stats = server_info["internal_states"][0].get("ttft_ms", {})
+    decode_step_stats = server_info["internal_states"][0].get("decode_step_latency_ms", {})
+    underfill = server_info["internal_states"][0].get("decode_underfill_ratio", None)
+    kv_headroom_pct = server_info["internal_states"][0].get("kv_headroom_pct", None)
 
     print(f"batch size: {batch_size}")
     print(f"input_len: {input_len}")
@@ -240,6 +245,14 @@ def run_one_case(
     print(f"input throughput: {input_throughput:.2f} tok/s")
     if output_len != 1:
         print(f"output throughput: {output_throughput:.2f} tok/s")
+    if ttft_stats:
+        print(f"scheduler TTFT p95: {ttft_stats.get('p95', 0.0):.2f} ms, p99: {ttft_stats.get('p99', 0.0):.2f} ms")
+    if decode_step_stats:
+        print(f"decode step p95: {decode_step_stats.get('p95', 0.0):.2f} ms")
+    if underfill is not None:
+        print(f"decode underfill ratio: {underfill:.2f}")
+    if kv_headroom_pct is not None:
+        print(f"kv headroom pct: {kv_headroom_pct:.2f}")
 
     if result_filename:
         with open(result_filename, "a") as fout:

@@ -73,6 +73,7 @@ class CacheAgnosticPolicy(Enum):
     FCFS = "fcfs"  # first come first serve
     LOF = "lof"  # longest output first
     RANDOM = "random"
+    WFQ_SF = "wfq-short-first"  # weighted short-first with aging
 
 
 class SchedulePolicy:
@@ -135,6 +136,8 @@ class SchedulePolicy:
                 )
             elif policy == CacheAgnosticPolicy.RANDOM:
                 SchedulePolicy._sort_randomly(waiting_queue)
+            elif policy == CacheAgnosticPolicy.WFQ_SF:
+                SchedulePolicy._sort_by_wfq_short_first(waiting_queue, self.tree_cache)
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
         return prefix_computed
@@ -264,6 +267,49 @@ class SchedulePolicy:
     def _sort_randomly(waiting_queue: List[Req]) -> None:
         """Shuffles the waiting queue randomly."""
         random.shuffle(waiting_queue)
+
+    @staticmethod
+    def _sort_by_wfq_short_first(waiting_queue: List[Req], tree_cache: BasePrefixCache) -> None:
+        """Weighted short-first with aging. Buckets by effective prefill tokens after prefix hit.
+
+        priority = w[bucket] + k * age_seconds, sorted descending.
+        Buckets: S1<=512, S2<=2048, S3>2048 (page-aligned). Weights (w1,w2,w3)=(1.0,0.6,0.2).
+        """
+        import time as _time
+
+        page_size = getattr(tree_cache, "page_size", 1) or 1
+
+        def ceil_pages(x: int) -> int:
+            return ((max(0, x) + page_size - 1) // page_size) * page_size
+
+        w = (1.0, 0.6, 0.2)
+        s1, s2 = 512, 2048
+        k = 0.1  # aging weight
+
+        # Ensure prefix match info exists
+        for r in waiting_queue:
+            prefix_ids = r.adjust_max_prefix_ids()
+            r.prefix_indices, r.last_node, r.last_host_node, r.host_hit_length = (
+                tree_cache.match_prefix(rid=r.rid, key=prefix_ids)
+            )
+
+        def score_req(r: Req):
+            # effective prefill tokens = (input_len - prefix_len - host_hit), page-aligned
+            prefix_len = len(r.prefix_indices)
+            eff = len(r.origin_input_ids) - prefix_len - (getattr(r, "host_hit_length", 0) or 0)
+            eff = ceil_pages(eff)
+            if eff <= s1:
+                wb = w[0]
+            elif eff <= s2:
+                wb = w[1]
+            else:
+                wb = w[2]
+            age_s = 0.0
+            if getattr(r, "queue_time_start", None) is not None:
+                age_s = max(0.0, _time.perf_counter() - r.queue_time_start)
+            return wb + k * age_s
+
+        waiting_queue.sort(key=lambda r: (-score_req(r), r.queue_time_start))
 
     @staticmethod
     def _sort_by_priority_and_fcfs(
