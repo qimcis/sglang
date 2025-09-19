@@ -85,12 +85,16 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        prefix_table: Optional[object] = None,
+        prefix_hash_len: int = 0,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
+        self.prefix_table = prefix_table
+        self.prefix_hash_len = prefix_hash_len
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache(
@@ -175,6 +179,28 @@ class SchedulePolicy:
 
         for r in waiting_queue:
             prefix_ids = r.adjust_max_prefix_ids()
+
+            # Optional hashed prefix fast-attach overlay
+            if (
+                self.prefix_table is not None
+                and self.prefix_hash_len > 0
+                and len(prefix_ids) >= self.prefix_hash_len
+            ):
+                try:
+                    entry = self.prefix_table.attach(prefix_ids)
+                    if entry is not None:
+                        # Reuse KV handles by locking the node and setting prefix indices
+                        r.prefix_indices = entry.device_indices
+                        r.last_node = entry.last_node
+                        r.last_host_node = entry.last_node
+                        r.host_hit_length = 0
+                        self.tree_cache.inc_lock_ref(r.last_node)
+                        # proceed to in-batch logic with the known prefix length
+                        # also insert a dummy to waiting_queue_radix_tree to avoid over-growth
+                        self.waiting_queue_radix_tree.insert(prefix_ids, torch.empty(len(prefix_ids), dtype=torch.bool))
+                        continue
+                except Exception:
+                    pass
 
             # NOTE: the prefix_indices must always be aligned with last_node
             r.prefix_indices, r.last_node, r.last_host_node, r.host_hit_length = (

@@ -110,6 +110,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_symm_mem",
     "enable_custom_logit_processor",
     "disaggregation_mode",
+    "pager_hotset_min_blocks",
+    "page_size",
 ]
 
 # Put some global args for easy access
@@ -1876,7 +1878,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             if self.token_to_kv_pool_allocator.available_size() < num_tokens:
                 if self.tree_cache is not None:
+                    # Build hot-set indices: last M blocks per active sequence (advisory)
+                    try:
+                        M = int(global_server_args_dict.get("pager_hotset_min_blocks", 1) or 0)
+                        page = int(global_server_args_dict.get("page_size", 1) or 1)
+                        hot_indices = []
+                        if M > 0:
+                            seq_lens_cpu = self.seq_lens.cpu().tolist() if isinstance(self.seq_lens, torch.Tensor) else []
+                            for i, req in enumerate(self.reqs):
+                                if i >= len(seq_lens_cpu):
+                                    continue
+                                seqlen = int(seq_lens_cpu[i])
+                                hot_len = min(seqlen, M * page)
+                                if hot_len <= 0:
+                                    continue
+                                start = seqlen - hot_len
+                                idx = self.req_to_token_pool.req_to_token[req.req_pool_idx, start:seqlen]
+                                hot_indices.append(idx.to(torch.int64, copy=True))
+                            if hot_indices:
+                                hot_flat = torch.cat(hot_indices).unique()
+                                self.tree_cache.set_hotset(hot_flat)
+                    except Exception:
+                        pass
                     self.tree_cache.evict(num_tokens)
+                    # Clear hot-set after eviction
+                    try:
+                        self.tree_cache.clear_hotset()
+                    except Exception:
+                        pass
 
     def _is_available_size_sufficient(self, num_tokens: int) -> bool:
         if self.is_hybrid:

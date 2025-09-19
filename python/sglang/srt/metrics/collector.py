@@ -345,6 +345,89 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        # KV quantization & paging/admission metrics (feature-flagged)
+        self.kv_quant_enabled = Gauge(
+            name="sglang:kv_quant_enabled",
+            documentation="Whether KV quantization is enabled (1) or not (0).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_quantized_tokens_total = Counter(
+            name="sglang:kv_quantized_tokens_total",
+            documentation="Total number of tokens stored with KV quantization.",
+            labelnames=labels.keys(),
+        )
+        self.kv_quant_fallback_heads_total = Counter(
+            name="sglang:kv_quant_fallback_heads_total",
+            documentation="Number of attention heads/layers falling back from quantization.",
+            labelnames=labels.keys(),
+        )
+        self.kv_quant_error_hist = Histogram(
+            name="sglang:kv_quant_error",
+            documentation="Observed quantization error metric during calibration.",
+            labelnames=labels.keys(),
+            buckets=[0.0, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0],
+        )
+        self.kv_prefix_hash_hits_total = Counter(
+            name="sglang:kv_prefix_hash_hits_total",
+            documentation="Number of hashed-prefix dedup hits.",
+            labelnames=labels.keys(),
+        )
+        self.kv_prefix_hash_misses_total = Counter(
+            name="sglang:kv_prefix_hash_misses_total",
+            documentation="Number of hashed-prefix dedup misses.",
+            labelnames=labels.keys(),
+        )
+        self.kv_prefetch_window = Gauge(
+            name="sglang:kv_pager_prefetch_window_blocks",
+            documentation="Configured pager prefetch window size in blocks.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_hotset_blocks = Gauge(
+            name="sglang:kv_pager_hotset_min_blocks",
+            documentation="Configured minimum hot-set blocks per active sequence.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_device_evicts_total = Counter(
+            name="sglang:kv_device_evicts_total",
+            documentation="Total number of device->host KV evictions (blocks).",
+            labelnames=labels.keys(),
+        )
+        self.kv_host_loads_total = Counter(
+            name="sglang:kv_host_loads_total",
+            documentation="Total number of host->device KV loads (blocks).",
+            labelnames=labels.keys(),
+        )
+        self.kv_transfer_h2d_bytes_total = Counter(
+            name="sglang:kv_transfer_h2d_bytes_total",
+            documentation="Total bytes transferred host->device for KV paging.",
+            labelnames=labels.keys(),
+        )
+        self.kv_transfer_d2h_bytes_total = Counter(
+            name="sglang:kv_transfer_d2h_bytes_total",
+            documentation="Total bytes transferred device->host for KV paging.",
+            labelnames=labels.keys(),
+        )
+        self.kv_admission_denied_total = Counter(
+            name="sglang:kv_admission_denied_total",
+            documentation="Number of requests denied by KV admission guard.",
+            labelnames=labels.keys(),
+        )
+        self.kv_admission_projected_blocks = Histogram(
+            name="sglang:kv_admission_projected_blocks",
+            documentation="Projected number of blocks for newly admitted requests.",
+            labelnames=labels.keys(),
+            buckets=[0, 1, 2, 4, 8, 16, 32, 64, 128],
+        )
+        self.kv_headroom_pct = Gauge(
+            name="sglang:kv_headroom_pct",
+            documentation="Current KV headroom percentage (available/total).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
         # Additional queueing time histogram
         self.queue_time = Histogram(
             name="sglang:queue_time_s",

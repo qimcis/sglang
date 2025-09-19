@@ -683,10 +683,11 @@ class FlashAttentionBackend(AttentionBackend):
         )
         window_size = (layer.sliding_window_size, 0) if is_swa else (-1, -1)
         k_descale, v_descale = None, None
-        # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
-        # has corresponding quantization method so that layer.k_scale is not None,
-        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
-        if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
+        # only use kv scaling for float8 kv-cache types; keep Q dtype for int8 path
+        if (
+            self.kv_cache_dtype_str in ["fp8_e4m3", "fp8_e5m2"]
+            and layer.head_dim <= 256
+        ):
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
@@ -754,6 +755,18 @@ class FlashAttentionBackend(AttentionBackend):
             value_cache = value_cache.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
+            # If KV cache is stored as int8, dequantize into scratch using per-layer scales
+            if key_cache.dtype == torch.int8:
+                s_k = getattr(layer, "k_scale", None)
+                s_v = getattr(layer, "v_scale", None)
+                if s_k is None:
+                    s_k = torch.tensor(1.0, device=q.device, dtype=q.dtype)
+                if s_v is None:
+                    s_v = torch.tensor(1.0, device=q.device, dtype=q.dtype)
+                key_cache = key_cache.to(q.dtype) * s_k
+                value_cache = value_cache.to(q.dtype) * s_v
+                k_descale = None
+                v_descale = None
             if layer.is_cross_attention:
                 page_table = metadata.encoder_page_table
                 cache_seqlens = metadata.encoder_lens_int32
@@ -1024,6 +1037,20 @@ class FlashAttentionBackend(AttentionBackend):
             value_cache = value_cache.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
+
+            # If KV cache is stored as int8, dequantize into scratch (per-layer scale)
+            if key_cache.dtype == torch.int8:
+                s_k = getattr(layer, "k_scale", None)
+                s_v = getattr(layer, "v_scale", None)
+                if s_k is None:
+                    s_k = torch.tensor(1.0, device=q.device, dtype=q.dtype)
+                if s_v is None:
+                    s_v = torch.tensor(1.0, device=q.device, dtype=q.dtype)
+                key_cache = key_cache.to(q.dtype) * s_k
+                value_cache = value_cache.to(q.dtype) * s_v
+                # prevent double scaling inside kernels
+                k_descale = None
+                v_descale = None
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention

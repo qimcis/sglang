@@ -616,12 +616,36 @@ class MHATokenToKVPool(KVCache):
         else:
             layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
+            # For int8 KV storage, compute per-layer scales on the fly if not provided
+            if self.dtype == torch.int8 and (k_scale is None or v_scale is None):
+                with torch.no_grad():
+                    # symmetric per-tensor scales
+                    # add small epsilon to avoid div by zero
+                    eps = 1e-6
+                    k_absmax = cache_k.abs().amax() + eps
+                    v_absmax = cache_v.abs().amax() + eps
+                    k_scale = (k_absmax / 127.0).to(torch.float32)
+                    v_scale = (v_absmax / 127.0).to(torch.float32)
+                    # Persist to layer if available
+                    if layer is not None and hasattr(layer, "k_scale"):
+                        try:
+                            layer.k_scale.copy_(k_scale)
+                            layer.v_scale.copy_(v_scale)
+                            layer.k_scale_float = float(k_scale)
+                            layer.v_scale_float = float(v_scale)
+                        except Exception:
+                            pass
             if k_scale is not None:
-                cache_k.div_(k_scale)
+                cache_k = cache_k / k_scale
             if v_scale is not None:
-                cache_v.div_(v_scale)
-            cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
+                cache_v = cache_v / v_scale
+            # Clamp for integer storage to avoid wrap-around
+            if self.dtype == torch.int8:
+                cache_k = cache_k.clamp(min=-128, max=127).to(self.dtype)
+                cache_v = cache_v.clamp(min=-128, max=127).to(self.dtype)
+            else:
+                cache_k = cache_k.to(self.dtype)
+                cache_v = cache_v.to(self.dtype)
 
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)

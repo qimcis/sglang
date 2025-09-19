@@ -60,6 +60,14 @@ class SchedulerMetricsMixin:
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
             self.metrics_collector = SchedulerMetricsCollector(labels=labels)
+            # Initialize static gauges for new knobs
+            try:
+                kv_quant_on = 1.0 if (self.server_args.kv_quantization not in (None, "", "none")) else 0.0
+                self.metrics_collector.kv_quant_enabled.labels(**labels).set(kv_quant_on)
+                self.metrics_collector.kv_prefetch_window.labels(**labels).set(self.server_args.pager_prefetch_window)
+                self.metrics_collector.kv_hotset_blocks.labels(**labels).set(self.server_args.pager_hotset_min_blocks)
+            except Exception:
+                pass
 
     def init_dp_balance(self: Scheduler, dp_balance_meta: Optional[DPBalanceMeta]):
         self.balance_meta = dp_balance_meta

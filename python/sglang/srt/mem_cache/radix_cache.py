@@ -153,6 +153,10 @@ class RadixCache(BasePrefixCache):
                 f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu'."
             )
         self.reset()
+        # Hot-set indices (advisory) to protect from eviction
+        self._hotset_indices: Optional[torch.Tensor] = None
+        # Optional hashed prefix table overlay (set by scheduler)
+        self.prefix_table = None
 
     ##### Public API #####
 
@@ -248,6 +252,27 @@ class RadixCache(BasePrefixCache):
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
 
+        # Publish hashed prefix entry (optional)
+        try:
+            if getattr(self, "prefix_table", None) is not None and getattr(self.prefix_table, "hash_len", 0) > 0:
+                # token_ids used above excludes the last token; publish up to hash_len tokens
+                hash_len = int(self.prefix_table.hash_len)
+                publish_len = min(hash_len, len(token_ids))
+                if publish_len > 0:
+                    if self.page_size != 1:
+                        publish_len = (publish_len // self.page_size) * self.page_size
+                    if publish_len > 0:
+                        prefix_tokens = token_ids[:publish_len]
+                        pmatch = self.match_prefix(prefix_tokens)
+                        if pmatch.device_indices.numel() > 0:
+                            self.prefix_table.put(
+                                torch.tensor(prefix_tokens, dtype=torch.int64, device=self.device),
+                                pmatch.device_indices,
+                                pmatch.last_device_node,
+                            )
+        except Exception:
+            pass
+
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:
@@ -320,6 +345,13 @@ class RadixCache(BasePrefixCache):
                 break
             if x.lock_ref > 0:
                 continue
+            # Skip nodes that intersect with hot-set indices
+            if self._hotset_indices is not None:
+                try:
+                    if torch.isin(x.value, self._hotset_indices).any():
+                        continue
+                except Exception:
+                    pass
 
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
@@ -378,6 +410,13 @@ class RadixCache(BasePrefixCache):
         return torch.cat(values)
 
     ##### Internal Helper Functions #####
+
+    def set_hotset(self, indices: torch.Tensor):
+        # indices: 1-D int64 tensor of token indices to protect
+        self._hotset_indices = indices.to(device=self.device, dtype=torch.int64)
+
+    def clear_hotset(self):
+        self._hotset_indices = None
 
     def _match_prefix_helper(self, node: TreeNode, key: List):
         node.last_access_time = time.monotonic()

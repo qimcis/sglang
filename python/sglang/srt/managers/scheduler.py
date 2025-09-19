@@ -268,6 +268,16 @@ class Scheduler(
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.page_size = server_args.page_size
+        # Export selected server args for batch helpers
+        try:
+            from sglang.srt.managers.schedule_batch import global_server_args_dict
+
+            global_server_args_dict["page_size"] = self.page_size
+            global_server_args_dict["pager_hotset_min_blocks"] = (
+                server_args.pager_hotset_min_blocks
+            )
+        except Exception:
+            pass
 
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
@@ -491,12 +501,27 @@ class Scheduler(
             self.grammar_backend = None
 
         # Init schedule policy and new token estimation
+        # Optional hashed prefix dedup table
+        prefix_table = None
+        if self.server_args.prefix_dedup_hash_len and self.server_args.prefix_dedup_hash_len > 0:
+            try:
+                from sglang.srt.mem_cache.prefix_table import PrefixTable
+
+                prefix_table = PrefixTable(self.server_args.prefix_dedup_hash_len)
+                # Attach to radix cache for publishing on finish
+                if hasattr(self.tree_cache, "prefix_table"):
+                    self.tree_cache.prefix_table = prefix_table
+            except Exception:
+                prefix_table = None
+
         self.policy = SchedulePolicy(
             self.schedule_policy,
             self.tree_cache,
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            prefix_table=prefix_table,
+            prefix_hash_len=self.server_args.prefix_dedup_hash_len or 0,
         )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
@@ -681,6 +706,14 @@ class Scheduler(
                     model_name=server_args.served_model_name,
                     storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
                 )
+                # Tune prefetch threshold based on pager prefetch window (blocks)
+                try:
+                    blocks = max(0, int(self.server_args.pager_prefetch_window))
+                    self.tree_cache.prefetch_threshold = max(self.page_size, blocks * self.page_size)
+                    if hasattr(self.tree_cache, "cache_controller"):
+                        self.tree_cache.cache_controller.prefetch_threshold = self.tree_cache.prefetch_threshold
+                except Exception:
+                    pass
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
@@ -1386,6 +1419,41 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
         else:
+            # Admission guard (projected KV growth safety headroom)
+            if self.server_args.admission_guard_enabled and not req.finished():
+                try:
+                    # Estimate effective prefill tokens (accounting for prefix hits on device/host)
+                    match = self.tree_cache.match_prefix(rid=req.rid, key=req.origin_input_ids)
+                    prefix_len = len(match.device_indices) if match and match.device_indices is not None else 0
+                    host_hit = getattr(match, "host_hit_length", 0) or 0
+                    effective_prefill = max(0, len(req.origin_input_ids) - prefix_len - host_hit)
+                    page = max(1, self.page_size)
+                    projected_tokens = ((effective_prefill + page - 1) // page) * page
+                    # Current headroom before admitting
+                    avail = self.token_to_kv_pool_allocator.available_size()
+                    headroom_after = max(0, avail - projected_tokens) / max(1, self.max_total_num_tokens)
+                    if self.enable_metrics:
+                        # Record headroom and projected blocks
+                        self.metrics_collector.kv_headroom_pct.labels(**self.metrics_collector.labels).set(headroom_after)
+                        self.metrics_collector.kv_admission_projected_blocks.labels(**self.metrics_collector.labels).observe(projected_tokens // page)
+                    if headroom_after < self.server_args.admission_guard_safety_pct:
+                        # Deny/defer: abort with retryable error for now
+                        message = (
+                            f"Admission guard: insufficient KV headroom (proj_tokens={projected_tokens}, "
+                            f"avail={avail}, headroom_after={headroom_after:.3f} < safety={self.server_args.admission_guard_safety_pct:.3f})."
+                        )
+                        if self.enable_metrics:
+                            self.metrics_collector.kv_admission_denied_total.labels(**self.metrics_collector.labels).inc()
+                        prepare_abort(
+                            req,
+                            message,
+                            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                        )
+                        # fallthrough to queue so client receives abort immediately
+                except Exception as _:
+                    # Fail-open: do not block admission if estimation fails
+                    pass
+
             self._set_or_validate_priority(req)
             if self._abort_on_queued_limit(req):
                 return

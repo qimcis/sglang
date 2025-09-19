@@ -276,6 +276,13 @@ class HiRadixCache(RadixCache):
 
             if x.lock_ref > 0:
                 continue
+            # Skip nodes that intersect with hot-set indices (advisory)
+            if getattr(self, "_hotset_indices", None) is not None:
+                try:
+                    if torch.isin(x.value, self._hotset_indices).any():
+                        continue
+                except Exception:
+                    pass
 
             if not x.backuped:
                 if self.cache_controller.write_policy == "write_back":

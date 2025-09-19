@@ -169,6 +169,12 @@ class ServerArgs:
     quantization: Optional[str] = None
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
+    # KV quantization controls (feature-flagged; default off)
+    kv_quantization: Optional[str] = None  # choices: None/"int8_head"/"nf4"/"fp8"
+    kv_quant_calib_steps: int = 2
+    kv_quant_error_threshold: float = 0.02
+    kv_quant_fallback: str = "head"  # choices: "head", "layer", "off"
+    kv_quant_per_block_scale: bool = False
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -187,6 +193,14 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    # Prefix KV dedup via hashing (advisory overlay; 0 disables)
+    prefix_dedup_hash_len: int = 0
+    # Pager knobs (hot/cold tiers)
+    pager_prefetch_window: int = 2  # blocks
+    pager_hotset_min_blocks: int = 1  # per active sequence (advisory)
+    # Admission guard
+    admission_guard_enabled: bool = False
+    admission_guard_safety_pct: float = 0.12
 
     # Runtime options
     device: Optional[str] = None
@@ -1132,8 +1146,42 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3"],
-            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "int8"],
+            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+. "int8" enables int8 KV storage (requires dequant).',
+        )
+
+        # KV quantization (separate from kv-cache-dtype; feature gated)
+        parser.add_argument(
+            "--kv-quantization",
+            type=nullable_str,
+            default=ServerArgs.kv_quantization,
+            choices=[None, "int8_head", "nf4", "fp8"],
+            help="Enable KV cache quantization path. Default None (disabled).",
+        )
+        parser.add_argument(
+            "--kv-quant-calib-steps",
+            type=int,
+            default=ServerArgs.kv_quant_calib_steps,
+            help="Calibration steps for per-head/layer scale estimation.",
+        )
+        parser.add_argument(
+            "--kv-quant-error-threshold",
+            type=float,
+            default=ServerArgs.kv_quant_error_threshold,
+            help="Error threshold (cosine/L2) to trigger selective fallback.",
+        )
+        parser.add_argument(
+            "--kv-quant-fallback",
+            type=str,
+            default=ServerArgs.kv_quant_fallback,
+            choices=["head", "layer", "off"],
+            help="Granularity for error-aware fallback to FP16/BF16.",
+        )
+        parser.add_argument(
+            "--kv-quant-per-block-scale",
+            action="store_true",
+            default=ServerArgs.kv_quant_per_block_scale,
+            help="Use per-block scales in addition to per-head scales.",
         )
 
         # Memory and scheduling
@@ -1210,6 +1258,36 @@ class ServerArgs:
             type=int,
             default=ServerArgs.page_size,
             help="The number of tokens in a page.",
+        )
+        parser.add_argument(
+            "--prefix-dedup-hash-len",
+            type=int,
+            default=ServerArgs.prefix_dedup_hash_len,
+            help="If > 0, hash first N tokens to opportunistically dedup shared prefixes (advisory).",
+        )
+        parser.add_argument(
+            "--pager-prefetch-window",
+            type=int,
+            default=ServerArgs.pager_prefetch_window,
+            help="Pager prefetch window size in blocks (advisory).",
+        )
+        parser.add_argument(
+            "--pager-hotset-min-blocks",
+            type=int,
+            default=ServerArgs.pager_hotset_min_blocks,
+            help="Minimum hot-set blocks to keep per active sequence on device (advisory).",
+        )
+        parser.add_argument(
+            "--admission-guard-enabled",
+            action="store_true",
+            default=ServerArgs.admission_guard_enabled,
+            help="Enable admission guard to avoid OOM cliffs based on projected KV growth.",
+        )
+        parser.add_argument(
+            "--admission-guard-safety-pct",
+            type=float,
+            default=ServerArgs.admission_guard_safety_pct,
+            help="Safety headroom percentage (0~1) for admission guard.",
         )
         parser.add_argument(
             "--hybrid-kvcache-ratio",

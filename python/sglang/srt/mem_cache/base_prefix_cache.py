@@ -59,6 +59,13 @@ class BasePrefixCache(ABC):
     def dec_lock_ref(self, node: Any, swa_uuid_for_lock: Optional[str] = None):
         pass
 
+    # Advisory hot-set protection to avoid evicting last blocks per active sequence
+    def set_hotset(self, indices: torch.Tensor):
+        pass
+
+    def clear_hotset(self):
+        pass
+
     def evictable_size(self):
         return 0
 
