@@ -375,9 +375,27 @@ class SchedulerMetricsMixin:
                 should_exit = True
 
         if self._clamp_active:
-            # Apply actions while clamped: soft cap first, then nudge new_token_ratio (once per decode-log tick)
-            self.new_token_ratio = min(self.new_token_ratio + 0.2, 0.95)
-            self._last_ratio_adjust_ts = now
+            # Apply actions while clamped: soft cap on joiners is handled in
+            # Scheduler.get_num_allocatable_reqs(). Optionally bump new_token_ratio to
+            # bias toward decode, but only when decode is demonstrably the bottleneck.
+            # If a user supplied a decode-step guard, respect it: do not bump ratio
+            # unless decode step latency also breaches the threshold.
+            decode_guard_required = (
+                self.server_args.max_decode_step_p95_ms is not None
+            )
+            decode_breached = not step_ok if decode_guard_required else True
+
+            if (
+                self._clamp_active
+                and decode_breached
+                and not self.server_args.ttft_clamp_disable_ratio_bump
+                and (getattr(self, "_decode_capacity_baseline", 0) or 0) > 0
+            ):
+                bump = max(0.0, float(self.server_args.ttft_clamp_ratio_bump))
+                max_ratio = float(self.server_args.ttft_clamp_ratio_max)
+                if bump > 0.0 and self.new_token_ratio < max_ratio - 1e-6:
+                    self.new_token_ratio = min(self.new_token_ratio + bump, max_ratio)
+                    self._last_ratio_adjust_ts = now
         if self._clamp_active and should_exit:
             self._clamp_active = False
             self._clamp_last_state_change = now

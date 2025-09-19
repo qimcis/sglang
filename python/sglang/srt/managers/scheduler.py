@@ -541,6 +541,15 @@ class Scheduler(
 
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
+        # Initialize decode capacity baseline for telemetry/clamp if missing
+        try:
+            if not getattr(self, "_decode_capacity_baseline", 0):
+                fallback = max(1, self.max_running_requests // self.pp_size)
+                self._decode_capacity_baseline = (
+                    self.server_args.max_micro_batch_size or fallback
+                )
+        except Exception:
+            pass
         self.init_kv_events(server_args.kv_events_config)
         self.init_dp_balance(dp_balance_meta)
 
@@ -1757,8 +1766,15 @@ class Scheduler(
                         baseline * self.server_args.decode_soft_cap_factor,
                     )
                     res = min(res, int(math.floor(allowed_cap)) - running_bs)
+                    # Prevent total starvation: allow a minimal trickle of joiners while clamped
+                    min_joiners = max(0, int(self.server_args.decode_soft_cap_min_joiners))
+                    if res <= 0 and min_joiners > 0:
+                        res = min_joiners
         except Exception:
             pass
+        # Ensure non-negative allocatable count
+        if res < 0:
+            res = 0
         if self.pp_size > 1:
             res = min(res, self.req_to_token_pool.available_size())
         return res

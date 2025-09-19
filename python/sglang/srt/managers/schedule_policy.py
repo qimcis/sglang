@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch, global_server_args_dict
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
@@ -273,7 +273,8 @@ class SchedulePolicy:
         """Weighted short-first with aging. Buckets by effective prefill tokens after prefix hit.
 
         priority = w[bucket] + k * age_seconds, sorted descending.
-        Buckets: S1<=512, S2<=2048, S3>2048 (page-aligned). Weights (w1,w2,w3)=(1.0,0.6,0.2).
+        Buckets: S1<=s1, S2<=s2, S3>s2 (page-aligned). Weights configurable via flags.
+        Reserved S3 share: admit up to floor(total_slots * reserved_long_pct) S3 by age first, use-it-or-lose-it per tick.
         """
         import time as _time
 
@@ -282,8 +283,15 @@ class SchedulePolicy:
         def ceil_pages(x: int) -> int:
             return ((max(0, x) + page_size - 1) // page_size) * page_size
 
-        w = (1.0, 0.6, 0.2)
-        s1, s2 = 512, 2048
+        # Read thresholds/weights from server args if available
+        s1 = int(global_server_args_dict.get("prefill_wfq_s1", 512) or 512)
+        s2 = int(global_server_args_dict.get("prefill_wfq_s2", 2048) or 2048)
+        w_raw = global_server_args_dict.get("prefill_wfq_weights")
+        if isinstance(w_raw, (list, tuple)) and len(w_raw) == 3:
+            w = tuple(float(x) for x in w_raw)
+        else:
+            w = (1.0, 0.6, 0.2)
+        reserved_long_pct = float(global_server_args_dict.get("prefill_wfq_reserved_long_pct", 0.0) or 0.0)
         k = 0.1  # aging weight
 
         # Ensure prefix match info exists
@@ -293,21 +301,41 @@ class SchedulePolicy:
                 tree_cache.match_prefix(rid=r.rid, key=prefix_ids)
             )
 
-        def score_req(r: Req):
+        def eff_tokens_and_bucket(r: Req):
             # effective prefill tokens = (input_len - prefix_len - host_hit), page-aligned
             prefix_len = len(r.prefix_indices)
             eff = len(r.origin_input_ids) - prefix_len - (getattr(r, "host_hit_length", 0) or 0)
             eff = ceil_pages(eff)
             if eff <= s1:
-                wb = w[0]
+                bucket = 0
             elif eff <= s2:
-                wb = w[1]
+                bucket = 1
             else:
-                wb = w[2]
+                bucket = 2
+            return eff, bucket
+
+        def score_req(r: Req):
+            eff, bucket = eff_tokens_and_bucket(r)
+            wb = w[bucket]
             age_s = 0.0
             if getattr(r, "queue_time_start", None) is not None:
                 age_s = max(0.0, _time.perf_counter() - r.queue_time_start)
             return wb + k * age_s
+
+        # If reserved_long_pct > 0, move up to reserved slots of S3 (long) by age first
+        if reserved_long_pct > 0.0 and len(waiting_queue) > 0:
+            total_slots = int(global_server_args_dict.get("max_micro_batch_size", 1) or 1)
+            reserved_slots = max(0, int(total_slots * reserved_long_pct))
+            if reserved_slots > 0:
+                # Stable partition S3, sort by age desc
+                s3 = [r for r in waiting_queue if eff_tokens_and_bucket(r)[1] == 2]
+                s3.sort(key=lambda r: getattr(r, "queue_time_start", 0.0))
+                s3 = s3[:reserved_slots]
+                s3_set = set(id(r) for r in s3)
+                rest = [r for r in waiting_queue if id(r) not in s3_set]
+                rest.sort(key=lambda r: (-score_req(r), r.queue_time_start))
+                waiting_queue[:] = s3 + rest
+                return
 
         waiting_queue.sort(key=lambda r: (-score_req(r), r.queue_time_start))
 

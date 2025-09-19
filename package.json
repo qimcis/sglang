@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "codex-monorepo": "github:openai/codex"
+  }
+}

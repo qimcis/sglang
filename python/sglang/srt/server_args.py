@@ -235,6 +235,11 @@ class ServerArgs:
     ttft_ema_alpha: float = 0.2
     ttft_min_samples: int = 200
     decode_lat_rolling_size: int = 400
+    # WFQ short-first knobs
+    prefill_wfq_s1: int = 512
+    prefill_wfq_s2: int = 2048
+    prefill_wfq_weights: Optional[List[float]] = None  # [w1, w2, w3]
+    prefill_wfq_reserved_long_pct: float = 0.0
     # TTFT clamp
     enable_ttft_clamp: bool = False
     ttft_target_p95_ms: Optional[int] = None
@@ -242,10 +247,16 @@ class ServerArgs:
     max_decode_step_p95_ms: Optional[int] = None
     decode_soft_cap_factor: float = 1.0
     decode_soft_cap_min_share: float = 0.5
+    # Minimum number of new joiners to allow while clamp is active to prevent complete starvation
+    decode_soft_cap_min_joiners: int = 1
     ttft_clamp_sustain_ms: int = 1000
     ttft_clamp_hysteresis_pct: float = 0.85
     ttft_clamp_cooldown_ms: int = 2000
     ttft_clamp_max_duration_ms: int = 15000
+    # Clamp bias controls (soften prefill starvation)
+    ttft_clamp_ratio_bump: float = 0.1
+    ttft_clamp_ratio_max: float = 0.9
+    ttft_clamp_disable_ratio_bump: bool = False
 
     # API related
     api_key: Optional[str] = None
@@ -1494,6 +1505,32 @@ class ServerArgs:
             default=ServerArgs.decode_lat_rolling_size,
             help="Rolling window size for decode step latency statistics.",
         )
+        # WFQ short-first knobs
+        parser.add_argument(
+            "--prefill-wfq-s1",
+            type=int,
+            default=ServerArgs.prefill_wfq_s1,
+            help="WFQ short-first: S1 bucket max effective tokens (<= this).",
+        )
+        parser.add_argument(
+            "--prefill-wfq-s2",
+            type=int,
+            default=ServerArgs.prefill_wfq_s2,
+            help="WFQ short-first: S2 bucket max effective tokens (<= this). S3 is > this.",
+        )
+        parser.add_argument(
+            "--prefill-wfq-weights",
+            nargs=3,
+            type=float,
+            default=ServerArgs.prefill_wfq_weights,
+            help="WFQ short-first: weights [w1 w2 w3] for S1/S2/S3 buckets.",
+        )
+        parser.add_argument(
+            "--prefill-wfq-reserved-long-pct",
+            type=float,
+            default=ServerArgs.prefill_wfq_reserved_long_pct,
+            help="WFQ short-first: reserved fraction of decode slots for S3 (long) requests, use-it-or-lose-it per tick.",
+        )
         parser.add_argument(
             "--enable-ttft-clamp",
             action="store_true",
@@ -1531,6 +1568,12 @@ class ServerArgs:
             help="Minimum share of baseline decode capacity to allow when clamped.",
         )
         parser.add_argument(
+            "--decode-soft-cap-min-joiners",
+            type=int,
+            default=ServerArgs.decode_soft_cap_min_joiners,
+            help="While clamp is active, always allow at least this many new joiners per scheduling tick to avoid total prefill starvation.",
+        )
+        parser.add_argument(
             "--ttft-clamp-sustain-ms",
             type=int,
             default=ServerArgs.ttft_clamp_sustain_ms,
@@ -1553,6 +1596,24 @@ class ServerArgs:
             type=int,
             default=ServerArgs.ttft_clamp_max_duration_ms,
             help="Maximum duration (ms) a single clamp episode can last.",
+        )
+        parser.add_argument(
+            "--ttft-clamp-ratio-bump",
+            type=float,
+            default=ServerArgs.ttft_clamp_ratio_bump,
+            help="When clamped, increment to new_token_ratio per decode-log tick (smaller=softer).",
+        )
+        parser.add_argument(
+            "--ttft-clamp-ratio-max",
+            type=float,
+            default=ServerArgs.ttft_clamp_ratio_max,
+            help="Upper bound for new_token_ratio while clamped.",
+        )
+        parser.add_argument(
+            "--ttft-clamp-disable-ratio-bump",
+            action="store_true",
+            default=ServerArgs.ttft_clamp_disable_ratio_bump,
+            help="Disable new_token_ratio bump during clamp (decode soft-cap only).",
         )
         parser.add_argument(
             "--enable-request-time-stats-logging",
