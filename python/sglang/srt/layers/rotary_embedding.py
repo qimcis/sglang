@@ -3,6 +3,7 @@
 """Rotary Positional Embeddings."""
 import itertools
 import math
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -224,6 +225,10 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg=None,  # Optional[FusedSetKVBufferArg]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if os.environ.get("SGLANG_FORCE_NATIVE_ROPE", "0") == "1":
+            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+            return self.forward_native(positions, query, key, offsets)
+
         if _is_cuda and (self.head_size in [64, 128, 256, 512]):
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,

@@ -63,6 +63,7 @@ from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 from sglang.srt.utils import is_cuda, is_hip, mxfp_supported
 from sglang.srt.layers.quantization.qgemm_int4 import QgemmInt4Config
+from sglang.srt.layers.quantization.qgemm_int4_ptq import QgemmInt4PTQConfig
 
 _is_mxfp_supported = mxfp_supported()
 
@@ -88,6 +89,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "petit_nvfp4": PetitNvFp4Config,
     "fbgemm_fp8": FBGEMMFp8Config,
     "qgemm_int4": QgemmInt4Config,
+    "qgemm_int4_ptq": QgemmInt4PTQConfig,
 }
 
 
