@@ -127,7 +127,10 @@ class QgemmInt4LinearMethod(LinearMethodBase):
             weight_loader=weight_loader,
         )
         layer.register_parameter("packed_w", packed_w)
-        set_weight_attrs(packed_w, extra_weight_attrs)
+        # Avoid overwriting existing attributes such as weight_loader
+        extra_attrs = {k: v for k, v in extra_weight_attrs.items() if k != "weight_loader"}
+        if extra_attrs:
+            set_weight_attrs(packed_w, extra_attrs)
 
         scales = GroupQuantScaleParameter(
             data=torch.empty(Nshard, _ceil_div(K, group_size), dtype=torch.float16),
@@ -136,7 +139,8 @@ class QgemmInt4LinearMethod(LinearMethodBase):
             weight_loader=weight_loader,
         )
         layer.register_parameter("scales", scales)
-        set_weight_attrs(scales, extra_weight_attrs)
+        if extra_attrs:
+            set_weight_attrs(scales, extra_attrs)
 
         # Nothing special for bias; ColumnParallelLinear already registers it
 
@@ -187,4 +191,3 @@ class QgemmInt4LinearMethod(LinearMethodBase):
 
         # Keep FP16 (kernel output); caller may cast if needed.
         return y
-
