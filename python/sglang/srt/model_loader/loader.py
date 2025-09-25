@@ -287,7 +287,11 @@ class DefaultModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         extra_config = load_config.model_loader_extra_config
-        allowed_keys = {"enable_multithread_load", "num_threads"}
+        # Allowlist extra config keys for the default loader.
+        # - enable_multithread_load/num_threads: generic load threading knobs
+        # - qgemm_int4_dir: optional directory containing per-layer INT4 packed
+        #   weights (packed_w/scales) produced by the qgemm converter.
+        allowed_keys = {"enable_multithread_load", "num_threads", "qgemm_int4_dir"}
         unexpected_keys = set(extra_config.keys()) - allowed_keys
 
         if unexpected_keys:
