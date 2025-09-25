@@ -32,6 +32,7 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
+    ColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -46,6 +47,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.utils import get_device_capability
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -69,13 +71,49 @@ class LlamaMLP(nn.Module):
         reduce_results: bool = True,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
-        )
+        # Decide whether to split gate/up paths for qgemm_int4 fused SiLU on gate
+        enable_split = False
+        if quant_config is not None:
+            try:
+                qname = quant_config.get_name()
+            except Exception:
+                qname = None
+            if qname == "qgemm_int4":
+                # Force via server flag or enable heuristically on SM80+ with large K
+                force = bool(global_server_args_dict.get("qgemm_split_gate_up", False))
+                major, minor = get_device_capability()
+                heur = (major is not None and major >= 8 and hidden_size >= 2048)
+                enable_split = force or heur
+
+        self.split_gate_up = enable_split
+
+        if self.split_gate_up:
+            # Two separate column-parallel linears; set fused SiLU on gate path
+            self.gate_proj = ColumnParallelLinear(
+                hidden_size,
+                intermediate_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("gate_proj", prefix),
+            )
+            # Hint the qgemm path to fuse SiLU in the kernel
+            setattr(self.gate_proj, "fused_activation", "silu")
+
+            self.up_proj = ColumnParallelLinear(
+                hidden_size,
+                intermediate_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("up_proj", prefix),
+            )
+        else:
+            self.gate_up_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [intermediate_size] * 2,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("gate_up_proj", prefix),
+            )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -89,7 +127,8 @@ class LlamaMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. "
                 "Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul()
+        if not self.split_gate_up:
+            self.act_fn = SiluAndMul()
 
     def forward(
         self,
@@ -97,8 +136,14 @@ class LlamaMLP(nn.Module):
         forward_batch=None,
         use_reduce_scatter: bool = False,
     ):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self.split_gate_up:
+            gate, _ = self.gate_proj(x)
+            up, _ = self.up_proj(x)
+            # gate already has SiLU applied inside the kernel; just multiply
+            x = gate * up
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x,
             skip_all_reduce=use_reduce_scatter,
@@ -554,13 +599,12 @@ class LlamaForCausalLM(nn.Module):
         return len(params_dict)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        # (param_name, shard_name, shard_id)
+        # For MLP, if split_gate_up is enabled, load gate/up directly (no mapping).
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
         ]
 
         params_dict = dict(self.named_parameters())
@@ -592,7 +636,16 @@ class LlamaForCausalLM(nn.Module):
                 if name is None:
                     continue
 
-            for param_name, weight_name, shard_id in stacked_params_mapping:
+            # If the layer uses merged gate_up_proj, augment mapping; otherwise, skip so direct names load
+            local_mapping = list(stacked_params_mapping)
+            # Heuristic: check existence of merged param in params_dict to decide mapping for gate/up
+            if any(k.endswith(".gate_up_proj.weight") for k in params_dict.keys()):
+                local_mapping += [
+                    (".gate_up_proj", ".gate_proj", 0),
+                    (".gate_up_proj", ".up_proj", 1),
+                ]
+
+            for param_name, weight_name, shard_id in local_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)

@@ -488,9 +488,52 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config,
                 )
 
-        self.load_weights_and_postprocess(
-            model, self._get_all_weights(model_config, model), target_device
-        )
+        # Optionally augment primary HF weights with qgemm INT4 per-layer safetensors
+        extra_cfg = self.load_config.model_loader_extra_config or {}
+        qgemm_dir = extra_cfg.get("qgemm_int4_dir")
+        if qgemm_dir:
+            def _qgemm_iter():
+                import json
+                import os
+                from safetensors import safe_open
+
+                index_path = os.path.join(qgemm_dir, "index.json")
+                if not os.path.exists(index_path):
+                    raise FileNotFoundError(f"qgemm_int4_dir missing index.json: {index_path}")
+                with open(index_path, "r") as f:
+                    index = json.load(f)
+                layers = index.get("layers", {})
+                for layer_name, entry in layers.items():
+                    fname = entry.get("file")
+                    if not fname:
+                        continue
+                    fpath = os.path.join(qgemm_dir, fname)
+                    if not os.path.exists(fpath):
+                        continue
+                    with safe_open(fpath, framework="pt", device="cpu") as sf:
+                        # Emit packed_w and scales; bias optional
+                        has_packed = "packed_w" in list(sf.keys())
+                        has_scales = "scales" in list(sf.keys())
+                        if has_packed:
+                            yield f"{layer_name}.packed_w", sf.get_tensor("packed_w")
+                        if has_scales:
+                            yield f"{layer_name}.scales", sf.get_tensor("scales")
+                        if "bias" in list(sf.keys()):
+                            yield f"{layer_name}.bias", sf.get_tensor("bias")
+
+            def _combined():
+                # First yield standard HF weights
+                for name, tensor in self._get_all_weights(model_config, model):
+                    yield name, tensor
+                # Then overlay qgemm INT4 weights
+                for name, tensor in _qgemm_iter():
+                    yield name, tensor
+
+            self.load_weights_and_postprocess(model, _combined(), target_device)
+        else:
+            self.load_weights_and_postprocess(
+                model, self._get_all_weights(model_config, model), target_device
+            )
 
         return model.eval()
 

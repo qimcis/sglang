@@ -87,6 +87,7 @@ QUANTIZATION_CHOICES = [
     "qoq",
     "w4afp8",
     "mxfp4",
+    "qgemm_int4",
 ]
 
 ATTENTION_BACKEND_CHOICES = [
@@ -198,6 +199,8 @@ class ServerArgs:
     max_micro_batch_size: Optional[int] = None
     stream_interval: int = 1
     stream_output: bool = False
+    # QGEMM tweaks
+    qgemm_split_gate_up: bool = False
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     watchdog_timeout: float = 300
@@ -1164,6 +1167,14 @@ class ServerArgs:
             default=ServerArgs.kv_cache_dtype,
             choices=["auto", "fp8_e5m2", "fp8_e4m3"],
             help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
+        )
+        parser.add_argument(
+            "--qgemm-split-gate-up",
+            action="store_true",
+            help=(
+                "For qgemm_int4: split MLP gate/up matmuls and use fused SiLU on the gate path. "
+                "If not set, a heuristic enables it by default when SM80+ and K>=2048."
+            ),
         )
 
         # Memory and scheduling
