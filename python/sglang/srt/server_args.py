@@ -203,6 +203,7 @@ class ServerArgs:
     base_gpu_id: int = 0
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
+    enable_fgemm_linear: bool = False
 
     # Logging
     log_level: str = "info"
@@ -1482,6 +1483,19 @@ class ServerArgs:
             action="store_true",
             help="Reduce CPU usage when sglang is idle.",
         )
+        parser.add_argument(
+            "--enable-fgemm-linear",
+            dest="enable_fgemm_linear",
+            action="store_true",
+            help="Enable FGemm fused CUDA kernels for unquantized linear layers.",
+        )
+        parser.add_argument(
+            "--disable-fgemm-linear",
+            dest="enable_fgemm_linear",
+            action="store_false",
+            help="Disable FGemm fused CUDA kernels for unquantized linear layers.",
+        )
+        parser.set_defaults(enable_fgemm_linear=ServerArgs.enable_fgemm_linear)
 
         # Logging
         parser.add_argument(

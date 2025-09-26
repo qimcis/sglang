@@ -72,6 +72,7 @@ from sglang.srt.layers.quantization import (
     deep_gemm_wrapper,
     monkey_patch_isinstance_for_vllm_base_layer,
 )
+from sglang.srt.fgemm_integration import configure_fgemm_linear
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -332,6 +333,7 @@ class ModelRunner:
 
         # Load the model
         self.sampler = Sampler()
+        configure_fgemm_linear(self.server_args.enable_fgemm_linear)
         self.load_model()
 
         # Check if the model is using hybrid SWA
