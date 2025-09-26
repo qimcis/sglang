@@ -247,10 +247,21 @@ class QgemmInt4PTQLinearMethod(LinearMethodBase):
                     x_2d, packed_w, scales, int(group_size), bias
                 )
         except Exception as err:
-            err_str = str(err)
+            err_str = str(err).lower()
             # Handle various kernel errors with fallback
-            is_small_batch = ("batch size" in err_str and "too small" in err_str) or ("is too small" in err_str)
-            is_cuda_error = "CUDA error" in err_str or "AcceleratorError" in str(err) or "unspecified launch failure" in err_str
+            # Match the exact error pattern from C++ code: "qgemm.int4_bias: batch size M=X is too small (< 16)"
+            is_small_batch = (
+                ("batch size" in err_str and "too small" in err_str) or
+                ("is too small" in err_str) or
+                ("qgemm.int4_bias" in err_str and "too small" in err_str) or
+                ("< 16" in err_str)
+            )
+            is_cuda_error = (
+                "cuda error" in err_str or
+                "acceleratorerror" in err_str or
+                "unspecified launch failure" in err_str or
+                "launch failure" in err_str
+            )
 
             if is_small_batch or is_cuda_error:
                 if is_small_batch:
