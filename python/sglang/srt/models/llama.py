@@ -98,7 +98,13 @@ class LlamaMLP(nn.Module):
         use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if getattr(self.gate_up_proj, "_fgemm_gate_pre_silu", False):
+            d = gate_up.shape[-1] // 2
+            gate = gate_up[..., :d]
+            up = gate_up[..., d:]
+            x = gate * up
+        else:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x,
             skip_all_reduce=use_reduce_scatter,

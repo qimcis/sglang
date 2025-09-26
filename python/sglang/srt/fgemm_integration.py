@@ -126,33 +126,13 @@ def _apply_with_fgemm(layer, x: torch.Tensor, bias: Optional[torch.Tensor]):
 
 def _run_fgemm(layer, x_mat: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]):
     if _should_fuse_gate(layer, weight):
-        return _run_gate_split(layer, x_mat, weight, bias)
+        gate_cols = _gate_columns(layer)
+        output = torch.ops.fgemm.fp16_bias_split_silu(x_mat, weight, bias, gate_cols)
+        layer._fgemm_gate_pre_silu = True
+        return output
+    if getattr(layer, "_fgemm_gate_pre_silu", False):
+        layer._fgemm_gate_pre_silu = False
     return torch.ops.fgemm.fp16_bias(x_mat, weight, bias)
-
-
-def _run_gate_split(layer, x_mat, weight, bias):
-    output_sizes = getattr(layer, "output_sizes", None)
-    tp_size = getattr(layer, "tp_size", 1)
-    gate_rows = output_sizes[0] // tp_size
-    up_rows = weight.size(0) - gate_rows
-
-    gate_weight = weight.narrow(0, 0, gate_rows).contiguous()
-    gate_bias = (
-        bias.narrow(0, 0, gate_rows).contiguous() if bias is not None else None
-    )
-    gate_out = torch.ops.fgemm.fp16_bias_silu(x_mat, gate_weight, gate_bias)
-
-    if up_rows == 0:
-        return gate_out
-
-    up_weight = weight.narrow(0, gate_rows, up_rows).contiguous()
-    up_bias = (
-        bias.narrow(0, gate_rows, up_rows).contiguous()
-        if bias is not None
-        else None
-    )
-    up_out = torch.ops.fgemm.fp16_bias(x_mat, up_weight, up_bias)
-    return torch.cat((gate_out, up_out), dim=1)
 
 
 def _should_fuse_gate(layer, weight: torch.Tensor) -> bool:
@@ -173,10 +153,19 @@ def _should_fuse_gate(layer, weight: torch.Tensor) -> bool:
     return "gate" in name
 
 
+def _gate_columns(layer) -> int:
+    output_sizes = getattr(layer, "output_sizes", None)
+    tp_size = getattr(layer, "tp_size", 1)
+    if not output_sizes or tp_size <= 0:
+        return 0
+    return output_sizes[0] // tp_size
+
+
 def _fallback_with_warning(self, layer, x, bias):
     global _FGEMM_WARNED_FALLBACK
     if not _FGEMM_WARNED_FALLBACK:
         logger.warning("FGemm kernel failure detected, falling back to PyTorch linear", exc_info=True)
         _FGEMM_WARNED_FALLBACK = True
+    if getattr(layer, "_fgemm_gate_pre_silu", False):
+        layer._fgemm_gate_pre_silu = False
     return _ORIGINAL_APPLY(self, layer, x, bias)
-
