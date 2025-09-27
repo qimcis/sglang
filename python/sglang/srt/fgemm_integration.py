@@ -127,7 +127,7 @@ def _apply_with_fgemm(layer, x: torch.Tensor, bias: Optional[torch.Tensor]):
 def _run_fgemm(layer, x_mat: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]):
     if _should_fuse_gate(layer, weight):
         gate_cols = _gate_columns(layer)
-        output = torch.ops.fgemm.fp16_bias_split_silu(x_mat, weight, bias, gate_cols)
+        output = torch.ops.fgemm.fp16_bias_split_silu(x_mat, weight, gate_cols, bias)
         layer._fgemm_gate_pre_silu = True
         return output
     if getattr(layer, "_fgemm_gate_pre_silu", False):
