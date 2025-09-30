@@ -75,9 +75,9 @@ def main(args):
 
     @sgl.function
     def few_shot_gsm8k(s, question):
-        s += few_shot_examples + question
-        s += sgl.gen(
-            "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
+        s += sgl.user(few_shot_examples + question)
+        s += sgl.assistant(
+            sgl.gen("answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"])
         )
 
     #####################################
