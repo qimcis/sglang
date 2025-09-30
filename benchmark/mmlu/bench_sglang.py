@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import tiktoken
 
+from sglang.lang.api import set_default_backend
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     dump_bench_raw_result,
@@ -36,19 +37,29 @@ def format_example(df, idx, include_answer=True):
         prompt += " {}\n\n".format(df.iloc[idx, k + 1])
     return prompt
 
-
-def gen_prompt(train_df, subject, k=-1):
-    prompt = "The following are multiple choice questions (with answers) about{}.\n\n".format(
-        format_subject(subject)
-    )
+def get_few_shot_examples_list(train_df, subject, k=-1):
     if k == -1:
         k = train_df.shape[0]
+        
+    examples = []
     for i in range(k):
-        prompt += format_example(train_df, i)
-    return prompt
+        question = train_df.iloc[i, 0]
+        k_options = train_df.shape[1] - 2
+        for j in range(k_options):
+            question += "\n{}. {}".format(choices[j], train_df.iloc[i, j + 1])
+        question += "\nAnswer:"
 
+        answer = " {}\n\n".format(train_df.iloc[i, k_options + 1])
+        
+        examples.append({
+            "question": question,
+            "answer": answer
+        })
+    return examples
 
 def main(args):
+    set_default_backend(select_sglang_backend(args))
+    
     subjects = sorted(
         [
             f.split("_test.csv")[0]
@@ -58,7 +69,7 @@ def main(args):
     )
 
     # Build prompts
-    arguments = []
+    all_questions = []
     labels = []
     num_questions = []
 
@@ -72,18 +83,19 @@ def main(args):
         num_questions.append(test_df.shape[0])
 
         k = args.ntrain
-        few_shot_examples = gen_prompt(dev_df, subject, k)
-        while len(tokenizer.encode(few_shot_examples)) > 1536:
-            k -= 1
-            few_shot_examples = gen_prompt(dev_df, subject, k)
+        few_shot_examples = get_few_shot_examples_list(dev_df, subject, k)
+        
+        # while len(tokenizer.encode(few_shot_examples)) > 1536:
+        #    k -= 1
+        #    few_shot_examples = get_few_shot_examples_list(dev_df, subject, k)
 
         for i in range(test_df.shape[0]):
-            prompt_end = format_example(test_df, i, include_answer=False)
+            question = format_example(test_df, i, include_answer=False)
 
-            arguments.append(
+            all_questions.append(
                 {
-                    "examples": few_shot_examples,
-                    "question": prompt_end,
+                    "few_shot_examples": few_shot_examples,
+                    "question": question,
                 }
             )
 
@@ -97,10 +109,14 @@ def main(args):
     import sglang as sgl
 
     @sgl.function
-    def few_shot_mmlu(s, examples, question):
-        s += sgl.user(examples + question)
-        s += sgl.assistant(sgl.gen("answer"))
+    def few_shot_mmlu(s, few_shot_examples, question):
+        for example in few_shot_examples:
+            s += sgl.user(example["question"])
+            s += sgl.assistant(example["answer"])
 
+        s += sgl.user(question)
+        s += sgl.assistant(sgl.gen("answer"))
+        
     #####################################
     ########## SGL Program End ##########
     #####################################
@@ -111,10 +127,9 @@ def main(args):
     # Run
     tic = time.perf_counter()
     states = few_shot_mmlu.run_batch(
-        arguments,
+        all_questions,
         temperature=0,
         max_new_tokens=1,
-        backend=backend,
         num_threads=args.parallel,
         progress_bar=True,
     )
@@ -154,7 +169,7 @@ def main(args):
             "num_gpus": 1,
             "latency": round(latency, 3),
             "accuracy": round(weighted_acc, 3),
-            "num_requests": len(arguments),
+            "num_requests": len(all_questions),
             "other": {
                 "nsub": args.nsub,
                 "parallel": args.parallel,
