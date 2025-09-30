@@ -25,12 +25,14 @@ def get_one_example(lines, i, include_answer):
     return ret
 
 
-def get_few_shot_examples(lines, k):
-    ret = ""
+def get_few_shot_examples_list(lines, k):
+    examples = []
     for i in range(k):
-        ret += get_one_example(lines, i, True) + "\n\n"
-    return ret
-
+        examples.append({
+            "question": "Question: " + lines[i]["question"] + "\nAnswer:",
+            "answer": " " + lines[i]["answer"]
+        })
+    return examples
 
 def get_answer_value(answer_str):
     answer_str = answer_str.replace(",", "")
@@ -57,7 +59,7 @@ def main(args):
     # Construct prompts
     num_questions = args.num_questions
     num_shots = args.num_shots
-    few_shot_examples = get_few_shot_examples(lines, num_shots)
+    few_shot_examples_list = get_few_shot_examples_list(lines, num_shots)
 
     questions = []
     labels = []
@@ -72,13 +74,17 @@ def main(args):
     #####################################
 
     import sglang as sgl
-
+    
     @sgl.function
     def few_shot_gsm8k(s, question):
-        s += sgl.user(few_shot_examples + question)
+        for example in few_shot_examples_list:
+            s += sgl.user(example["question"])
+            s += sgl.assistant(example["answer"])
+        
+        s += sgl.user(question)
         s += sgl.assistant(
             sgl.gen("answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"])
-        )
+    )
 
     #####################################
     ########## SGL Program End ##########
