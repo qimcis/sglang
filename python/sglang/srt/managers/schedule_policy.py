@@ -566,34 +566,6 @@ class PrefillAdder:
         else:
             self.tree_cache.inc_lock_ref(req.last_node)
 
-    def add_dllm_staging_req(self, req: Req):
-        assert self.dllm_config is not None
-        _rem_tokens = self._get_dllm_remain_tokens()
-
-        if _rem_tokens <= 0:
-            return AddReqResult.NO_TOKEN
-
-        # Truncate input length to available tokens and update request metadata
-        truncated = req.extend_input_len > _rem_tokens
-        req.extend_input_len = min(req.extend_input_len, _rem_tokens)
-        req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
-        self.can_run_list.append(req)
-
-        # Update budget: reserve max_new_tokens only if not truncated
-        max_new_tokens = (
-            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-            if not truncated
-            else 0
-        )
-        self._update_prefill_budget(0, req.extend_input_len, max_new_tokens)
-
-        # Return based on remaining token availability
-        return (
-            AddReqResult.NO_TOKEN
-            if self._get_dllm_remain_tokens() <= 0
-            else AddReqResult.CONTINUE
-        )
-
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
@@ -603,6 +575,14 @@ class PrefillAdder:
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
                 _rem_tokens = self.rem_chunk_tokens
+        if (
+            self.is_hybrid_ssm_cache
+            and self.marconi_two_pass_branch_prefill
+            and req.mamba_branching_seqlen is not None
+        ):
+            prefix_len = len(req.prefix_indices)
+            if prefix_len < req.mamba_branching_seqlen:
+                _rem_tokens = min(_rem_tokens, req.mamba_branching_seqlen - prefix_len)
 
         truncated = req.extend_input_len > _rem_tokens
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
@@ -791,46 +771,76 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
-                # Non-chunked prefill
-                self.can_run_list.append(req)
-
-                self._req_inc_lock_ref(req)
-                self._update_prefill_budget(
-                    prefix_len,
-                    input_tokens,
-                    min(
-                        req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKENS,
-                    ),
-                )
             else:
-                # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+                trunc_len = None
+                branch_trunc_len = None
+                if self.is_hybrid_ssm_cache and self.marconi_two_pass_branch_prefill:
+                    branching_seqlen = req.mamba_branching_seqlen
+                    prefix_len = len(req.prefix_indices)
+                    if (
+                        branching_seqlen is not None
+                        and prefix_len < branching_seqlen
+                        and branching_seqlen < len(req.fill_ids)
+                    ):
+                        branch_trunc_len = branching_seqlen - prefix_len
+                        if branch_trunc_len > 0:
+                            trunc_len = branch_trunc_len
+                needs_chunking = trunc_len is not None or (
+                    self.rem_chunk_tokens is not None
+                    and input_tokens > self.rem_chunk_tokens
+                )
+                if not needs_chunking:
+                    # Non-chunked prefill
+                    self.can_run_list.append(req)
 
-                if trunc_len <= 0:
-                    return AddReqResult.OTHER
-
-                # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
-                # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
-                # we need the prefill prefix length to be multiple of attention split size
-                if truncation_align_size is not None:
-                    if trunc_len < truncation_align_size:
-                        return AddReqResult.OTHER
-                    else:
-                        trunc_len = truncation_align_size * (
-                            trunc_len // truncation_align_size
+                    self._req_inc_lock_ref(req)
+                    self._update_prefill_budget(
+                        prefix_len,
+                        input_tokens,
+                        min(
+                            req.sampling_params.max_new_tokens,
+                            CLIP_MAX_NEW_TOKENS,
+                        ),
+                    )
+                else:
+                    # Make sure at least one page is available
+                    if trunc_len is None:
+                        trunc_len = (
+                            self.rem_chunk_tokens // self.page_size * self.page_size
                         )
+                    elif self.rem_chunk_tokens is not None:
+                        trunc_len = min(
+                            trunc_len,
+                            self.rem_chunk_tokens // self.page_size * self.page_size,
+                        )
+                    if trunc_len <= 0:
+                        return AddReqResult.OTHER
 
-                # Chunked prefill
-                req.set_extend_input_len(trunc_len)
-                req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
+                    # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
+                    # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
+                    # we need the prefill prefix length to be multiple of attention split size
+                    if truncation_align_size is not None:
+                        if trunc_len < truncation_align_size:
+                            return AddReqResult.OTHER
+                        else:
+                            trunc_len = truncation_align_size * (
+                                trunc_len // truncation_align_size
+                            )
 
-                self.can_run_list.append(req)
-                self.new_chunked_req = req
+                    # Chunked prefill
+                    req.set_extend_input_len(trunc_len)
+                    req.fill_ids = req.fill_ids[
+                        : len(req.prefix_indices) + trunc_len
+                    ]
 
-                self._req_inc_lock_ref(req)
-                self._update_prefill_budget(prefix_len, trunc_len, 0)
+                    self.can_run_list.append(req)
+                    self.new_chunked_req = req
+
+                    self._req_inc_lock_ref(req)
+                    self._update_prefill_budget(prefix_len, trunc_len, 0)
+
+                    if branch_trunc_len is not None:
+                        req.mamba_branching_seqlen = None
 
         return self.budget_state()
 
