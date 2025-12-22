@@ -120,6 +120,8 @@ class DiffusionServerArgs:
     # resources
     num_gpus: int = 1
     tp_size: int | None = None
+    sp_degree: int | None = None
+    # sequence parallel overrides
     ulysses_degree: int | None = None
     ring_degree: int | None = None
     # LoRA
@@ -414,6 +416,8 @@ TWO_GPU_CASES_A = [
             warmup_text=0,
             warmup_edit=0,
             custom_validator="video",
+            num_gpus=2,
+            sp_degree=2,
         ),
         TI2V_sampling_params,
     ),
@@ -426,6 +430,7 @@ TWO_GPU_CASES_A = [
             warmup_edit=0,
             custom_validator="video",
             num_gpus=2,
+            sp_degree=2,
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
@@ -441,6 +446,7 @@ TWO_GPU_CASES_A = [
             warmup_edit=0,
             custom_validator="video",
             num_gpus=2,
+            sp_degree=2,
             lora_path="Cseti/wan2.2-14B-Arcane_Jinx-lora-v1",
         ),
         DiffusionSamplingParams(
@@ -455,6 +461,7 @@ TWO_GPU_CASES_A = [
             warmup_edit=0,
             modality="video",
             num_gpus=2,
+            sp_degree=2,
             custom_validator="video",
         ),
         DiffusionSamplingParams(
@@ -474,6 +481,7 @@ TWO_GPU_CASES_B = [
             modality="video",
             custom_validator="video",
             num_gpus=2,
+            sp_degree=2,
         ),
         TI2V_sampling_params,
     ),
@@ -487,6 +495,7 @@ TWO_GPU_CASES_B = [
             warmup_edit=0,
             custom_validator="video",
             num_gpus=2,
+            sp_degree=2,
             lora_path="starsfriday/Wan2.1-Divine-Power-LoRA",
         ),
         TI2V_sampling_params,
@@ -500,6 +509,7 @@ TWO_GPU_CASES_B = [
             warmup_edit=0,
             custom_validator="video",
             num_gpus=2,
+            sp_degree=2,
         ),
         TI2V_sampling_params,
     ),
