@@ -11,6 +11,7 @@ import os
 import time
 import weakref
 from collections.abc import Iterable
+from contextlib import nullcontext
 from functools import lru_cache
 from typing import Any
 
@@ -99,6 +100,74 @@ except ImportError:
     vsa_available = False
 
 logger = init_logger(__name__)
+
+
+class _DenoiseOverlapContext:
+    """Manages CUDA streams/events for overlapping forward and scheduler step."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled and current_platform.is_cuda_alike()
+        self.model_stream = None
+        self.sched_stream = None
+        self.forward_done_event = None
+        self.step_done_event = None
+
+        if not self.enabled:
+            return
+
+        self.model_stream = current_platform.create_stream()
+        self.sched_stream = current_platform.create_stream()
+        self.forward_done_event = current_platform.create_event()
+        self.step_done_event = current_platform.create_event()
+
+        if any(
+            x is None
+            for x in (
+                self.model_stream,
+                self.sched_stream,
+                self.forward_done_event,
+                self.step_done_event,
+            )
+        ):
+            # If the platform cannot provide streams/events, disable overlap
+            self.enabled = False
+            self.model_stream = None
+            self.sched_stream = None
+            self.forward_done_event = None
+            self.step_done_event = None
+
+    def use_overlap(self) -> bool:
+        return self.enabled
+
+    def model_guard(self):
+        if self.model_stream is not None:
+            return current_platform.stream_guard(self.model_stream)
+        return nullcontext()
+
+    def sched_guard(self):
+        if self.sched_stream is not None:
+            return current_platform.stream_guard(self.sched_stream)
+        return nullcontext()
+
+    def record_forward_done(self):
+        if self.forward_done_event is not None:
+            current_platform.record_event(self.forward_done_event, self.model_stream)
+
+    def record_step_done(self):
+        if self.step_done_event is not None:
+            current_platform.record_event(self.step_done_event, self.sched_stream)
+
+    def wait_step_before_forward(self, iteration: int):
+        if iteration > 0 and self.step_done_event is not None:
+            current_platform.wait_event(self.model_stream, self.step_done_event)
+
+    def wait_forward_before_step(self):
+        if self.forward_done_event is not None:
+            current_platform.wait_event(self.sched_stream, self.forward_done_event)
+
+    def fence_model_on_step(self):
+        if self.step_done_event is not None:
+            current_platform.wait_event(self.model_stream, self.step_done_event)
 
 
 class DenoisingStage(PipelineStage):
@@ -608,8 +677,13 @@ class DenoisingStage(PipelineStage):
             )
         else:
             reserved_frames_mask_sp, z_sp = (
-                reserved_frames_masks[0] if reserved_frames_masks is not None else None
-            ), z
+                (
+                    reserved_frames_masks[0]
+                    if reserved_frames_masks is not None
+                    else None
+                ),
+                z,
+            )
 
         guidance = self.get_or_build_guidance(
             # TODO: replace with raw_latent_shape?
@@ -984,97 +1058,239 @@ class DenoisingStage(PipelineStage):
         self.scheduler.set_begin_index(0)
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=target_dtype,
-            enabled=autocast_enabled,
-        ):
-            with self.progress_bar(total=num_inference_steps) as progress_bar:
-                for i, t_host in enumerate(timesteps_cpu):
-                    with StageProfiler(
-                        f"denoising_step_{i}", logger=logger, timings=batch.timings
-                    ):
-                        t_int = int(t_host.item())
-                        t_device = timesteps[i]
-                        current_model, current_guidance_scale = (
-                            self._select_and_manage_model(
-                                t_int=t_int,
-                                boundary_timestep=boundary_timestep,
-                                server_args=server_args,
-                                batch=batch,
-                            )
-                        )
+        overlap_ctx = _DenoiseOverlapContext(
+            enabled=server_args.enable_double_buffered_denoising
+        )
 
-                        # Expand latents for I2V
-                        latent_model_input = latents.to(target_dtype)
-                        if batch.image_latent is not None:
-                            assert (
-                                not server_args.pipeline_config.task_type
-                                == ModelTaskType.TI2V
-                            ), "image latents should not be provided for TI2V task"
-                            latent_model_input = torch.cat(
-                                [latent_model_input, batch.image_latent], dim=1
-                            ).to(target_dtype)
-
-                        timestep = self.expand_timestep_before_forward(
-                            batch,
-                            server_args,
-                            t_device,
-                            target_dtype,
-                            seq_len,
-                            reserved_frames_mask,
-                        )
-
-                        latent_model_input = self.scheduler.scale_model_input(
-                            latent_model_input, t_device
-                        )
-
-                        # Predict noise residual
-                        attn_metadata = self._build_attn_metadata(i, batch, server_args)
-                        noise_pred = self._predict_noise_with_cfg(
-                            current_model=current_model,
-                            latent_model_input=latent_model_input,
-                            timestep=timestep,
-                            batch=batch,
-                            timestep_index=i,
-                            attn_metadata=attn_metadata,
-                            target_dtype=target_dtype,
-                            current_guidance_scale=current_guidance_scale,
-                            image_kwargs=image_kwargs,
-                            pos_cond_kwargs=pos_cond_kwargs,
-                            neg_cond_kwargs=neg_cond_kwargs,
-                            server_args=server_args,
-                            guidance=guidance,
-                            latents=latents,
-                        )
-
-                        # Compute the previous noisy sample
-                        latents = self.scheduler.step(
-                            model_output=noise_pred,
-                            timestep=t_device,
-                            sample=latents,
-                            **extra_step_kwargs,
-                            return_dict=False,
-                        )[0]
-
-                        latents = self.post_forward_for_ti2v_task(
-                            batch, server_args, reserved_frames_mask, latents, z
-                        )
-
-                        # save trajectory latents if needed
-                        if batch.return_trajectory_latents:
-                            trajectory_timesteps.append(t_host)
-                            trajectory_latents.append(latents)
-
-                        # Update progress bar
-                        if i == num_timesteps - 1 or (
-                            (i + 1) > num_warmup_steps
-                            and (i + 1) % self.scheduler.order == 0
-                            and progress_bar is not None
+        def _run_sequential_loop():
+            nonlocal latents
+            with torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=target_dtype,
+                enabled=autocast_enabled,
+            ):
+                with self.progress_bar(total=num_inference_steps) as progress_bar:
+                    for i, t_host in enumerate(timesteps_cpu):
+                        with StageProfiler(
+                            f"denoising_step_{i}", logger=logger, timings=batch.timings
                         ):
-                            progress_bar.update()
+                            t_int = int(t_host.item())
+                            t_device = timesteps[i]
+                            current_model, current_guidance_scale = (
+                                self._select_and_manage_model(
+                                    t_int=t_int,
+                                    boundary_timestep=boundary_timestep,
+                                    server_args=server_args,
+                                    batch=batch,
+                                )
+                            )
 
-                        self.step_profile()
+                            # Expand latents for I2V
+                            latent_model_input = latents.to(target_dtype)
+                            if batch.image_latent is not None:
+                                assert (
+                                    not server_args.pipeline_config.task_type
+                                    == ModelTaskType.TI2V
+                                ), "image latents should not be provided for TI2V task"
+                                latent_model_input = torch.cat(
+                                    [latent_model_input, batch.image_latent], dim=1
+                                ).to(target_dtype)
+
+                            timestep = self.expand_timestep_before_forward(
+                                batch,
+                                server_args,
+                                t_device,
+                                target_dtype,
+                                seq_len,
+                                reserved_frames_mask,
+                            )
+
+                            latent_model_input = self.scheduler.scale_model_input(
+                                latent_model_input, t_device
+                            )
+
+                            # Predict noise residual
+                            attn_metadata = self._build_attn_metadata(
+                                i, batch, server_args
+                            )
+                            noise_pred = self._predict_noise_with_cfg(
+                                current_model=current_model,
+                                latent_model_input=latent_model_input,
+                                timestep=timestep,
+                                batch=batch,
+                                timestep_index=i,
+                                attn_metadata=attn_metadata,
+                                target_dtype=target_dtype,
+                                current_guidance_scale=current_guidance_scale,
+                                image_kwargs=image_kwargs,
+                                pos_cond_kwargs=pos_cond_kwargs,
+                                neg_cond_kwargs=neg_cond_kwargs,
+                                server_args=server_args,
+                                guidance=guidance,
+                                latents=latents,
+                            )
+
+                            # Compute the previous noisy sample
+                            latents = self.scheduler.step(
+                                model_output=noise_pred,
+                                timestep=t_device,
+                                sample=latents,
+                                **extra_step_kwargs,
+                                return_dict=False,
+                            )[0]
+
+                            latents = self.post_forward_for_ti2v_task(
+                                batch, server_args, reserved_frames_mask, latents, z
+                            )
+
+                            # save trajectory latents if needed
+                            if batch.return_trajectory_latents:
+                                trajectory_timesteps.append(t_host)
+                                trajectory_latents.append(latents)
+
+                            # Update progress bar
+                            if i == num_timesteps - 1 or (
+                                (i + 1) > num_warmup_steps
+                                and (i + 1) % self.scheduler.order == 0
+                                and progress_bar is not None
+                            ):
+                                progress_bar.update()
+
+                            self.step_profile()
+
+        def _run_double_buffered_loop():
+            """Overlap model forward and scheduler step with stream ping-pong."""
+            nonlocal latents
+            # Use two latent buffers for ping-pong
+            latent_buffers = [latents, None]
+            current_idx = 0
+
+            with torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=target_dtype,
+                enabled=autocast_enabled,
+            ):
+                with self.progress_bar(total=num_inference_steps) as progress_bar:
+                    for i, t_host in enumerate(timesteps_cpu):
+                        with StageProfiler(
+                            f"denoising_step_{i}", logger=logger, timings=batch.timings
+                        ):
+                            # Ensure model stream waits for previous step to finish before reusing buffers.
+                            overlap_ctx.wait_step_before_forward(i)
+
+                            # Select model/guidance on host (no stream needed).
+                            t_int = int(t_host.item())
+                            current_model, current_guidance_scale = (
+                                self._select_and_manage_model(
+                                    t_int=t_int,
+                                    boundary_timestep=boundary_timestep,
+                                    server_args=server_args,
+                                    batch=batch,
+                                )
+                            )
+
+                            attn_metadata = self._build_attn_metadata(
+                                i, batch, server_args
+                            )
+
+                            next_idx = 1 - current_idx
+
+                            # Model forward on model_stream
+                            with overlap_ctx.model_guard():
+                                t_device = timesteps[i]
+
+                                latent_model_input = latent_buffers[current_idx].to(
+                                    target_dtype
+                                )
+                                if batch.image_latent is not None:
+                                    assert (
+                                        not server_args.pipeline_config.task_type
+                                        == ModelTaskType.TI2V
+                                    ), (
+                                        "image latents should not be provided for TI2V task"
+                                    )
+                                    latent_model_input = torch.cat(
+                                        [latent_model_input, batch.image_latent], dim=1
+                                    ).to(target_dtype)
+
+                                timestep = self.expand_timestep_before_forward(
+                                    batch,
+                                    server_args,
+                                    t_device,
+                                    target_dtype,
+                                    seq_len,
+                                    reserved_frames_mask,
+                                )
+
+                                latent_model_input = self.scheduler.scale_model_input(
+                                    latent_model_input, t_device
+                                )
+
+                                noise_pred = self._predict_noise_with_cfg(
+                                    current_model=current_model,
+                                    latent_model_input=latent_model_input,
+                                    timestep=timestep,
+                                    batch=batch,
+                                    timestep_index=i,
+                                    attn_metadata=attn_metadata,
+                                    target_dtype=target_dtype,
+                                    current_guidance_scale=current_guidance_scale,
+                                    image_kwargs=image_kwargs,
+                                    pos_cond_kwargs=pos_cond_kwargs,
+                                    neg_cond_kwargs=neg_cond_kwargs,
+                                    server_args=server_args,
+                                    guidance=guidance,
+                                    latents=latent_buffers[current_idx],
+                                )
+
+                                overlap_ctx.record_forward_done()
+
+                            # Scheduler step on sched_stream, waiting for forward to finish
+                            with overlap_ctx.sched_guard():
+                                overlap_ctx.wait_forward_before_step()
+                                latent_buffers[next_idx] = self.scheduler.step(
+                                    model_output=noise_pred,
+                                    timestep=t_device,
+                                    sample=latent_buffers[current_idx],
+                                    **extra_step_kwargs,
+                                    return_dict=False,
+                                )[0]
+
+                                latent_buffers[next_idx] = (
+                                    self.post_forward_for_ti2v_task(
+                                        batch,
+                                        server_args,
+                                        reserved_frames_mask,
+                                        latent_buffers[next_idx],
+                                        z,
+                                    )
+                                )
+
+                                overlap_ctx.record_step_done()
+
+                            # Ensure model stream sees the completed scheduler step before next iteration
+                            overlap_ctx.fence_model_on_step()
+
+                            latents = latent_buffers[next_idx]
+                            current_idx = next_idx
+
+                            if batch.return_trajectory_latents:
+                                trajectory_timesteps.append(t_host)
+                                trajectory_latents.append(latents)
+
+                            if i == num_timesteps - 1 or (
+                                (i + 1) > num_warmup_steps
+                                and (i + 1) % self.scheduler.order == 0
+                                and progress_bar is not None
+                            ):
+                                progress_bar.update()
+
+                            self.step_profile()
+
+        if overlap_ctx.use_overlap():
+            _run_double_buffered_loop()
+        else:
+            _run_sequential_loop()
 
         denoising_end_time = time.time()
 

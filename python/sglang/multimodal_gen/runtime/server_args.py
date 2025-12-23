@@ -248,6 +248,9 @@ class ServerArgs:
     # VSA parameters
     VSA_sparsity: float = 0.0  # inference/validation sparsity
 
+    # Denoising overlap
+    enable_double_buffered_denoising: bool = False
+
     # V-MoBA parameters
     moba_config_path: str | None = None
     moba_config: dict[str, Any] = field(default_factory=dict)
@@ -502,6 +505,12 @@ class ServerArgs:
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--enable-double-buffered-denoising",
+            action=StoreBoolean,
+            default=ServerArgs.enable_double_buffered_denoising,
+            help="Enable double-buffered denoising that overlaps model forward with scheduler step using CUDA streams.",
         )
         parser.add_argument(
             "--dit-cpu-offload",
@@ -880,12 +889,12 @@ class ServerArgs:
             self.disable_autocast = False
 
         # Validate mode consistency
-        assert isinstance(
-            self.mode, ExecutionMode
-        ), f"Mode must be an ExecutionMode enum, got {type(self.mode)}"
-        assert (
-            self.mode in ExecutionMode.choices()
-        ), f"Invalid execution mode: {self.mode}"
+        assert isinstance(self.mode, ExecutionMode), (
+            f"Mode must be an ExecutionMode enum, got {type(self.mode)}"
+        )
+        assert self.mode in ExecutionMode.choices(), (
+            f"Invalid execution mode: {self.mode}"
+        )
 
         if self.tp_size == -1:
             self.tp_size = 1

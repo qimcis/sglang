@@ -106,6 +106,27 @@ class CudaPlatformBase(Platform):
         pass
 
     @classmethod
+    def create_stream(cls):
+        return torch.cuda.Stream()
+
+    @classmethod
+    def stream_guard(cls, stream):
+        return torch.cuda.stream(stream)
+
+    @classmethod
+    def create_event(cls):
+        return torch.cuda.Event(enable_timing=False, blocking=False)
+
+    @classmethod
+    def record_event(cls, event, stream=None):
+        (stream or torch.cuda.current_stream()).record_event(event)
+
+    @classmethod
+    def wait_event(cls, stream, event):
+        if stream is not None and event is not None:
+            stream.wait_event(event)
+
+    @classmethod
     def get_current_memory_usage(
         cls, device: torch.types.Device | None = None
     ) -> float:
@@ -223,7 +244,6 @@ class CudaPlatformBase(Platform):
         elif selected_backend:
             raise ValueError(f"Invalid attention backend for {cls.device_name}")
         else:
-
             if is_blackwell():
                 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
                     set_fa_ver,
@@ -247,9 +267,7 @@ class CudaPlatformBase(Platform):
                     target_backend = AttentionBackendEnum.TORCH_SDPA
 
         if not cls.has_device_capability(80):
-            logger.info(
-                "Cannot use FlashAttention backend for Volta and Turing " "GPUs."
-            )
+            logger.info("Cannot use FlashAttention backend for Volta and Turing GPUs.")
             target_backend = AttentionBackendEnum.TORCH_SDPA
         elif dtype not in (torch.float16, torch.bfloat16):
             logger.info(
@@ -300,7 +318,6 @@ class CudaPlatformBase(Platform):
 # all the related functions work on real physical device ids.
 # the major benefit of using NVML is that it will not initialize CUDA
 class NvmlCudaPlatform(CudaPlatformBase):
-
     @classmethod
     @lru_cache(maxsize=8)
     @with_nvml_context
@@ -399,7 +416,6 @@ class NvmlCudaPlatform(CudaPlatformBase):
 
 
 class NonNvmlCudaPlatform(CudaPlatformBase):
-
     @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:
         major, minor = torch.cuda.get_device_capability(device_id)

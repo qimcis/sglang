@@ -57,6 +57,27 @@ class RocmPlatform(Platform):
         pass  # ROCm-specific warnings can be added here
 
     @classmethod
+    def create_stream(cls):
+        return torch.cuda.Stream()
+
+    @classmethod
+    def stream_guard(cls, stream):
+        return torch.cuda.stream(stream)
+
+    @classmethod
+    def create_event(cls):
+        return torch.cuda.Event(enable_timing=False, blocking=False)
+
+    @classmethod
+    def record_event(cls, event, stream=None):
+        (stream or torch.cuda.current_stream()).record_event(event)
+
+    @classmethod
+    def wait_event(cls, stream, event):
+        if stream is not None and event is not None:
+            stream.wait_event(event)
+
+    @classmethod
     def get_current_memory_usage(cls, device: torch.device | None = None) -> float:
         torch.cuda.reset_peak_memory_stats(device)
         return float(torch.cuda.max_memory_allocated(device))

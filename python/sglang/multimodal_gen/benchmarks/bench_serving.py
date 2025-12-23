@@ -658,6 +658,9 @@ async def benchmark(args):
 
     print(f"Loading requests...")
     requests_list = dataset.get_requests()
+    if args.enable_double_buffered_denoising:
+        for req in requests_list:
+            req.extra_body["enable_double_buffered_denoising"] = True
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
 
     # Limit concurrency
@@ -832,6 +835,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--disable-tqdm", action="store_true", help="Disable progress bar."
+    )
+    parser.add_argument(
+        "--enable-double-buffered-denoising",
+        action="store_true",
+        help="Request double-buffered denoising (if supported by the server).",
     )
 
     args = parser.parse_args()

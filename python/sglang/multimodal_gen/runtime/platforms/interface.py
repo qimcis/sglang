@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import enum
 import random
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
@@ -185,6 +186,31 @@ class Platform:
         return torch.inference_mode(mode=True)
 
     @classmethod
+    def create_stream(cls):
+        """Create a device-specific stream object, or None if unsupported."""
+        return None
+
+    @classmethod
+    def stream_guard(cls, stream):
+        """Context manager to make a stream current. Falls back to no-op."""
+        return nullcontext()
+
+    @classmethod
+    def create_event(cls):
+        """Create a device-specific event object, or None if unsupported."""
+        return None
+
+    @classmethod
+    def record_event(cls, event, stream=None):
+        """Record an event on the given stream if supported."""
+        return None
+
+    @classmethod
+    def wait_event(cls, stream, event):
+        """Make a stream wait on an event if supported."""
+        return None
+
+    @classmethod
     def seed_everything(cls, seed: int | None = None) -> None:
         """
         Set the seed of each random module.
@@ -217,8 +243,7 @@ class Platform:
         """
         if cls.supported_quantization and quant not in cls.supported_quantization:
             raise ValueError(
-                f"{quant} quantization is currently not supported in "
-                f"{cls.device_name}."
+                f"{quant} quantization is currently not supported in {cls.device_name}."
             )
 
     @classmethod
