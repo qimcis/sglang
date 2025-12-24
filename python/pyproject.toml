@@ -97,6 +97,9 @@ diffusion = [
   "runai_model_streamer",
   "cache-dit==1.1.8"
 ]
+turbodiffusion = [
+  "turbodiffusion==1.0.0"
+]
 
 tracing = [
   "opentelemetry-api",

@@ -116,11 +116,39 @@ def is_diffusers_model_path(model_path: str) -> True:
 
 
 def get_is_diffusion_model(model_path: str):
-    model_path = _maybe_download_model(model_path)
-    is_diffusion_model = is_diffusers_model_path(model_path)
+    """Detect whether a model path should be handled by the diffusion runtime.
+
+    Order of checks:
+      1) Standard diffusers detection (model_index.json with _diffusers_version).
+      2) Registry-based detection (e.g., custom pipelines without diffusers layouts).
+    """
+    original_model_path = model_path
+    try:
+        model_path = _maybe_download_model(model_path)
+        is_diffusion_model = is_diffusers_model_path(model_path)
+    except Exception as e:
+        logger.debug("Standard diffusers detection failed: %s", e)
+        is_diffusion_model = False
+
     if is_diffusion_model:
         logger.info("Diffusion model detected")
-    return is_diffusion_model
+        return True
+
+    # Fallback: ask the multimodal registry (supports non-diffusers layouts)
+    try:
+        from sglang.multimodal_gen.registry import get_model_info
+
+        model_info = get_model_info(original_model_path)
+        if model_info is not None:
+            logger.info(
+                "Diffusion model detected via registry resolver: %s",
+                original_model_path,
+            )
+            return True
+    except Exception as e:
+        logger.debug("Registry-based diffusion detection failed: %s", e)
+
+    return False
 
 
 def get_model_path(extra_argv):
@@ -146,7 +174,6 @@ def get_model_path(extra_argv):
             )
         else:
             raise Exception(
-                "Error: --model-path is required. "
-                "Please provide the path to the model."
+                "Error: --model-path is required. Please provide the path to the model."
             )
     return model_path

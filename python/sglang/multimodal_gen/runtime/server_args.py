@@ -213,6 +213,20 @@ class ServerArgs:
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
+    # TurboDiffusion assets and overrides
+    turbo_dit_path: str | None = None
+    turbo_high_noise_dit_path: str | None = None
+    turbo_low_noise_dit_path: str | None = None
+    turbo_text_encoder_path: str | None = None
+    turbo_num_steps: int | None = None
+    turbo_sigma_max: float | None = None
+    turbo_attention_type: str | None = None
+    turbo_sla_topk: float | None = None
+    turbo_quant_linear: bool | None = None
+    turbo_default_norm: bool | None = None
+    turbo_auto_download: bool = False
+    turbo_cache_dir: str | None = None
+
     # LoRA parameters
     # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
     lora_path: str | None = None
@@ -352,6 +366,67 @@ class ServerArgs:
             type=str,
             default=ServerArgs.vae_path,
             help="Custom path to VAE model (e.g., for distilled autoencoder). If not specified, VAE will be loaded from the main model path.",
+        )
+        parser.add_argument(
+            "--turbo-dit-path",
+            type=str,
+            default=ServerArgs.turbo_dit_path,
+            help="Path to the TurboDiffusion DiT checkpoint (defaults to --model-path).",
+        )
+        parser.add_argument(
+            "--turbo-text-encoder-path",
+            type=str,
+            default=ServerArgs.turbo_text_encoder_path,
+            help="Path to the umT5 text encoder checkpoint for TurboDiffusion.",
+        )
+        parser.add_argument(
+            "--turbo-num-steps",
+            type=int,
+            default=ServerArgs.turbo_num_steps,
+            help="Number of TurboDiffusion sampling steps (1-4).",
+        )
+        parser.add_argument(
+            "--turbo-sigma-max",
+            type=float,
+            default=ServerArgs.turbo_sigma_max,
+            help="Initial sigma for TurboDiffusion rectified-flow sampling.",
+        )
+        parser.add_argument(
+            "--turbo-attention-type",
+            type=str,
+            choices=["sagesla", "sla", "original"],
+            default=ServerArgs.turbo_attention_type,
+            help="Attention backend for TurboDiffusion checkpoints.",
+        )
+        parser.add_argument(
+            "--turbo-sla-topk",
+            type=float,
+            default=ServerArgs.turbo_sla_topk,
+            help="Top-k ratio for SLA/SageSLA attention.",
+        )
+        parser.add_argument(
+            "--turbo-quant-linear",
+            action=StoreBoolean,
+            default=ServerArgs.turbo_quant_linear,
+            help="Enable quantized Linear layers for TurboDiffusion checkpoints.",
+        )
+        parser.add_argument(
+            "--turbo-default-norm",
+            action=StoreBoolean,
+            default=ServerArgs.turbo_default_norm,
+            help="Use the original LayerNorm/RMSNorm kernels instead of Turbo replacements.",
+        )
+        parser.add_argument(
+            "--turbo-auto-download",
+            action=StoreBoolean,
+            default=ServerArgs.turbo_auto_download,
+            help="Automatically download missing Turbo assets (VAE, umT5) from Hugging Face.",
+        )
+        parser.add_argument(
+            "--turbo-cache-dir",
+            type=str,
+            default=ServerArgs.turbo_cache_dir,
+            help="Cache directory for downloaded Turbo assets.",
         )
 
         # attention
@@ -879,13 +954,41 @@ class ServerArgs:
         else:
             self.disable_autocast = False
 
+        # TurboDiffusion overrides
+        try:
+            from sglang.multimodal_gen.configs.pipeline_configs.turbo_wan import (
+                TurboWanI2VPipelineConfig,
+                TurboWanPipelineConfig,
+            )
+
+            is_turbo_pipeline = isinstance(
+                self.pipeline_config,
+                (TurboWanPipelineConfig, TurboWanI2VPipelineConfig),
+            )
+        except Exception:
+            is_turbo_pipeline = False
+
+        if is_turbo_pipeline:
+            if self.turbo_num_steps is not None:
+                self.pipeline_config.num_steps = self.turbo_num_steps
+            if self.turbo_sigma_max is not None:
+                self.pipeline_config.sigma_max = self.turbo_sigma_max
+            if self.turbo_attention_type:
+                self.pipeline_config.attention_type = self.turbo_attention_type
+            if self.turbo_sla_topk is not None:
+                self.pipeline_config.sla_topk = self.turbo_sla_topk
+            if self.turbo_quant_linear is not None:
+                self.pipeline_config.quant_linear = self.turbo_quant_linear
+            if self.turbo_default_norm is not None:
+                self.pipeline_config.default_norm = self.turbo_default_norm
+
         # Validate mode consistency
-        assert isinstance(
-            self.mode, ExecutionMode
-        ), f"Mode must be an ExecutionMode enum, got {type(self.mode)}"
-        assert (
-            self.mode in ExecutionMode.choices()
-        ), f"Invalid execution mode: {self.mode}"
+        assert isinstance(self.mode, ExecutionMode), (
+            f"Mode must be an ExecutionMode enum, got {type(self.mode)}"
+        )
+        assert self.mode in ExecutionMode.choices(), (
+            f"Invalid execution mode: {self.mode}"
+        )
 
         if self.tp_size == -1:
             self.tp_size = 1

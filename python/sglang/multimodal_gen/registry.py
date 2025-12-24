@@ -233,6 +233,36 @@ class ModelInfo:
     pipeline_config_cls: Type[PipelineConfig]
 
 
+def _maybe_resolve_special_model(model_path: str) -> Optional[ModelInfo]:
+    """Resolve non-diffusers models that still use the diffusion stack."""
+    lower = model_path.lower()
+    if "turbodiffusion" in lower or "turbowan" in lower:
+        try:
+            from sglang.multimodal_gen.configs.pipeline_configs.turbo_wan import (
+                TurboWanPipelineConfig,
+            )
+            from sglang.multimodal_gen.configs.sample.turbo_wan import (
+                TurboWanSamplingParams,
+            )
+            from sglang.multimodal_gen.runtime.pipelines.turbodiffusion_wan import (
+                TurboWanPipeline,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to import TurboDiffusion integration for '%s': %s",
+                model_path,
+                e,
+            )
+            return None
+
+        return ModelInfo(
+            pipeline_cls=TurboWanPipeline,
+            sampling_param_cls=TurboWanSamplingParams,
+            pipeline_config_cls=TurboWanPipelineConfig,
+        )
+    return None
+
+
 @lru_cache(maxsize=1)
 def get_model_info(model_path: str) -> Optional[ModelInfo]:
     """
@@ -244,6 +274,11 @@ def get_model_info(model_path: str) -> Optional[ModelInfo]:
     2. Resolves the associated configuration classes (for sampling and pipeline) using a
        manually registered mapping based on the model path.
     """
+    special_model_info = _maybe_resolve_special_model(model_path)
+    if special_model_info is not None:
+        logger.info("Resolved '%s' via custom model resolver", model_path)
+        return special_model_info
+
     # 1. Discover all available pipeline classes and cache them
     _discover_and_register_pipelines()
 

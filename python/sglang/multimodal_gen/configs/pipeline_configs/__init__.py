@@ -13,6 +13,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     HunyuanConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.stepvideo import StepVideoT2VConfig
+from sglang.multimodal_gen.configs.pipeline_configs.turbo_wan import (
+    TurboWanI2VPipelineConfig,
+    TurboWanPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     SelfForcingWanT2V480PConfig,
     WanI2V480PConfig,
@@ -36,4 +40,6 @@ __all__ = [
     "StepVideoT2VConfig",
     "SelfForcingWanT2V480PConfig",
     "ZImagePipelineConfig",
+    "TurboWanPipelineConfig",
+    "TurboWanI2VPipelineConfig",
 ]
