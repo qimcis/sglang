@@ -649,8 +649,13 @@ def get_generate_fn(
     sampling_params: DiffusionSamplingParams,
 ) -> Callable[[str, Client], str]:
     """Return appropriate generation function for the case."""
+
+    # Pick size from explicit width/height when provided; otherwise use configured output_size.
     # Allow override via environment variable (useful for AMD where large resolutions cause slow VAE)
-    output_size = os.environ.get("SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size)
+    if sampling_params.width is not None and sampling_params.height is not None:
+        output_size = f"{sampling_params.width}x{sampling_params.height}"
+    else:
+        output_size = os.environ.get("SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size)
     n = sampling_params.num_outputs_per_prompt
 
     def _create_and_download_video(
@@ -759,38 +764,12 @@ def get_generate_fn(
 
     video_seconds = sampling_params.seconds or 4
 
-    def _get_int_env(name: str) -> int | None:
-        val = os.getenv(name)
-        if val is None:
-            return None
-        try:
-            return int(val)
-        except ValueError:
-            return None
-
-    def _build_video_extra_body(
+    def _video_extra_body(
         extra_fields: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Compose extra_body for video generation with optional overrides."""
         body: dict[str, Any] = {}
-        steps_override = _get_int_env("SGLANG_TEST_VIDEO_STEPS")
-        height_override = _get_int_env("SGLANG_TEST_VIDEO_HEIGHT")
-        width_override = _get_int_env("SGLANG_TEST_VIDEO_WIDTH")
-
-        if steps_override is not None:
-            body["steps"] = steps_override
-        elif sampling_params.num_inference_steps is not None:
-            body["steps"] = sampling_params.num_inference_steps
-
-        if height_override is not None:
-            body["height"] = height_override
-        elif sampling_params.height is not None:
-            body["height"] = sampling_params.height
-
-        if width_override is not None:
-            body["width"] = width_override
-        elif sampling_params.width is not None:
-            body["width"] = sampling_params.width
+        if sampling_params.num_inference_steps is not None:
+            body["num_inference_steps"] = sampling_params.num_inference_steps
         if sampling_params.num_frames is not None:
             body["num_frames"] = sampling_params.num_frames
         if sampling_params.fps is not None:
@@ -1028,7 +1007,7 @@ def get_generate_fn(
             prompt=sampling_params.prompt,
             size=output_size,
             seconds=video_seconds,
-            extra_body=_build_video_extra_body(extra_body if extra_body else None),
+            extra_body=_video_extra_body(extra_body if extra_body else None),
         )
 
     def generate_image_to_video(case_id, client) -> str:
@@ -1057,7 +1036,7 @@ def get_generate_fn(
                 size=output_size,
                 seconds=video_seconds,
                 input_reference=fh,
-                extra_body=_build_video_extra_body(extra_body if extra_body else None),
+                extra_body=_video_extra_body(extra_body if extra_body else None),
             )
 
     def generate_text_url_image_to_video(case_id, client) -> str:
@@ -1076,7 +1055,7 @@ def get_generate_fn(
             prompt=sampling_params.prompt,
             size=output_size,
             seconds=video_seconds,
-            extra_body=_build_video_extra_body(extra_body),
+            extra_body=_video_extra_body(extra_body),
         )
 
     def generate_text_image_to_video(case_id, client) -> str:
@@ -1105,7 +1084,7 @@ def get_generate_fn(
                 size=output_size,
                 seconds=video_seconds,
                 input_reference=fh,
-                extra_body=_build_video_extra_body(extra_body if extra_body else None),
+                extra_body=_video_extra_body(extra_body if extra_body else None),
             )
 
     if modality == "video":
