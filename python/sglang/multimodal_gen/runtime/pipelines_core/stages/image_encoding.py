@@ -187,6 +187,7 @@ class ImageVAEEncodingStage(PipelineStage):
     def __init__(self, vae: ParallelTiledVAE, **kwargs) -> None:
         super().__init__()
         self.vae: ParallelTiledVAE = vae
+        self._zero_video_cache: dict[tuple, torch.Tensor] = {}
 
     def forward(
         self,
@@ -211,6 +212,11 @@ class ImageVAEEncodingStage(PipelineStage):
 
         self.vae = self.vae.to(get_local_torch_device())
 
+        cache_zero_video = not server_args.vae_cpu_offload
+        if not cache_zero_video and self._zero_video_cache:
+            self._zero_video_cache.clear()
+        zero_video_cache = self._zero_video_cache if cache_zero_video else {}
+
         images = (
             batch.vae_image if batch.vae_image is not None else batch.condition_image
         )
@@ -229,19 +235,19 @@ class ImageVAEEncodingStage(PipelineStage):
             if num_frames == 1:
                 video_condition = image
             else:
-                video_condition = torch.cat(
-                    [
-                        image,
-                        image.new_zeros(
-                            image.shape[0],
-                            image.shape[1],
-                            num_frames - 1,
-                            image.shape[3],
-                            image.shape[4],
-                        ),
-                    ],
-                    dim=2,
+                zero_shape = (
+                    image.shape[0],
+                    image.shape[1],
+                    num_frames - 1,
+                    image.shape[3],
+                    image.shape[4],
                 )
+                zero_key = (zero_shape, image.dtype, image.device)
+                zero_video = zero_video_cache.get(zero_key)
+                if zero_video is None:
+                    zero_video = image.new_zeros(zero_shape)
+                    zero_video_cache[zero_key] = zero_video
+                video_condition = torch.cat([image, zero_video], dim=2)
             video_condition = video_condition.to(
                 device=get_local_torch_device(), dtype=torch.float32
             )
@@ -307,7 +313,8 @@ class ImageVAEEncodingStage(PipelineStage):
         batch.image_latent = torch.cat(all_image_latents, dim=1)
         self.maybe_free_model_hooks()
 
-        self.vae.to("cpu")
+        if server_args.vae_cpu_offload:
+            self.vae.to("cpu")
 
         return batch
 
@@ -328,7 +335,6 @@ class ImageVAEEncodingStage(PipelineStage):
         self,
         image: torch.Tensor | PIL.Image.Image,
     ) -> torch.Tensor:
-
         if isinstance(image, PIL.Image.Image):
             image = pil_to_numpy(image)  # to np
             image = numpy_to_pt(image)  # to pt
