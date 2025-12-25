@@ -7,6 +7,8 @@ Image encoding stages for I2V diffusion pipelines.
 This module contains implementations of image encoding stages for diffusion pipelines.
 """
 
+import os
+
 import PIL
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
@@ -188,6 +190,41 @@ class ImageVAEEncodingStage(PipelineStage):
         super().__init__()
         self.vae: ParallelTiledVAE = vae
         self._zero_video_cache: dict[tuple, torch.Tensor] = {}
+        self._tiling_enabled: bool = False
+        self._compiled: bool = False
+        self._channels_last_set: bool = False
+        torch.set_float32_matmul_precision("high")
+
+    def _prepare_vae(self, server_args: ServerArgs):
+        """Keep VAE hot on GPU and avoid repeated setup work."""
+        device = get_local_torch_device()
+        if self.vae.device != device:
+            self.vae = self.vae.to(device)
+        if not self._channels_last_set:
+            try:
+                self.vae = self.vae.to(memory_format=torch.channels_last)
+            except Exception:
+                pass
+            self._channels_last_set = True
+        if server_args.pipeline_config.vae_tiling and not self._tiling_enabled:
+            try:
+                self.vae.enable_tiling()
+                self._tiling_enabled = True
+            except Exception:
+                pass
+        if not self._compiled and os.environ.get(
+            "SGLANG_DIFFUSION_VAE_COMPILE", ""
+        ).lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            try:
+                self.vae = torch.compile(self.vae, mode="reduce-overhead")  # type: ignore[attr-defined]
+                self._compiled = True
+            except Exception:
+                # Best-effort: ignore if compile is not available/supported
+                pass
 
     def forward(
         self,
@@ -210,7 +247,7 @@ class ImageVAEEncodingStage(PipelineStage):
 
         num_frames = batch.num_frames
 
-        self.vae = self.vae.to(get_local_torch_device())
+        self._prepare_vae(server_args)
 
         cache_zero_video = not server_args.vae_cpu_offload
         if not cache_zero_video and self._zero_video_cache:
@@ -264,8 +301,12 @@ class ImageVAEEncodingStage(PipelineStage):
                 dtype=vae_dtype,
                 enabled=vae_autocast_enabled,
             ):
-                if server_args.pipeline_config.vae_tiling:
-                    self.vae.enable_tiling()
+                if server_args.pipeline_config.vae_tiling and not self._tiling_enabled:
+                    try:
+                        self.vae.enable_tiling()
+                        self._tiling_enabled = True
+                    except Exception:
+                        pass
                 # if server_args.vae_sp:
                 #     self.vae.enable_parallel()
                 if not vae_autocast_enabled:

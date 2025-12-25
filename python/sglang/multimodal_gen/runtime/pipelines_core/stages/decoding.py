@@ -5,6 +5,7 @@
 Decoding stage for diffusion pipelines.
 """
 
+import os
 import weakref
 
 import torch
@@ -59,6 +60,54 @@ class DecodingStage(PipelineStage):
     def __init__(self, vae, pipeline=None) -> None:
         self.vae: ParallelTiledVAE = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
+        self._tiling_enabled: bool = False
+        self._compiled: bool = False
+        self._channels_last_set: bool = False
+        self._decode_scale_shift_cache: dict[tuple, tuple] = {}
+        torch.set_float32_matmul_precision("high")
+
+    def _prepare_vae(self, server_args: ServerArgs):
+        "Keep VAE hot on GPU and avoid repeated setup work."
+        device = get_local_torch_device()
+        if self.vae.device != device:
+            self.vae = self.vae.to(device)
+        if not self._channels_last_set:
+            try:
+                self.vae = self.vae.to(memory_format=torch.channels_last)
+            except Exception:
+                pass
+            self._channels_last_set = True
+        if server_args.pipeline_config.vae_tiling and not self._tiling_enabled:
+            try:
+                self.vae.enable_tiling()
+                self._tiling_enabled = True
+            except Exception:
+                pass
+        if not self._compiled and os.environ.get(
+            "SGLANG_DIFFUSION_VAE_COMPILE", ""
+        ).lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            try:
+                self.vae = torch.compile(self.vae, mode="reduce-overhead")  # type: ignore[attr-defined]
+                self._compiled = True
+            except Exception:
+                pass
+
+    def _get_scale_and_shift(self, latents: torch.Tensor, server_args: ServerArgs):
+        key = (latents.device, latents.dtype)
+        if key not in self._decode_scale_shift_cache:
+            scale, shift = server_args.pipeline_config.get_decode_scale_and_shift(
+                latents.device, latents.dtype, self.vae
+            )
+            if isinstance(scale, torch.Tensor):
+                scale = scale.to(latents.device, latents.dtype)
+            if isinstance(shift, torch.Tensor):
+                shift = shift.to(latents.device, latents.dtype)
+            self._decode_scale_shift_cache[key] = (scale, shift)
+        return self._decode_scale_shift_cache[key]
 
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -81,22 +130,18 @@ class DecodingStage(PipelineStage):
         return result
 
     def scale_and_shift(self, latents: torch.Tensor, server_args):
-        scaling_factor, shift_factor = (
-            server_args.pipeline_config.get_decode_scale_and_shift(
-                latents.device, latents.dtype, self.vae
-            )
-        )
+        scaling_factor, shift_factor = self._get_scale_and_shift(latents, server_args)
 
         # 1. scale
         if isinstance(scaling_factor, torch.Tensor):
-            latents = latents / scaling_factor.to(latents.device, latents.dtype)
+            latents = latents / scaling_factor
         else:
             latents = latents / scaling_factor
 
         # 2. apply shifting if needed
         if shift_factor is not None:
             if isinstance(shift_factor, torch.Tensor):
-                latents += shift_factor.to(latents.device, latents.dtype)
+                latents += shift_factor
             else:
                 latents += shift_factor
         return latents
@@ -117,7 +162,7 @@ class DecodingStage(PipelineStage):
             Decoded video tensor with shape (batch, channels, frames, height, width),
             normalized to [0, 1] range and moved to CPU as float32
         """
-        self.vae = self.vae.to(get_local_torch_device())
+        self._prepare_vae(server_args)
         latents = latents.to(get_local_torch_device())
         # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
@@ -140,8 +185,9 @@ class DecodingStage(PipelineStage):
         ):
             try:
                 # TODO: make it more specific
-                if server_args.pipeline_config.vae_tiling:
+                if server_args.pipeline_config.vae_tiling and not self._tiling_enabled:
                     self.vae.enable_tiling()
+                    self._tiling_enabled = True
             except Exception:
                 pass
             if not vae_autocast_enabled:
