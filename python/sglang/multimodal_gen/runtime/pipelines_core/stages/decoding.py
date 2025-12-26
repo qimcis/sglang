@@ -69,7 +69,13 @@ class DecodingStage(PipelineStage):
     def _prepare_vae(self, server_args: ServerArgs):
         "Keep VAE hot on GPU and avoid repeated setup work."
         device = get_local_torch_device()
-        if self.vae.device != device:
+        vae_device = getattr(self.vae, "device", None)
+        if vae_device is None:
+            try:
+                vae_device = next(self.vae.parameters()).device
+            except StopIteration:
+                vae_device = device
+        if vae_device != device:
             self.vae = self.vae.to(device)
         if not self._channels_last_set:
             try:

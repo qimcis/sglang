@@ -193,12 +193,19 @@ class ImageVAEEncodingStage(PipelineStage):
         self._tiling_enabled: bool = False
         self._compiled: bool = False
         self._channels_last_set: bool = False
+        self._encode_scale_shift_cache: dict[tuple, tuple] = {}
         torch.set_float32_matmul_precision("high")
 
     def _prepare_vae(self, server_args: ServerArgs):
         """Keep VAE hot on GPU and avoid repeated setup work."""
         device = get_local_torch_device()
-        if self.vae.device != device:
+        vae_device = getattr(self.vae, "device", None)
+        if vae_device is None:
+            try:
+                vae_device = next(self.vae.parameters()).device
+            except StopIteration:
+                vae_device = device
+        if vae_device != device:
             self.vae = self.vae.to(device)
         if not self._channels_last_set:
             try:
@@ -226,6 +233,22 @@ class ImageVAEEncodingStage(PipelineStage):
                 # Best-effort: ignore if compile is not available/supported
                 pass
 
+    def _get_scale_and_shift(
+        self, latents: torch.Tensor, server_args: ServerArgs
+    ) -> tuple[torch.Tensor | float, torch.Tensor | float | None]:
+        key = (latents.device, latents.dtype)
+        if key not in self._encode_scale_shift_cache:
+            scale, shift = server_args.pipeline_config.get_decode_scale_and_shift(
+                device=latents.device, dtype=latents.dtype, vae=self.vae
+            )
+            if isinstance(scale, torch.Tensor):
+                scale = scale.to(latents.device, latents.dtype)
+            if isinstance(shift, torch.Tensor):
+                shift = shift.to(latents.device, latents.dtype)
+            self._encode_scale_shift_cache[key] = (scale, shift)
+        return self._encode_scale_shift_cache[key]
+
+    @torch.inference_mode()
     def forward(
         self,
         batch: Req,
@@ -328,12 +351,8 @@ class ImageVAEEncodingStage(PipelineStage):
                 latent_condition, self.vae
             )
 
-            scaling_factor, shift_factor = (
-                server_args.pipeline_config.get_decode_scale_and_shift(
-                    device=latent_condition.device,
-                    dtype=latent_condition.dtype,
-                    vae=self.vae,
-                )
+            scaling_factor, shift_factor = self._get_scale_and_shift(
+                latent_condition, server_args
             )
 
             # apply shift & scale if needed

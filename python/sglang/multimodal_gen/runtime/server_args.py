@@ -322,6 +322,34 @@ class ServerArgs:
                     "Failed to load V-MoBA config from %s: %s", self.moba_config_path, e
                 )
                 raise
+
+        # Prefer tensor cores for VAE when we keep it on GPU.
+        try:
+            if (
+                not self.vae_cpu_offload
+                and self.pipeline_config.vae_precision
+                == type(self.pipeline_config).vae_precision
+            ):
+                import torch  # Lazy import to avoid overhead at module import time
+
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        "CUDA is not available for VAE auto precision selection"
+                    )
+                compute_capability = torch.cuda.get_device_capability()
+                target_precision = "bf16"
+                if compute_capability and compute_capability[0] < 8:
+                    # Fall back to fp16 on older GPUs without native bf16
+                    target_precision = "fp16"
+                if self.pipeline_config.vae_precision != target_precision:
+                    logger.info(
+                        "Auto-selecting VAE precision to %s because vae_cpu_offload is disabled.",
+                        target_precision,
+                    )
+                    self.pipeline_config.vae_precision = target_precision
+        except Exception as e:  # pragma: no cover - best effort path
+            logger.warning("Failed to auto-select VAE precision: %s", e)
+
         self.check_server_args()
 
         configure_logger(server_args=self)

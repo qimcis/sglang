@@ -51,6 +51,7 @@ class EncodingStage(PipelineStage):
         result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(5)])
         return result
 
+    @torch.inference_mode()
     def forward(
         self,
         batch: Req,

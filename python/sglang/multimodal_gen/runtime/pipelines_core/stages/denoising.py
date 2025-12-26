@@ -369,6 +369,7 @@ class DenoisingStage(PipelineStage):
         # return StageParallelismType.CFG_PARALLEL if get_global_server_args().enable_cfg_parallel else StageParallelismType.REPLICATED
         return StageParallelismType.REPLICATED
 
+    @torch.inference_mode()
     def _preprocess_latents_for_ti2v(
         self, latents, target_dtype, batch, server_args: ServerArgs
     ):
@@ -608,8 +609,13 @@ class DenoisingStage(PipelineStage):
             )
         else:
             reserved_frames_mask_sp, z_sp = (
-                reserved_frames_masks[0] if reserved_frames_masks is not None else None
-            ), z
+                (
+                    reserved_frames_masks[0]
+                    if reserved_frames_masks is not None
+                    else None
+                ),
+                z,
+            )
 
         guidance = self.get_or_build_guidance(
             # TODO: replace with raw_latent_shape?
