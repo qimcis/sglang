@@ -52,6 +52,9 @@ class InsertParams:
 
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
+    branchoff_mamba_value: Optional[torch.Tensor] = None
+    branch_checkpoint_len: Optional[int] = None
+    mamba_layer_mask_bits: Optional[int] = None
 
     # SWA specific
     prev_prefix_len: int = 0

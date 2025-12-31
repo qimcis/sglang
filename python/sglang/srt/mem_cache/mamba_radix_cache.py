@@ -61,7 +61,6 @@ logger = logging.getLogger(__name__)
 
 
 class TreeNode:
-
     counter = 0
     last_access_time_counter_float = float64(1.0)
 
@@ -491,7 +490,8 @@ class MambaRadixCache(BasePrefixCache):
             key,
             value,
             mamba_value,
-            branchoff_mamba_value=getattr(params, "branchoff_mamba_value", None),
+            branchoff_mamba_value=params.branchoff_mamba_value,
+            branch_checkpoint_len=params.branch_checkpoint_len,
         )
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
@@ -663,6 +663,12 @@ class MambaRadixCache(BasePrefixCache):
                 key=RadixKey(page_aligned_token_ids, req.extra_key),
                 value=page_aligned_kv_indices,
                 mamba_value=mamba_value_forked,
+                branchoff_mamba_value=(
+                    mamba_value_forked if branch_checkpoint else None
+                ),
+                branch_checkpoint_len=(
+                    req.mamba_branching_seqlen if branch_checkpoint else None
+                ),
             )
         )
         new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
@@ -1128,6 +1134,7 @@ class MambaRadixCache(BasePrefixCache):
         value,
         mamba_value,
         branchoff_mamba_value=None,
+        branch_checkpoint_len: Optional[int] = None,
     ) -> Tuple[int, bool]:
         # Update the last access time from root to leaf, so that
         # mamba will tombstone the node closer to root first
@@ -1153,6 +1160,7 @@ class MambaRadixCache(BasePrefixCache):
         child_key = self.get_child_key_fn(key)
 
         total_prefix_length = 0
+        branch_state_attached = False
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = get_last_access_time()
@@ -1174,6 +1182,41 @@ class MambaRadixCache(BasePrefixCache):
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
+            if (
+                branch_checkpoint_len is not None
+                and not branch_state_attached
+                and total_prefix_length == branch_checkpoint_len
+                and node.mamba_value is None
+            ):
+                node.mamba_value = (
+                    branchoff_mamba_value
+                    if branchoff_mamba_value is not None
+                    else mamba_value
+                )
+                self.mamba_lru_list.insert_mru(node)
+                self.mamba_evictable_size_ += len(node.mamba_value)
+                node.last_access_time = get_last_access_time()
+                branch_state_attached = True
+
+        if (
+            branch_checkpoint_len is not None
+            and not branch_state_attached
+            and total_prefix_length == branch_checkpoint_len
+            and node.mamba_value is None
+        ):
+            node.mamba_value = (
+                branchoff_mamba_value
+                if branchoff_mamba_value is not None
+                else mamba_value
+            )
+            self.mamba_lru_list.insert_mru(node)
+            self.mamba_evictable_size_ += len(node.mamba_value)
+            node.last_access_time = get_last_access_time()
+            branch_state_attached = True
+
+        node_had_mamba_before = (
+            node.mamba_value is not None and not branch_state_attached
+        )
         mamba_value_exist = False
         if len(key):
             new_node = TreeNode()
@@ -1186,19 +1229,24 @@ class MambaRadixCache(BasePrefixCache):
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
             self.mamba_evictable_size_ += len(mamba_value)
-        elif node.mamba_value is None:  # add for mamba tombstone
-            node.mamba_value = mamba_value
-            self.full_lru_list.reset_node_mru(node)
-            self.mamba_lru_list.insert_mru(node)
-            self.mamba_evictable_size_ += len(mamba_value)
+            return total_prefix_length, (mamba_value_exist or node_had_mamba_before)
+
+        # len(key) == 0
+        mamba_value_exist = node_had_mamba_before
+        if not mamba_value_exist:
+            if not branch_state_attached:
+                node.mamba_value = mamba_value
+                self.mamba_lru_list.insert_mru(node)
+                self.mamba_evictable_size_ += len(mamba_value)
+            else:
+                self.mamba_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
-        else:  # mamba value already exists
-            mamba_value_exist = True
-            self.full_lru_list.reset_node_mru(node)
+        else:
             self.mamba_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
 
-        return total_prefix_length, mamba_value_exist
+        self.full_lru_list.reset_node_mru(node)
+        return 0, mamba_value_exist
 
     def _iteratively_delete_tombstone_leaf(
         self, node: TreeNode
