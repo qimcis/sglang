@@ -4,7 +4,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
-import torch.distributed._functional_collectives as ft_c
+import torch.distributed as dist
 from packaging.version import parse
 from torch.distributed.tensor.experimental._attention import _cp_options
 
@@ -23,27 +23,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
-    """
-    When tracing the code, the result tensor is not an AsyncCollectiveTensor,
-    so we cannot call ``wait()``.
-    """
-    if isinstance(tensor, ft_c.AsyncCollectiveTensor):
-        return tensor.wait()
-    return tensor
-
-
 def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
-    x_shape = x.shape
-    x = x.flatten()
-    x = ft_c.all_to_all_single(
-        x, output_split_sizes=None, input_split_sizes=None, group=ulysses_pg
-    )
-    x = _maybe_wait(x)
-    x = x.reshape(x_shape)
-    return x
+    if not x.is_contiguous():
+        x = x.contiguous()
+    output = torch.empty_like(x)
+    dist.all_to_all_single(output, x, group=ulysses_pg)
+    return output
 
 
 def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
