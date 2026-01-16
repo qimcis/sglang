@@ -173,6 +173,7 @@ from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.marconi_config import MarconiConfig
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -679,6 +680,22 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
+        marconi_config = None
+        if server_args.enable_marconi:
+            if not self.is_hybrid_ssm:
+                logger.warning(
+                    "Marconi is enabled but the model is not using Mamba radix cache."
+                )
+            else:
+                marconi_config = MarconiConfig(
+                    enable=True,
+                    eviction_policy=server_args.marconi_eviction_policy,
+                    eff_weight=server_args.marconi_eff_weight,
+                    bootstrap_window_size=server_args.marconi_bootstrap_window_size,
+                    bootstrap_multiplier=server_args.marconi_bootstrap_multiplier,
+                    tuning_interval=server_args.marconi_tuning_interval,
+                )
+
         # Create cache
         params = CacheInitParams(
             disable=server_args.disable_radix_cache,
@@ -694,11 +711,13 @@ class Scheduler(
             eviction_policy=server_args.radix_eviction_policy,
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
+            marconi_config=marconi_config,
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
             chunked_prefill_size=server_args.chunked_prefill_size,
             sliding_window_size=self.sliding_window_size,
+            attention_chunk_size=getattr(self, "attention_chunk_size", None),
         )
 
         if (
