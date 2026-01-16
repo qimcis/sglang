@@ -400,6 +400,17 @@ class MambaRadixCache(BasePrefixCache):
         ) or isinstance(params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator)
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
+        self.marconi_config = params.marconi_config
+        self.marconi_enabled = bool(
+            self.marconi_config is not None and self.marconi_config.enable
+        )
+        if self.marconi_enabled:
+            self.marconi_eff_weight = self.marconi_config.eff_weight
+            self.marconi_bootstrap_window_size = (
+                self.marconi_config.bootstrap_window_size
+            )
+            self.marconi_bootstrap_multiplier = self.marconi_config.bootstrap_multiplier
+            self.marconi_tuning_interval = self.marconi_config.tuning_interval
 
         self.page_size = params.page_size
         self.disable = params.disable
@@ -444,6 +455,10 @@ class MambaRadixCache(BasePrefixCache):
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(mamba=False)
         self.mamba_lru_list = LRUList(mamba=True)
+        if self.marconi_enabled:
+            self.marconi_request_history = []
+            self.marconi_request_history_windowed = []
+            self.marconi_num_reqs_before_eviction = None
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -506,6 +521,8 @@ class MambaRadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free_mamba_cache(req)
             return
+        if self.marconi_enabled and kv_committed_len > 0:
+            self._marconi_record_request(req, kv_committed_len)
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -586,6 +603,14 @@ class MambaRadixCache(BasePrefixCache):
             )
 
         self.dec_lock_ref(req.last_node)
+
+    def _marconi_record_request(self, req: Req, total_tokens: int) -> None:
+        cached_tokens = min(len(req.prefix_indices), total_tokens)
+        cache_hit = cached_tokens > 0
+        self.marconi_request_history.append((cache_hit, total_tokens, cached_tokens))
+        self.marconi_request_history_windowed.append(
+            (list(req.origin_input_ids), list(req.output_ids))
+        )
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
