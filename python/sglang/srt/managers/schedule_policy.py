@@ -819,7 +819,7 @@ class PrefillAdder:
                     # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
                     # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
                     # we need the prefill prefix length to be multiple of attention split size
-                    if truncation_align_size is not None:
+                    if truncation_align_size is not None and branch_trunc_len is None:
                         if trunc_len < truncation_align_size:
                             return AddReqResult.OTHER
                         else:
