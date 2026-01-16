@@ -140,12 +140,17 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--page-size` | The number of tokens in a page. | `1` | Type: int |
 | `--swa-full-tokens-ratio` | The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens. | `0.8` | Type: float |
 | `--disable-hybrid-swa-memory` | Disable the hybrid SWA memory. | `False` | bool flag (set to enable) |
-| `--radix-eviction-policy` | The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used. | `lru` | `lru`, `lfu` |
+| `--radix-eviction-policy` | The eviction policy of radix trees. `lru` stands for Least Recently Used, `lfu` stands for Least Frequently Used, and `slru` stands for Segmented LRU. | `lru` | `lru`, `lfu`, `slru` |
 | `--enable-prefill-delayer` | Enable prefill delayer for DP attention to reduce idle time. | `False` | bool flag (set to enable) |
 | `--prefill-delayer-max-delay-passes` | Maximum forward passes to delay prefill. | `30` | Type: int |
 | `--prefill-delayer-token-usage-low-watermark` | Token usage low watermark for prefill delayer. | `None` | Type: float |
 | `--prefill-delayer-forward-passes-buckets` | Custom buckets for prefill delayer forward passes histogram. 0 and max_delay_passes-1 will be auto-added. | `None` | List[float] |
 | `--prefill-delayer-wait-seconds-buckets` | Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added. | `None` | List[float] |
+| `--enable-marconi` | Enable Marconi eviction and tuning for the Mamba radix cache. | `False` | bool flag (set to enable) |
+| `--marconi-eff-weight` | Initial efficiency weight (alpha) for Marconi eviction scoring. | `0.0` | Type: float |
+| `--marconi-bootstrap-window-size` | Fixed bootstrap window size for Marconi tuning. | `None` | Type: int |
+| `--marconi-bootstrap-multiplier` | Multiplier for bootstrap window size when a fixed size is not provided. | `5` | Type: int |
+| `--marconi-tuning-interval` | Number of requests per Marconi tuning window. | `500` | Type: int |
 
 ## Runtime options
 | Argument | Description | Defaults | Options |
