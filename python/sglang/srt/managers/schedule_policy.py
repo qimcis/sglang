@@ -803,6 +803,9 @@ class PrefillAdder:
                         ),
                     )
                 else:
+                    if has_chunked_req:
+                        return AddReqResult.OTHER
+
                     # Make sure at least one page is available
                     if trunc_len is None:
                         trunc_len = (
