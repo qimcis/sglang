@@ -648,6 +648,7 @@ class Req(ReqDllmMixin):
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
         self.mamba_branching_seqlen: Optional[int] = None
+        self.marconi_cache_len: Optional[int] = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1112,6 +1113,7 @@ class Req(ReqDllmMixin):
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
+        self.marconi_cache_len = None
         self.already_computed = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0
