@@ -2037,6 +2037,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 elif hasattr(layer.self_attn, "attn_mqa"):
                     # For DeepSeek model
                     self.attention_layers.append(layer.self_attn.attn_mqa)
+                elif self.kimi_linear_config is not None:
+                    self.attention_layers.append(layer.self_attn)
             # For hybrid model
             elif hasattr(layer, "attn"):
                 self.attention_layers.append(layer.attn)

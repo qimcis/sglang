@@ -7,6 +7,8 @@ import torch
 from einops import rearrange
 from torch import nn
 
+from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
     divide,
@@ -44,6 +46,7 @@ from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
+from sglang.srt.utils.custom_op import register_custom_op
 
 
 class KimiMoE(nn.Module):
@@ -300,6 +303,17 @@ class KimiDeltaAttention(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> None:
+        output = torch.empty_like(hidden_states)
+        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
+            kda_with_output(hidden_states, output, self.layer_idx)
+            return output
+        return self._forward(hidden_states, forward_batch)
+
+    def _forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
         q_proj_states = self.q_proj(hidden_states)[0]
         k_proj_states = self.k_proj(hidden_states)[0]
         v_proj_states = self.v_proj(hidden_states)[0]
@@ -710,3 +724,25 @@ class KimiLinearForCausalLM(nn.Module):
 
 
 EntryClass = KimiLinearForCausalLM
+
+
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def kda_with_output(
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+) -> None:
+    context = get_forward_context()
+    forward_batch = context.forward_batch
+    attention_layers = context.attention_layers
+    attention_layer = attention_layers[layer_id]
+
+    ret = attention_layer._forward(hidden_states, forward_batch)
+
+    assert (
+        output.numel() == ret.numel()
+    ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
+
+    output.view(ret.shape).copy_(ret)
+    return
