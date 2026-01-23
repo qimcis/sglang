@@ -647,6 +647,13 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock: Optional[int] = None
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+        # The prefix length whose KV indices are already cached in the tree.
+        # This can exceed cache_protected_len in Marconi due to mamba tombstones.
+        self.kv_cache_protected_len: int = 0
+        # The KV prefix range inserted by this request during cache_unfinished_req.
+        # Used to avoid freeing KV inserted by the same request during cache_finished_req.
+        self.kv_cache_inserted_start: Optional[int] = None
+        self.kv_cache_inserted_end: Optional[int] = None
         self.mamba_branching_seqlen: Optional[int] = None
         self.marconi_cache_len: Optional[int] = None
 
@@ -908,6 +915,8 @@ class Req(ReqDllmMixin):
             if match_result.cache_protected_len is not None:
                 self.cache_protected_len = match_result.cache_protected_len
 
+            self.kv_cache_protected_len = self.cache_protected_len
+            self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
 
