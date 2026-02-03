@@ -66,8 +66,7 @@ __global__ void qknorm_across_heads_reg_kernel(
   const uint32_t lane_id = threadIdx.x % device::kWarpThreads;
   const uint32_t warp_id = threadIdx.x / device::kWarpThreads;
   const uint32_t num_warps = blockDim.x / device::kWarpThreads;
-  const float inv_hidden =
-      1.0f / static_cast<float>(vec_hidden_size * (VEC_SIZE_IN_BYTE / sizeof(T)));
+  const float inv_hidden = 1.0f / static_cast<float>(vec_hidden_size * (VEC_SIZE_IN_BYTE / sizeof(T)));
 
   vec_t* q_vec = reinterpret_cast<vec_t*>(q);
   vec_t* k_vec = reinterpret_cast<vec_t*>(k);
@@ -110,9 +109,7 @@ __global__ void qknorm_across_heads_reg_kernel(
       const float cta_sum_q = device::warp::reduce_sum(local_q);
       const float cta_sum_k = device::warp::reduce_sum(local_k);
       if (lane_id == 0) {
-        shared_memory[0] = make_float2(
-            rsqrtf(eps + cta_sum_q * inv_hidden),
-            rsqrtf(eps + cta_sum_k * inv_hidden));
+        shared_memory[0] = make_float2(rsqrtf(eps + cta_sum_q * inv_hidden), rsqrtf(eps + cta_sum_k * inv_hidden));
       }
     }
     __syncthreads();
