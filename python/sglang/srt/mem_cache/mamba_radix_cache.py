@@ -422,7 +422,6 @@ class MambaRadixCache(BasePrefixCache):
         self.marconi_enabled = bool(
             self.marconi_config is not None and self.marconi_config.enable
         )
-        self.marconi_attn_only_reuse = False
         self.marconi_track_buffer_size = None
         self.marconi_track_max_points = None
         self.marconi_mamba_layer_mask_bits = None
@@ -469,7 +468,6 @@ class MambaRadixCache(BasePrefixCache):
             self.marconi_eviction_regret_max_entries = (
                 self.marconi_config.eviction_regret_max_entries
             )
-            self.marconi_attn_only_reuse = self.marconi_config.attn_only_reuse
             self.marconi_track_buffer_size = self.marconi_config.track_buffer_size
             self.marconi_track_max_points = self.marconi_config.track_max_points
             latency_weights = self.marconi_config.eviction_latency_weights
@@ -590,6 +588,8 @@ class MambaRadixCache(BasePrefixCache):
             return True
         if node.mamba_layer_mask_bits is None:
             return True
+        if self.marconi_mamba_layer_mask_bits == 0:
+            return node.mamba_layer_mask_bits == 0
         return node.mamba_layer_mask_bits == self.marconi_mamba_layer_mask_full_bits
 
     def reset(self) -> None:
@@ -634,6 +634,7 @@ class MambaRadixCache(BasePrefixCache):
             self.marconi_tune_future = None
             self.marconi_tune_generation = 0
             self.marconi_admission_tree = MarconiAdmissionTree(
+                policy=self.marconi_config.admission_policy,
                 min_hits=self.marconi_admission_min_hits,
                 min_success_ratio=self.marconi_admission_min_success_ratio,
                 decay=self.marconi_admission_decay,
@@ -783,14 +784,6 @@ class MambaRadixCache(BasePrefixCache):
         kv_cache_protected_len = getattr(
             req, "kv_cache_protected_len", req.cache_protected_len
         )
-
-        if self.marconi_enabled and getattr(req, "marconi_rehydrate_active", False):
-            self._marconi_cache_rehydrate(req, kv_cache_protected_len)
-            kv_cache_protected_len = getattr(
-                req, "kv_cache_protected_len", req.cache_protected_len
-            )
-            req.marconi_track_entries = None
-            is_insert = False
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -1192,10 +1185,6 @@ class MambaRadixCache(BasePrefixCache):
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
-        if self.marconi_enabled and getattr(req, "marconi_rehydrate_active", False):
-            self._marconi_cache_rehydrate(req, kv_cache_protected_len)
-            return
-
         token_ids = req.fill_ids
         cache_len = (
             req.mamba_last_track_seqlen
@@ -1479,7 +1468,6 @@ class MambaRadixCache(BasePrefixCache):
 
         req.marconi_track_entries = None
         req.finish_marconi_rehydrate()
-
     def _marconi_cache_track_entries(
         self,
         req: Req,
@@ -1656,6 +1644,18 @@ class MambaRadixCache(BasePrefixCache):
             return False
         return node.pin_until > TreeNode.last_access_time_counter_float
 
+    def _marconi_node_mamba_layers(self, node: TreeNode) -> int:
+        stats = self.marconi_model_stats
+        if stats is None or node.mamba_value is None:
+            return 0
+        if self.marconi_mamba_layer_mask_full_bits is None:
+            return stats.num_mamba_layers
+        if node.mamba_layer_mask_bits is None:
+            return stats.num_mamba_layers
+        if node.mamba_layer_mask_bits == 0:
+            return 0
+        return int(node.mamba_layer_mask_bits.bit_count())
+
     def _marconi_record_eviction(self, node: TreeNode) -> None:
         if not self.marconi_enabled:
             return
@@ -1737,7 +1737,8 @@ class MambaRadixCache(BasePrefixCache):
             seqlen_child = len(node.key)
             seqlen_parent = max(seqlen_total - seqlen_child, 0)
 
-            flops_savings_mamba = stats.num_mamba_layers * get_mamba1_flops(
+            mamba_layers = self._marconi_node_mamba_layers(node)
+            flops_savings_mamba = mamba_layers * get_mamba1_flops(
                 seqlen_child, stats.model_dim, stats.ssm_state_size
             )
             flops_savings_attn = stats.num_attn_layers * (
@@ -1753,7 +1754,7 @@ class MambaRadixCache(BasePrefixCache):
                 + attn_weight * flops_savings_attn
                 + mlp_weight * flops_savings_mlp
             )
-            total_memory = stats.num_mamba_layers * stats.mamba_state_size_bytes
+            total_memory = mamba_layers * stats.mamba_state_size_bytes
             total_memory += stats.num_attn_layers * get_kv_cache_size_bytes(
                 seqlen_total, stats.model_dim, stats.kv_cache_dtype_size
             )

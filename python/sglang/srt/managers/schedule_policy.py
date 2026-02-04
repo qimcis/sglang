@@ -387,6 +387,7 @@ class PrefillAdder:
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
+        marconi_two_pass_branch_prefill: bool = True,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -439,6 +440,7 @@ class PrefillAdder:
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
+        self.marconi_two_pass_branch_prefill = marconi_two_pass_branch_prefill
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
