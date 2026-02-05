@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.layers.attention import (
 )
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
+    RMSNormTanhMulAdd,
     apply_qk_norm_with_optional_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -414,7 +415,7 @@ class ZImageTransformerBlock(nn.Module):
         self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
 
         self.attention_norm2 = RMSNorm(dim, eps=norm_eps)
-        self.ffn_norm2 = RMSNorm(dim, eps=norm_eps)
+        self.ffn_norm2 = RMSNormTanhMulAdd(dim, eps=norm_eps, affine=True, dtype=torch.bfloat16)
 
         if modulation:
             self.adaLN_modulation = nn.Sequential(
@@ -435,8 +436,9 @@ class ZImageTransformerBlock(nn.Module):
             scale_msa, gate_msa, scale_mlp, gate_mlp = scale_msa_gate.unsqueeze(
                 1
             ).chunk(4, dim=2)
-            gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
+            gate_msa = gate_msa.tanh()
             scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
+
 
             # Attention block
             attn_out = self.attention(
@@ -448,11 +450,14 @@ class ZImageTransformerBlock(nn.Module):
             x = x + gate_msa * self.attention_norm2(attn_out)
 
             # FFN block
-            x = x + gate_mlp * self.ffn_norm2(
-                self.feed_forward(
-                    self.ffn_norm1(x) * scale_mlp,
-                )
-            )
+            # x = x + gate_mlp * self.ffn_norm2(
+            #     self.feed_forward(
+            #         self.ffn_norm1(x) * scale_mlp,
+            #     )
+            # )
+            ffn_out = self.feed_forward(self.ffn_norm1(x) * scale_mlp)
+            # x = norm(x) * tanh(gate_mlp) + ffn_out
+            x = self.ffn_norm2(x, gate_mlp, ffn_out)
         else:
             # Attention block
             attn_input = self.attention_norm1(x)
