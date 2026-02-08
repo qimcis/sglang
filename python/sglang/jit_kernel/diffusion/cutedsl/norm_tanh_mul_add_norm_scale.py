@@ -10,48 +10,13 @@ from sglang.jit_kernel.diffusion.cutedsl.common.norm_fusion import (
     broadcast_tensor_for_bsfd,
     tensor_slice_for_bsfd,
 )
-from sglang.jit_kernel.diffusion.cutedsl.utils import TORCH_TO_CUTE_DTYPE, WARP_SIZE
+from sglang.jit_kernel.diffusion.cutedsl.utils import (
+    WARP_SIZE,
+    to_cute_arg,
+    to_fake_cute_args,
+)
 
 _COMPILE_CACHE = {}
-
-
-def to_cute_arg(
-    t,
-    *,
-    assume_aligned: Optional[int] = 32,
-    use_32bit_stride: bool = False,
-    enable_tvm_ffi: bool = True,
-):
-    """
-    Convert a Python value into a CuTeDSL value.
-    """
-    if isinstance(t, torch.Tensor):
-        return cute.runtime.from_dlpack(
-            t,
-            assumed_align=assume_aligned,
-            use_32bit_stride=use_32bit_stride,
-            enable_tvm_ffi=enable_tvm_ffi,
-        )
-    if isinstance(t, int):
-        return cutlass.Int32(t)
-    if isinstance(t, float):
-        return cutlass.Float32(t)
-    return t
-
-
-def to_fake_cute_args(t: torch.Tensor):
-    if isinstance(t, torch.Tensor):
-        # Only keep the last dim as compile-time value to maximum compiled kernel reuse
-        # e.g. (1,2,1536):(3027,1536,1) -> (?,?,1536):(?,?,1)
-        D = t.shape[-1]
-        dtype = TORCH_TO_CUTE_DTYPE[t.dtype]
-        shape = (*(cute.sym_int() for _ in range(t.ndim - 1)), D)
-        stride = (*(cute.sym_int(divisibility=D) for _ in range(t.ndim - 1)), 1)
-        fake_t = cute.runtime.make_fake_tensor(
-            dtype, shape, stride, memspace=cute.AddressSpace.gmem, assumed_align=32
-        )
-        return fake_t
-    return to_cute_arg(t)
 
 
 class NormTanhMulAddNormScale:
@@ -78,10 +43,13 @@ class NormTanhMulAddNormScale:
 
         return tuple(_sig(val) for val in inputs)
 
-    def __init__(self, D: int, norm_type: str, is_norm2: bool):
+    def __init__(
+        self, D: int, norm_type: str, is_norm2: bool, precomputed_tanh: bool = False
+    ):
         self.D = D
         self.norm_type = norm_type  # "layer" or "rms"
-        self.is_norm2 = is_norm2 # single norm or double norm
+        self.is_norm2 = is_norm2  # single norm or double norm
+        self.precomputed_tanh = precomputed_tanh
         self.num_warps = self.D // 256  # num of warps per cta
         self.num_threads = self.num_warps * WARP_SIZE  # num of threads per cta
 
@@ -192,25 +160,26 @@ class NormTanhMulAddNormScale:
         copy_if(tXgX, tXrX)  # gmem -> rmem
         copy_if(tWgW, tWrW)  # gmem -> rmem
         copy_if(tBgB, tBrB)  # gmem -> rmem
-        tNrN = norm(tXrX, tWrW, tBrB)
-        # Compute: value = value * tanh(<scale>) + <shift>
         copy_if(tSCgSC, tSCrSC)  # gmem -> rmem
         copy_if(tSHgSH, tSHrSH)  # gmem -> rmem
-        value = tNrN.load() * cute.tanh(tSCrSC.load()) + tSHrSH.load()
+        tNrN = norm(tXrX, tWrW, tBrB)
+        if cutlass.const_expr(self.precomputed_tanh):
+            value = tNrN.load() * tSCrSC.load() + tSHrSH.load()
+        else:
+            value = tNrN.load() * cute.tanh(tSCrSC.load()) + tSHrSH.load()
         # Store: y
         tYrY.store(value.to(tYrY.element_type))
         copy_if(tYrY, tYgY)  # rmem -> gmem
         if cutlass.const_expr(self.is_norm2):
             copy_if(tWgW2, tWrW2)  # gmem -> rmem
             copy_if(tBgB2, tBrB2)  # gmem -> rmem
+            copy_if(tSCgSC2, tSCrSC2)  # gmem -> rmem
             tNrN2 = norm(tYrY, tWrW2, tBrB2)
             # Compute: value2 = value2 * (1 + <scale2>)
-            copy_if(tSCgSC2, tSCrSC2)  # gmem -> rmem
             value2 = tNrN2.load() * (1 + tSCrSC2.load())
             # Store: y2
             tYrY2.store(value2.to(tYrY2.element_type))
             copy_if(tYrY2, tYgY2)  # rmem -> gmem
-            
 
 
 def validate_3d(t: torch.Tensor, B: int, S: int, D: int):
@@ -242,8 +211,9 @@ def fused_norm_tanh_mul_add(
     shift: torch.Tensor,
     norm_type: str,
     eps: float = 1e-5,
+    precomputed_tanh: bool = False,
     stream: cuda.CUstream = cuda.CUstream(cuda.CUstream_flags.CU_STREAM_DEFAULT),
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
     Fuse: norm(x) * tanh(scale) + shift
       where norm is either layernorm or rmsnorm.
@@ -278,10 +248,14 @@ def fused_norm_tanh_mul_add(
         torch_tensors = [y, None, x, weight, bias, scale, shift, None, None, None]
         cute_tensor_args = [to_cute_arg(t) for t in torch_tensors]
         # Compile cache
-        hash_key = NormTanhMulAddNormScale.make_hash_key(norm_type, *torch_tensors)
+        hash_key = NormTanhMulAddNormScale.make_hash_key(
+            norm_type, precomputed_tanh, *torch_tensors
+        )
         compiled_fn = _COMPILE_CACHE.get(hash_key)
         if compiled_fn is None:
-            kernel = NormTanhMulAddNormScale(D, norm_type, is_norm2=False)
+            kernel = NormTanhMulAddNormScale(
+                D, norm_type, is_norm2=False, precomputed_tanh=precomputed_tanh
+            )
             fake_sig_args = [to_fake_cute_args(t) for t in torch_tensors]
             compiled_fn = cute.compile(
                 kernel, *fake_sig_args, options="--enable-tvm-ffi"
@@ -306,6 +280,7 @@ def fused_norm_tanh_mul_add_norm_scale(
     scale2: torch.Tensor,
     norm_type: str,
     eps: float = 1e-5,
+    precomputed_tanh: bool = False,
     stream: cuda.CUstream = cuda.CUstream(cuda.CUstream_flags.CU_STREAM_DEFAULT),
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -348,10 +323,14 @@ def fused_norm_tanh_mul_add_norm_scale(
         torch_tensors = [y, y2, x, weight, bias, scale, shift, weight2, bias2, scale2]
         cute_tensor_args = [to_cute_arg(t) for t in torch_tensors]
         # Compile cache
-        hash_key = NormTanhMulAddNormScale.make_hash_key(norm_type, *torch_tensors)
+        hash_key = NormTanhMulAddNormScale.make_hash_key(
+            norm_type, precomputed_tanh, *torch_tensors
+        )
         compiled_fn = _COMPILE_CACHE.get(hash_key)
         if compiled_fn is None:
-            kernel = NormTanhMulAddNormScale(D, norm_type, is_norm2=True)
+            kernel = NormTanhMulAddNormScale(
+                D, norm_type, is_norm2=True, precomputed_tanh=precomputed_tanh
+            )
             fake_sig_args = [to_fake_cute_args(t) for t in torch_tensors]
             compiled_fn = cute.compile(
                 kernel, *fake_sig_args, options="--enable-tvm-ffi"

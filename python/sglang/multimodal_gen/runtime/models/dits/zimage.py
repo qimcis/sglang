@@ -239,7 +239,10 @@ class ZImageTransformerBlock(nn.Module):
         self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
 
         self.attention_norm2 = RMSNorm(dim, eps=norm_eps)
-        self.ffn_norm2 = RMSNormTanhMulAdd(dim, eps=norm_eps, affine=True, dtype=torch.bfloat16)
+        if modulation:
+            self.ffn_norm2 = RMSNormTanhMulAdd(dim, eps=norm_eps, affine=True, dtype=torch.bfloat16)
+        else:
+            self.ffn_norm2 = RMSNorm(dim, eps=norm_eps)
 
         if modulation:
             self.adaLN_modulation = nn.Sequential(
@@ -276,7 +279,6 @@ class ZImageTransformerBlock(nn.Module):
             #     )
             # )
             ffn_out = self.feed_forward(self.ffn_norm1(x) * scale_mlp)
-            # x = norm(x) * tanh(gate_mlp) + ffn_out
             x = self.ffn_norm2(x, gate_mlp, ffn_out)
         else:
             # Attention block
