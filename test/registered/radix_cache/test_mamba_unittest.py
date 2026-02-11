@@ -381,6 +381,139 @@ class TestMamba(unittest.TestCase):
             == mamba_pool.mamba_cache.temporal[:, last_node.mamba_value]
         )
 
+    def test_mamba_marconi_internal_eviction(self):
+        set_global_server_args_for_scheduler(
+            ServerArgs(
+                model_path="dummy",
+                page_size=1,
+                mamba_eviction_policy="marconi",
+                mamba_marconi_alpha=0.0,
+            )
+        )
+        # kv cache
+        size = 128
+        dtype = torch.bfloat16
+        head_num = 2
+        head_dim = 256
+        num_layers = 48
+        global_interval = 4
+        max_num_reqs = 10
+        mamba_cache_size = 20
+        max_context_len = 128
+        device = get_device()
+        full_attention_layer_ids = [
+            i for i in range(global_interval - 1, num_layers, global_interval)
+        ]
+
+        # mamba
+        mamba_layers = [
+            i for i in range(num_layers) if i not in full_attention_layer_ids
+        ]
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            shape = Mamba2StateShape.create(
+                tp_world_size=1,
+                intermediate_size=4096,
+                n_groups=16,
+                num_heads=32,
+                head_dim=128,
+                state_size=128,
+                conv_kernel=4,
+            )
+            mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
+
+        req_to_token_pool = HybridReqToTokenPool(
+            size=max_num_reqs,
+            mamba_size=mamba_cache_size,
+            mamba_spec_state_size=max_num_reqs,
+            max_context_len=max_context_len,
+            device=device,
+            enable_memory_saver=False,
+            cache_params=mamba2_cache_params,
+            enable_mamba_extra_buffer=False,
+            speculative_num_draft_tokens=3,
+        )
+        pool = HybridLinearKVPool(
+            size=size,
+            dtype=dtype,
+            page_size=1,
+            head_num=head_num,
+            head_dim=head_dim,
+            full_attention_layer_ids=full_attention_layer_ids,
+            enable_kvcache_transpose=False,
+            device=device,
+            enable_memory_saver=False,
+            mamba_pool=req_to_token_pool.mamba_pool,
+        )
+        allocator = TokenToKVPoolAllocator(
+            size=size,
+            dtype=dtype,
+            device=device,
+            kvcache=pool,
+            need_sort=False,
+        )
+        tree = MambaRadixCache(
+            params=CacheInitParams(
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=1,
+                disable=False,
+            )
+        )
+
+        def make_dummy_req():
+            sampling_params = SamplingParams(
+                temperature=0,
+                max_new_tokens=1,
+            )
+            req = Req(
+                rid=0,
+                origin_input_text="",
+                origin_input_ids=[],
+                sampling_params=sampling_params,
+            )
+            req_to_token_pool.alloc([req])
+            return req
+
+        req1 = make_dummy_req()
+        kv1 = allocator.alloc(3)
+        tree.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3]),
+                value=kv1,
+                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+
+        req2 = make_dummy_req()
+        kv2 = allocator.alloc(4)
+        tree.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 4]),
+                value=kv2,
+                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+
+        pre = tree.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3, 4])))
+        assert len(pre.device_indices) == 4
+
+        full_tokens_before = len(tree.all_values_flatten())
+        mamba_before = len(tree.all_mamba_values_flatten())
+
+        result = tree.evict(EvictParams(num_tokens=0, mamba_num=1))
+        assert result.mamba_num_evicted >= 1
+
+        full_tokens_after = len(tree.all_values_flatten())
+        mamba_after = len(tree.all_mamba_values_flatten())
+
+        # Marconi internal eviction should free one mamba state while preserving KV coverage.
+        assert mamba_after == mamba_before - 1
+        assert full_tokens_after == full_tokens_before
+
+        post = tree.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3, 4])))
+        assert len(post.device_indices) == 4
+        tree.sanity_check()
+
 
 if __name__ == "__main__":
     unittest.main()

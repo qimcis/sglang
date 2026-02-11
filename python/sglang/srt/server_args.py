@@ -215,6 +215,8 @@ MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
 
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
+MAMBA_EVICTION_POLICY_CHOICES = ["lru", "marconi"]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -517,6 +519,8 @@ class ServerArgs:
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
+    mamba_eviction_policy: str = "lru"
+    mamba_marconi_alpha: float = 1.0
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -1691,6 +1695,11 @@ class ServerArgs:
             )
             self.disable_radix_cache = True
             return
+
+        if self.mamba_eviction_policy == "marconi":
+            assert (
+                self.mamba_marconi_alpha >= 0
+            ), f"mamba_marconi_alpha must be non-negative, got {self.mamba_marconi_alpha}"
 
         if not support_mamba_cache_extra_buffer:
             assert (
@@ -4154,6 +4163,19 @@ class ServerArgs:
             type=int,
             default=ServerArgs.mamba_track_interval,
             help="The interval to track the mamba state during decode.",
+        )
+        parser.add_argument(
+            "--mamba-eviction-policy",
+            type=str,
+            choices=MAMBA_EVICTION_POLICY_CHOICES,
+            default=ServerArgs.mamba_eviction_policy,
+            help="Eviction policy for MambaRadixCache ('lru' or 'marconi').",
+        )
+        parser.add_argument(
+            "--mamba-marconi-alpha",
+            type=float,
+            default=ServerArgs.mamba_marconi_alpha,
+            help="The alpha weight for Marconi eviction utility: recency + alpha * flop_efficiency.",
         )
 
         # Hierarchical cache
