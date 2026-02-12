@@ -296,6 +296,8 @@ class ServerArgs:
     webui_port: int | None = 12312
 
     scheduler_port: int = 5555
+    dynamic_batch_max_size: int = 1
+    dynamic_batch_delay_ms: float = 0.0
 
     output_path: str | None = "outputs/"
     input_save_path: str | None = "inputs/uploads"
@@ -830,6 +832,18 @@ class ServerArgs:
             help="Port for the scheduler server.",
         )
         parser.add_argument(
+            "--dynamic-batch-max-size",
+            type=int,
+            default=ServerArgs.dynamic_batch_max_size,
+            help="Maximum number of compatible generation requests to merge into one dynamic batch.",
+        )
+        parser.add_argument(
+            "--dynamic-batch-delay-ms",
+            type=float,
+            default=ServerArgs.dynamic_batch_delay_ms,
+            help="Maximum time (in ms) to wait for forming a larger dynamic batch before dispatch.",
+        )
+        parser.add_argument(
             "--host",
             type=str,
             default=ServerArgs.host,
@@ -1188,6 +1202,11 @@ class ServerArgs:
                 f"sp_degree ({self.sp_degree}) must equal ring_degree * ulysses_degree "
                 f"({self.ring_degree} * {self.ulysses_degree} = {self.ring_degree * self.ulysses_degree})"
             )
+
+        if self.dynamic_batch_max_size < 1:
+            raise ValueError("dynamic_batch_max_size must be >= 1")
+        if self.dynamic_batch_delay_ms < 0:
+            raise ValueError("dynamic_batch_delay_ms must be >= 0")
 
         if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
             has_sp = self.sp_degree > 1
