@@ -73,7 +73,25 @@ class InputValidationStage(PipelineStage):
         num_videos_per_prompt = batch.num_outputs_per_prompt
 
         assert seed is not None
-        if isinstance(seed, list):
+
+        prompt_count = len(batch.prompt) if isinstance(batch.prompt, list) else 1
+        dynamic_batch_seeds = batch.extra.get("dynamic_batch_seeds")
+
+        if dynamic_batch_seeds is not None:
+            if (
+                not isinstance(dynamic_batch_seeds, list)
+                or len(dynamic_batch_seeds) != prompt_count
+            ):
+                raise ValueError(
+                    "dynamic_batch_seeds must be a list with one seed per prompt"
+                )
+            base_seeds = [int(item) for item in dynamic_batch_seeds]
+            seeds = []
+            for base_seed in base_seeds:
+                seeds.extend(
+                    [base_seed + i for i in range(num_videos_per_prompt)]
+                )
+        elif isinstance(seed, list):
             if len(seed) != num_videos_per_prompt:
                 raise ValueError(
                     f"seed list length must match num_outputs_per_prompt "
@@ -81,7 +99,15 @@ class InputValidationStage(PipelineStage):
                 )
             seeds = [int(item) for item in seed]
         else:
-            seeds = [int(seed) + i for i in range(num_videos_per_prompt)]
+            # Keep per-prompt seed streams deterministic and non-overlapping.
+            base_seeds = [
+                int(seed) + i * num_videos_per_prompt for i in range(prompt_count)
+            ]
+            seeds = []
+            for base_seed in base_seeds:
+                seeds.extend(
+                    [base_seed + i for i in range(num_videos_per_prompt)]
+                )
         batch.seeds = seeds
 
         # Create generators based on generator_device parameter

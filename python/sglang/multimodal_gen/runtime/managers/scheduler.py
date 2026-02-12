@@ -2,10 +2,15 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
+import dataclasses
+import json
 import os
 import pickle
 import tempfile
+import time
 from collections import deque
+from copy import deepcopy
+from enum import Enum
 from typing import Any, List
 
 import zmq
@@ -55,6 +60,15 @@ MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEU
 # sequence — rank 1's uncond branch then produces a valid tensor for
 # _combine_cfg_parallel's all-reduce.
 DEFAULT_PLACEHOLDER_PROMPT = "warmup"
+
+_DYNAMIC_BATCH_SIGNATURE_EXCLUDED_FIELDS = {
+    "prompt",
+    "request_id",
+    "output_file_name",
+    "seed",
+    "perf_dump_path",
+    "suppress_logs",
+}
 
 
 class Scheduler(SchedulerDisaggMixin):
@@ -122,8 +136,12 @@ class Scheduler(SchedulerDisaggMixin):
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
         }
 
-        # FIFO, new reqs are appended
-        self.waiting_queue: deque[tuple[bytes, Any]] = deque()
+        # FIFO queue entries: (identity, request, enqueue_ts_s)
+        self.waiting_queue: deque[tuple[bytes | None, Any, float]] = deque()
+        self._dynamic_batch_max_size = max(1, server_args.dynamic_batch_max_size)
+        self._dynamic_batch_delay_s = max(
+            0.0, server_args.dynamic_batch_delay_ms / 1000.0
+        )
 
         # whether we've send the necessary warmup reqs
         self.warmed_up = False
@@ -216,7 +234,7 @@ class Scheduler(SchedulerDisaggMixin):
         req = cls._first_generation_req(req_or_group)
         return req.is_warmup if req is not None else False
 
-    def _dispatch_request(self, reqs: list[Any]) -> OutputBatch:
+    def _dispatch_request(self, reqs: list[Any]) -> OutputBatch | list[OutputBatch]:
         """dispatch req to its registered handler"""
         req_or_group = reqs[0]
         if isinstance(req_or_group, list):
@@ -232,15 +250,20 @@ class Scheduler(SchedulerDisaggMixin):
             return
 
         if output_batch.error is None:
+            total_duration_s = (
+                output_batch.metrics.total_duration_s
+                if output_batch.metrics is not None
+                else 0.0
+            )
             if self._warmup_total > 0:
                 logger.info(
                     f"Warmup req ({self._warmup_processed}/{self._warmup_total}) processed in {GREEN}%.2f{RESET} seconds",
-                    output_batch.metrics.total_duration_s,
+                    total_duration_s,
                 )
             else:
                 logger.info(
                     f"Warmup req processed in {GREEN}%.2f{RESET} seconds",
-                    output_batch.metrics.total_duration_s,
+                    total_duration_s,
                 )
         else:
             if self._warmup_total > 0:
@@ -271,7 +294,46 @@ class Scheduler(SchedulerDisaggMixin):
             DiffStage.SCHEDULER_DISPATCH,
             thread_finish_flag=True,
         ):
-            return self.worker.execute_forward(reqs)
+            if len(reqs) == 1:
+                return self.worker.execute_forward(reqs)
+
+            merged_req = self._try_merge_generation_reqs(reqs)
+            if merged_req is None:
+                return self._execute_generation_sequential(reqs)
+
+            batch_size = len(reqs)
+            try:
+                output_batch = self.worker.execute_forward([merged_req])
+                if output_batch.error:
+                    logger.warning(
+                        "Dynamic batch execution returned error. Falling back to sequential execution: %s",
+                        output_batch.error,
+                    )
+                    return self._execute_generation_sequential(reqs)
+
+                split_outputs = self._split_batched_output(output_batch, reqs)
+                if split_outputs is None:
+                    logger.warning(
+                        "Failed to split dynamic batched output cleanly. Falling back to sequential execution."
+                    )
+                    return self._execute_generation_sequential(reqs)
+
+                logger.info(
+                    "Processed dynamic batch of %d request(s) with max_delay=%.2fms",
+                    batch_size,
+                    self._dynamic_batch_delay_s * 1000.0,
+                )
+                return split_outputs
+            except Exception as e:
+                logger.warning(
+                    "Dynamic batching failed (%s). Falling back to sequential execution.",
+                    e,
+                    exc_info=True,
+                )
+                return self._execute_generation_sequential(reqs)
+
+    def _execute_generation_sequential(self, reqs: List[Req]) -> List[OutputBatch]:
+        return [self.worker.execute_forward([req]) for req in reqs]
 
     def return_result(
         self,
@@ -285,15 +347,222 @@ class Scheduler(SchedulerDisaggMixin):
         if not is_warmup and self.receiver is not None and identity is not None:
             self.receiver.send_multipart([identity, b"", pickle.dumps(output_batch)])
 
-    def get_next_batch_to_run(self) -> list[tuple[bytes, Any]] | None:
-        """pull a req from waiting_queue"""
+    def _normalize_for_signature(self, value: Any):
+        if isinstance(value, Enum):
+            return value.value
+        if dataclasses.is_dataclass(value):
+            return self._normalize_for_signature(dataclasses.asdict(value))
+        if isinstance(value, dict):
+            return {
+                str(k): self._normalize_for_signature(v)
+                for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
+            }
+        if isinstance(value, (list, tuple)):
+            return [self._normalize_for_signature(v) for v in value]
+        return value
+
+    def _build_dynamic_batch_signature(self, req: Req) -> str | None:
+        sp = req.sampling_params
+        if sp is None:
+            return None
+
+        try:
+            sp_dict = dataclasses.asdict(sp)
+        except Exception:
+            return None
+
+        for key in _DYNAMIC_BATCH_SIGNATURE_EXCLUDED_FIELDS:
+            sp_dict.pop(key, None)
+
+        if req.extra:
+            # Only include user-facing knobs that can alter generation behavior.
+            diffusers_kwargs = req.extra.get("diffusers_kwargs")
+            if diffusers_kwargs:
+                sp_dict["diffusers_kwargs"] = diffusers_kwargs
+
+        normalized = self._normalize_for_signature(sp_dict)
+        return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+
+    def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
+        if base_req.is_warmup or candidate_req.is_warmup:
+            return False
+
+        if not isinstance(base_req.prompt, str) or not isinstance(
+            candidate_req.prompt, str
+        ):
+            return False
+
+        # Keep image-conditioned requests out of dynamic batching to avoid
+        # ambiguity with list-valued image inputs in existing pipelines.
+        if base_req.image_path is not None or candidate_req.image_path is not None:
+            return False
+
+        base_sig = self._build_dynamic_batch_signature(base_req)
+        cand_sig = self._build_dynamic_batch_signature(candidate_req)
+        return base_sig is not None and base_sig == cand_sig
+
+    def _try_merge_generation_reqs(self, reqs: List[Req]) -> Req | None:
+        if len(reqs) <= 1:
+            return reqs[0] if reqs else None
+
+        base_req = reqs[0]
+        for req in reqs[1:]:
+            if not self._can_dynamic_batch(base_req, req):
+                return None
+
+        merged_req = deepcopy(base_req)
+        merged_req.prompt = [req.prompt for req in reqs]
+
+        merged_req.extra = deepcopy(merged_req.extra)
+        merged_req.extra["dynamic_batch_seeds"] = [req.seed for req in reqs]
+        merged_req.extra["dynamic_batch_request_ids"] = [req.request_id for req in reqs]
+
+        # We split outputs back per original request in scheduler, so avoid
+        # saving output files inside a merged worker call.
+        merged_req.return_file_paths_only = False
+        merged_req.request_id = f"dynamic_batch::{merged_req.request_id}"
+
+        return merged_req
+
+    @staticmethod
+    def _count_first_dim(value: Any) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            return len(value)
+
+        shape = getattr(value, "shape", None)
+        if shape is not None:
+            try:
+                if len(shape) > 0:
+                    return int(shape[0])
+            except Exception:
+                return None
+        return None
+
+    def _slice_batched_value(
+        self, value: Any, start: int, end: int, total_items: int
+    ) -> Any:
+        if value is None:
+            return None
+
+        if isinstance(value, (list, tuple)):
+            if len(value) == total_items:
+                sliced = value[start:end]
+                return list(sliced) if isinstance(value, list) else tuple(sliced)
+            # Nested list/tuple (e.g., trajectory per denoising step). Slice recursively.
+            sliced_nested = [
+                self._slice_batched_value(v, start, end, total_items) for v in value
+            ]
+            return sliced_nested if isinstance(value, list) else tuple(sliced_nested)
+
+        value_items = self._count_first_dim(value)
+        if value_items == total_items:
+            try:
+                return value[start:end]
+            except Exception:
+                pass
+
+        # Scalar / non-batched metadata
+        return deepcopy(value)
+
+    def _split_batched_output(
+        self, output_batch: OutputBatch, reqs: List[Req]
+    ) -> List[OutputBatch] | None:
+        per_req_counts = [req.num_outputs_per_prompt for req in reqs]
+        total_items = sum(per_req_counts)
+        output_items = self._count_first_dim(output_batch.output)
+
+        if output_items is not None and output_items != total_items:
+            logger.warning(
+                "Unexpected batched output size: got %s items, expected %s",
+                output_items,
+                total_items,
+            )
+            return None
+
+        outputs: list[OutputBatch] = []
+        start = 0
+        for req, req_count in zip(reqs, per_req_counts):
+            end = start + req_count
+            split = OutputBatch(
+                output=self._slice_batched_value(
+                    output_batch.output, start, end, total_items
+                ),
+                audio=self._slice_batched_value(
+                    output_batch.audio, start, end, total_items
+                ),
+                audio_sample_rate=output_batch.audio_sample_rate,
+                trajectory_timesteps=self._slice_batched_value(
+                    output_batch.trajectory_timesteps, start, end, total_items
+                ),
+                trajectory_latents=self._slice_batched_value(
+                    output_batch.trajectory_latents, start, end, total_items
+                ),
+                trajectory_decoded=self._slice_batched_value(
+                    output_batch.trajectory_decoded, start, end, total_items
+                ),
+                error=output_batch.error,
+                output_file_paths=None,
+                timings=deepcopy(output_batch.timings),
+                noise_pred=self._slice_batched_value(
+                    output_batch.noise_pred, start, end, total_items
+                ),
+                peak_memory_mb=output_batch.peak_memory_mb,
+            )
+            if split.timings is not None:
+                split.timings.request_id = req.request_id
+            outputs.append(split)
+            start = end
+
+        return outputs
+
+    def _dynamic_batching_enabled(self) -> bool:
+        return self._dynamic_batch_max_size > 1
+
+    def get_next_batch_to_run(self) -> list[tuple[bytes | None, Any]] | None:
+        """Pull one request or one dynamic batch from waiting_queue."""
         if not self.waiting_queue:
             return None
 
-        # pop the first (earliest)
-        item = self.waiting_queue.popleft()
+        if not self._dynamic_batching_enabled():
+            identity, req, _ = self.waiting_queue.popleft()
+            return [(identity, req)]
 
-        return [item]
+        identity, req, enqueue_time = self.waiting_queue[0]
+        if not isinstance(req, Req):
+            identity, req, _ = self.waiting_queue.popleft()
+            return [(identity, req)]
+
+        batch_len = 0
+        hit_incompatible_front = False
+        for _identity, candidate_req, _enqueue_time in self.waiting_queue:
+            if batch_len >= self._dynamic_batch_max_size:
+                break
+            if not isinstance(candidate_req, Req) or not self._can_dynamic_batch(
+                req, candidate_req
+            ):
+                hit_incompatible_front = True
+                break
+            batch_len += 1
+
+        if batch_len <= 0:
+            return None
+
+        oldest_wait_s = time.monotonic() - enqueue_time
+        should_wait_for_more = (
+            batch_len < self._dynamic_batch_max_size
+            and oldest_wait_s < self._dynamic_batch_delay_s
+            and not hit_incompatible_front
+        )
+        if should_wait_for_more:
+            return None
+
+        batch_items: list[tuple[bytes | None, Any]] = []
+        for _ in range(batch_len):
+            item_identity, item_req, _ = self.waiting_queue.popleft()
+            batch_items.append((item_identity, item_req))
+        return batch_items
 
     def prepare_server_warmup_reqs(self):
         if (
@@ -334,7 +603,7 @@ class Scheduler(SchedulerDisaggMixin):
                     req_kwargs["do_classifier_free_guidance"] = True
                 req = Req(**req_kwargs)
                 req.set_as_warmup(self.server_args.warmup_steps)
-                self.waiting_queue.append((None, req))
+                self.waiting_queue.append((None, req, time.monotonic()))
             # if server is warmed-up, set this flag to avoid req-based warmup
             self.warmed_up = True
 
@@ -491,7 +760,10 @@ class Scheduler(SchedulerDisaggMixin):
             try:
                 new_reqs = self.recv_reqs()
                 new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
-                self.waiting_queue.extend(new_reqs)
+                now = time.monotonic()
+                self.waiting_queue.extend(
+                    [(identity, req, now) for identity, req in new_reqs]
+                )
                 # Reset error count on success
                 self._consecutive_error_count = 0
             except Exception as e:
@@ -515,28 +787,57 @@ class Scheduler(SchedulerDisaggMixin):
             # 2: execute, make sure a reply is always sent
             items = self.get_next_batch_to_run()
             if not items:
+                if self.waiting_queue and self._dynamic_batch_delay_s > 0:
+                    # Avoid busy-spin while waiting for max-batch-delay to elapse.
+                    time.sleep(min(0.001, self._dynamic_batch_delay_s))
                 continue
 
-            identities = [item[0] for item in items]
             reqs = [item[1] for item in items]
 
             try:
-                req_or_group = reqs[0]
-                is_warmup = self._is_warmup_item(req_or_group)
-                output_batch = self._dispatch_request(reqs)
+                handler_result = self._dispatch_request(reqs)
             except Exception as e:
                 logger.error(
                     f"Error executing request in scheduler event loop: {e}",
                     exc_info=True,
                 )
-                output_batch = OutputBatch(error=str(e))
+                # Determine appropriate error response format
+                handler_result = (
+                    OutputBatch(error=str(e))
+                    if reqs and isinstance(reqs[0], Req)
+                    else OutputBatch(error=str(e))
+                )
+
+            if isinstance(handler_result, list):
+                output_batches = handler_result
+            else:
+                output_batches = [handler_result]
+
+            if len(output_batches) != len(items):
+                logger.error(
+                    "Handler returned %d output(s) for %d request(s). Returning error for unmatched requests.",
+                    len(output_batches),
+                    len(items),
+                )
+                output_batches = [
+                    OutputBatch(
+                        error=(
+                            f"Internal scheduler error: expected {len(items)} outputs, "
+                            f"got {len(output_batches)}."
+                        )
+                    )
+                    for _ in items
+                ]
 
             # 3. return results
             try:
-                self._log_warmup_result(output_batch, is_warmup)
+                for (identity, processed_req), output_batch in zip(
+                    items, output_batches, strict=True
+                ):
+                    is_warmup = self._is_warmup_item(processed_req)
+                    self._log_warmup_result(output_batch, is_warmup)
 
-                # TODO: Support sending back to multiple identities if batched
-                self.return_result(output_batch, identities[0], is_warmup=is_warmup)
+                    self.return_result(output_batch, identity, is_warmup=is_warmup)
             except zmq.ZMQError as e:
                 # Reply failed; log and keep loop alive to accept future requests
                 logger.error(f"ZMQ error sending reply: {e}")
