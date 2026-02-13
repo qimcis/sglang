@@ -56,6 +56,8 @@ _DYNAMIC_BATCH_SIGNATURE_EXCLUDED_FIELDS = {
     "suppress_logs",
 }
 
+_MAX_RECV_REQS_PER_POLL = 1024
+
 
 class Scheduler:
     """
@@ -535,26 +537,20 @@ class Scheduler:
         """
         if self.receiver is not None:
             try:
-                try:
-                    # Accept valid REQ envelopes only, ignore malformed/probe frames.
-                    parts = self.receiver.recv_multipart(zmq.NOBLOCK)
-                    identity, payload = parts[0], parts[-1]
+                recv_reqs: list[tuple[bytes, Any]] = []
+                while len(recv_reqs) < _MAX_RECV_REQS_PER_POLL:
+                    try:
+                        identity, _, payload = self.receiver.recv_multipart(zmq.NOBLOCK)
+                    except zmq.Again:
+                        break
 
-                    # Ignore malformed probes or non-pickle data
-                    recv_reqs = pickle.loads(payload) if len(parts) > 2 else []
-                except (zmq.Again, pickle.UnpicklingError, IndexError, EOFError):
-                    recv_reqs = []
+                    reqs = pickle.loads(payload)
+                    if not isinstance(reqs, list):
+                        reqs = [reqs]
+                    recv_reqs.extend((identity, req) for req in reqs)
             except zmq.ZMQError:
                 # re-raise or handle appropriately to let the outer loop continue
                 raise
-
-            if recv_reqs:
-                # Ensure recv_reqs is a list
-                if not isinstance(recv_reqs, list):
-                    recv_reqs = [recv_reqs]
-
-                # Pack with identity for rank 0
-                recv_reqs = [(identity, req) for req in recv_reqs]
         else:
             recv_reqs = None
 
