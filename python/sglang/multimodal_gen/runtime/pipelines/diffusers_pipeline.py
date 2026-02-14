@@ -428,7 +428,7 @@ class DiffusersPipeline(ComposedPipelineBase):
             quant_config = None
 
         if gguf_settings is not None:
-            component_name = gguf_settings["component_name"]
+            component_name = "transformer"
             component_model = self._load_gguf_component(
                 server_args=server_args,
                 base_model_path=model_path,
@@ -512,18 +512,8 @@ class DiffusersPipeline(ComposedPipelineBase):
         config = server_args.pipeline_config
 
         gguf_file = server_args.gguf_file or self._safe_getattr(config, "gguf_file")
-        gguf_component = server_args.gguf_component or self._safe_getattr(
-            config, "gguf_component"
-        )
-        gguf_component = gguf_component or "transformer"
         gguf_base_model_path = server_args.gguf_base_model_path or self._safe_getattr(
             config, "gguf_base_model_path"
-        )
-        gguf_repo_id = server_args.gguf_repo_id or self._safe_getattr(
-            config, "gguf_repo_id"
-        )
-        gguf_component_class = server_args.gguf_component_class or self._safe_getattr(
-            config, "gguf_component_class"
         )
 
         model_path_is_gguf = check_gguf_file(model_path) or str(model_path).lower().endswith(".gguf")
@@ -543,14 +533,11 @@ class DiffusersPipeline(ComposedPipelineBase):
         base_model_source = gguf_base_model_path or model_path
         return {
             "gguf_file": gguf_file,
-            "component_name": gguf_component,
             "base_model_source": base_model_source,
-            "gguf_repo_id": gguf_repo_id,
-            "gguf_component_class": gguf_component_class,
         }
 
     def _resolve_gguf_file_path(
-        self, gguf_file: str, base_model_path: str, gguf_repo_id: str | None
+        self, gguf_file: str, base_model_path: str, base_model_source: str
     ) -> str:
         if check_gguf_file(gguf_file):
             return gguf_file
@@ -561,14 +548,6 @@ class DiffusersPipeline(ComposedPipelineBase):
         candidate_in_base = os.path.join(base_model_path, gguf_file)
         if check_gguf_file(candidate_in_base):
             return candidate_in_base
-
-        if gguf_repo_id:
-            downloaded_file = hf_hub_download(repo_id=gguf_repo_id, filename=gguf_file)
-            if not check_gguf_file(downloaded_file):
-                raise ValueError(
-                    f"Downloaded file '{downloaded_file}' is not a valid GGUF checkpoint."
-                )
-            return downloaded_file
 
         if gguf_file.endswith(".gguf"):
             parts = gguf_file.split("/")
@@ -581,23 +560,33 @@ class DiffusersPipeline(ComposedPipelineBase):
                 if check_gguf_file(downloaded_file):
                     return downloaded_file
 
+        if (
+            not os.path.exists(base_model_source)
+            and "/" in base_model_source
+            and not base_model_source.startswith("http")
+        ):
+            try:
+                downloaded_file = hf_hub_download(
+                    repo_id=base_model_source, filename=gguf_file
+                )
+            except Exception:
+                downloaded_file = None
+            if downloaded_file and check_gguf_file(downloaded_file):
+                return downloaded_file
+
         if os.path.isfile(gguf_file):
             raise ValueError(f"File '{gguf_file}' exists but is not a valid GGUF file.")
 
         raise ValueError(
             f"Unable to resolve GGUF file '{gguf_file}'. Provide a local path, URL, "
-            f"or set --gguf-repo-id when passing a filename."
+            "or use '<repo>/<subpath>/<file.gguf>' shorthand."
         )
 
     def _resolve_gguf_component_class(
         self,
         base_model_path: str,
-        component_name: str,
-        component_class_override: str | None,
+        component_name: str = "transformer",
     ) -> Any:
-        if component_class_override:
-            return self._import_component_class(component_class_override)
-
         model_index = maybe_download_model_index(base_model_path)
         component_spec = model_index.get(component_name)
         if not (
@@ -607,7 +596,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         ):
             raise ValueError(
                 f"Component '{component_name}' not found in model_index.json. "
-                "Set --gguf-component or --gguf-component-class explicitly."
+                "Ensure the base diffusers model exports this component."
             )
 
         library_name, class_name = component_spec
@@ -625,24 +614,6 @@ class DiffusersPipeline(ComposedPipelineBase):
                 f"Could not resolve class '{class_name}' in module '{library_name}'."
             )
         return getattr(module, class_name)
-
-    def _import_component_class(self, class_ref: str) -> Any:
-        if "." in class_ref:
-            module_name, class_name = class_ref.rsplit(".", 1)
-            module = importlib.import_module(module_name)
-            if not hasattr(module, class_name):
-                raise ValueError(
-                    f"Could not resolve class '{class_name}' in module '{module_name}'."
-                )
-            return getattr(module, class_name)
-
-        diffusers_module = importlib.import_module("diffusers")
-        if hasattr(diffusers_module, class_ref):
-            return getattr(diffusers_module, class_ref)
-
-        raise ValueError(
-            f"Could not resolve class '{class_ref}'. Use a full module path or a valid diffusers class."
-        )
 
     @staticmethod
     def _filter_supported_kwargs(callable_obj: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -677,12 +648,11 @@ class DiffusersPipeline(ComposedPipelineBase):
         gguf_path = self._resolve_gguf_file_path(
             gguf_file=gguf_settings["gguf_file"],
             base_model_path=base_model_path,
-            gguf_repo_id=gguf_settings["gguf_repo_id"],
+            base_model_source=gguf_settings["base_model_source"],
         )
         component_cls = self._resolve_gguf_component_class(
             base_model_path=base_model_path,
-            component_name=gguf_settings["component_name"],
-            component_class_override=gguf_settings["gguf_component_class"],
+            component_name="transformer",
         )
         if not hasattr(component_cls, "from_single_file"):
             raise ValueError(

@@ -242,10 +242,7 @@ class ServerArgs:
         None  # cache-dit config for diffusers
     )
     gguf_file: str | None = None
-    gguf_component: str = "transformer"
     gguf_base_model_path: str | None = None
-    gguf_repo_id: str | None = None
-    gguf_component_class: str | None = None
 
     # Distributed executor backend
     nccl_port: Optional[int] = None
@@ -526,16 +523,7 @@ class ServerArgs:
             default=ServerArgs.gguf_file,
             help=(
                 "GGUF checkpoint for diffusers backend. Accepts a local path, URL, "
-                "or filename in --gguf-repo-id / base model repo."
-            ),
-        )
-        parser.add_argument(
-            "--gguf-component",
-            type=str,
-            default=ServerArgs.gguf_component,
-            help=(
-                "Pipeline component to override with GGUF weights (for example: "
-                "'transformer'). Only used with --backend diffusers."
+                "or a repo-prefixed path like '<repo>/<subpath>/<file.gguf>'."
             ),
         )
         parser.add_argument(
@@ -545,24 +533,6 @@ class ServerArgs:
             help=(
                 "Base diffusers model path/repo used with GGUF component loading. "
                 "Required when --model-path points directly to a GGUF file."
-            ),
-        )
-        parser.add_argument(
-            "--gguf-repo-id",
-            type=str,
-            default=ServerArgs.gguf_repo_id,
-            help=(
-                "Hugging Face repo ID containing --gguf-file when --gguf-file is a "
-                "filename instead of a local path/URL."
-            ),
-        )
-        parser.add_argument(
-            "--gguf-component-class",
-            type=str,
-            default=ServerArgs.gguf_component_class,
-            help=(
-                "Optional component class override for GGUF loading. Accepts either "
-                "a class name (looked up in diffusers) or a full module path."
             ),
         )
 

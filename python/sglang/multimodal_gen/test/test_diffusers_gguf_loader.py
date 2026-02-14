@@ -91,10 +91,7 @@ class TestDiffusersGGUFLoader(unittest.TestCase):
     def _make_server_args(**overrides):
         base = {
             "gguf_file": "weights.gguf",
-            "gguf_component": "transformer",
             "gguf_base_model_path": "black-forest-labs/FLUX.1-dev",
-            "gguf_repo_id": None,
-            "gguf_component_class": None,
             "trust_remote_code": False,
             "revision": None,
             "attention_backend": None,
