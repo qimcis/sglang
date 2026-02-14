@@ -7,7 +7,9 @@ through sglang's infrastructure using vanilla diffusers pipelines.
 """
 
 import argparse
+import importlib
 import inspect
+import os
 import re
 import warnings
 from io import BytesIO
@@ -35,7 +37,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    check_gguf_file,
+    hf_hub_download,
+    maybe_download_model,
+    maybe_download_model_index,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -391,7 +398,11 @@ class DiffusersPipeline(ComposedPipelineBase):
         """
 
         original_model_path = model_path  # Keep original for custom_pipeline
-        model_path = maybe_download_model(model_path)
+        gguf_settings = self._resolve_gguf_settings(model_path, server_args)
+        base_model_source = (
+            gguf_settings["base_model_source"] if gguf_settings else model_path
+        )
+        model_path = maybe_download_model(base_model_source)
         self.model_path = model_path
 
         dtype = self._get_dtype(server_args)
@@ -413,6 +424,24 @@ class DiffusersPipeline(ComposedPipelineBase):
                 logger.info(
                     "Using quantization config: %s", type(quant_config).__name__
                 )
+        else:
+            quant_config = None
+
+        if gguf_settings is not None:
+            component_name = gguf_settings["component_name"]
+            component_model = self._load_gguf_component(
+                server_args=server_args,
+                base_model_path=model_path,
+                gguf_settings=gguf_settings,
+                dtype=dtype,
+                quant_config=quant_config,
+            )
+            load_kwargs[component_name] = component_model
+            logger.info(
+                "Overriding diffusers component '%s' with GGUF file '%s'",
+                component_name,
+                gguf_settings["gguf_file"],
+            )
 
         try:
             pipe = DiffusionPipeline.from_pretrained(model_path, **load_kwargs)
@@ -423,9 +452,14 @@ class DiffusersPipeline(ComposedPipelineBase):
                     "Pipeline class not found in diffusers, trying custom_pipeline from repo..."
                 )
                 try:
+                    custom_pipeline = (
+                        gguf_settings["base_model_source"]
+                        if gguf_settings is not None
+                        else original_model_path
+                    )
                     custom_kwargs = {
                         **load_kwargs,
-                        "custom_pipeline": original_model_path,
+                        "custom_pipeline": custom_pipeline,
                     }
                     custom_kwargs["trust_remote_code"] = True
                     pipe = DiffusionPipeline.from_pretrained(
@@ -461,6 +495,218 @@ class DiffusersPipeline(ComposedPipelineBase):
         pipe = self._apply_cache_dit(pipe, server_args)
         logger.info("Loaded diffusers pipeline: %s", pipe.__class__.__name__)
         return pipe
+
+    @staticmethod
+    def _is_url(path: str) -> bool:
+        return path.startswith("http://") or path.startswith("https://")
+
+    @staticmethod
+    def _safe_getattr(config: Any, key: str) -> Any:
+        if config is None:
+            return None
+        return getattr(config, key, None)
+
+    def _resolve_gguf_settings(
+        self, model_path: str, server_args: ServerArgs
+    ) -> dict[str, str] | None:
+        config = server_args.pipeline_config
+
+        gguf_file = server_args.gguf_file or self._safe_getattr(config, "gguf_file")
+        gguf_component = server_args.gguf_component or self._safe_getattr(
+            config, "gguf_component"
+        )
+        gguf_component = gguf_component or "transformer"
+        gguf_base_model_path = server_args.gguf_base_model_path or self._safe_getattr(
+            config, "gguf_base_model_path"
+        )
+        gguf_repo_id = server_args.gguf_repo_id or self._safe_getattr(
+            config, "gguf_repo_id"
+        )
+        gguf_component_class = server_args.gguf_component_class or self._safe_getattr(
+            config, "gguf_component_class"
+        )
+
+        model_path_is_gguf = check_gguf_file(model_path) or str(model_path).lower().endswith(".gguf")
+        if gguf_file is None and model_path_is_gguf:
+            gguf_file = model_path
+
+        if gguf_file is None:
+            return None
+
+        if gguf_base_model_path is None and model_path_is_gguf:
+            raise ValueError(
+                "GGUF loading via diffusers requires a base pipeline repo. "
+                "Set --gguf-base-model-path to a diffusers model ID/path "
+                "(for example, black-forest-labs/FLUX.1-dev)."
+            )
+
+        base_model_source = gguf_base_model_path or model_path
+        return {
+            "gguf_file": gguf_file,
+            "component_name": gguf_component,
+            "base_model_source": base_model_source,
+            "gguf_repo_id": gguf_repo_id,
+            "gguf_component_class": gguf_component_class,
+        }
+
+    def _resolve_gguf_file_path(
+        self, gguf_file: str, base_model_path: str, gguf_repo_id: str | None
+    ) -> str:
+        if check_gguf_file(gguf_file):
+            return gguf_file
+
+        if self._is_url(gguf_file):
+            return gguf_file
+
+        candidate_in_base = os.path.join(base_model_path, gguf_file)
+        if check_gguf_file(candidate_in_base):
+            return candidate_in_base
+
+        if gguf_repo_id:
+            downloaded_file = hf_hub_download(repo_id=gguf_repo_id, filename=gguf_file)
+            if not check_gguf_file(downloaded_file):
+                raise ValueError(
+                    f"Downloaded file '{downloaded_file}' is not a valid GGUF checkpoint."
+                )
+            return downloaded_file
+
+        if gguf_file.endswith(".gguf"):
+            parts = gguf_file.split("/")
+            if len(parts) >= 3 and parts[0] and parts[1]:
+                inferred_repo_id = "/".join(parts[:2])
+                inferred_filename = "/".join(parts[2:])
+                downloaded_file = hf_hub_download(
+                    repo_id=inferred_repo_id, filename=inferred_filename
+                )
+                if check_gguf_file(downloaded_file):
+                    return downloaded_file
+
+        if os.path.isfile(gguf_file):
+            raise ValueError(f"File '{gguf_file}' exists but is not a valid GGUF file.")
+
+        raise ValueError(
+            f"Unable to resolve GGUF file '{gguf_file}'. Provide a local path, URL, "
+            f"or set --gguf-repo-id when passing a filename."
+        )
+
+    def _resolve_gguf_component_class(
+        self,
+        base_model_path: str,
+        component_name: str,
+        component_class_override: str | None,
+    ) -> Any:
+        if component_class_override:
+            return self._import_component_class(component_class_override)
+
+        model_index = maybe_download_model_index(base_model_path)
+        component_spec = model_index.get(component_name)
+        if not (
+            isinstance(component_spec, (list, tuple))
+            and len(component_spec) == 2
+            and all(isinstance(item, str) for item in component_spec)
+        ):
+            raise ValueError(
+                f"Component '{component_name}' not found in model_index.json. "
+                "Set --gguf-component or --gguf-component-class explicitly."
+            )
+
+        library_name, class_name = component_spec
+        if library_name == "diffusers":
+            diffusers_module = importlib.import_module("diffusers")
+            if hasattr(diffusers_module, class_name):
+                return getattr(diffusers_module, class_name)
+            raise ValueError(
+                f"Could not resolve diffusers class '{class_name}' for component '{component_name}'."
+            )
+
+        module = importlib.import_module(library_name)
+        if not hasattr(module, class_name):
+            raise ValueError(
+                f"Could not resolve class '{class_name}' in module '{library_name}'."
+            )
+        return getattr(module, class_name)
+
+    def _import_component_class(self, class_ref: str) -> Any:
+        if "." in class_ref:
+            module_name, class_name = class_ref.rsplit(".", 1)
+            module = importlib.import_module(module_name)
+            if not hasattr(module, class_name):
+                raise ValueError(
+                    f"Could not resolve class '{class_name}' in module '{module_name}'."
+                )
+            return getattr(module, class_name)
+
+        diffusers_module = importlib.import_module("diffusers")
+        if hasattr(diffusers_module, class_ref):
+            return getattr(diffusers_module, class_ref)
+
+        raise ValueError(
+            f"Could not resolve class '{class_ref}'. Use a full module path or a valid diffusers class."
+        )
+
+    @staticmethod
+    def _filter_supported_kwargs(callable_obj: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+        try:
+            sig = inspect.signature(callable_obj)
+        except (TypeError, ValueError):
+            return kwargs
+
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            return kwargs
+
+        valid = {
+            name
+            for name, p in sig.parameters.items()
+            if name not in {"self", "cls"}
+            and p.kind
+            in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        }
+        return {k: v for k, v in kwargs.items() if k in valid}
+
+    def _load_gguf_component(
+        self,
+        server_args: ServerArgs,
+        base_model_path: str,
+        gguf_settings: dict[str, str],
+        dtype: torch.dtype,
+        quant_config: Any,
+    ) -> Any:
+        gguf_path = self._resolve_gguf_file_path(
+            gguf_file=gguf_settings["gguf_file"],
+            base_model_path=base_model_path,
+            gguf_repo_id=gguf_settings["gguf_repo_id"],
+        )
+        component_cls = self._resolve_gguf_component_class(
+            base_model_path=base_model_path,
+            component_name=gguf_settings["component_name"],
+            component_class_override=gguf_settings["gguf_component_class"],
+        )
+        if not hasattr(component_cls, "from_single_file"):
+            raise ValueError(
+                f"Component class '{component_cls.__name__}' does not support from_single_file() "
+                "required for GGUF loading."
+            )
+
+        component_kwargs: dict[str, Any] = {"torch_dtype": dtype}
+        if quant_config is not None:
+            component_kwargs["quantization_config"] = quant_config
+        if server_args.revision is not None:
+            component_kwargs["revision"] = server_args.revision
+        if server_args.trust_remote_code:
+            component_kwargs["trust_remote_code"] = True
+
+        load_component = getattr(component_cls, "from_single_file")
+        component_kwargs = self._filter_supported_kwargs(load_component, component_kwargs)
+        try:
+            return load_component(gguf_path, **component_kwargs)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load GGUF component from '{gguf_path}' using "
+                f"{component_cls.__name__}.from_single_file()."
+            ) from e
 
     def _apply_vae_optimizations(self, pipe: Any, server_args: ServerArgs) -> None:
         """Apply VAE memory optimizations (tiling, slicing) from pipeline config."""
