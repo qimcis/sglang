@@ -550,6 +550,18 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
 if not current_platform.is_hip():
     ONE_GPU_CASES_B.append(
         DiffusionTestCase(
+            "qwen_image_t2i_cache_dit_server",
+            DiffusionServerArgs(
+                model_path="Qwen/Qwen-Image",
+                modality="image",
+                enable_cache_dit=True,
+            ),
+            T2I_sampling_params,
+        )
+    )
+
+    ONE_GPU_CASES_B.append(
+        DiffusionTestCase(
             "turbo_wan2_1_t2v_1.3b",
             DiffusionServerArgs(
                 model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
