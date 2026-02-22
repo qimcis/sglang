@@ -58,7 +58,6 @@ _DYNAMIC_BATCH_SIGNATURE_EXCLUDED_FIELDS = {
     "profile",
     "profile_all_stages",
     "num_profiled_timesteps",
-    "save_output",
     "return_frames",
     "no_override_protected_fields",
     "supported_resolutions",
