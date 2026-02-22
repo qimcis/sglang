@@ -332,6 +332,8 @@ class Scheduler:
 
         if base_req.image_path is not None or candidate_req.image_path is not None:
             return False
+        if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
+            return False
 
         base_sig = self._get_cached_signature(base_req)
         cand_sig = self._get_cached_signature(candidate_req)
@@ -503,8 +505,6 @@ class Scheduler:
                 compatible_indices.append(idx)
 
         batch_len = len(compatible_indices)
-        if batch_len <= 0:
-            return None
 
         oldest_wait_s = time.monotonic() - enqueue_time
 
