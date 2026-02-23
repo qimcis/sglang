@@ -1,12 +1,22 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import asyncio
 import base64
 import os
 import time
-from typing import List, Optional
+from typing import Any, List, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Path, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import (
+    APIRouter,
+    File,
+    Form,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    UploadFile,
+)
+from fastapi.responses import FileResponse, StreamingResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
@@ -14,8 +24,19 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageResponse,
     ImageResponseData,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime_utils import (
+    apply_realtime_control,
+    emit_realtime_session_accepted,
+    emit_realtime_terminal_error,
+    emit_realtime_terminal_result,
+    resolve_realtime_session_ttl_seconds,
+    stream_realtime_events,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_storage
-from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
+from sglang.multimodal_gen.runtime.entrypoints.openai.stores import (
+    IMAGE_STORE,
+    REALTIME_STORE,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     build_sampling_params,
@@ -98,11 +119,12 @@ def _build_image_response_kwargs(
     return ret
 
 
-@router.post("/generations", response_model=ImageResponse)
-async def generations(
+def _build_image_batch(
+    request_id: str,
     request: ImageGenerationsRequest,
+    *,
+    realtime_enabled: bool,
 ):
-    request_id = generate_request_id()
     ext = choose_output_image_ext(request.output_format, request.background)
     sampling = build_sampling_params(
         request_id,
@@ -119,26 +141,33 @@ async def generations(
         enable_teacache=request.enable_teacache,
         output_compression=request.output_compression,
         output_quality=request.output_quality,
+        realtime_enabled=realtime_enabled,
+        realtime_stream_every_n_steps=request.realtime_stream_every_n_steps,
+        realtime_decode_preview=request.realtime_decode_preview,
     )
     batch = prepare_request(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
-    # Add diffusers_kwargs if provided
     if request.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = request.diffusers_kwargs
+    return batch
 
+
+async def _execute_image_batch(
+    request: ImageGenerationsRequest,
+    request_id: str,
+    batch,
+) -> tuple[dict[str, Any], OutputBatch]:
     save_file_path_list, result = await process_generation_batch(
         async_scheduler_client, batch
     )
     save_file_path = save_file_path_list[0]
     resp_format = (request.response_format or "b64_json").lower()
 
-    # read b64 before cloud upload may delete the local file
     b64_list = (
         _read_b64_for_paths(save_file_path_list) if resp_format == "b64_json" else None
     )
-
     cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
 
     await IMAGE_STORE.upsert(
@@ -148,6 +177,7 @@ async def generations(
             "created_at": int(time.time()),
             "file_path": None if cloud_url else save_file_path,
             "url": cloud_url,
+            "artifact_dir": batch.extra.get("realtime_artifact_dir"),
         },
     )
 
@@ -160,8 +190,119 @@ async def generations(
         b64_list=b64_list,
         cloud_url=cloud_url,
     )
+    return response_kwargs, result
 
+
+@router.post("/generations", response_model=ImageResponse)
+async def generations(
+    request: ImageGenerationsRequest,
+):
+    if request.stream:
+        raise HTTPException(
+            status_code=400,
+            detail="Use /v1/images/generations/stream for realtime streaming responses.",
+        )
+    request_id = generate_request_id()
+    batch = _build_image_batch(request_id, request, realtime_enabled=False)
+    response_kwargs, _ = await _execute_image_batch(request, request_id, batch)
     return ImageResponse(**response_kwargs)
+
+
+@router.post("/generations/stream")
+async def generations_stream(
+    raw_request: Request,
+    request: ImageGenerationsRequest,
+):
+    request_id = generate_request_id()
+    batch = _build_image_batch(request_id, request, realtime_enabled=True)
+    artifact_dir = batch.extra.get("realtime_artifact_dir")
+    if artifact_dir is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Realtime artifact directory is not available for this request.",
+        )
+
+    try:
+        ttl_seconds = resolve_realtime_session_ttl_seconds(
+            request.realtime_session_ttl_seconds
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+    expires_at = int(time.time()) + ttl_seconds
+    cancel_on_disconnect = bool(request.cancel_on_disconnect)
+
+    await REALTIME_STORE.upsert(
+        request_id,
+        {
+            "id": request_id,
+            "created_at": int(time.time()),
+            "kind": "image",
+            "status": "queued",
+            "artifact_dir": artifact_dir,
+            "cancel_on_disconnect": cancel_on_disconnect,
+            "expires_at": expires_at,
+        },
+    )
+
+    emit_realtime_session_accepted(
+        artifact_dir=artifact_dir,
+        request_id=request_id,
+        kind="image",
+        cancel_on_disconnect=cancel_on_disconnect,
+        expires_at=expires_at,
+    )
+
+    async def _cancel_for_disconnect():
+        apply_realtime_control(
+            request_id=request_id,
+            artifact_dir=artifact_dir,
+            control_updates={"cancel": True},
+        )
+        await REALTIME_STORE.update_fields(request_id, {"status": "cancelling"})
+
+    async def _run_job():
+        try:
+            response_kwargs, result = await _execute_image_batch(
+                request, request_id, batch
+            )
+            response_payload = ImageResponse(**response_kwargs).model_dump(mode="json")
+            terminal_type = "cancelled" if result.cancelled else "completed"
+            emit_realtime_terminal_result(
+                artifact_dir=artifact_dir,
+                request_id=request_id,
+                status=terminal_type,
+                result_payload=response_payload,
+            )
+            await REALTIME_STORE.update_fields(
+                request_id, {"status": terminal_type, "result": response_payload}
+            )
+        except Exception as e:
+            error_message = str(e)
+            emit_realtime_terminal_error(
+                artifact_dir=artifact_dir,
+                request_id=request_id,
+                error_message=error_message,
+            )
+            await REALTIME_STORE.update_fields(
+                request_id,
+                {"status": "failed", "error": error_message},
+            )
+
+    producer_task = asyncio.create_task(_run_job())
+    on_disconnect = _cancel_for_disconnect if cancel_on_disconnect else None
+    return StreamingResponse(
+        stream_realtime_events(
+            request=raw_request,
+            request_id=request_id,
+            artifact_dir=artifact_dir,
+            producer_task=producer_task,
+            on_disconnect=on_disconnect,
+        ),
+        media_type="text/event-stream",
+    )
 
 
 @router.post("/edits", response_model=ImageResponse)
@@ -279,6 +420,35 @@ async def edits(
     )
 
     return ImageResponse(**response_kwargs)
+
+
+@router.delete("/{image_id}")
+async def delete_image(image_id: str = Path(...)):
+    realtime_job = await REALTIME_STORE.get(image_id)
+    if realtime_job:
+        terminal_statuses = {"completed", "failed", "deleted", "cancelled"}
+        if realtime_job.get("status") in terminal_statuses:
+            await REALTIME_STORE.pop(image_id)
+            removed = await IMAGE_STORE.pop(image_id)
+            if removed:
+                return {"id": image_id, "status": "deleted"}
+            return {"id": image_id, "status": "deleted"}
+
+        artifact_dir = realtime_job.get("artifact_dir")
+        if artifact_dir:
+            apply_realtime_control(
+                request_id=image_id,
+                artifact_dir=artifact_dir,
+                control_updates={"cancel": True},
+            )
+        await REALTIME_STORE.update_fields(image_id, {"status": "cancelling"})
+        return {"id": image_id, "status": "cancelling"}
+
+    item = await IMAGE_STORE.pop(image_id)
+    if item:
+        return {"id": image_id, "status": "deleted"}
+
+    raise HTTPException(status_code=404, detail="Image not found")
 
 
 @router.get("/{image_id}/content")

@@ -16,7 +16,7 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
@@ -27,8 +27,19 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoListResponse,
     VideoResponse,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime_utils import (
+    apply_realtime_control,
+    emit_realtime_session_accepted,
+    emit_realtime_terminal_error,
+    emit_realtime_terminal_result,
+    resolve_realtime_session_ttl_seconds,
+    stream_realtime_events,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_storage
-from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
+from sglang.multimodal_gen.runtime.entrypoints.openai.stores import (
+    REALTIME_STORE,
+    VIDEO_STORE,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     DEFAULT_FPS,
     DEFAULT_VIDEO_SECONDS,
@@ -40,6 +51,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -47,7 +59,9 @@ logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
 
 
-def _build_video_sampling_params(request_id: str, request: VideoGenerationsRequest):
+def _build_video_sampling_params(
+    request_id: str, request: VideoGenerationsRequest, *, realtime_enabled: bool
+):
     """Resolve video-specific defaults (fps, seconds → num_frames) then
     delegate to the shared build_sampling_params."""
     seconds = request.seconds if request.seconds is not None else DEFAULT_VIDEO_SECONDS
@@ -72,6 +86,9 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         output_path=request.output_path,
         output_compression=request.output_compression,
         output_quality=request.output_quality,
+        realtime_enabled=realtime_enabled,
+        realtime_stream_every_n_steps=request.realtime_stream_every_n_steps,
+        realtime_decode_preview=request.realtime_decode_preview,
     )
 
 
@@ -111,8 +128,7 @@ async def _save_first_input_image(image_sources, request_id: str) -> str | None:
 
 
 async def _dispatch_job_async(job_id: str, batch: Req) -> None:
-    from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
-
+    artifact_dir = batch.extra.get("realtime_artifact_dir")
     try:
         save_file_path_list, result = await process_generation_batch(
             async_scheduler_client, batch
@@ -120,9 +136,10 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
         save_file_path = save_file_path_list[0]
 
         cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+        terminal_status = "cancelled" if result.cancelled else "completed"
 
         update_fields = {
-            "status": "completed",
+            "status": terminal_status,
             "progress": 100,
             "completed_at": int(time.time()),
             "url": cloud_url,
@@ -132,11 +149,32 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
             update_fields, request_id=job_id, result=result
         )
         await VIDEO_STORE.update_fields(job_id, update_fields)
+
+        if artifact_dir:
+            emit_realtime_terminal_result(
+                artifact_dir=artifact_dir,
+                request_id=job_id,
+                status=terminal_status,
+                result_payload=update_fields,
+            )
+            await REALTIME_STORE.update_fields(
+                job_id, {"status": terminal_status, "result": update_fields}
+            )
     except Exception as e:
         logger.error(f"{e}")
         await VIDEO_STORE.update_fields(
             job_id, {"status": "failed", "error": {"message": str(e)}}
         )
+        if artifact_dir:
+            emit_realtime_terminal_error(
+                artifact_dir=artifact_dir,
+                request_id=job_id,
+                error_message=str(e),
+            )
+            await REALTIME_STORE.update_fields(
+                job_id,
+                {"status": "failed", "error": str(e)},
+            )
 
 
 # TODO: support image to video generation
@@ -260,22 +298,197 @@ async def create_video(
             raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
 
     logger.debug(f"Server received from create_video endpoint: req={req}")
+    if req.stream:
+        raise HTTPException(
+            status_code=400,
+            detail="Use /v1/videos/stream for realtime streaming responses.",
+        )
 
-    sampling_params = _build_video_sampling_params(request_id, req)
+    sampling_params = _build_video_sampling_params(
+        request_id, req, realtime_enabled=False
+    )
     job = _video_job_from_sampling(request_id, req, sampling_params)
-    await VIDEO_STORE.upsert(request_id, job)
 
     # Build Req for scheduler
     batch = prepare_request(
         server_args=server_args,
         sampling_params=sampling_params,
     )
+    artifact_dir = batch.extra.get("realtime_artifact_dir")
+    if artifact_dir:
+        job["artifact_dir"] = artifact_dir
+        await REALTIME_STORE.upsert(
+            request_id,
+            {
+                "id": request_id,
+                "kind": "video",
+                "status": "queued",
+                "created_at": int(time.time()),
+                "artifact_dir": artifact_dir,
+            },
+        )
+        emit_realtime_session_accepted(
+            artifact_dir=artifact_dir,
+            request_id=request_id,
+            kind="video",
+        )
+    await VIDEO_STORE.upsert(request_id, job)
     # Add diffusers_kwargs if provided
     if req.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
     # Enqueue the job asynchronously and return immediately
     asyncio.create_task(_dispatch_job_async(request_id, batch))
     return VideoResponse(**job)
+
+
+@router.post("/stream")
+async def stream_video(
+    raw_request: Request,
+    request: VideoGenerationsRequest,
+):
+    request_id = generate_request_id()
+    server_args = get_global_server_args()
+    task_type = server_args.pipeline_config.task_type
+
+    if task_type.requires_image_input() and not (
+        request.input_reference or request.reference_url
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="input_reference or reference_url is required for image-to-video generation",
+        )
+
+    req = request
+    if request.reference_url and not request.input_reference:
+        try:
+            input_path = await _save_first_input_image(
+                request.reference_url, request_id
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to process image source: {str(e)}",
+            )
+        req = request.model_copy(update={"input_reference": input_path})
+
+    sampling_params = _build_video_sampling_params(
+        request_id, req, realtime_enabled=True
+    )
+    batch = prepare_request(
+        server_args=server_args,
+        sampling_params=sampling_params,
+    )
+    if req.diffusers_kwargs:
+        batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
+
+    artifact_dir = batch.extra.get("realtime_artifact_dir")
+    if artifact_dir is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Realtime artifact directory is not available for this request.",
+        )
+
+    try:
+        ttl_seconds = resolve_realtime_session_ttl_seconds(
+            request.realtime_session_ttl_seconds
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+    expires_at = int(time.time()) + ttl_seconds
+    cancel_on_disconnect = bool(request.cancel_on_disconnect)
+
+    job = _video_job_from_sampling(request_id, req, sampling_params)
+    job["artifact_dir"] = artifact_dir
+    await VIDEO_STORE.upsert(request_id, job)
+    await REALTIME_STORE.upsert(
+        request_id,
+        {
+            "id": request_id,
+            "kind": "video",
+            "status": "queued",
+            "created_at": int(time.time()),
+            "artifact_dir": artifact_dir,
+            "cancel_on_disconnect": cancel_on_disconnect,
+            "expires_at": expires_at,
+        },
+    )
+
+    emit_realtime_session_accepted(
+        artifact_dir=artifact_dir,
+        request_id=request_id,
+        kind="video",
+        cancel_on_disconnect=cancel_on_disconnect,
+        expires_at=expires_at,
+    )
+
+    async def _cancel_for_disconnect():
+        apply_realtime_control(
+            request_id=request_id,
+            artifact_dir=artifact_dir,
+            control_updates={"cancel": True},
+        )
+        await REALTIME_STORE.update_fields(request_id, {"status": "cancelling"})
+        await VIDEO_STORE.update_fields(request_id, {"status": "cancelling"})
+
+    async def _run_job():
+        try:
+            save_file_path_list, result = await process_generation_batch(
+                async_scheduler_client, batch
+            )
+            save_file_path = save_file_path_list[0]
+            cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+
+            terminal_status = "cancelled" if result.cancelled else "completed"
+            update_fields = {
+                "status": terminal_status,
+                "progress": 100,
+                "completed_at": int(time.time()),
+                "url": cloud_url,
+                "file_path": save_file_path if not cloud_url else None,
+            }
+            update_fields = add_common_data_to_response(
+                update_fields, request_id=request_id, result=result
+            )
+
+            await VIDEO_STORE.update_fields(request_id, update_fields)
+            await REALTIME_STORE.update_fields(
+                request_id, {"status": terminal_status, "result": update_fields}
+            )
+            emit_realtime_terminal_result(
+                artifact_dir=artifact_dir,
+                request_id=request_id,
+                status=terminal_status,
+                result_payload=update_fields,
+            )
+        except Exception as e:
+            error_message = str(e)
+            await VIDEO_STORE.update_fields(
+                request_id, {"status": "failed", "error": {"message": error_message}}
+            )
+            await REALTIME_STORE.update_fields(
+                request_id, {"status": "failed", "error": error_message}
+            )
+            emit_realtime_terminal_error(
+                artifact_dir=artifact_dir,
+                request_id=request_id,
+                error_message=error_message,
+            )
+
+    producer_task = asyncio.create_task(_run_job())
+    on_disconnect = _cancel_for_disconnect if cancel_on_disconnect else None
+    return StreamingResponse(
+        stream_realtime_events(
+            request=raw_request,
+            request_id=request_id,
+            artifact_dir=artifact_dir,
+            producer_task=producer_task,
+            on_disconnect=on_disconnect,
+        ),
+        media_type="text/event-stream",
+    )
 
 
 @router.get("", response_model=VideoListResponse)
@@ -314,15 +527,32 @@ async def retrieve_video(video_id: str = Path(...)):
     return VideoResponse(**job)
 
 
-# TODO: support aborting a job.
 @router.delete("/{video_id}", response_model=VideoResponse)
 async def delete_video(video_id: str = Path(...)):
-    job = await VIDEO_STORE.pop(video_id)
+    job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
-    # Mark as deleted in response semantics
-    job["status"] = "deleted"
-    return VideoResponse(**job)
+
+    terminal_statuses = {"completed", "failed", "deleted", "cancelled"}
+    if job.get("status") in terminal_statuses:
+        removed = await VIDEO_STORE.pop(video_id)
+        assert removed is not None
+        removed["status"] = "deleted"
+        return VideoResponse(**removed)
+
+    artifact_dir = job.get("artifact_dir")
+    if artifact_dir:
+        apply_realtime_control(
+            request_id=video_id,
+            artifact_dir=artifact_dir,
+            control_updates={"cancel": True},
+        )
+
+    await VIDEO_STORE.update_fields(video_id, {"status": "cancelling"})
+    await REALTIME_STORE.update_fields(video_id, {"status": "cancelling"})
+    updated = await VIDEO_STORE.get(video_id)
+    assert updated is not None
+    return VideoResponse(**updated)
 
 
 @router.get("/{video_id}/content")

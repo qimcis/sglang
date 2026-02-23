@@ -94,6 +94,8 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
 
     # filter out None values to let SamplingParams defaults apply
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
+    if "realtime_allow_control" not in kwargs:
+        kwargs["realtime_allow_control"] = bool(kwargs.get("realtime_enabled", False))
     kwargs.setdefault("save_output", True)
 
     sampling_params = SamplingParams.from_user_sampling_params_args(

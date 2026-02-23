@@ -224,6 +224,9 @@ class GPUWorker:
 
             req.log(server_args=self.server_args)
             result = self.pipeline.forward(req, self.server_args)
+            realtime_cancelled = bool(
+                getattr(req, "extra", {}).get("realtime_cancelled", False)
+            )
 
             if isinstance(result, Req):
                 output_batch = OutputBatch(
@@ -235,9 +238,15 @@ class GPUWorker:
                     trajectory_latents=getattr(result, "trajectory_latents", None),
                     noise_pred=getattr(result, "noise_pred", None),
                     trajectory_decoded=getattr(result, "trajectory_decoded", None),
+                    cancelled=getattr(result, "extra", {}).get("realtime_cancelled")
+                    or realtime_cancelled,
                 )
             else:
                 output_batch = result
+                if isinstance(output_batch, OutputBatch):
+                    output_batch.cancelled = bool(
+                        output_batch.cancelled or realtime_cancelled
+                    )
 
             # capture memory after forward (peak)
             if self.rank == 0 and output_batch.metrics:

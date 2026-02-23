@@ -46,6 +46,11 @@ class ImageGenerationsRequest(BaseModel):
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
     enable_teacache: Optional[bool] = False
+    stream: Optional[bool] = False
+    realtime_stream_every_n_steps: Optional[int] = 1
+    realtime_decode_preview: Optional[bool] = True
+    cancel_on_disconnect: Optional[bool] = False
+    realtime_session_ttl_seconds: Optional[int] = 3600
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 
@@ -93,7 +98,37 @@ class VideoGenerationsRequest(BaseModel):
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
     output_path: Optional[str] = None
+    stream: Optional[bool] = False
+    realtime_stream_every_n_steps: Optional[int] = 1
+    realtime_decode_preview: Optional[bool] = True
+    cancel_on_disconnect: Optional[bool] = False
+    realtime_session_ttl_seconds: Optional[int] = 3600
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
+
+
+class RealtimeControlRequest(BaseModel):
+    cancel: Optional[bool] = None
+    guidance_scale: Optional[float] = None
+    guidance_scale_2: Optional[float] = None
+    true_cfg_scale: Optional[float] = None
+
+
+class RealtimeControlResponse(BaseModel):
+    id: str
+    status: str
+    applied: Dict[str, Any]
+
+
+class RealtimeEventsResponse(BaseModel):
+    id: str
+    status: str
+    since_seq: int
+    next_seq: int
+    has_more: bool
+    events: List[Dict[str, Any]]
+    latest_preview: Optional[Dict[str, Any]] = None
+    result: Optional[Dict[str, Any]] = None
+    expires_at: Optional[int] = None
 
 
 class VideoListResponse(BaseModel):

@@ -24,7 +24,7 @@ import json
 import os
 import shutil
 import time
-from functools import reduce
+from functools import lru_cache, reduce
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, cast
 
@@ -32,6 +32,7 @@ from diffusers.loaders.lora_base import (
     _best_guess_weight_name,  # watch out for potetential removal from diffusers
 )
 from huggingface_hub.errors import (
+    EntryNotFoundError,
     LocalEntryNotFoundError,
     RepositoryNotFoundError,
     RevisionNotFoundError,
@@ -53,6 +54,65 @@ from sglang.srt.environ import envs
 from sglang.utils import is_in_ci
 
 logger = init_logger(__name__)
+
+
+def _build_diffusers_repo_candidate(model_name_or_path: str) -> str | None:
+    """Infer a likely diffusers repo id from a known non-diffusers repo id."""
+    if os.path.exists(model_name_or_path):
+        return None
+    if "/" not in model_name_or_path:
+        return None
+
+    lower_name = model_name_or_path.lower()
+    if lower_name.endswith("-diffusers"):
+        return None
+
+    # Keep this conservative: only apply to Wan repos that commonly have a
+    # corresponding `-Diffusers` variant.
+    if "wan" not in lower_name:
+        return None
+
+    return f"{model_name_or_path}-Diffusers"
+
+
+@lru_cache(maxsize=128)
+def _remote_repo_has_model_index(repo_id: str) -> bool:
+    """Check whether a remote repo has a diffusers model_index.json."""
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            hf_hub_download(
+                repo_id=repo_id,
+                filename="model_index.json",
+                local_dir=tmp_dir,
+            )
+        return True
+    except (EntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError):
+        return False
+    except Exception as exc:
+        logger.debug("Could not check model_index.json for repo %s: %s", repo_id, exc)
+        return False
+
+
+def _resolve_diffusers_repo_id(model_name_or_path: str) -> str:
+    """Resolve non-diffusers repo ids to diffusers repo ids when possible."""
+    candidate_repo = _build_diffusers_repo_candidate(model_name_or_path)
+    if candidate_repo is None:
+        return model_name_or_path
+
+    if _remote_repo_has_model_index(model_name_or_path):
+        return model_name_or_path
+
+    if _remote_repo_has_model_index(candidate_repo):
+        logger.info(
+            "Repo %s does not appear to be in diffusers format; using %s instead",
+            model_name_or_path,
+            candidate_repo,
+        )
+        return candidate_repo
+
+    return model_name_or_path
 
 
 def _check_index_files_for_missing_shards(
@@ -562,8 +622,6 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
     """
     import tempfile
 
-    from huggingface_hub.errors import EntryNotFoundError
-
     # If it's a local path, verify it directly
     if os.path.exists(model_name_or_path):
         try:
@@ -576,6 +634,17 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
                     config = json.load(f)
                 return config
             raise
+
+    # For remote models, resolve known non-diffusers repo IDs to their
+    # corresponding diffusers variants when available.
+    resolved_model_name_or_path = _resolve_diffusers_repo_id(model_name_or_path)
+    if resolved_model_name_or_path != model_name_or_path:
+        logger.info(
+            "Resolved model id %s -> %s for model_index lookup",
+            model_name_or_path,
+            resolved_model_name_or_path,
+        )
+    model_name_or_path = resolved_model_name_or_path
 
     # For remote models, download just the model_index.json
     try:
@@ -652,6 +721,18 @@ def maybe_download_model(
     Returns:
         Local path to the model
     """
+
+    # Resolve known non-diffusers repo IDs to their diffusers variants when this
+    # call explicitly requires a diffusers-format model.
+    if force_diffusers_model and not os.path.exists(model_name_or_path):
+        resolved_model_name_or_path = _resolve_diffusers_repo_id(model_name_or_path)
+        if resolved_model_name_or_path != model_name_or_path:
+            logger.info(
+                "Resolved diffusers model id %s -> %s",
+                model_name_or_path,
+                resolved_model_name_or_path,
+            )
+        model_name_or_path = resolved_model_name_or_path
 
     # 1. Local path check: if path exists locally, verify it's complete (skip for LoRA)
     if os.path.exists(model_name_or_path):

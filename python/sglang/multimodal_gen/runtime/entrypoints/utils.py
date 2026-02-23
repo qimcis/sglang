@@ -32,8 +32,13 @@ except ImportError:  # pragma: no cover
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
+    generate_request_id,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.realtime import (
+    ensure_realtime_artifacts,
+    update_realtime_state,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 
@@ -295,6 +300,31 @@ def prepare_request(
         diffusers_kwargs = None
     if diffusers_kwargs:
         req.extra["diffusers_kwargs"] = diffusers_kwargs
+
+    if sampling_params.realtime_enabled or sampling_params.realtime_allow_control:
+        if not sampling_params.request_id:
+            sampling_params.request_id = generate_request_id()
+
+        artifact_dir = ensure_realtime_artifacts(
+            request_id=sampling_params.request_id,
+            output_path=sampling_params.output_path,
+        )
+        req.extra["realtime_artifact_dir"] = artifact_dir
+        req.extra["realtime_enabled"] = bool(sampling_params.realtime_enabled)
+        req.extra["realtime_allow_control"] = bool(
+            sampling_params.realtime_allow_control
+        )
+        req.extra["realtime_stream_every_n_steps"] = int(
+            sampling_params.realtime_stream_every_n_steps
+        )
+        req.extra["realtime_decode_preview"] = bool(
+            sampling_params.realtime_decode_preview
+        )
+
+        update_realtime_state(
+            artifact_dir=artifact_dir,
+            updates={"status": "queued", "request_id": sampling_params.request_id},
+        )
 
     req.adjust_size(server_args)
 

@@ -5,6 +5,7 @@
 Denoising stage for diffusion pipelines.
 """
 
+import base64
 import inspect
 import math
 import os
@@ -12,11 +13,13 @@ import time
 import weakref
 from collections.abc import Iterable
 from functools import lru_cache
+from io import BytesIO
 from typing import Any
 
 import torch
 import torch.nn as nn
 from einops import rearrange
+from PIL import Image
 from tqdm.auto import tqdm
 
 from sglang.multimodal_gen import envs
@@ -41,6 +44,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     get_tp_group,
     get_world_group,
+    get_world_rank,
     get_world_size,
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
@@ -64,6 +68,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    _ensure_tensor_decode_output,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -74,12 +81,17 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.realtime import (
+    append_realtime_event,
+    read_realtime_control_if_changed,
+    update_realtime_state,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE, dict_to_3d_list, masks_like
 
 logger = init_logger(__name__)
 
@@ -608,8 +620,13 @@ class DenoisingStage(PipelineStage):
             )
         else:
             reserved_frames_mask_sp, z_sp = (
-                reserved_frames_masks[0] if reserved_frames_masks is not None else None
-            ), z
+                (
+                    reserved_frames_masks[0]
+                    if reserved_frames_masks is not None
+                    else None
+                ),
+                z,
+            )
 
         guidance = self.get_or_build_guidance(
             # TODO: replace with raw_latent_shape?
@@ -967,6 +984,143 @@ class DenoisingStage(PipelineStage):
 
         return latents
 
+    def _is_realtime_emitter_rank(self) -> bool:
+        try:
+            return get_world_rank() == 0
+        except Exception:
+            return True
+
+    def _decode_realtime_preview(
+        self, latents: torch.Tensor, server_args: ServerArgs
+    ) -> str | None:
+        if self.vae is None:
+            return None
+
+        try:
+            latents_preview = latents[:1]
+            # For video latents, stream a single frame preview to keep event payload small.
+            if latents_preview.ndim == 5 and latents_preview.shape[2] > 1:
+                latents_preview = latents_preview[:, :, :1, :, :]
+
+            self.vae = self.vae.to(get_local_torch_device())
+            latents_preview = latents_preview.to(get_local_torch_device())
+
+            scaling_factor, shift_factor = (
+                server_args.pipeline_config.get_decode_scale_and_shift(
+                    latents_preview.device, latents_preview.dtype, self.vae
+                )
+            )
+            if isinstance(scaling_factor, torch.Tensor):
+                latents_preview = latents_preview / scaling_factor.to(
+                    latents_preview.device, latents_preview.dtype
+                )
+            else:
+                latents_preview = latents_preview / scaling_factor
+
+            if shift_factor is not None:
+                if isinstance(shift_factor, torch.Tensor):
+                    latents_preview += shift_factor.to(
+                        latents_preview.device, latents_preview.dtype
+                    )
+                else:
+                    latents_preview += shift_factor
+
+            latents_preview = server_args.pipeline_config.preprocess_decoding(
+                latents_preview, server_args, vae=self.vae
+            )
+
+            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            vae_autocast_enabled = (
+                vae_dtype != torch.float32
+            ) and not server_args.disable_autocast
+
+            with torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=vae_dtype,
+                enabled=vae_autocast_enabled,
+            ):
+                if not vae_autocast_enabled:
+                    latents_preview = latents_preview.to(vae_dtype)
+                decode_output = self.vae.decode(latents_preview)
+                image = _ensure_tensor_decode_output(decode_output)
+
+            image = (image / 2 + 0.5).clamp(0, 1)
+            image = server_args.pipeline_config.post_decoding(image, server_args)
+            image = image.detach().cpu()
+
+            if image.ndim == 5:
+                image = image[:, :, 0, :, :]
+            if image.ndim != 4 or image.shape[0] == 0:
+                return None
+
+            img = image[0].permute(1, 2, 0).contiguous()
+            img_uint8 = (img * 255.0).clamp(0, 255).to(torch.uint8).numpy()
+            if img_uint8.ndim == 3 and img_uint8.shape[2] == 4:
+                img_uint8 = img_uint8[:, :, :3]
+            if img_uint8.ndim == 3 and img_uint8.shape[2] == 1:
+                img_uint8 = img_uint8[:, :, 0]
+            pil_img = Image.fromarray(img_uint8)
+
+            with BytesIO() as buffer:
+                pil_img.save(buffer, format="JPEG", quality=75)
+                return base64.b64encode(buffer.getvalue()).decode("utf-8")
+        except Exception:
+            logger.debug("Failed to decode realtime preview frame.", exc_info=True)
+            return None
+
+    def _maybe_apply_realtime_control(
+        self,
+        batch: Req,
+        artifact_dir: str | None,
+        control_mtime: float | None,
+        *,
+        step_index: int,
+    ) -> tuple[bool, float | None]:
+        if not artifact_dir:
+            return False, control_mtime
+
+        control, control_mtime = read_realtime_control_if_changed(
+            artifact_dir=artifact_dir,
+            last_mtime=control_mtime,
+        )
+        if not control:
+            return False, control_mtime
+
+        if bool(control.get("cancel", False)):
+            batch.extra["realtime_cancelled"] = True
+            update_realtime_state(
+                artifact_dir=artifact_dir,
+                updates={"status": "cancelling", "cancelled_step": step_index},
+            )
+            if self._is_realtime_emitter_rank():
+                append_realtime_event(
+                    artifact_dir=artifact_dir,
+                    event_type="cancelling",
+                    request_id=batch.request_id,
+                    payload={"step": step_index},
+                )
+            return True, control_mtime
+
+        updated_fields: dict[str, float] = {}
+        for field_name in ("guidance_scale", "guidance_scale_2", "true_cfg_scale"):
+            if field_name not in control or control[field_name] is None:
+                continue
+            new_value = float(control[field_name])
+            old_value = getattr(batch, field_name, None)
+            if old_value is None or float(old_value) != new_value:
+                setattr(batch, field_name, new_value)
+                updated_fields[field_name] = new_value
+
+        if updated_fields and self._is_realtime_emitter_rank():
+            append_realtime_event(
+                artifact_dir=artifact_dir,
+                event_type="control_applied",
+                request_id=batch.request_id,
+                payload={"step": step_index, "updates": updated_fields},
+            )
+
+        return False, control_mtime
+
     @torch.no_grad()
     def forward(
         self,
@@ -1004,6 +1158,35 @@ class DenoisingStage(PipelineStage):
 
         # to avoid device-sync caused by timestep comparison
         is_warmup = batch.is_warmup
+        realtime_artifact_dir = batch.extra.get("realtime_artifact_dir")
+        realtime_enabled = bool(batch.extra.get("realtime_enabled", False))
+        realtime_allow_control = bool(batch.extra.get("realtime_allow_control", False))
+        realtime_stream_every_n_steps = max(
+            1, int(batch.extra.get("realtime_stream_every_n_steps", 1))
+        )
+        realtime_decode_preview = bool(batch.extra.get("realtime_decode_preview", True))
+        realtime_control_mtime: float | None = None
+        is_realtime_emitter = (
+            not is_warmup
+            and realtime_artifact_dir is not None
+            and self._is_realtime_emitter_rank()
+        )
+
+        if is_realtime_emitter:
+            update_realtime_state(
+                artifact_dir=realtime_artifact_dir,
+                updates={"status": "running", "started_at": time.time()},
+            )
+            append_realtime_event(
+                artifact_dir=realtime_artifact_dir,
+                event_type="started",
+                request_id=batch.request_id,
+                payload={
+                    "num_inference_steps": num_inference_steps,
+                    "emit_every_n_steps": realtime_stream_every_n_steps,
+                },
+            )
+
         self.scheduler.set_begin_index(0)
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
@@ -1014,6 +1197,18 @@ class DenoisingStage(PipelineStage):
         ):
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for i, t_host in enumerate(timesteps_cpu):
+                    if realtime_allow_control:
+                        should_cancel, realtime_control_mtime = (
+                            self._maybe_apply_realtime_control(
+                                batch=batch,
+                                artifact_dir=realtime_artifact_dir,
+                                control_mtime=realtime_control_mtime,
+                                step_index=i,
+                            )
+                        )
+                        if should_cancel:
+                            break
+
                     with StageProfiler(
                         f"denoising_step_{i}",
                         logger=logger,
@@ -1102,6 +1297,52 @@ class DenoisingStage(PipelineStage):
                             trajectory_timesteps.append(t_host)
                             trajectory_latents.append(latents)
 
+                        if realtime_enabled and is_realtime_emitter:
+                            is_last_step = i == num_timesteps - 1
+                            if is_last_step or (
+                                (i + 1) % realtime_stream_every_n_steps == 0
+                            ):
+                                preview_b64 = None
+                                if realtime_decode_preview:
+                                    preview_b64 = self._decode_realtime_preview(
+                                        latents=latents,
+                                        server_args=server_args,
+                                    )
+
+                                payload = {
+                                    "step": i + 1,
+                                    "num_steps": num_timesteps,
+                                    "progress": float(i + 1)
+                                    / float(max(num_timesteps, 1)),
+                                    "timestep": int(t_host.item()),
+                                }
+                                if preview_b64 is not None:
+                                    payload["preview_b64"] = preview_b64
+
+                                append_realtime_event(
+                                    artifact_dir=realtime_artifact_dir,
+                                    event_type="step",
+                                    request_id=batch.request_id,
+                                    payload=payload,
+                                )
+                                state_updates = {
+                                    "last_step": i + 1,
+                                    "num_steps": num_timesteps,
+                                    "progress": payload["progress"],
+                                    "last_timestep": payload["timestep"],
+                                }
+                                if preview_b64 is not None:
+                                    state_updates["latest_preview"] = {
+                                        "step": i + 1,
+                                        "num_steps": num_timesteps,
+                                        "timestep": payload["timestep"],
+                                        "preview_b64": preview_b64,
+                                    }
+                                update_realtime_state(
+                                    artifact_dir=realtime_artifact_dir,
+                                    updates=state_updates,
+                                )
+
                         # Update progress bar
                         if i == num_timesteps - 1 or (
                             (i + 1) > num_warmup_steps
@@ -1120,6 +1361,28 @@ class DenoisingStage(PipelineStage):
                 "average time per step: %.4f seconds",
                 (denoising_end_time - denoising_start_time) / len(timesteps),
             )
+
+        if is_realtime_emitter:
+            if batch.extra.get("realtime_cancelled", False):
+                update_realtime_state(
+                    artifact_dir=realtime_artifact_dir,
+                    updates={"status": "cancelled", "denoising_ended_at": time.time()},
+                )
+            else:
+                update_realtime_state(
+                    artifact_dir=realtime_artifact_dir,
+                    updates={
+                        "status": "denoising_complete",
+                        "denoising_ended_at": time.time(),
+                    },
+                )
+                if realtime_enabled:
+                    append_realtime_event(
+                        artifact_dir=realtime_artifact_dir,
+                        event_type="denoising_complete",
+                        request_id=batch.request_id,
+                        payload={"num_steps": num_timesteps},
+                    )
 
         self._post_denoising_loop(
             batch=batch,

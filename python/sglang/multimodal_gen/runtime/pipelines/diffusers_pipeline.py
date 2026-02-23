@@ -20,7 +20,10 @@ import torchvision.transforms as T
 from diffusers import DiffusionPipeline
 from PIL import Image
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.base import (
+    ModelTaskType,
+    PipelineConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -453,6 +456,7 @@ class DiffusersPipeline(ComposedPipelineBase):
                 raise
 
         pipe = pipe.to(get_local_torch_device())
+        self._maybe_fix_umt5_embed_tokens(pipe)
         # Apply VAE memory optimizations from pipeline config
         self._apply_vae_optimizations(pipe, server_args)
         # Apply attention backend if specified
@@ -481,6 +485,47 @@ class DiffusersPipeline(ComposedPipelineBase):
             if hasattr(pipe, "enable_vae_tiling"):
                 pipe.enable_vae_tiling()
                 logger.info("Enabled VAE tiling for large image support")
+
+    def _maybe_fix_umt5_embed_tokens(self, pipe: Any) -> None:
+        """Tie UMT5 encoder input embeddings to shared weights when missing.
+
+        Some Wan checkpoints only include `shared.weight` and omit
+        `encoder.embed_tokens.weight`. In that case, transformers initializes
+        `encoder.embed_tokens` to zeros, which can collapse text conditioning.
+        """
+        text_encoder = getattr(pipe, "text_encoder", None)
+        if text_encoder is None:
+            return
+        if text_encoder.__class__.__name__ != "UMT5EncoderModel":
+            return
+
+        shared = getattr(text_encoder, "shared", None)
+        encoder = getattr(text_encoder, "encoder", None)
+        embed_tokens = getattr(encoder, "embed_tokens", None) if encoder else None
+        if shared is None or embed_tokens is None:
+            return
+
+        shared_weight = getattr(shared, "weight", None)
+        embed_weight = getattr(embed_tokens, "weight", None)
+        if shared_weight is None or embed_weight is None:
+            return
+
+        # Already tied.
+        if embed_weight.data_ptr() == shared_weight.data_ptr():
+            return
+
+        try:
+            shared_norm = float(shared_weight.detach().float().norm().item())
+            embed_norm = float(embed_weight.detach().float().norm().item())
+        except Exception:
+            return
+
+        # Only override when embed tokens appear uninitialized.
+        if shared_norm > 0 and embed_norm < 1e-6:
+            text_encoder.encoder.embed_tokens.weight = text_encoder.shared.weight
+            logger.info(
+                "Fixed UMT5 embed tokens by tying encoder.embed_tokens to shared.weight"
+            )
 
     def _apply_attention_backend(self, pipe: Any, server_args: ServerArgs) -> None:
         """Apply attention backend setting from pipeline config or server_args.
@@ -588,10 +633,105 @@ class DiffusersPipeline(ComposedPipelineBase):
         pipe_class_name = self.diffusers_pipe.__class__.__name__.lower()
         video_indicators = ["video", "animat", "cogvideo", "wan", "hunyuan"]
         self.is_video_pipeline = any(ind in pipe_class_name for ind in video_indicators)
+        if (
+            self.server_args is not None
+            and self.server_args.pipeline_config is not None
+        ):
+            current_task_type = self.server_args.pipeline_config.task_type
+            inferred_task_type = self._infer_task_type_from_pipeline_signature()
+            if inferred_task_type != current_task_type:
+                self.server_args.pipeline_config.task_type = inferred_task_type
+                logger.info(
+                    "Adjusted diffusers task_type to %s based on pipeline class/signature: %s",
+                    inferred_task_type.name,
+                    self.diffusers_pipe.__class__.__name__,
+                )
         logger.debug(
             "Detected pipeline type: %s",
             "video" if self.is_video_pipeline else "image",
         )
+
+    def _infer_task_type_from_pipeline_signature(self) -> ModelTaskType:
+        """Infer task type from the loaded diffusers pipeline signature.
+
+        This is more robust than model-id substring matching because it uses the
+        actual pipeline callable interface.
+        """
+        default_task_type = (
+            ModelTaskType.T2V if self.is_video_pipeline else ModelTaskType.T2I
+        )
+
+        try:
+            params = inspect.signature(self.diffusers_pipe.__call__).parameters
+        except Exception:
+            return default_task_type
+
+        # Candidate image/frame-like conditioning arguments.
+        image_like_names = {
+            "image",
+            "images",
+            "init_image",
+            "input_image",
+            "reference_image",
+            "source_image",
+            "conditioning_image",
+            "control_image",
+            "first_frame",
+            "frame",
+            "frames",
+            "video",
+            "input_video",
+            "reference_video",
+        }
+        excluded_name_tokens = {
+            "image_embed",
+            "image_embeds",
+            "images_embeds",
+            "embedding",
+            "embeds",
+            "image_size",
+            "output_image",
+            "num_frames",
+            "num_images",
+            "num_videos",
+            "frame_rate",
+        }
+
+        required_image_input = False
+        optional_image_input = False
+
+        for name, param in params.items():
+            lname = name.lower()
+            if any(token in lname for token in excluded_name_tokens):
+                continue
+
+            is_image_arg = (
+                lname in image_like_names
+                or lname.endswith("_image")
+                or lname.endswith("_images")
+                or lname.endswith("_frame")
+                or lname.endswith("_frames")
+            )
+            if not is_image_arg:
+                continue
+
+            if param.default is inspect._empty:
+                required_image_input = True
+            else:
+                optional_image_input = True
+
+        if self.is_video_pipeline:
+            if required_image_input:
+                return ModelTaskType.I2V
+            if optional_image_input:
+                return ModelTaskType.TI2V
+            return ModelTaskType.T2V
+
+        if required_image_input:
+            return ModelTaskType.I2I
+        if optional_image_input:
+            return ModelTaskType.TI2I
+        return ModelTaskType.T2I
 
     def load_modules(
         self,

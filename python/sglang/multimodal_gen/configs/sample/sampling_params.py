@@ -148,6 +148,11 @@ class SamplingParams:
     return_frames: bool = False
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
+    # Real-time controls and intermediate streaming
+    realtime_enabled: bool = False
+    realtime_allow_control: bool = False
+    realtime_stream_every_n_steps: int = 1
+    realtime_decode_preview: bool = True
     # if True, disallow user params to override subclass-defined protected fields
     no_override_protected_fields: bool = False
     # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
@@ -293,6 +298,15 @@ class SamplingParams:
         _finite_non_negative_float(
             "guidance_rescale", self.guidance_rescale, allow_none=False
         )
+
+        if (
+            not isinstance(self.realtime_stream_every_n_steps, int)
+            or self.realtime_stream_every_n_steps <= 0
+        ):
+            raise ValueError(
+                "realtime_stream_every_n_steps must be a positive int, got "
+                f"{self.realtime_stream_every_n_steps!r}"
+            )
 
         if self.cfg_normalization is None:
             self.cfg_normalization = 0.0
@@ -748,6 +762,30 @@ class SamplingParams:
             action="store_true",
             default=SamplingParams.return_trajectory_decoded,
             help="Whether to return the decoded trajectory",
+        )
+        parser.add_argument(
+            "--realtime-enabled",
+            action=StoreBoolean,
+            default=SamplingParams.realtime_enabled,
+            help="Enable realtime step events and intermediate preview frames.",
+        )
+        parser.add_argument(
+            "--realtime-allow-control",
+            action=StoreBoolean,
+            default=SamplingParams.realtime_allow_control,
+            help="Allow runtime controls (cancel/guidance updates) for this request.",
+        )
+        parser.add_argument(
+            "--realtime-stream-every-n-steps",
+            type=int,
+            default=SamplingParams.realtime_stream_every_n_steps,
+            help="Emit a realtime event every N denoising steps.",
+        )
+        parser.add_argument(
+            "--realtime-decode-preview",
+            action=StoreBoolean,
+            default=SamplingParams.realtime_decode_preview,
+            help="Decode and include preview images in realtime step events.",
         )
         parser.add_argument(
             "--diffusers-kwargs",

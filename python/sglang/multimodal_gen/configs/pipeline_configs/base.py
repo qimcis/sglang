@@ -627,6 +627,40 @@ class PipelineConfig:
         # 3. Update PipelineConfig from CLI arguments if provided
         kwargs[prefix_with_dot + "model_path"] = model_path
         pipeline_config.update_config_from_dict(kwargs, config_cli_prefix)
+
+        # 4. For diffusers generic backend, infer task type from model id unless
+        #    caller explicitly provided task_type or custom pipeline_config.
+        explicit_task_type_keys = {
+            "task_type",
+            f"{prefix_with_dot}task_type",
+            f"{prefix_with_dot.replace('.', '_')}task_type",
+        }
+        has_explicit_task_type = any(key in kwargs for key in explicit_task_type_keys)
+        if (
+            not has_explicit_task_type
+            and pipeline_config_or_path is None
+            and model_info is not None
+        ):
+            from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
+                DiffusersGenericPipelineConfig,
+            )
+
+            if isinstance(pipeline_config, DiffusersGenericPipelineConfig):
+                inferred_task_type = (
+                    DiffusersGenericPipelineConfig.infer_task_type_from_model_path(
+                        model_path
+                    )
+                )
+                if (
+                    inferred_task_type is not None
+                    and inferred_task_type != pipeline_config.task_type
+                ):
+                    logger.info(
+                        "Auto-detected diffusers task_type=%s for model %s",
+                        inferred_task_type.name,
+                        model_path,
+                    )
+                    pipeline_config.task_type = inferred_task_type
         return pipeline_config
 
     def check_pipeline_config(self) -> None:
