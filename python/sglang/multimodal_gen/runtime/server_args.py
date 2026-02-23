@@ -362,6 +362,7 @@ class ServerArgs:
         self._validate_offload()
         self._validate_parallelism()
         self._validate_cfg_parallel()
+        self._validate_dynamic_batching()
 
     def _adjust_save_paths(self):
         """Normalize empty-string save paths to None (disabled)."""
@@ -1203,11 +1204,6 @@ class ServerArgs:
                 f"({self.ring_degree} * {self.ulysses_degree} = {self.ring_degree * self.ulysses_degree})"
             )
 
-        if self.dynamic_batch_max_size < 1:
-            raise ValueError("dynamic_batch_max_size must be >= 1")
-        if self.dynamic_batch_delay_ms < 0:
-            raise ValueError("dynamic_batch_delay_ms must be >= 0")
-
         if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
             has_sp = self.sp_degree > 1
             has_tp = self.tp_size > 1
@@ -1222,6 +1218,12 @@ class ServerArgs:
             raise ValueError(
                 "CFG Parallelism is enabled via `--enable-cfg-parallel`, but num_gpus == 1"
             )
+
+    def _validate_dynamic_batching(self):
+        if self.dynamic_batch_max_size < 1:
+            raise ValueError("dynamic_batch_max_size must be >= 1")
+        if self.dynamic_batch_delay_ms < 0:
+            raise ValueError("dynamic_batch_delay_ms must be >= 0")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""
