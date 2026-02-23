@@ -655,7 +655,9 @@ def get_generate_fn(
     if sampling_params.width is not None and sampling_params.height is not None:
         output_size = f"{sampling_params.width}x{sampling_params.height}"
     else:
-        output_size = os.environ.get("SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size)
+        output_size = os.environ.get(
+            "SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size
+        )
     n = sampling_params.num_outputs_per_prompt
 
     def _create_and_download_video(
