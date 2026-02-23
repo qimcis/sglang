@@ -60,26 +60,6 @@ MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEU
 # _combine_cfg_parallel's all-reduce.
 DEFAULT_PLACEHOLDER_PROMPT = "warmup"
 
-_DYNAMIC_BATCH_SIGNATURE_EXCLUDED_FIELDS = {
-    "prompt",
-    "request_id",
-    "prompt_path",
-    "output_path",
-    "output_file_name",
-    "seed",
-    "perf_dump_path",
-    "suppress_logs",
-    "debug",
-    "profile",
-    "profile_all_stages",
-    "num_profiled_timesteps",
-    "return_frames",
-    "no_override_protected_fields",
-    "supported_resolutions",
-    "height_not_provided",
-    "width_not_provided",
-}
-
 _MAX_RECV_REQS_PER_POLL = 1024
 
 
@@ -150,10 +130,8 @@ class Scheduler(SchedulerDisaggMixin):
 
         # FIFO queue entries: (identity, request, enqueue_ts_s)
         self.waiting_queue: deque[tuple[bytes | None, Any, float]] = deque()
-        self._dynamic_batch_max_size = max(1, server_args.dynamic_batch_max_size)
-        self._dynamic_batch_delay_s = max(
-            0.0, server_args.dynamic_batch_delay_ms / 1000.0
-        )
+        self._dynamic_batch_max_size = server_args.dynamic_batch_max_size
+        self._dynamic_batch_delay_s = server_args.dynamic_batch_delay_ms / 1000.0
         self._poller = zmq.Poller()
         if self.receiver is not None:
             self._poller.register(self.receiver, zmq.POLLIN)
@@ -403,12 +381,11 @@ class Scheduler(SchedulerDisaggMixin):
             return None
 
         signature_items: list[tuple[str, Any]] = []
-        for field in sp_fields:
-            key = field.name
-            if key in _DYNAMIC_BATCH_SIGNATURE_EXCLUDED_FIELDS:
+        for f in sp_fields:
+            if f.metadata.get("batch_sig_exclude", False):
                 continue
             signature_items.append(
-                (key, self._freeze_signature_value(getattr(sp, key, None)))
+                (f.name, self._freeze_signature_value(getattr(sp, f.name, None)))
             )
 
         if req.extra:
@@ -853,7 +830,7 @@ class Scheduler(SchedulerDisaggMixin):
             # 2: execute, make sure a reply is always sent
             items = self.get_next_batch_to_run()
             if not items:
-                if self.waiting_queue and self._dynamic_batch_delay_s > 0:
+                if self.waiting_queue and self._dynamic_batching_enabled():
                     oldest_ts = self.waiting_queue[0][2]
                     elapsed_ms = (time.monotonic() - oldest_ts) * 1000.0
                     remaining_ms = max(
