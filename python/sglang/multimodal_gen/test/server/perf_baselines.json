@@ -1187,7 +1187,7 @@
         },
         "fastwan2_2_ti2v_5b": {
             "stages_ms": {
-                "InputValidationStage": 300.0,
+                "InputValidationStage": 300.00,
                 "TextEncodingStage": 843.86,
                 "TimestepPreparationStage": 58.66,
                 "LatentPreparationStage": 28.55,
@@ -1280,7 +1280,7 @@
                 "39": 1599.78
             },
             "expected_e2e_ms": 123182.9887,
-            "expected_avg_denoise_ms": 2831.0,
+            "expected_avg_denoise_ms": 2831.00,
             "expected_median_denoise_ms": 1600.09
         },
         "turbo_wan2_2_i2v_a14b_2gpu": {
@@ -1297,7 +1297,7 @@
             "denoise_step_ms": {
                 "0": 3042.56,
                 "1": 485.88,
-                "2": 721.2,
+                "2": 721.20,
                 "3": 475.58
             },
             "expected_e2e_ms": 11605.97,

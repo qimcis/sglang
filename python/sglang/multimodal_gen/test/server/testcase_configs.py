@@ -744,7 +744,6 @@ TWO_GPU_CASES_B = [
             ],
         ),
         DiffusionSamplingParams(
-            # Keep prompt length even for Ulysses context parallelism (2 GPUs).
             prompt="Doraemon is eating dorayaki.",
             output_size="1024x1024",
             diffusers_kwargs={"max_sequence_length": 512},
