@@ -388,6 +388,20 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         T2I_sampling_params,
     ),
     DiffusionTestCase(
+        "qwen_image_t2i_cache_dit_config_diffusers_1gpu",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image",
+            modality="image",
+            extras=[
+                "--backend",
+                "diffusers",
+                "--cache-dit-config",
+                str(Path(__file__).with_name("cache_dit_config_1gpu.yaml")),
+            ],
+        ),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
         "flux_image_t2i",
         DiffusionServerArgs(
             model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST, modality="image"
@@ -829,6 +843,28 @@ TWO_GPU_CASES_B = [
         T2I_sampling_params,
     ),
     DiffusionTestCase(
+        "qwen_image_t2i_cache_dit_config_diffusers_2gpu",
+        DiffusionServerArgs(
+            model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+            modality="image",
+            num_gpus=2,
+            ulysses_degree=2,
+            extras=[
+                "--backend",
+                "diffusers",
+                "--cache-dit-config",
+                str(Path(__file__).with_name("cache_dit_config_2gpu.yaml")),
+                "--warmup",
+                "false",
+            ],
+        ),
+        DiffusionSamplingParams(
+            prompt="Doraemon is eating dorayaki.",
+            output_size="1024x1024",
+            diffusers_kwargs={"max_sequence_length": 512},
+        ),
+    ),
+    DiffusionTestCase(
         "zimage_image_t2i_2_gpus",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -909,7 +945,6 @@ if not current_platform.is_hip():
             TURBOWAN_I2V_sampling_params,
         )
     )
-
 # Load global configuration
 BASELINE_CONFIG = BaselineConfig.load(
     Path(__file__).with_name("perf_baselines.json")
