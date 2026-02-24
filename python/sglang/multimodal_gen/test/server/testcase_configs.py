@@ -218,6 +218,8 @@ class DiffusionSamplingParams:
     # TeaCache acceleration
     enable_teacache: bool = False
 
+    diffusers_kwargs: dict | None = None
+
 
 @dataclass(frozen=True)
 class DiffusionTestCase:
@@ -737,9 +739,15 @@ TWO_GPU_CASES_B = [
                 "diffusers",
                 "--cache-dit-config",
                 str(Path(__file__).with_name("cache_dit_config_2gpu.yaml")),
+                "--warmup",
+                "false",
             ],
         ),
-        T2I_sampling_params,
+        DiffusionSamplingParams(
+            prompt="Doraemon is eating dorayaki",
+            output_size="1024x1024",
+            diffusers_kwargs={"max_sequence_length": 512},
+        ),
     ),
     DiffusionTestCase(
         "zimage_image_t2i_2_gpus",
