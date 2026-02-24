@@ -239,6 +239,8 @@ class DiffusionSamplingParams:
 
     diffusers_kwargs: dict | None = None
 
+    diffusers_kwargs: dict | None = None
+
 
 @dataclass(frozen=True)
 class DiffusionTestCase:
