@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import os
 import statistics
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
@@ -576,12 +576,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             modality="video",
             custom_validator="video",
         ),
-        replace(
-            TI2V_sampling_params,
-            width=832,
-            height=480,
-            num_inference_steps=12,
-        ),
+        TI2V_sampling_params,
     ),
     DiffusionTestCase(
         "fastwan2_2_ti2v_5b",
@@ -590,12 +585,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             modality="video",
             custom_validator="video",
         ),
-        replace(
-            TI2V_sampling_params,
-            width=832,
-            height=480,
-            num_inference_steps=12,
-        ),
+        TI2V_sampling_params,
     ),
 ]
 
@@ -623,14 +613,7 @@ TWO_GPU_CASES_A = [
             modality="video",
             custom_validator="video",
         ),
-        replace(
-            TI2V_sampling_params,
-            width=832,
-            height=480,
-            num_inference_steps=12,
-            fps=8,
-            num_frames=8,
-        ),
+        TI2V_sampling_params,
     ),
     DiffusionTestCase(
         "wan2_2_t2v_a14b_2gpu",
@@ -735,14 +718,7 @@ TWO_GPU_CASES_B = [
             custom_validator="video",
             num_gpus=2,
         ),
-        replace(
-            TI2V_sampling_params,
-            width=832,
-            height=480,
-            num_inference_steps=12,
-            fps=8,
-            num_frames=8,
-        ),
+        TI2V_sampling_params,
     ),
     # I2V LoRA test case
     DiffusionTestCase(
@@ -754,14 +730,7 @@ TWO_GPU_CASES_B = [
             num_gpus=2,
             lora_path="starsfriday/Wan2.1-Divine-Power-LoRA",
         ),
-        replace(
-            TI2V_sampling_params,
-            width=832,
-            height=480,
-            num_inference_steps=12,
-            fps=8,
-            num_frames=8,
-        ),
+        TI2V_sampling_params,
     ),
     DiffusionTestCase(
         "wan2_1_i2v_14b_720P_2gpu",
@@ -771,14 +740,7 @@ TWO_GPU_CASES_B = [
             custom_validator="video",
             num_gpus=2,
         ),
-        replace(
-            TI2V_sampling_params,
-            width=832,
-            height=480,
-            num_inference_steps=12,
-            fps=8,
-            num_frames=8,
-        ),
+        TI2V_sampling_params,
     ),
     DiffusionTestCase(
         "qwen_image_t2i_2_gpus",
