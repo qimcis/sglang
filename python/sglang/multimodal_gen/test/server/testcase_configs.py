@@ -362,6 +362,20 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         T2I_sampling_params,
     ),
     DiffusionTestCase(
+        "qwen_image_t2i_cache_dit_config_diffusers_1gpu",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image",
+            modality="image",
+            extras=[
+                "--backend",
+                "diffusers",
+                "--cache-dit-config",
+                str(Path(__file__).with_name("cache_dit_config_1gpu.yaml")),
+            ],
+        ),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
         "flux_image_t2i",
         DiffusionServerArgs(
             model_path="black-forest-labs/FLUX.1-dev", modality="image"
@@ -708,6 +722,22 @@ TWO_GPU_CASES_B = [
             # test ring attn
             ulysses_degree=1,
             ring_degree=2,
+        ),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "qwen_image_t2i_cache_dit_config_diffusers_2gpu",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image",
+            modality="image",
+            num_gpus=2,
+            ulysses_degree=2,
+            extras=[
+                "--backend",
+                "diffusers",
+                "--cache-dit-config",
+                str(Path(__file__).with_name("cache_dit_config_2gpu.yaml")),
+            ],
         ),
         T2I_sampling_params,
     ),
