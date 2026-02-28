@@ -1,8 +1,11 @@
-import numpy as np
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
+from sglang.srt.dllm.algorithm.ops import (
+    compute_confidence_batched,
+    compute_start_list,
+    compute_transfer_indices_batched,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -30,22 +33,20 @@ class JointThreshold(DllmAlgorithm):
     ) -> tuple[LogitsProcessorOutput | torch.Tensor, torch.Tensor | None, bool]:
         batch_size = forward_batch.batch_size
         device = forward_batch.input_ids.device
+        input_ids_2d = forward_batch.input_ids.view(batch_size, self.block_size)
 
-        mask_index = forward_batch.input_ids == self.mask_id
+        mask_index = input_ids_2d == self.mask_id
         if not mask_index.any():
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             return out.logits_output, [], out.can_run_graph
 
-        start_list = []
-        prompt_masks = []
-        for i in range(batch_size):
-            block_start = i * self.block_size
-            block_end = block_start + self.block_size
-            block_input_ids = forward_batch.input_ids[block_start:block_end]
-
-            prompt_mask = block_input_ids != self.mask_id
-            prompt_masks.append(prompt_mask)
-            start_list.append(prompt_mask.sum().item())
+        start_list = compute_start_list(
+            forward_batch.input_ids,
+            self.mask_id,
+            batch_size,
+            self.block_size,
+        )
+        prompt_masks = ~mask_index
 
         post_edit_steps = torch.zeros(batch_size, dtype=torch.int32, device=device)
 
@@ -53,7 +54,7 @@ class JointThreshold(DllmAlgorithm):
         # Controls whether to perform an additional forward pass for KV cache persistence.
         # For certain decoding rounds where the terminal step yields no state change,
         # this can be set to False to bypass the overhead of an idle forward pass.
-        any_changed_in_last_step = False
+        any_changed_in_last_step = torch.zeros((), dtype=torch.bool, device=device)
 
         max_iterations = self.block_size + self.max_post_edit_steps
         for _ in range(max_iterations):
@@ -63,74 +64,61 @@ class JointThreshold(DllmAlgorithm):
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
-            any_changed_in_last_step = False
-
-            for i in range(batch_size):
-                if finished[i]:
-                    continue
-
-                block_start = i * self.block_size
-                block_end = block_start + self.block_size
-
-                curr_input_ids = forward_batch.input_ids[block_start:block_end]
-                curr_logits = logits_output.full_logits[block_start:block_end]
-                curr_prompt_mask = prompt_masks[i]
-
-                if self.penalty_lambda > 0:
-                    prev_ids = curr_input_ids[:-1]
-                    curr_logits[1:, :].scatter_(
-                        1, prev_ids.unsqueeze(-1), -self.penalty_lambda, reduce="add"
-                    )
-
-                x = torch.argmax(curr_logits, dim=-1)
-                p = torch.squeeze(
-                    torch.gather(
-                        F.softmax(curr_logits, dim=-1),
-                        dim=-1,
-                        index=torch.unsqueeze(x, -1),
-                    ),
-                    -1,
+            logits_3d = logits_output.full_logits.view(batch_size, self.block_size, -1)
+            if self.penalty_lambda > 0:
+                prev_ids = input_ids_2d[:, :-1]
+                logits_3d[:, 1:, :].scatter_(
+                    2, prev_ids.unsqueeze(-1), -self.penalty_lambda, reduce="add"
                 )
 
-                mask_index = curr_input_ids == self.mask_id
-                has_mask = mask_index.any()
+            x, p, confidence, mask_index = compute_confidence_batched(
+                logits_output.full_logits,
+                forward_batch.input_ids,
+                self.mask_id,
+                batch_size,
+                self.block_size,
+                return_probs=True,
+            )
+            active = ~finished
+            has_mask = mask_index.any(dim=1)
 
-                # Mask to token (M2T)
-                mask_transfer_index = torch.zeros_like(mask_index)
-                if has_mask:
-                    confidence = torch.where(mask_index, p, -np.inf)
-                    mask_transfer_index = confidence > self.threshold
+            # Mask to token (M2T)
+            mask_transfer_index = compute_transfer_indices_batched(
+                confidence,
+                self.threshold,
+                mask_index,
+            )
 
-                    if not mask_transfer_index.any():
-                        _, select_index = torch.topk(confidence, k=1)
-                        mask_transfer_index[select_index] = True
-                else:
-                    post_edit_steps[i] += 1
-                    if post_edit_steps[i] > self.max_post_edit_steps:
-                        finished[i] = True
-                        continue
+            no_mask = active & ~has_mask
+            post_edit_steps[no_mask] += 1
+            exceeded_post_edit_steps = no_mask & (
+                post_edit_steps > self.max_post_edit_steps
+            )
+            finished = finished | exceeded_post_edit_steps
 
-                # Token to token (T2T)
-                edit_mask = ~mask_index & ~curr_prompt_mask
-                edit_transfer_index = (
-                    (p > self.edit_threshold) & (curr_input_ids != x) & edit_mask
-                )
+            # Token to token (T2T)
+            edit_mask = ~mask_index & ~prompt_masks
+            edit_transfer_index = (
+                (p > self.edit_threshold) & (input_ids_2d != x) & edit_mask
+            )
 
-                transfer_index = mask_transfer_index | edit_transfer_index
-                if not transfer_index.any():
-                    finished[i] = True
-                    continue
+            active_after_post_edit = active & ~exceeded_post_edit_steps
+            transfer_index = (mask_transfer_index | edit_transfer_index) & (
+                active_after_post_edit.unsqueeze(1)
+            )
+            no_transfer = active_after_post_edit & ~transfer_index.any(dim=1)
+            finished = finished | no_transfer
 
-                curr_input_ids[transfer_index] = x[transfer_index]
-                any_changed_in_last_step = True
+            input_ids_2d[transfer_index] = x[transfer_index]
+            any_changed_in_last_step = transfer_index.any()
 
-        if any_changed_in_last_step:
+        if any_changed_in_last_step.item():
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
-        next_token_ids = torch.reshape(forward_batch.input_ids, (batch_size, -1))
+        start_list_cpu = start_list.tolist()
         next_token_ids_list = [
-            next_token_ids[i, start_list[i] :] for i in range(batch_size)
+            input_ids_2d[i, start:] for i, start in enumerate(start_list_cpu)
         ]
 
         return logits_output, next_token_ids_list, can_run_cuda_graph

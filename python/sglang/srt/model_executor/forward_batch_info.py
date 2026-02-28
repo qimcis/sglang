@@ -471,13 +471,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             block_size = batch.dllm_config.block_size
             # Use int64 for AMD rotary embedding kernel compatibility
             positions_dtype = torch.int64 if is_hip() else torch.int32
-            ret.positions = torch.tensor(
-                [
-                    i
-                    for block_offset in batch.dllm_block_offsets
-                    for i in range(block_offset, block_offset + block_size)
-                ],
-                dtype=positions_dtype,
+            ret.positions = compute_dllm_positions(
+                batch.dllm_block_offsets,
+                block_size,
+                positions_dtype,
             ).to(device, non_blocking=True)
         elif (
             ret.spec_info is not None
@@ -1024,6 +1021,16 @@ def compute_position(
             extend_prefix_lens, extend_seq_lens
         )
     return positions, extend_start_loc
+
+
+def compute_dllm_positions(
+    dllm_block_offsets: List[int],
+    block_size: int,
+    positions_dtype: torch.dtype,
+) -> torch.Tensor:
+    offsets = torch.tensor(dllm_block_offsets, dtype=positions_dtype)
+    arange = torch.arange(block_size, dtype=positions_dtype)
+    return (offsets.unsqueeze(1) + arange.unsqueeze(0)).reshape(-1)
 
 
 def compute_position_triton(
