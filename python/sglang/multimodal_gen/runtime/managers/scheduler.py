@@ -545,7 +545,7 @@ class Scheduler(SchedulerDisaggMixin):
                 output_file_paths=self._slice_batched_value(
                     output_batch.output_file_paths, start, end, total_items
                 ),
-                timings=deepcopy(output_batch.metrics),
+                metrics=deepcopy(output_batch.metrics),
                 noise_pred=self._slice_batched_value(
                     output_batch.noise_pred, start, end, total_items
                 ),
