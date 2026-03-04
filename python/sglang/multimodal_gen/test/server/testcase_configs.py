@@ -781,6 +781,15 @@ TWO_GPU_CASES_B = [
         ),
         T2I_sampling_params,
     ),
+    DiffusionTestCase(
+        "flux_2_klein_ti2i_2_gpus",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-klein-4B",
+            modality="image",
+            num_gpus=2,
+        ),
+        TI2I_sampling_params,
+    ),
 ]
 
 if not current_platform.is_hip():
