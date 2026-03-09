@@ -143,6 +143,8 @@ class Scheduler(SchedulerDisaggMixin):
         self.waiting_queue: deque[tuple[bytes | None, Any, float]] = deque()
         self._dynamic_batch_max_size = server_args.dynamic_batch_max_size
         self._dynamic_batch_delay_s = server_args.dynamic_batch_delay_ms / 1000.0
+        self._batch_metrics_enabled = server_args.enable_batch_metrics
+        self._batch_metrics_window = _BatchMetricsWindow()
         self._poller = zmq.Poller()
         if self.receiver is not None:
             self._poller.register(self.receiver, zmq.POLLIN)
@@ -160,6 +162,12 @@ class Scheduler(SchedulerDisaggMixin):
         self._consecutive_error_count = 0
 
         self._init_disagg_state(server_args, local_rank)
+
+        if self._batch_metrics_enabled:
+            logger.info(
+                "Dynamic batch metrics enabled; logging summary every %d dispatches.",
+                _BATCH_METRICS_LOG_INTERVAL,
+            )
 
     def get_disagg_metrics(self) -> dict | None:
         """Return disagg role metrics snapshot, or None if not in disagg mode."""
@@ -347,6 +355,139 @@ class Scheduler(SchedulerDisaggMixin):
 
     def _execute_generation_sequential(self, reqs: List[Req]) -> List[OutputBatch]:
         return [self.worker.execute_forward([req]) for req in reqs]
+
+    @staticmethod
+    def _percentile(values: list[float], percentile: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        index = min(
+            len(ordered) - 1,
+            max(0, int(round((percentile / 100.0) * (len(ordered) - 1)))),
+        )
+        return ordered[index]
+
+    def _find_sampling_param_mismatch_field(
+        self, base_req: Req, candidate_req: Req
+    ) -> str | None:
+        base_sp = base_req.sampling_params
+        candidate_sp = candidate_req.sampling_params
+        if base_sp is None or candidate_sp is None:
+            return None
+
+        try:
+            sp_fields = dataclasses.fields(base_sp)
+        except Exception:
+            return None
+
+        for f in sp_fields:
+            if f.metadata.get("batch_sig_exclude", False):
+                continue
+            base_value = self._freeze_signature_value(getattr(base_sp, f.name, None))
+            candidate_value = self._freeze_signature_value(
+                getattr(candidate_sp, f.name, None)
+            )
+            if base_value != candidate_value:
+                return f"sampling_params.{f.name}"
+
+        base_diffusers_kwargs = self._freeze_signature_value(
+            (base_req.extra or {}).get("diffusers_kwargs")
+        )
+        candidate_diffusers_kwargs = self._freeze_signature_value(
+            (candidate_req.extra or {}).get("diffusers_kwargs")
+        )
+        if base_diffusers_kwargs != candidate_diffusers_kwargs:
+            return "extra.diffusers_kwargs"
+
+        return None
+
+    def _get_dynamic_batch_reject_reason(
+        self, base_req: Req, candidate_req: Req
+    ) -> str | None:
+        if self._can_dynamic_batch(base_req, candidate_req):
+            return None
+
+        if base_req.is_warmup or candidate_req.is_warmup:
+            return "warmup"
+        if not isinstance(base_req.prompt, str) or not isinstance(
+            candidate_req.prompt, str
+        ):
+            return "prompt_type"
+        if base_req.image_path is not None or candidate_req.image_path is not None:
+            return "image_conditioning"
+        if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
+            return "return_file_paths_only"
+
+        base_sig = self._get_cached_signature(base_req)
+        candidate_sig = self._get_cached_signature(candidate_req)
+        if base_sig is None or candidate_sig is None:
+            return "signature_unavailable"
+
+        return (
+            self._find_sampling_param_mismatch_field(base_req, candidate_req)
+            or "signature_mismatch"
+        )
+
+    def _record_batch_dispatch_metrics(
+        self,
+        batch_size: int,
+        queue_wait_ms: float,
+        reject_reasons: list[str] | None = None,
+    ) -> None:
+        if not self._batch_metrics_enabled:
+            return
+
+        window = self._batch_metrics_window
+        window.dispatches += 1
+        window.total_requests += batch_size
+        if batch_size > 1:
+            window.merged_dispatches += 1
+        if (
+            self._dynamic_batching_enabled()
+            and batch_size >= self._dynamic_batch_max_size
+        ):
+            window.full_dispatches += 1
+        window.wait_times_ms.append(max(queue_wait_ms, 0.0))
+        if reject_reasons:
+            window.reject_reasons.update(reject_reasons)
+
+        if window.dispatches >= _BATCH_METRICS_LOG_INTERVAL:
+            self._log_batch_metrics_summary()
+
+    def _log_batch_metrics_summary(self) -> None:
+        if not self._batch_metrics_enabled:
+            return
+
+        window = self._batch_metrics_window
+        if window.dispatches == 0:
+            return
+
+        avg_size = window.total_requests / window.dispatches
+        max_batch_size = max(1, self._dynamic_batch_max_size)
+        utilization = avg_size / max_batch_size
+        avg_wait_ms = sum(window.wait_times_ms) / len(window.wait_times_ms)
+        p95_wait_ms = self._percentile(window.wait_times_ms, 95.0)
+        merged_rate = window.merged_dispatches / window.dispatches
+        full_rate = window.full_dispatches / window.dispatches
+        top_rejects = ", ".join(
+            f"{reason}={count}"
+            for reason, count in window.reject_reasons.most_common(5)
+        )
+        if not top_rejects:
+            top_rejects = "none"
+
+        logger.info(
+            "Dynamic batch stats (last %d dispatches): avg_size=%.2f, merged_rate=%.1f%%, full_rate=%.1f%%, utilization=%.1f%%, wait_avg=%.2fms, wait_p95=%.2fms, top_rejects=%s",
+            window.dispatches,
+            avg_size,
+            merged_rate * 100.0,
+            full_rate * 100.0,
+            utilization * 100.0,
+            avg_wait_ms,
+            p95_wait_ms,
+            top_rejects,
+        )
+        self._batch_metrics_window = _BatchMetricsWindow()
 
     def _build_dynamic_batch_error_outputs(
         self,
@@ -578,7 +719,12 @@ class Scheduler(SchedulerDisaggMixin):
             return None
 
         if not self._dynamic_batching_enabled():
-            identity, req, _ = self.waiting_queue.popleft()
+            identity, req, enqueue_time = self.waiting_queue.popleft()
+            if isinstance(req, Req):
+                self._record_batch_dispatch_metrics(
+                    batch_size=1,
+                    queue_wait_ms=(time.monotonic() - enqueue_time) * 1000.0,
+                )
             return [(identity, req)]
 
         identity, req, enqueue_time = self.waiting_queue[0]
@@ -589,10 +735,21 @@ class Scheduler(SchedulerDisaggMixin):
         # If the head request itself is not eligible for dynamic batching
         # (e.g., image-conditioned i2i request), dispatch it immediately.
         if not self._can_dynamic_batch(req, req):
-            identity, req, _ = self.waiting_queue.popleft()
+            identity, req, head_enqueue_time = self.waiting_queue.popleft()
+            reject_reasons: list[str] = []
+            if self._batch_metrics_enabled:
+                reason = self._get_dynamic_batch_reject_reason(req, req)
+                if reason is not None:
+                    reject_reasons.append(f"head:{reason}")
+            self._record_batch_dispatch_metrics(
+                batch_size=1,
+                queue_wait_ms=(time.monotonic() - head_enqueue_time) * 1000.0,
+                reject_reasons=reject_reasons,
+            )
             return [(identity, req)]
 
         compatible_indices: list[int] = [0]
+        reject_reasons: list[str] = []
         for idx in range(1, len(self.waiting_queue)):
             if len(compatible_indices) >= self._dynamic_batch_max_size:
                 break
@@ -601,6 +758,10 @@ class Scheduler(SchedulerDisaggMixin):
                 req, candidate_req
             ):
                 compatible_indices.append(idx)
+            elif self._batch_metrics_enabled and isinstance(candidate_req, Req):
+                reason = self._get_dynamic_batch_reject_reason(req, candidate_req)
+                if reason is not None:
+                    reject_reasons.append(reason)
 
         batch_len = len(compatible_indices)
 
@@ -618,6 +779,11 @@ class Scheduler(SchedulerDisaggMixin):
             item_identity, item_req, _ = self.waiting_queue[idx]
             batch_items[batch_len - 1 - pos] = (item_identity, item_req)
             del self.waiting_queue[idx]
+        self._record_batch_dispatch_metrics(
+            batch_size=batch_len,
+            queue_wait_ms=oldest_wait_s * 1000.0,
+            reject_reasons=reject_reasons,
+        )
         return batch_items
 
     def prepare_server_warmup_reqs(self):
@@ -903,6 +1069,8 @@ class Scheduler(SchedulerDisaggMixin):
                 # Reply failed; log and keep loop alive to accept future requests
                 logger.error(f"ZMQ error sending reply: {e}")
                 continue
+
+        self._log_batch_metrics_summary()
 
         if self.receiver is not None:
             self.receiver.close()
