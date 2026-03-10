@@ -7,7 +7,7 @@ import os
 import pickle
 import tempfile
 import time
-from collections import deque
+from collections import Counter, deque
 from copy import deepcopy
 from enum import Enum
 from typing import Any, List
@@ -61,6 +61,17 @@ MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEU
 DEFAULT_PLACEHOLDER_PROMPT = "warmup"
 
 _MAX_RECV_REQS_PER_POLL = 1024
+_BATCH_METRICS_LOG_INTERVAL = 5
+
+
+@dataclasses.dataclass
+class _BatchMetricsWindow:
+    dispatches: int = 0
+    total_requests: int = 0
+    merged_dispatches: int = 0
+    full_dispatches: int = 0
+    wait_times_ms: list[float] = dataclasses.field(default_factory=list)
+    reject_reasons: Counter[str] = dataclasses.field(default_factory=Counter)
 
 
 class Scheduler(SchedulerDisaggMixin):
