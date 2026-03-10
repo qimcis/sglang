@@ -6,7 +6,7 @@ import dataclasses
 import os
 import pickle
 import time
-from collections import deque
+from collections import Counter, deque
 from copy import deepcopy
 from enum import Enum
 from typing import Any, List
@@ -46,6 +46,17 @@ logger = init_logger(__name__)
 MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
 _MAX_RECV_REQS_PER_POLL = 1024
+_BATCH_METRICS_LOG_INTERVAL = 5
+
+
+@dataclasses.dataclass
+class _BatchMetricsWindow:
+    dispatches: int = 0
+    total_requests: int = 0
+    merged_dispatches: int = 0
+    full_dispatches: int = 0
+    wait_times_ms: list[float] = dataclasses.field(default_factory=list)
+    reject_reasons: Counter[str] = dataclasses.field(default_factory=Counter)
 
 
 class Scheduler:
