@@ -299,6 +299,7 @@ class ServerArgs:
     scheduler_port: int = 5555
     dynamic_batch_max_size: int = 1
     dynamic_batch_delay_ms: float = 0.0
+    enable_batch_metrics: bool = False
 
     output_path: str | None = "outputs/"
     input_save_path: str | None = "inputs/uploads"
@@ -865,6 +866,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.dynamic_batch_delay_ms,
             help="Maximum time (in ms) to wait for forming a larger dynamic batch before dispatch.",
+        )
+        parser.add_argument(
+            "--enable-batch-metrics",
+            action="store_true",
+            default=ServerArgs.enable_batch_metrics,
+            help="Log periodic dynamic batch efficiency metrics such as realized batch size and queue wait time.",
         )
         parser.add_argument(
             "--host",

@@ -95,14 +95,41 @@ class TextEncodingStage(PipelineStage):
 
             assert batch.negative_prompt_embeds is not None
 
-            for ne in neg_embeds_list:
+            target_batch_sizes = [pe.shape[0] for pe in prompt_embeds_list]
+
+            def align_negative_batch_dim(
+                tensor: torch.Tensor, target_batch: int, name: str
+            ) -> torch.Tensor:
+                if tensor.shape[0] == target_batch:
+                    return tensor
+                if tensor.shape[0] == 1 and target_batch > 1:
+                    return tensor.expand(target_batch, *tensor.shape[1:])
+                raise ValueError(
+                    f"{name} batch dimension mismatch: got {tensor.shape[0]}, expected 1 or {target_batch}"
+                )
+
+            for idx, ne in enumerate(neg_embeds_list):
+                target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
+                ne = align_negative_batch_dim(
+                    ne, target_batch, "negative_prompt_embeds"
+                )
                 batch.negative_prompt_embeds.append(ne)
 
-            for pe in neg_pooler_embeds_list:
+            for idx, pe in enumerate(neg_pooler_embeds_list):
+                target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
+                pe = align_negative_batch_dim(
+                    pe, target_batch, "negative_pooled_embeds"
+                )
                 batch.neg_pooled_embeds.append(pe)
             if batch.negative_attention_mask is None:
                 batch.negative_attention_mask = []
-                for nm in neg_masks_list:
+                for idx, nm in enumerate(neg_masks_list):
+                    target_batch = target_batch_sizes[
+                        min(idx, len(target_batch_sizes) - 1)
+                    ]
+                    nm = align_negative_batch_dim(
+                        nm, target_batch, "negative_attention_mask"
+                    )
                     batch.negative_attention_mask.append(nm)
 
         return batch
