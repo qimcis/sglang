@@ -88,9 +88,7 @@ class InputValidationStage(PipelineStage):
             base_seeds = [int(item) for item in dynamic_batch_seeds]
             seeds = []
             for base_seed in base_seeds:
-                seeds.extend(
-                    [base_seed + i for i in range(num_videos_per_prompt)]
-                )
+                seeds.extend([base_seed + i for i in range(num_videos_per_prompt)])
         elif isinstance(seed, list):
             if len(seed) != num_videos_per_prompt:
                 raise ValueError(
@@ -105,9 +103,7 @@ class InputValidationStage(PipelineStage):
             ]
             seeds = []
             for base_seed in base_seeds:
-                seeds.extend(
-                    [base_seed + i for i in range(num_videos_per_prompt)]
-                )
+                seeds.extend([base_seed + i for i in range(num_videos_per_prompt)])
         batch.seeds = seeds
 
         # Create generators based on generator_device parameter

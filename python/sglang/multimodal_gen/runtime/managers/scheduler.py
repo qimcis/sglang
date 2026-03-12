@@ -297,8 +297,7 @@ class Scheduler(SchedulerDisaggMixin):
             else:
                 logger.info("Processing warmup req...")
 
-        # Diffusion dispatches one generation request at a time, so reqs[0]
-        # always carries the trace context for the entire batch.
+        # Use the head request trace context for scheduler-side dispatch work.
         req = reqs[0]
         req.trace_ctx.rebuild_thread_context()
         with trace_slice(
@@ -1028,12 +1027,7 @@ class Scheduler(SchedulerDisaggMixin):
                     f"Error executing request in scheduler event loop: {e}",
                     exc_info=True,
                 )
-                # Determine appropriate error response format
-                handler_result = (
-                    OutputBatch(error=str(e))
-                    if reqs and isinstance(reqs[0], Req)
-                    else OutputBatch(error=str(e))
-                )
+                handler_result = OutputBatch(error=str(e))
 
             if isinstance(handler_result, list):
                 output_batches = handler_result

@@ -354,7 +354,6 @@ class DiffGenerator:
                 logger,
                 len(results),
                 total_gen_time,
-                num_requests=len(requests),
             )
         self._log_summary(results)
 

@@ -148,13 +148,6 @@ class SamplingParams:
 
     height: int | None = None
     width: int | None = None
-    # NOTE: this is temporary, we need a way to know if width or height is not provided, or do the image resize earlier
-    height_not_provided: bool = field(
-        default=False, metadata={"batch_sig_exclude": True}
-    )
-    width_not_provided: bool = field(
-        default=False, metadata={"batch_sig_exclude": True}
-    )
     fps: int = 24
 
     # Resolution validation
