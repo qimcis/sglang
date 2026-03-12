@@ -294,7 +294,6 @@ async def process_generation_batch(
             logger,
             len(save_file_path_list),
             total_time,
-            num_requests=1,
         )
 
     if result.peak_memory_mb and result.peak_memory_mb > 0:
