@@ -23,7 +23,6 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
     apply_qk_norm_with_optional_rope,
     apply_rmsnorm_tanh_mul_add,
-    apply_rmsnorm_tanh_mul_add_norm_scale,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -446,14 +445,35 @@ class ZImageTransformerBlock(nn.Module):
                 num_replicated_prefix=num_replicated_prefix,
                 num_replicated_suffix=num_replicated_suffix,
             )
-            x, ffn_in = apply_rmsnorm_tanh_mul_add_norm_scale(
-                attn_out,
-                gate_msa,
-                x,
-                self.attention_norm2,
-                self.ffn_norm1,
-                scale_mlp,
-            )
+            if (
+                _is_cuda
+                and attn_out.is_cuda
+                and attn_out.shape[-1] % 256 == 0
+                and attn_out.shape[-1] <= 8192
+                and self.attention_norm2.variance_epsilon
+                == self.ffn_norm1.variance_epsilon
+            ):
+                from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
+                    fused_norm_tanh_mul_add_norm_scale,
+                )
+
+                x, ffn_in = fused_norm_tanh_mul_add_norm_scale(
+                    attn_out.contiguous(),
+                    self.attention_norm2.weight.data.contiguous(),
+                    None,
+                    gate_msa.contiguous(),
+                    x.contiguous(),
+                    self.ffn_norm1.weight.data.contiguous(),
+                    None,
+                    scale_mlp.contiguous(),
+                    "rms",
+                    self.attention_norm2.variance_epsilon,
+                )
+            else:
+                x = apply_rmsnorm_tanh_mul_add(
+                    attn_out, gate_msa, x, self.attention_norm2
+                )
+                ffn_in = self.ffn_norm1(x) * (1.0 + scale_mlp)
 
             # FFN block
             ffn_out = self.feed_forward(ffn_in)
