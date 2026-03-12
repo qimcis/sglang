@@ -665,6 +665,54 @@ def apply_rmsnorm_tanh_mul_add(
     return residual + torch.tanh(gate) * norm(x)
 
 
+def apply_rmsnorm_tanh_mul_add_norm_scale(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    residual: torch.Tensor,
+    norm: "RMSNorm",
+    norm2: "RMSNorm",
+    scale2: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute:
+      y = residual + tanh(gate) * rmsnorm(x)
+      y2 = rmsnorm(y) * (1 + scale2)
+    with a fused CUDA fast path.
+    """
+    if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"):
+        y = residual + torch.tanh(gate) * norm(x)
+        y2 = norm2(y) * (1 + scale2)
+        return y, y2
+
+    if (
+        _is_cuda
+        and x.is_cuda
+        and x.shape[-1] % 256 == 0
+        and x.shape[-1] <= 8192
+        and norm.variance_epsilon == norm2.variance_epsilon
+    ):
+        from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
+            fused_norm_tanh_mul_add_norm_scale,
+        )
+
+        return fused_norm_tanh_mul_add_norm_scale(
+            x.contiguous(),
+            norm.weight.data.contiguous(),
+            None,
+            gate.contiguous(),
+            residual.contiguous(),
+            norm2.weight.data.contiguous(),
+            None,
+            scale2.contiguous(),
+            "rms",
+            norm.variance_epsilon,
+        )
+
+    y = residual + torch.tanh(gate) * norm(x)
+    y2 = norm2(y) * (1 + scale2)
+    return y, y2
+
+
 def tensor_parallel_rms_norm(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()

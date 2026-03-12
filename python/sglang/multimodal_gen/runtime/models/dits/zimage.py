@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
     apply_qk_norm,
     apply_rmsnorm_tanh_mul_add,
+    apply_rmsnorm_tanh_mul_add_norm_scale,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -258,17 +259,24 @@ class ZImageTransformerBlock(nn.Module):
             scale_msa, gate_msa, scale_mlp, gate_mlp = scale_msa_gate.unsqueeze(
                 1
             ).chunk(4, dim=2)
-            scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
+            scale_msa = 1.0 + scale_msa
 
             # Attention block
             attn_out = self.attention(
                 self.attention_norm1(x) * scale_msa,
                 freqs_cis=freqs_cis,
             )
-            x = apply_rmsnorm_tanh_mul_add(attn_out, gate_msa, x, self.attention_norm2)
+            x, ffn_in = apply_rmsnorm_tanh_mul_add_norm_scale(
+                attn_out,
+                gate_msa,
+                x,
+                self.attention_norm2,
+                self.ffn_norm1,
+                scale_mlp,
+            )
 
             # FFN block
-            ffn_out = self.feed_forward(self.ffn_norm1(x) * scale_mlp)
+            ffn_out = self.feed_forward(ffn_in)
             x = apply_rmsnorm_tanh_mul_add(ffn_out, gate_mlp, x, self.ffn_norm2)
         else:
             # Attention block
