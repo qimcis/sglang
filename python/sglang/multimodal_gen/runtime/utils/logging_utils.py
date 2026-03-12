@@ -647,10 +647,23 @@ def log_generation_timer(
 
 
 def log_batch_completion(
-    logger: logging.Logger, num_outputs: int, total_time: float
+    logger: logging.Logger,
+    num_outputs: int,
+    total_time: float,
+    num_requests: int = 1,
 ) -> None:
+    if num_requests > 1:
+        logger.info(
+            f"Completed batch processing for %d requests. Generated %d outputs in {GREEN}%.2f{RESET} seconds",
+            num_requests,
+            num_outputs,
+            total_time,
+        )
+        return
+
     logger.info(
-        f"Completed batch processing. Generated %d outputs in {GREEN}%.2f{RESET} seconds",
+        f"Completed request processing. Generated %d output%s in {GREEN}%.2f{RESET} seconds",
         num_outputs,
+        "" if num_outputs == 1 else "s",
         total_time,
     )
