@@ -81,7 +81,7 @@ class NormTanhMulAddNormScale:
     def __init__(self, D: int, norm_type: str, is_norm2: bool):
         self.D = D
         self.norm_type = norm_type  # "layer" or "rms"
-        self.is_norm2 = is_norm2 # single norm or double norm
+        self.is_norm2 = is_norm2  # single norm or double norm
         self.num_warps = self.D // 256  # num of warps per cta
         self.num_threads = self.num_warps * WARP_SIZE  # num of threads per cta
 
@@ -210,13 +210,16 @@ class NormTanhMulAddNormScale:
             # Store: y2
             tYrY2.store(value2.to(tYrY2.element_type))
             copy_if(tYrY2, tYgY2)  # rmem -> gmem
-            
 
 
 def validate_3d(t: torch.Tensor, B: int, S: int, D: int):
     if t.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise ValueError(f"Validate failed: unsupported dtype: {t.dtype}")
-    if t.ndim != 3 or (t.shape[0] not in (1, B)) or (t.shape[1] not in (1, S) or t.shape[2] != D):
+    if (
+        t.ndim != 3
+        or (t.shape[0] not in (1, B))
+        or (t.shape[1] not in (1, S) or t.shape[2] != D)
+    ):
         raise ValueError(f"Validate failed: unsupported 3d-tensor: {t.shape}.")
     if t.stride()[-1] != 1:
         raise ValueError(f"Validate failed: not contiguous on dim D.")
@@ -233,7 +236,7 @@ def validate_weight_bias(t: Optional[torch.Tensor], D: int):
         raise ValueError(f"Validate failed: not contiguous on dim D.")
 
 
-@torch._dynamo.disable  # Disable Dynamo tracing
+@torch.library.custom_op("sglang::fused_norm_tanh_mul_add", mutates_args=())
 def fused_norm_tanh_mul_add(
     x: torch.Tensor,
     weight: Optional[torch.Tensor],
@@ -242,8 +245,7 @@ def fused_norm_tanh_mul_add(
     shift: torch.Tensor,
     norm_type: str,
     eps: float = 1e-5,
-    stream: cuda.CUstream = cuda.CUstream(cuda.CUstream_flags.CU_STREAM_DEFAULT),
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
     Fuse: norm(x) * tanh(scale) + shift
       where norm is either layernorm or rmsnorm.
@@ -258,6 +260,7 @@ def fused_norm_tanh_mul_add(
     D must be a multiple of 256 and <= 8192 to enable LDG.128 vectorized loads per
     thread and avoid predicated loads (e.g., bounds checks such as `index < D`).
     """
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # Tensor Validation
     BSD = x.shape
     validate_3d(x, *BSD)
@@ -294,7 +297,12 @@ def fused_norm_tanh_mul_add(
         raise ValueError(f'norm_type must be one of "layer" and "rms"')
 
 
-@torch._dynamo.disable  # Disable Dynamo tracing
+@fused_norm_tanh_mul_add.register_fake
+def _fused_norm_tanh_mul_add_fake(x, weight, bias, scale, shift, norm_type, eps=1e-5):
+    return x.new_empty(x.shape)
+
+
+@torch.library.custom_op("sglang::fused_norm_tanh_mul_add_norm_scale", mutates_args=())
 def fused_norm_tanh_mul_add_norm_scale(
     x: torch.Tensor,
     weight: Optional[torch.Tensor],
@@ -306,7 +314,6 @@ def fused_norm_tanh_mul_add_norm_scale(
     scale2: torch.Tensor,
     norm_type: str,
     eps: float = 1e-5,
-    stream: cuda.CUstream = cuda.CUstream(cuda.CUstream_flags.CU_STREAM_DEFAULT),
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Fuse:
@@ -324,6 +331,7 @@ def fused_norm_tanh_mul_add_norm_scale(
     D must be a multiple of 256 and <= 8192 to enable LDG.128 vectorized loads per
     thread and avoid predicated loads (e.g., bounds checks such as `index < D`).
     """
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # Tensor Validation
     BSD = x.shape
     validate_3d(x, *BSD)
@@ -362,3 +370,10 @@ def fused_norm_tanh_mul_add_norm_scale(
         return y, y2
     else:
         raise ValueError(f'norm_type must be one of "layer" and "rms"')
+
+
+@fused_norm_tanh_mul_add_norm_scale.register_fake
+def _fused_norm_tanh_mul_add_norm_scale_fake(
+    x, weight, bias, scale, shift, weight2, bias2, scale2, norm_type, eps=1e-5
+):
+    return x.new_empty(x.shape), x.new_empty(x.shape)
