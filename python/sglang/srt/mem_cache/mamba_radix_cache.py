@@ -474,6 +474,26 @@ class MambaRadixCache(BasePrefixCache):
     def _make_marconi_admission_tree(self) -> MarconiAdmissionTree:
         return MarconiAdmissionTree()
 
+    def _fork_mamba_value_for_cache(
+        self,
+        mamba_value: torch.Tensor,
+        *,
+        context: str,
+        required: bool = False,
+    ) -> Optional[torch.Tensor]:
+        mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
+        if mamba_value_forked is None:
+            self.evict_mamba(1)
+            mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
+                mamba_value
+            )
+        if mamba_value_forked is not None:
+            return mamba_value_forked
+        if required:
+            raise AssertionError("Can not alloc mamba cache")
+        logger.debug("Marconi skipped %s due to mamba alloc pressure", context)
+        return None
+
     def _get_marconi_live_stats(self) -> dict:
         hit_rate = (
             self.marconi_live_hit_count / self.marconi_live_match_count
@@ -834,126 +854,130 @@ class MambaRadixCache(BasePrefixCache):
 
             mamba_value = mamba_value_src
             if self.marconi_enabled:
-                primary_mamba_forked = self.req_to_token_pool.mamba_pool.fork_from(
-                    mamba_value_src
+                primary_mamba_forked = self._fork_mamba_value_for_cache(
+                    mamba_value_src,
+                    context="cache_finished_req:primary",
                 )
                 if primary_mamba_forked is None:
-                    self.evict_mamba(1)
-                    primary_mamba_forked = self.req_to_token_pool.mamba_pool.fork_from(
-                        mamba_value_src
+                    is_insert = False
+                else:
+                    mamba_value = primary_mamba_forked
+                    mamba_ping_pong_track_buffer_to_keep = None
+
+            if is_insert:
+                result = self.insert(
+                    InsertParams(
+                        key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
+                        value=page_aligned_kv_indices,
+                        mamba_value=mamba_value,
                     )
-                    assert primary_mamba_forked is not None, "Can not alloc mamba cache"
-                mamba_value = primary_mamba_forked
-                mamba_ping_pong_track_buffer_to_keep = None
-
-            result = self.insert(
-                InsertParams(
-                    key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
-                    value=page_aligned_kv_indices,
-                    mamba_value=mamba_value,
                 )
-            )
-            new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
-            if mamba_exist and primary_mamba_forked is not None:
-                self.req_to_token_pool.mamba_pool.free(primary_mamba_forked)
+                new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
+                if mamba_exist and primary_mamba_forked is not None:
+                    self.req_to_token_pool.mamba_pool.free(primary_mamba_forked)
 
-            inserted_start = getattr(req, "kv_cache_inserted_start", None)
-            inserted_end = getattr(req, "kv_cache_inserted_end", None)
-            dup_ranges = []
-            if (
-                inserted_start is not None
-                and inserted_end is not None
-                and inserted_start < inserted_end
-            ):
-                pre_end = min(new_prefix_len, inserted_start)
-                if kv_cache_protected_len < pre_end:
+                inserted_start = getattr(req, "kv_cache_inserted_start", None)
+                inserted_end = getattr(req, "kv_cache_inserted_end", None)
+                dup_ranges = []
+                if (
+                    inserted_start is not None
+                    and inserted_end is not None
+                    and inserted_start < inserted_end
+                ):
+                    pre_end = min(new_prefix_len, inserted_start)
+                    if kv_cache_protected_len < pre_end:
+                        dup_ranges.append(
+                            (
+                                kv_cache_protected_len,
+                                pre_end,
+                                "cache_finished_req:dup_prefix_pre",
+                            )
+                        )
+                    post_start = max(kv_cache_protected_len, inserted_end)
+                    if post_start < new_prefix_len:
+                        dup_ranges.append(
+                            (
+                                post_start,
+                                new_prefix_len,
+                                "cache_finished_req:dup_prefix_post",
+                            )
+                        )
+                elif kv_cache_protected_len < new_prefix_len:
                     dup_ranges.append(
                         (
                             kv_cache_protected_len,
-                            pre_end,
-                            "cache_finished_req:dup_prefix_pre",
-                        )
-                    )
-                post_start = max(kv_cache_protected_len, inserted_end)
-                if post_start < new_prefix_len:
-                    dup_ranges.append(
-                        (
-                            post_start,
                             new_prefix_len,
-                            "cache_finished_req:dup_prefix_post",
+                            "cache_finished_req:dup_prefix",
                         )
                     )
-            elif kv_cache_protected_len < new_prefix_len:
-                dup_ranges.append(
-                    (
-                        kv_cache_protected_len,
-                        new_prefix_len,
-                        "cache_finished_req:dup_prefix",
-                    )
-                )
-
-            for start, end, where in dup_ranges:
-                dup_slice = kv_indices[start:end]
-                if self.marconi_enabled:
-                    safe = self._marconi_filter_free_indices(dup_slice, where)
-                    if safe is not None:
-                        self.token_to_kv_pool_allocator.free(safe)
-                else:
-                    self.token_to_kv_pool_allocator.free(dup_slice)
-
-            if secondary_entries:
-                for cache_len, mamba_idx in secondary_entries:
-                    cache_len = min(cache_len, len(token_ids))
-                    if cache_len <= 0:
-                        continue
-                    kv_indices_sub = kv_indices[:cache_len]
-                    if self.page_size != 1:
-                        page_aligned_len = (
-                            len(kv_indices_sub) // self.page_size * self.page_size
-                        )
-                        if page_aligned_len <= 0:
-                            continue
-                        kv_indices_sub = kv_indices_sub[:page_aligned_len].to(
-                            dtype=torch.int64, copy=True
-                        )
-                        token_ids_sub = token_ids[:page_aligned_len]
-                        cache_len = page_aligned_len
+                for start, end, where in dup_ranges:
+                    dup_slice = kv_indices[start:end]
+                    if self.marconi_enabled:
+                        safe = self._marconi_filter_free_indices(dup_slice, where)
+                        if safe is not None:
+                            self.token_to_kv_pool_allocator.free(safe)
                     else:
-                        kv_indices_sub = kv_indices_sub.to(dtype=torch.int64, copy=True)
-                        token_ids_sub = token_ids[:cache_len]
+                        self.token_to_kv_pool_allocator.free(dup_slice)
 
-                    mamba_value = torch.tensor(
-                        [mamba_idx], dtype=torch.int64, device=kv_indices_sub.device
-                    )
-                    secondary_forked = self.req_to_token_pool.mamba_pool.fork_from(
-                        mamba_value
-                    )
-                    if secondary_forked is None:
-                        self.evict_mamba(1)
-                        secondary_forked = self.req_to_token_pool.mamba_pool.fork_from(
-                            mamba_value
+                if secondary_entries:
+                    for cache_len, mamba_idx in secondary_entries:
+                        cache_len = min(cache_len, len(token_ids))
+                        if cache_len <= 0:
+                            continue
+                        kv_indices_sub = kv_indices[:cache_len]
+                        if self.page_size != 1:
+                            page_aligned_len = (
+                                len(kv_indices_sub) // self.page_size * self.page_size
+                            )
+                            if page_aligned_len <= 0:
+                                continue
+                            kv_indices_sub = kv_indices_sub[:page_aligned_len].to(
+                                dtype=torch.int64, copy=True
+                            )
+                            token_ids_sub = token_ids[:page_aligned_len]
+                            cache_len = page_aligned_len
+                        else:
+                            kv_indices_sub = kv_indices_sub.to(
+                                dtype=torch.int64, copy=True
+                            )
+                            token_ids_sub = token_ids[:cache_len]
+
+                        mamba_value = torch.tensor(
+                            [mamba_idx], dtype=torch.int64, device=kv_indices_sub.device
+                        )
+                        secondary_forked = self._fork_mamba_value_for_cache(
+                            mamba_value,
+                            context="cache_finished_req:secondary",
                         )
                         if secondary_forked is None:
                             continue
-                    result = self.insert(
-                        InsertParams(
-                            key=RadixKey(token_ids_sub, req.extra_key),
-                            value=kv_indices_sub,
-                            mamba_value=secondary_forked,
-                            branch_checkpoint_len=cache_len,
+                        result = self.insert(
+                            InsertParams(
+                                key=RadixKey(token_ids_sub, req.extra_key),
+                                value=kv_indices_sub,
+                                mamba_value=secondary_forked,
+                                branch_checkpoint_len=cache_len,
+                            )
                         )
-                    )
-                    mamba_exist = result.mamba_exist
-                    if mamba_exist:
-                        self.req_to_token_pool.mamba_pool.free(secondary_forked)
+                        mamba_exist = result.mamba_exist
+                        if mamba_exist:
+                            self.req_to_token_pool.mamba_pool.free(secondary_forked)
 
-            if track_entries:
-                req.mamba_track_entries = None
-            if self.marconi_enabled:
-                req.kv_cache_protected_len = max(kv_cache_protected_len, new_prefix_len)
+                if self.marconi_enabled:
+                    req.kv_cache_protected_len = max(
+                        kv_cache_protected_len, new_prefix_len
+                    )
+            else:
+                self.token_to_kv_pool_allocator.free(
+                    kv_indices[kv_cache_protected_len:]
+                )
+                mamba_exist = True
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[kv_cache_protected_len:])
             mamba_exist = True
+
+        if track_entries:
+            req.mamba_track_entries = None
 
         if mamba_exist:
             mamba_ping_pong_track_buffer_to_keep = None
@@ -1007,14 +1031,12 @@ class MambaRadixCache(BasePrefixCache):
 
         track_entries = getattr(req, "mamba_track_entries", None)
         if self.marconi_enabled and track_entries:
-            self._marconi_cache_track_entries(
-                req,
-                track_entries,
-                kv_cache_protected_len,
-                kv_indices_orig,
-                token_ids,
+            inserted = self._marconi_cache_track_entries(
+                req, track_entries, kv_cache_protected_len, kv_indices_orig, token_ids
             )
             req.mamba_track_entries = None
+            if not inserted:
+                _skip_cache_unfinished_req(req)
             return
         # kv_indices is the kv indices to be cached
         kv_indices = kv_indices_orig[:cache_len]
@@ -1079,15 +1101,12 @@ class MambaRadixCache(BasePrefixCache):
                 ]
                 page_aligned_len = branch_checkpoint_len
         # Radix tree mamba value is forked from request-local state.
-        mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
-
-        # if alloc mamba cache failed, do evict and alloc again
+        mamba_value_forked = self._fork_mamba_value_for_cache(
+            mamba_value,
+            context="cache_unfinished_req",
+        )
         if mamba_value_forked is None:
-            self.evict(EvictParams(num_tokens=0, mamba_num=1))
-            mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
-                mamba_value
-            )
-            assert mamba_value_forked is not None, "Can not alloc mamba cache"
+            return _skip_cache_unfinished_req(req)
         result = self.insert(
             InsertParams(
                 key=RadixKey(page_aligned_token_ids, req.extra_key),
@@ -1216,13 +1235,14 @@ class MambaRadixCache(BasePrefixCache):
         mamba_value = torch.tensor(
             [mamba_idx], dtype=torch.int64, device=kv_indices.device
         )
-        mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
+        mamba_value_forked = self._fork_mamba_value_for_cache(
+            mamba_value,
+            context="cache_rehydrate",
+        )
         if mamba_value_forked is None:
-            self.evict_mamba(1)
-            mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
-                mamba_value
-            )
-            assert mamba_value_forked is not None, "Can not alloc mamba cache"
+            req.marconi_track_entries = None
+            req.finish_marconi_rehydrate()
+            return
 
         result = self.insert(
             InsertParams(
@@ -1246,13 +1266,13 @@ class MambaRadixCache(BasePrefixCache):
         kv_cache_protected_len: int,
         kv_indices_orig: torch.Tensor,
         token_ids: List[int],
-    ) -> None:
+    ) -> bool:
         entries = sorted(track_entries, key=lambda x: x[0])
         self.marconi_live_track_entry_insert_count += len(entries)
         primary_len, primary_idx = entries[-1]
         cache_len = min(primary_len, len(token_ids))
         if cache_len <= 0:
-            return
+            return False
 
         kv_indices = kv_indices_orig[:cache_len]
         if self.page_size != 1:
@@ -1265,20 +1285,19 @@ class MambaRadixCache(BasePrefixCache):
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
         if page_aligned_len <= 0:
-            return
+            return False
 
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
         mamba_value = torch.tensor(
             [primary_idx], dtype=torch.int64, device=page_aligned_kv_indices.device
         )
-        mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
+        mamba_value_forked = self._fork_mamba_value_for_cache(
+            mamba_value,
+            context="cache_track_entries:primary",
+        )
         if mamba_value_forked is None:
-            self.evict_mamba(1)
-            mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
-                mamba_value
-            )
-            assert mamba_value_forked is not None, "Can not alloc mamba cache"
+            return False
 
         result = self.insert(
             InsertParams(
@@ -1362,16 +1381,12 @@ class MambaRadixCache(BasePrefixCache):
             mamba_value = torch.tensor(
                 [mamba_idx], dtype=torch.int64, device=kv_indices.device
             )
-            mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
-                mamba_value
+            mamba_value_forked = self._fork_mamba_value_for_cache(
+                mamba_value,
+                context="cache_track_entries:secondary",
             )
             if mamba_value_forked is None:
-                self.evict_mamba(1)
-                mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
-                    mamba_value
-                )
-                if mamba_value_forked is None:
-                    continue
+                continue
             result = self.insert(
                 InsertParams(
                     key=RadixKey(token_ids_sub, req.extra_key),
@@ -1383,6 +1398,7 @@ class MambaRadixCache(BasePrefixCache):
             mamba_exist = result.mamba_exist
             if mamba_exist:
                 self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
+        return True
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
