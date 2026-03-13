@@ -37,8 +37,8 @@ class MarconiAdmissionTree:
         min_success_ratio: float = 0.1,
         decay: float = 0.995,
         score_threshold: float = 1.0,
-        max_nodes: Optional[int] = None,
-        max_tokens: Optional[int] = None,
+        max_nodes: Optional[int] = 100_000,
+        max_tokens: Optional[int] = 4_000_000,
         prune_interval: int = 200,
     ):
         self.root_node = AdmissionNode()

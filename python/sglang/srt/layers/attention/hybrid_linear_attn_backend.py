@@ -4,9 +4,15 @@ from typing import Optional, Union
 import torch
 import triton
 import triton.language as tl
+from einops import rearrange
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
+from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
+from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    PAD_SLOT_ID,
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
@@ -16,18 +22,65 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, is_npu
 
 if not is_cpu():
+    from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
+    from sglang.srt.layers.attention.fla.fused_recurrent import (
+        fused_recurrent_gated_delta_rule_update,
+    )
+    from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+        fused_sigmoid_gating_delta_rule_update,
+    )
+    from sglang.srt.layers.attention.fla.kda import (
+        chunk_kda,
+        fused_kda_gate,
+        fused_recurrent_kda,
+    )
+
+if is_npu():
+    from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
+    from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
+    from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
+        fused_sigmoid_gating_delta_rule_update_npu,
+    )
+    from sgl_kernel_npu.mamba.causal_conv1d import (
+        causal_conv1d_fn_npu,
+        causal_conv1d_update_npu,
+    )
+
+    chunk_gated_delta_rule = chunk_gated_delta_rule_npu
+    fused_gdn_gating = fused_gdn_gating_npu
+    fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
+    causal_conv1d_fn = causal_conv1d_fn_npu
+    causal_conv1d_update = causal_conv1d_update_npu
+elif is_cpu():
+    from sgl_kernel.mamba import (
+        causal_conv1d_fn_cpu,
+        causal_conv1d_update_cpu,
+        chunk_gated_delta_rule_cpu,
+    )
+
+    chunk_kda = None
+    fused_kda_gate = None
+    fused_recurrent_gated_delta_rule_update = None
+    fused_recurrent_kda = None
+    chunk_gated_delta_rule = chunk_gated_delta_rule_cpu
+    fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
+    fused_sigmoid_gating_delta_rule_update = (
+        torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu
+    )
+    causal_conv1d_fn = causal_conv1d_fn_cpu
+    causal_conv1d_update = causal_conv1d_update_cpu
 
 logger = logging.getLogger(__name__)
 
@@ -691,6 +744,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 forward_metadata.track_ssm_final_src
             ]
 
+
 class KimiLinearAttnBackend(MambaAttnBackendBase):
     """Attention backend using Mamba kernel."""
 
@@ -1170,6 +1224,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
 
         return core_attn_out
+
 
 class Mamba2AttnBackend(MambaAttnBackendBase):
     """Attention backend wrapper for Mamba2Mixer kernels."""

@@ -384,7 +384,6 @@ class MambaPool:
             ]
             return
 
-        # Copy selected layers only (used by Marconi selective caching).
         for layer in layer_indices:
             for i in range(len(self.mamba_cache.conv)):
                 self.mamba_cache.conv[i][layer, dst_index] = self.mamba_cache.conv[i][

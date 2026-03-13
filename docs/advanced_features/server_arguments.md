@@ -143,22 +143,13 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--radix-eviction-policy` | The eviction policy of radix trees. `lru` stands for Least Recently Used, `lfu` stands for Least Frequently Used, and `slru` stands for Segmented LRU. | `lru` | `lru`, `lfu`, `slru` |
 | `--enable-marconi` | Enable Marconi eviction for the Mamba radix cache. | `False` | bool flag (set to enable) |
 | `--marconi-eff-weight` | FLOP-efficiency weight for eviction utility. | `None` | Type: float |
-| `--marconi-branch-align` | Alignment interval for Marconi branch checkpoints. | `None` | Type: int |
-| `--marconi-two-pass` | Enable two-pass prefill for branch checkpoints. | `None` | Type: bool |
-| `--marconi-no-two-pass` | Disable two-pass prefill for branch checkpoints. | `None` | Type: bool |
-| `--marconi-mamba-layer-mask` | Optional mamba layer mask for cached state (e.g., `0,2,4-6`). | `None` | Type: str |
-| `--marconi-hot-weight` | Weight for hotness in Marconi eviction utility. | `0.2` | Type: float |
-| `--marconi-admission-max-nodes` | Maximum number of nodes tracked by Marconi admission tree. | `None` | Type: int |
-| `--marconi-admission-max-tokens` | Maximum number of logical tokens tracked by Marconi admission tree. | `None` | Type: int |
-| `--marconi-admission-prune-interval` | Insertion interval between Marconi admission-tree pruning passes. | `200` | Type: int |
 
 ### Marconi defaults
 Marconi uses one admission/eviction behavior.
-When Marconi is enabled, two-pass branch prefill is enabled by default.
+When Marconi is enabled, two-pass branch prefill is always enabled.
 When Marconi is enabled and `--mamba-scheduler-strategy` is left at `auto`, it is promoted to `extra_buffer`.
-If `--marconi-mamba-layer-mask` is not set, it defaults to `all` under Marconi.
-If `--marconi-branch-align` is not set, Marconi defaults it to `512`.
-If admission bounds are not set, Marconi defaults to `--marconi-admission-max-nodes 100000` and `--marconi-admission-max-tokens 4000000`.
+Marconi uses an internal branch-alignment interval of `512`.
+Marconi uses internal admission-tree limits of `100000` nodes and `4000000` logical tokens.
 | `--enable-prefill-delayer` | Enable prefill delayer for DP attention to reduce idle time. | `False` | bool flag (set to enable) |
 | `--prefill-delayer-max-delay-passes` | Maximum forward passes to delay prefill. | `30` | Type: int |
 | `--prefill-delayer-token-usage-low-watermark` | Token usage low watermark for prefill delayer. | `None` | Type: float |

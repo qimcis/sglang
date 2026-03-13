@@ -31,6 +31,10 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.mem_cache.marconi_config import (
+    DEFAULT_MARCONI_EFF_WEIGHT,
+    get_marconi_branch_align_interval,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
@@ -355,13 +359,6 @@ class ServerArgs:
     radix_eviction_policy: str = "lru"
     enable_marconi: bool = False
     marconi_eff_weight: Optional[float] = None
-    marconi_eviction_hot_weight: float = 0.2
-    marconi_branch_align_interval: Optional[int] = None
-    marconi_two_pass_branch_prefill: Optional[bool] = None
-    marconi_mamba_layer_mask: Optional[str] = None
-    marconi_admission_max_nodes: Optional[int] = None
-    marconi_admission_max_tokens: Optional[int] = None
-    marconi_admission_prune_interval: int = 200
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
@@ -2894,23 +2891,11 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
-    def _marconi_set_if_default(self, name: str, value):
-        default = getattr(type(self), name)
-        if getattr(self, name) == default:
-            setattr(self, name, value)
-
     def _handle_marconi_mode(self):
         if not self.enable_marconi:
             return
-        self._marconi_set_if_default("marconi_eviction_hot_weight", 0.0)
-        self._marconi_set_if_default("marconi_branch_align_interval", 512)
-        self._marconi_set_if_default("marconi_eff_weight", 0.75)
-        self._marconi_set_if_default("marconi_admission_max_nodes", 100000)
-        self._marconi_set_if_default("marconi_admission_max_tokens", 4000000)
-        if self.marconi_two_pass_branch_prefill is None:
-            self.marconi_two_pass_branch_prefill = True
-        if self.marconi_mamba_layer_mask is None:
-            self.marconi_mamba_layer_mask = "all"
+        if self.marconi_eff_weight is None:
+            self.marconi_eff_weight = DEFAULT_MARCONI_EFF_WEIGHT
 
     def _handle_load_format(self):
         if (
@@ -3094,29 +3079,9 @@ class ServerArgs:
             if self.disable_radix_cache:
                 logger.warning("Marconi is disabled because radix cache is disabled.")
                 self.enable_marconi = False
-            if self.marconi_eviction_hot_weight < 0.0:
-                raise ValueError("marconi_eviction_hot_weight must be non-negative.")
-            if self.marconi_admission_max_nodes is not None:
-                if self.marconi_admission_max_nodes <= 0:
-                    raise ValueError(
-                        "marconi_admission_max_nodes must be positive when set."
-                    )
-            if self.marconi_admission_max_tokens is not None:
-                if self.marconi_admission_max_tokens <= 0:
-                    raise ValueError(
-                        "marconi_admission_max_tokens must be positive when set."
-                    )
-            if self.marconi_admission_prune_interval <= 0:
-                raise ValueError("marconi_admission_prune_interval must be positive.")
-            if self.marconi_branch_align_interval is not None:
-                if self.marconi_branch_align_interval <= 0:
-                    raise ValueError(
-                        "marconi_branch_align_interval must be positive when set."
-                    )
-                if self.marconi_branch_align_interval % self.page_size != 0:
-                    raise ValueError(
-                        "marconi_branch_align_interval must be divisible by page_size."
-                    )
+            if self.marconi_eff_weight is not None and self.marconi_eff_weight < 0.0:
+                raise ValueError("marconi_eff_weight must be non-negative.")
+            get_marconi_branch_align_interval(self.page_size)
 
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
@@ -3767,58 +3732,6 @@ class ServerArgs:
             help="Weight for FLOP efficiency in Marconi eviction utility.",
         )
         parser.add_argument(
-            "--marconi-hot-weight",
-            type=float,
-            default=ServerArgs.marconi_eviction_hot_weight,
-            dest="marconi_eviction_hot_weight",
-            help="Weight for hotness in Marconi eviction utility.",
-        )
-        parser.add_argument(
-            "--marconi-branch-align",
-            type=int,
-            default=ServerArgs.marconi_branch_align_interval,
-            dest="marconi_branch_align_interval",
-            help="Optional alignment interval for Marconi branch checkpoints.",
-        )
-        parser.add_argument(
-            "--marconi-two-pass",
-            action="store_true",
-            dest="marconi_two_pass_branch_prefill",
-            default=None,
-            help="Enable two-pass prefill for branch checkpoints.",
-        )
-        parser.add_argument(
-            "--marconi-no-two-pass",
-            action="store_false",
-            dest="marconi_two_pass_branch_prefill",
-            default=None,
-            help="Disable two-pass prefill for branch checkpoints.",
-        )
-        parser.add_argument(
-            "--marconi-mamba-layer-mask",
-            type=str,
-            default=ServerArgs.marconi_mamba_layer_mask,
-            help="Optional mamba layer mask for cached state (e.g., '0,2,4-6').",
-        )
-        parser.add_argument(
-            "--marconi-admission-max-nodes",
-            type=int,
-            default=ServerArgs.marconi_admission_max_nodes,
-            help="Maximum number of nodes tracked by Marconi admission tree.",
-        )
-        parser.add_argument(
-            "--marconi-admission-max-tokens",
-            type=int,
-            default=ServerArgs.marconi_admission_max_tokens,
-            help="Maximum number of logical tokens tracked by Marconi admission tree.",
-        )
-        parser.add_argument(
-            "--marconi-admission-prune-interval",
-            type=int,
-            default=ServerArgs.marconi_admission_prune_interval,
-            help="Insertion interval between Marconi admission-tree pruning passes.",
-        )
-        parser.add_argument(
             "--enable-prefill-delayer",
             action="store_true",
             help="Enable prefill delayer for DP attention to reduce idle time.",
@@ -3849,36 +3762,6 @@ class ServerArgs:
             default=None,
             help="Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added.",
         )
-        parser.add_argument(
-            "--enable-marconi",
-            action="store_true",
-            help="Enable Marconi eviction and tuning for hybrid radix cache.",
-        )
-        parser.add_argument(
-            "--marconi-eff-weight",
-            type=float,
-            default=ServerArgs.marconi_eff_weight,
-            help="Marconi efficiency weight (alpha) for eviction scoring.",
-        )
-        parser.add_argument(
-            "--marconi-bootstrap-window-size",
-            type=int,
-            default=ServerArgs.marconi_bootstrap_window_size,
-            help="Fixed bootstrap window size for Marconi tuning. If unset, uses marconi-bootstrap-multiplier.",
-        )
-        parser.add_argument(
-            "--marconi-bootstrap-multiplier",
-            type=int,
-            default=ServerArgs.marconi_bootstrap_multiplier,
-            help="Bootstrap window size multiplier when fixed window size is not set.",
-        )
-        parser.add_argument(
-            "--marconi-tuning-interval",
-            type=int,
-            default=ServerArgs.marconi_tuning_interval,
-            help="Number of requests per tuning window for Marconi.",
-        )
-
         # Runtime options
         parser.add_argument(
             "--device",

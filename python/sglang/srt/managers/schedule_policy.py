@@ -387,7 +387,7 @@ class PrefillAdder:
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
-        marconi_two_pass_branch_prefill: bool = True,
+        marconi_branch_prefill: bool = False,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -440,7 +440,7 @@ class PrefillAdder:
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
-        self.marconi_two_pass_branch_prefill = marconi_two_pass_branch_prefill
+        self.marconi_branch_prefill = marconi_branch_prefill
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -615,7 +615,7 @@ class PrefillAdder:
                 _rem_tokens = self.rem_chunk_tokens
         if (
             self.is_hybrid_ssm_cache
-            and self.marconi_two_pass_branch_prefill
+            and self.marconi_branch_prefill
             and req.mamba_branching_seqlen is not None
         ):
             prefix_len = len(req.prefix_indices)
@@ -825,7 +825,7 @@ class PrefillAdder:
             else:
                 trunc_len = None
                 branch_trunc_len = None
-                if self.is_hybrid_ssm_cache and self.marconi_two_pass_branch_prefill:
+                if self.is_hybrid_ssm_cache and self.marconi_branch_prefill:
                     branching_seqlen = req.mamba_branching_seqlen
                     prefix_len = len(req.prefix_indices)
                     if (
@@ -884,9 +884,7 @@ class PrefillAdder:
 
                     # Chunked prefill
                     req.set_extend_input_len(trunc_len)
-                    req.fill_ids = req.fill_ids[
-                        : len(req.prefix_indices) + trunc_len
-                    ]
+                    req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
                     self.can_run_list.append(req)
                     self.new_chunked_req = req
