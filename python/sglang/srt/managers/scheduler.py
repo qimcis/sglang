@@ -875,7 +875,6 @@ class Scheduler(
             pp_size=self.pp_size,
             chunked_prefill_size=server_args.chunked_prefill_size,
             sliding_window_size=self.sliding_window_size,
-            attention_chunk_size=getattr(self, "attention_chunk_size", None),
         )
 
         if (
@@ -1973,9 +1972,7 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
-            if not getattr(req, "_prefill_matched_this_round", False):
-                req.init_next_round_input(self.tree_cache, cow_mamba=False)
-            req._prefill_matched_this_round = False
+            req.init_next_round_input(self.tree_cache, cow_mamba=False)
 
             last_host_node = (
                 req.last_host_backup_node
@@ -2441,9 +2438,7 @@ class Scheduler(
                     req.rid
                 )
 
-            if not getattr(req, "_prefill_matched_this_round", False):
-                req.init_next_round_input(self.tree_cache)
-            req._prefill_matched_this_round = False
+            req.init_next_round_input(self.tree_cache)
 
             res = adder.add_one_req(
                 req,
@@ -2473,9 +2468,6 @@ class Scheduler(
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
-        for req in self.waiting_queue:
-            if getattr(req, "_prefill_matched_this_round", False):
-                req._prefill_matched_this_round = False
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)

@@ -98,7 +98,6 @@ class TreeNode:
 
         self.hit_count = 0
         self.host_ref_counter = 0
-        self.pin_until = 0.0
         # store the host indices of KV cache
         self.host_value = None
         # store hash values of each pages
@@ -608,7 +607,6 @@ class MambaRadixCache(BasePrefixCache):
         if self.marconi_enabled:
             self.marconi_admission_match_count = 0
             self.marconi_admission_branch_count = 0
-            self.marconi_num_reqs_before_eviction = None
             self.marconi_admission_tree = self._make_marconi_admission_tree()
 
     def _marconi_filter_free_indices(

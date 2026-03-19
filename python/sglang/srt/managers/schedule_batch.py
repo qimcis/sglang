@@ -2193,9 +2193,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_entry_req_indices = None
         self.mamba_track_entry_indices = None
         self.mamba_track_entry_seqlens = None
-        self.mamba_track_entry_req_indices = None
-        self.mamba_track_entry_indices = None
-        self.mamba_track_entry_seqlens = None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
