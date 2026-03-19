@@ -28,7 +28,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import is_cpu, is_npu
+from sglang.srt.utils import is_cpu
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
@@ -47,23 +47,7 @@ if not is_cpu():
         fused_recurrent_kda,
     )
 
-if is_npu():
-    from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
-    from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
-    from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
-        fused_sigmoid_gating_delta_rule_update_npu,
-    )
-    from sgl_kernel_npu.mamba.causal_conv1d import (
-        causal_conv1d_fn_npu,
-        causal_conv1d_update_npu,
-    )
-
-    chunk_gated_delta_rule = chunk_gated_delta_rule_npu
-    fused_gdn_gating = fused_gdn_gating_npu
-    fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
-    causal_conv1d_fn = causal_conv1d_fn_npu
-    causal_conv1d_update = causal_conv1d_update_npu
-elif is_cpu():
+if is_cpu():
     from sgl_kernel.mamba import (
         causal_conv1d_fn_cpu,
         causal_conv1d_update_cpu,
@@ -852,10 +836,6 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-            causal_conv1d_fn,
-        )
-
         q_proj_states = kwargs["q_proj_states"]
         k_proj_states = kwargs["k_proj_states"]
         v_proj_states = kwargs["v_proj_states"]
@@ -1197,10 +1177,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             # Only cuda env uses fuse ssm_states update
             recurrent_state = ssm_states
-            recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-            if is_npu():
-                recurrent_state = ssm_states[cache_indices]
-                recurrent_state_indices_args = {}
             core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
                 q=query,
                 k=key,
@@ -1211,13 +1187,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cu_seqlens=query_start_loc,
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
-                **recurrent_state_indices_args,
+                initial_state_indices=cache_indices,
             )
-            if is_npu():
-                last_recurrent_state = last_recurrent_state.to(
-                    ssm_states.dtype, copy=False
-                )
-                ssm_states[cache_indices] = last_recurrent_state
 
             self._track_mamba_state_extend(
                 forward_batch, h, ssm_states, forward_metadata
