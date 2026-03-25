@@ -360,7 +360,6 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
-    enable_marconi: bool = False
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
@@ -3088,7 +3087,16 @@ class ServerArgs:
                 )
 
     def _handle_marconi_mode(self):
-        return
+        if self.radix_eviction_policy != "marconi":
+            return
+        if self.disable_radix_cache:
+            raise ValueError("Cannot enable Marconi when radix cache is disabled.")
+        get_marconi_branch_align_interval(
+            self.page_size, align_interval=self.mamba_cache_chunk_size
+        )
+
+    def enable_marconi_admission(self) -> bool:
+        return self.radix_eviction_policy == "marconi"
 
     def _handle_load_format(self):
         if (
@@ -3329,12 +3337,6 @@ class ServerArgs:
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
-
-        if self.enable_marconi:
-            if self.disable_radix_cache:
-                logger.warning("Disabling Marconi since radix cache is disabled.")
-                self.enable_marconi = False
-            get_marconi_branch_align_interval(self.page_size)
 
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
@@ -3979,12 +3981,7 @@ class ServerArgs:
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, and 'slru' stands for Segmented Least Recently Used.",
-        )
-        parser.add_argument(
-            "--enable-marconi",
-            action="store_true",
-            help="Enable Marconi admission for hybrid radix cache.",
+            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'slru' stands for Segmented Least Recently Used, and 'marconi' enables Marconi admission for hybrid radix cache.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",

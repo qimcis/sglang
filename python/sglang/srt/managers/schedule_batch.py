@@ -1806,8 +1806,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 track_points
             ):
                 align_interval = (
-                    get_marconi_branch_align_interval(server_args.page_size)
-                    if server_args.enable_marconi
+                    get_marconi_branch_align_interval(
+                        server_args.page_size,
+                        align_interval=server_args.mamba_cache_chunk_size,
+                    )
+                    if server_args.enable_marconi_admission()
                     else mamba_cache_chunk_size
                 )
                 if align_interval <= 0:

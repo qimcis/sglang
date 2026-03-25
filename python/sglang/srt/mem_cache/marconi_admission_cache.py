@@ -20,71 +20,24 @@ class AdmissionNode:
         self.value: List[int] = []
         self.prefix_len = 0
         self.extra_key: Optional[str] = None
-        self.insert_count = 0
-        self.hit_count = 0
-        self.success_count = 0
         self.last_access_time = 0
-        self.score = 0.0
-        self.last_score_time = 0
 
 
 class MarconiAdmissionTree:
     def __init__(
         self,
         *,
-        policy: str = "taxonomy",
-        min_hits: int = 2,
-        min_success_ratio: float = 0.1,
-        decay: float = 0.995,
-        score_threshold: float = 1.0,
-        max_nodes: Optional[int] = 100_000,
-        max_tokens: Optional[int] = 4_000_000,
-        prune_interval: int = 200,
+        max_tokens: Optional[int] = None,
     ):
         self.root_node = AdmissionNode()
-        if policy not in ("taxonomy", "thresholded"):
-            raise ValueError(f"Unknown Marconi admission policy: {policy}")
-        self.policy = policy
-        self.min_hits = min_hits
-        self.min_success_ratio = min_success_ratio
-        self.decay = decay
-        self.score_threshold = score_threshold
-        self.max_nodes = max_nodes
         self.max_tokens = max_tokens
-        self.prune_interval = prune_interval
         self.logical_ts = 0
         self.num_nodes = 1
         self.num_tokens = 0
-        self.insertions_since_prune = 0
 
     def _tick(self) -> int:
         self.logical_ts += 1
         return self.logical_ts
-
-    def _update_score(self, node: AdmissionNode, ts: int, add: float = 0.0) -> None:
-        if node.last_score_time != ts:
-            delta = ts - node.last_score_time
-            if delta > 0:
-                node.score *= self.decay**delta
-            node.last_score_time = ts
-        if add:
-            node.score += add
-
-    def _eligible(self, node: Optional[AdmissionNode]) -> bool:
-        if node is None:
-            return False
-        if self.policy == "taxonomy":
-            return True
-        if node.hit_count < self.min_hits:
-            return False
-        success_ratio = (
-            node.success_count / node.hit_count if node.hit_count > 0 else 0.0
-        )
-        if success_ratio < self.min_success_ratio:
-            return False
-        if node.score < self.score_threshold:
-            return False
-        return True
 
     def match_prefix(
         self, token_ids: List[int], extra_key: Optional[str]
@@ -103,15 +56,12 @@ class MarconiAdmissionTree:
             prefix_len = _key_match(child.key, key)
             matched_len += prefix_len
             child.last_access_time = ts
-            child.hit_count += 1
-            self._update_score(child, ts, add=1.0)
             if prefix_len < len(child.key):
-                # Speculative insertion would create an intermediate branch here.
-                if self._eligible(child):
+                if child.children:
                     candidate_node = child
                     candidate_len = matched_len
                 break
-            if len(child.children) >= 2 and self._eligible(child):
+            if len(child.children) >= 2:
                 candidate_node = child
                 candidate_len = child.prefix_len
             key = key[prefix_len:]
@@ -134,35 +84,26 @@ class MarconiAdmissionTree:
                 new_node.value = value
                 new_node.prefix_len = node.prefix_len + len(value)
                 new_node.extra_key = extra_key
-                new_node.insert_count = 1
                 new_node.last_access_time = ts
-                self._update_score(new_node, ts, add=1.0)
                 node.children[child_key] = new_node
                 self.num_nodes += 1
                 self.num_tokens += len(new_node.value)
-                self.insertions_since_prune += 1
                 self._maybe_prune()
                 return
             prefix_len = _key_match(child.key, key)
             if prefix_len == len(child.key):
                 if prefix_len == len(key):
-                    child.insert_count += 1
                     child.last_access_time = ts
-                    self._update_score(child, ts, add=1.0)
-                    self.insertions_since_prune += 1
                     self._maybe_prune()
                     return
                 node = child
                 key = key[prefix_len:]
                 value = value[prefix_len:]
-                child.insert_count += 1
                 child.last_access_time = ts
-                self._update_score(child, ts, add=1.0)
                 continue
             node = self._split_node(child, prefix_len, extra_key)
             key = key[prefix_len:]
             value = value[prefix_len:]
-        self.insertions_since_prune += 1
         self._maybe_prune()
 
     def _split_node(
@@ -203,30 +144,21 @@ class MarconiAdmissionTree:
             prefix_len = _key_match(child.key, key)
             if prefix_len < len(child.key):
                 break
-            child.success_count += 1
             child.last_access_time = ts
-            self._update_score(child, ts, add=weight)
             key = key[prefix_len:]
             node = child
 
     def _maybe_prune(self) -> None:
-        if self.insertions_since_prune < self.prune_interval:
+        if self.max_tokens is None:
             return
-        self.insertions_since_prune = 0
-        if self.max_nodes is None and self.max_tokens is None:
+        if self.num_tokens <= self.max_tokens:
             return
-        self._prune()
-
-    def _prune(self) -> None:
         leaves = self._collect_leaves()
         if not leaves:
             return
         leaves.sort(key=lambda n: n.last_access_time)
         idx = 0
-        while (
-            (self.max_nodes is not None and self.num_nodes > self.max_nodes)
-            or (self.max_tokens is not None and self.num_tokens > self.max_tokens)
-        ) and idx < len(leaves):
+        while self.num_tokens > self.max_tokens and idx < len(leaves):
             node = leaves[idx]
             idx += 1
             if node == self.root_node or node.children:

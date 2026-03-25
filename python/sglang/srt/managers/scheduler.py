@@ -691,10 +691,10 @@ class Scheduler(
         )
 
         marconi_config = None
-        if server_args.enable_marconi:
+        if server_args.enable_marconi_admission():
             if not self.is_hybrid_ssm:
-                logger.warning(
-                    "Marconi is enabled but the model is not using Mamba radix cache."
+                raise ValueError(
+                    "Marconi admission requires a hybrid SSM model with Mamba radix cache."
                 )
             else:
                 marconi_config = MarconiConfig.enabled()
@@ -711,7 +711,11 @@ class Scheduler(
                 if self.server_args.enable_dp_attention
                 else self.tp_cpu_group
             ),
-            eviction_policy=server_args.radix_eviction_policy,
+            eviction_policy=(
+                "lru"
+                if server_args.radix_eviction_policy == "marconi"
+                else server_args.radix_eviction_policy
+            ),
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
             marconi_config=marconi_config,
@@ -2305,7 +2309,7 @@ class Scheduler(
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
-            marconi_branch_prefill=self.server_args.enable_marconi,
+            marconi_branch_prefill=self.server_args.enable_marconi_admission(),
         )
 
         if self.chunked_req is not None:

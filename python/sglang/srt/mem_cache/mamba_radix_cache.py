@@ -56,6 +56,7 @@ from sglang.srt.mem_cache.radix_cache import (
     _key_match_paged,
     get_child_key,
 )
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -418,17 +419,22 @@ class MambaRadixCache(BasePrefixCache):
         ) or isinstance(params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator)
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
+        self.page_size = params.page_size
+        self.disable = params.disable
+        self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
         self.marconi_config = params.marconi_config
         self.marconi_enabled = bool(
             self.marconi_config is not None and self.marconi_config.enable
         )
+        self.marconi_branch_align_interval = 0
+        if self.marconi_enabled:
+            server_args = get_global_server_args()
+            self.marconi_branch_align_interval = get_marconi_branch_align_interval(
+                self.page_size, align_interval=server_args.mamba_cache_chunk_size
+            )
         self.marconi_admission_tree = (
             self._make_marconi_admission_tree() if self.marconi_enabled else None
         )
-
-        self.page_size = params.page_size
-        self.disable = params.disable
-        self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
 
         if not self.enable_mamba_extra_buffer:
             assert (
@@ -460,7 +466,8 @@ class MambaRadixCache(BasePrefixCache):
         return node.mamba_value is not None
 
     def _make_marconi_admission_tree(self) -> MarconiAdmissionTree:
-        return MarconiAdmissionTree()
+        max_tokens = getattr(self.token_to_kv_pool_allocator, "size", None)
+        return MarconiAdmissionTree(max_tokens=max_tokens)
 
     def _fork_mamba_value_for_cache(
         self,
@@ -676,7 +683,7 @@ class MambaRadixCache(BasePrefixCache):
     def _marconi_align_branch_len(self, cache_len: int) -> Optional[int]:
         if cache_len <= 0:
             return None
-        align_interval = get_marconi_branch_align_interval(self.page_size)
+        align_interval = self.marconi_branch_align_interval
         if align_interval <= 1:
             return cache_len
         aligned = cache_len // align_interval * align_interval
@@ -961,8 +968,6 @@ class MambaRadixCache(BasePrefixCache):
         if mamba_exist:
             mamba_ping_pong_track_buffer_to_keep = None
 
-        # Finished requests should not keep ping-pong buffers; keeping one slot
-        # can leave mamba pages allocated but not tracked in the cache.
         if self.enable_mamba_extra_buffer:
             mamba_ping_pong_track_buffer_to_keep = None
 
@@ -991,7 +996,6 @@ class MambaRadixCache(BasePrefixCache):
                 req.req_pool_idx, : len(req.fill_ids)
             ]
 
-            # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
@@ -1017,7 +1021,6 @@ class MambaRadixCache(BasePrefixCache):
             if not inserted:
                 _skip_cache_unfinished_req(req)
             return
-        # kv_indices is the kv indices to be cached
         kv_indices = kv_indices_orig[:cache_len]
         if self.page_size != 1:
             page_aligned_len = len(kv_indices) // self.page_size * self.page_size
@@ -1035,7 +1038,6 @@ class MambaRadixCache(BasePrefixCache):
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
         if self.enable_mamba_extra_buffer:
-            # copy from the ping pong track buffer
             mamba_ping_pong_track_buffer_to_keep = (
                 self.req_to_token_pool.get_mamba_ping_pong_other_idx(
                     req.mamba_next_track_idx
@@ -1056,7 +1058,8 @@ class MambaRadixCache(BasePrefixCache):
                 branch_checkpoint_len = req.mamba_branching_seqlen
             else:
                 branch_align_interval = get_marconi_branch_align_interval(
-                    self.page_size
+                    self.page_size,
+                    align_interval=self.marconi_branch_align_interval,
                 )
                 if (
                     page_aligned_len < req.mamba_branching_seqlen
@@ -1070,16 +1073,12 @@ class MambaRadixCache(BasePrefixCache):
             return _skip_cache_unfinished_req(req)
         if self.marconi_enabled and branch_checkpoint_len is not None:
             self.marconi_live_branch_checkpoint_count += 1
-            # Only cache up to the branch checkpoint when Marconi is enabled.
-            # KV entries beyond the checkpoint are not reusable without a matching
-            # SSM state and should remain request-local.
             if branch_checkpoint_len < page_aligned_len:
                 page_aligned_token_ids = page_aligned_token_ids[:branch_checkpoint_len]
                 page_aligned_kv_indices = page_aligned_kv_indices[
                     :branch_checkpoint_len
                 ]
                 page_aligned_len = branch_checkpoint_len
-        # Radix tree mamba value is forked from request-local state.
         mamba_value_forked = self._fork_mamba_value_for_cache(
             mamba_value,
             context="cache_unfinished_req",
@@ -1110,11 +1109,9 @@ class MambaRadixCache(BasePrefixCache):
                     req.kv_cache_inserted_end = max(
                         req.kv_cache_inserted_end, page_aligned_len
                     )
-        # there is a mamba cache in radix cache, release it
         if mamba_exist:
             self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
 
-        # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
             MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
         )
@@ -1146,7 +1143,6 @@ class MambaRadixCache(BasePrefixCache):
         free_end = min(new_prefix_len, new_cache_protected_len)
         dup_slice = None
         if kv_cache_protected_len < free_end:
-            # Clone before we overwrite req_to_token_pool so we free request-local KV.
             dup_slice = kv_indices_orig[kv_cache_protected_len:free_end].clone()
 
         self.req_to_token_pool.write(
@@ -1167,8 +1163,6 @@ class MambaRadixCache(BasePrefixCache):
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-        # NOTE: this is needed for both page_size == 1 and page_size > 1
         req.prefix_indices = torch.cat(
             [new_indices, kv_indices_orig[len(new_indices) :]]
         )
@@ -1280,7 +1274,6 @@ class MambaRadixCache(BasePrefixCache):
         req.mamba_last_track_seqlen = None
         req.last_node = new_last_node
 
-        # Insert secondary track entries.
         for cache_len, mamba_idx in entries[:-1]:
             cache_len = min(cache_len, len(token_ids))
             if cache_len <= 0:
@@ -1339,7 +1332,6 @@ class MambaRadixCache(BasePrefixCache):
         assert (
             x.mamba_value is not None
         ), f"leaf node mamba value must not be None, {x.id=}"
-        # 1. a leaf node, free full tokens and mamba
         if self.marconi_enabled:
             self._marconi_kv_mask_remove(x.value)
         self.token_to_kv_pool_allocator.free(x.value)
@@ -1347,7 +1339,6 @@ class MambaRadixCache(BasePrefixCache):
         self.req_to_token_pool.mamba_pool.free(x.mamba_value)
         mamba_num_evicted = len(x.mamba_value)
 
-        # 2. get the next node, update the lru lists
         if is_evict_mamba:
             x_next = self.mamba_lru_list.get_prev_no_lock(x)
         else:
@@ -1355,10 +1346,8 @@ class MambaRadixCache(BasePrefixCache):
         self.full_lru_list.remove_node(x)
         self.mamba_lru_list.remove_node(x)
 
-        # 3. delete the leaf node
         self._delete_leaf(x)
 
-        # 4. Iteratively delete tombstone leaves to maintain invariant that leaf nodes are not tombstone
         x, leaf_full_num_evicted = self._iteratively_delete_tombstone_leaf(x)
         full_num_evicted += leaf_full_num_evicted
         return full_num_evicted, mamba_num_evicted, x, x_next
@@ -1383,10 +1372,8 @@ class MambaRadixCache(BasePrefixCache):
         """Evict mamba states. Returns the number of mamba states evicted."""
         if self.disable or mamba_num <= 0:
             return 0
-        # get the least recently used node that is not locked, doesn't have to be a leaf
         x = self.mamba_lru_list.get_lru_no_lock()
         mamba_num_evicted = 0
-        # evict lru leaf nodes until mamba_num_tokens is reached
         while mamba_num_evicted < mamba_num and (self.mamba_lru_list.in_list(x)):
             assert x.mamba_value is not None, f"node has no mamba value, {x.id=}"
             assert (
@@ -1396,15 +1383,12 @@ class MambaRadixCache(BasePrefixCache):
             assert x.mamba_lock_ref == 0, f"node is in use by mamba kv indices, {x.id=}"
 
             if len(x.children) > 0:
-                # 1. an internal node, free mamba tokens.
                 self.req_to_token_pool.mamba_pool.free(x.mamba_value)
                 mamba_num_evicted += len(x.mamba_value)
 
-                # 2. get the next node, update the lru lists
                 x_next = self.mamba_lru_list.get_prev_no_lock(x)
                 self.mamba_lru_list.remove_node(x)
 
-                # 3. tombstone the node
                 self._tombstone_internal_node(x)
             else:
                 _, mamba_evicted_delta, _, x_next = self._evict_leaf_node(x, True)
@@ -1420,7 +1404,6 @@ class MambaRadixCache(BasePrefixCache):
             return 0
 
         full_num_evicted = 0
-        # get the least recently used leaf node that is not locked
         x = self.full_lru_list.get_leaf_lru_no_lock()
 
         while full_num_evicted < full_num_tokens and self.full_lru_list.in_list(x):
@@ -1430,8 +1413,6 @@ class MambaRadixCache(BasePrefixCache):
             full_num_evicted_delta, _, x, x_next = self._evict_leaf_node(x, False)
             full_num_evicted += full_num_evicted_delta
 
-            # if parent has no more children, it is a leaf. It is possible that this node is lru, so
-            # we need to get the first leaf node in the lru list
             if len(x.parent.children) == 0:
                 x_next = self.full_lru_list.get_leaf_lru_no_lock()
 
