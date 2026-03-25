@@ -1,0 +1,24 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+DEFAULT_MAMBA_TRACK_BUFFER_SIZE = 2
+
+
+@dataclass(frozen=True, kw_only=True)
+class MarconiConfig:
+    enable: bool
+
+    @classmethod
+    def enabled(cls) -> "MarconiConfig":
+        return cls(enable=True)
+
+
+def get_marconi_branch_align_interval(
+    page_size: Optional[int] = None, *, align_interval: int = 512
+) -> int:
+    if page_size is not None and page_size > 0:
+        if align_interval % page_size != 0:
+            raise ValueError("Marconi branch alignment must be divisible by page_size.")
+    return align_interval

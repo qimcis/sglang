@@ -178,6 +178,9 @@ from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.marconi_config import (
+    MarconiConfig,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -687,6 +690,15 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
+        marconi_config = None
+        if server_args.enable_marconi:
+            if not self.is_hybrid_ssm:
+                logger.warning(
+                    "Marconi is enabled but the model is not using Mamba radix cache."
+                )
+            else:
+                marconi_config = MarconiConfig.enabled()
+
         # Create cache
         params = CacheInitParams(
             disable=server_args.disable_radix_cache,
@@ -702,6 +714,7 @@ class Scheduler(
             eviction_policy=server_args.radix_eviction_policy,
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
+            marconi_config=marconi_config,
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
@@ -1818,7 +1831,11 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
-            last_host_node = req.last_host_node
+            last_host_node = (
+                req.last_host_backup_node
+                if req.last_host_backup_node is not None
+                else req.last_host_node
+            )
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
@@ -2288,6 +2305,7 @@ class Scheduler(
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
+            marconi_branch_prefill=self.server_args.enable_marconi,
         )
 
         if self.chunked_req is not None:
@@ -2296,6 +2314,8 @@ class Scheduler(
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
+
+        # No marconi-specific prefill reordering.
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
@@ -2342,6 +2362,7 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -2966,6 +2987,11 @@ class Scheduler(
 
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
+
+        if self.tree_cache is not None:
+            runtime_stats = self.tree_cache.get_runtime_stats()
+            if runtime_stats is not None:
+                ret.update(runtime_stats)
 
         # This field is not serializable.
         ret.pop("model_config", None)
