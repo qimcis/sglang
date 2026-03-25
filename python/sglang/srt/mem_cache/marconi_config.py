@@ -3,9 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-DEFAULT_MAMBA_TRACK_BUFFER_SIZE = 2
-
-
 @dataclass(frozen=True, kw_only=True)
 class MarconiConfig:
     enable: bool
