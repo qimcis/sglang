@@ -710,8 +710,6 @@ class MambaRadixCache(BasePrefixCache):
         key = params.key
         value = params.value
         mamba_value = params.mamba_value
-        prev_prefix_len = params.prev_prefix_len
-
         if value is None:
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
         prefix_len, mamba_exist = self._insert_helper(
@@ -719,8 +717,6 @@ class MambaRadixCache(BasePrefixCache):
             key,
             value,
             mamba_value,
-            chunked=params.chunked,
-            prev_prefix_len=prev_prefix_len,
             branchoff_mamba_value=params.branchoff_mamba_value,
             branch_checkpoint_len=params.branch_checkpoint_len,
         )
@@ -855,7 +851,6 @@ class MambaRadixCache(BasePrefixCache):
                         key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
                         value=page_aligned_kv_indices,
                         mamba_value=mamba_value,
-                        prev_prefix_len=req.cache_protected_len,
                     )
                 )
                 new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
@@ -1058,8 +1053,7 @@ class MambaRadixCache(BasePrefixCache):
                 branch_checkpoint_len = req.mamba_branching_seqlen
             else:
                 branch_align_interval = get_marconi_branch_align_interval(
-                    self.page_size,
-                    align_interval=self.marconi_branch_align_interval,
+                    self.page_size
                 )
                 if (
                     page_aligned_len < req.mamba_branching_seqlen
@@ -1090,7 +1084,6 @@ class MambaRadixCache(BasePrefixCache):
                 key=RadixKey(page_aligned_token_ids, req.extra_key),
                 value=page_aligned_kv_indices,
                 mamba_value=mamba_value_forked,
-                prev_prefix_len=req.cache_protected_len,
                 branchoff_mamba_value=(
                     mamba_value_forked if branch_checkpoint else None
                 ),
@@ -1774,8 +1767,6 @@ class MambaRadixCache(BasePrefixCache):
         key: RadixKey,
         value,
         mamba_value,
-        chunked: bool = False,
-        prev_prefix_len: int = 0,
         branchoff_mamba_value=None,
         branch_checkpoint_len: Optional[int] = None,
     ) -> Tuple[int, bool]:
@@ -1812,10 +1803,6 @@ class MambaRadixCache(BasePrefixCache):
             if node.mamba_value is not None:
                 self.mamba_lru_list.reset_node_mru(node)
             prefix_len = self.key_match_fn(node.key, key)
-
-            if prev_prefix_len < total_prefix_length + prefix_len:
-                start = max(0, prev_prefix_len - total_prefix_length)
-                self.token_to_kv_pool_allocator.free(value[start:prefix_len])
 
             total_prefix_length += prefix_len
             key = key[prefix_len:]

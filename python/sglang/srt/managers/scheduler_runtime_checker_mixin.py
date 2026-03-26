@@ -173,7 +173,11 @@ class SchedulerRuntimeCheckerMixin:
             )
             free_mamba_pages = set(free_mamba_pages_list)
             cached_mamba_pages = set(cached_mamba_pages_list)
-            expected_mamba_pages = set(range(self.req_to_token_pool.mamba_pool.size))
+            # Mamba pool slot 0 is reserved for padded dummy writes and is not
+            # part of alloc/free accounting.
+            expected_mamba_pages = set(
+                range(1, self.req_to_token_pool.mamba_pool.size + 1)
+            )
             leaked_mamba_pages = (
                 expected_mamba_pages - free_mamba_pages - cached_mamba_pages
             )
