@@ -178,14 +178,14 @@ from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.marconi_cost_model import (
-    build_marconi_cost_profile,
-)
 from sglang.srt.mem_cache.marconi_config import (
     DEFAULT_MARCONI_BOOTSTRAP_MULTIPLIER,
     DEFAULT_MARCONI_TUNING_INTERVAL,
     MarconiConfig,
     MarconiTuningConfig,
+)
+from sglang.srt.mem_cache.marconi_cost_model import (
+    build_marconi_cost_profile,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
@@ -707,7 +707,9 @@ class Scheduler(
 
             cost_profile = None
             if marconi_eviction_enabled:
-                hf_config = self.model_config.hf_text_config or self.model_config.hf_config
+                hf_config = (
+                    self.model_config.hf_text_config or self.model_config.hf_config
+                )
                 cost_profile = build_marconi_cost_profile(
                     hf_config=hf_config,
                     model_runner=self.tp_worker.model_runner,
@@ -2770,6 +2772,11 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if hasattr(self.tree_cache, "update_scheduler_request_counts"):
+            self.tree_cache.update_scheduler_request_counts(
+                running_req_count=len(self.running_batch.reqs),
+                queue_req_count=len(self.waiting_queue),
+            )
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
@@ -3034,6 +3041,11 @@ class Scheduler(
             ret["step_time_dict"] = self.step_time_dict
 
         if self.tree_cache is not None:
+            if hasattr(self.tree_cache, "update_scheduler_request_counts"):
+                self.tree_cache.update_scheduler_request_counts(
+                    running_req_count=len(self.running_batch.reqs),
+                    queue_req_count=len(self.waiting_queue),
+                )
             runtime_stats = self.tree_cache.get_runtime_stats()
             if runtime_stats is not None:
                 ret.update(runtime_stats)

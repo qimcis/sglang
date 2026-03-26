@@ -629,20 +629,32 @@ class MambaRadixCache(BasePrefixCache):
             self._marconi_get_autotune_target(),
         )
 
-    def _marconi_poll_tuning_future(self) -> None:
+    def update_scheduler_request_counts(
+        self, running_req_count: int, queue_req_count: int
+    ) -> None:
+        self.marconi_last_running_req_count = int(running_req_count)
+        self.marconi_last_queue_req_count = int(queue_req_count)
+
+    def _marconi_poll_tuning_future(self, source: str) -> None:
         if self.marconi_tuning_future is None or not self.marconi_tuning_future.done():
             return
         future = self.marconi_tuning_future
         self.marconi_tuning_future = None
+        self.marconi_last_autotune_poll_source = source
         try:
             tuned_weight = future.result()
         except Exception:
             self.marconi_live_autotune_failures += 1
             self.marconi_last_autotune_status = "failed"
+            self.marconi_last_autotune_apply_source = None
             self.marconi_last_autotune_finished_request_count = (
                 self.marconi_completed_request_count
             )
-            logger.exception("Marconi autotuning failed")
+            logger.exception(
+                "Marconi autotuning failed: source=%s completed_requests=%d",
+                source,
+                self.marconi_completed_request_count,
+            )
             return
         self.marconi_live_autotune_finishes += 1
         self.marconi_last_autotune_status = "finished"
@@ -650,7 +662,9 @@ class MambaRadixCache(BasePrefixCache):
             self.marconi_completed_request_count
         )
         logger.info(
-            "Marconi autotune finished: tuned_weight=%s completed_requests=%d",
+            "Marconi autotune finished: source=%s tuned_weight=%s "
+            "completed_requests=%d",
+            source,
             tuned_weight,
             self.marconi_completed_request_count,
         )
@@ -663,16 +677,38 @@ class MambaRadixCache(BasePrefixCache):
         self.marconi_live_autotune_rounds += 1
         self.marconi_live_autotune_applies += 1
         self.marconi_last_autotune_status = "applied"
+        self.marconi_last_autotune_apply_source = source
         self.marconi_last_autotune_applied_request_count = (
             self.marconi_completed_request_count
         )
+        self.marconi_log_next_eviction_after_apply = True
+        target = self._marconi_get_autotune_target()
+        next_round_ready = (
+            target is not None
+            and self.marconi_window_request_count >= max(1, target)
+            and self.marconi_tuning_future is None
+        )
         logger.info(
             "Marconi autotune applied: old_weight=%.4f new_weight=%.4f "
-            "round=%d completed_requests=%d",
+            "round=%d completed_requests=%d source=%s running_req=%s "
+            "queue_req=%s window_requests=%d target=%s next_round_ready=%s "
+            "evict_full=%d evict_mamba=%d evict_mamba_leaf=%d "
+            "evict_mamba_internal=%d evict_mamba_no_candidate=%d",
             old_weight,
             tuned_weight,
             self.marconi_live_autotune_rounds,
             self.marconi_completed_request_count,
+            source,
+            self.marconi_last_running_req_count,
+            self.marconi_last_queue_req_count,
+            self.marconi_window_request_count,
+            target,
+            next_round_ready,
+            self.marconi_live_evict_full,
+            self.marconi_live_evict_mamba,
+            self.marconi_live_evict_mamba_leaf_count,
+            self.marconi_live_evict_mamba_internal_count,
+            self.marconi_live_evict_mamba_no_candidate_count,
         )
 
     def _marconi_record_insert_event(
@@ -697,7 +733,7 @@ class MambaRadixCache(BasePrefixCache):
     def _marconi_record_finished_request(self, req: Req) -> None:
         if not self.marconi_eviction_enabled:
             return
-        self._marconi_poll_tuning_future()
+        self._marconi_poll_tuning_future("request_finished")
         pending_events = self.marconi_pending_insert_events.pop(req.rid, ())
         insert_events = tuple(
             MarconiReplayInsertEvent(
@@ -723,7 +759,7 @@ class MambaRadixCache(BasePrefixCache):
             return
         if not self.marconi_tuning_config.enabled or self.marconi_tuner_pool is None:
             return
-        self._marconi_poll_tuning_future()
+        self._marconi_poll_tuning_future("maybe_start")
         if self.marconi_tuning_future is not None:
             return
         if self.marconi_bootstrap_window_size is None:
@@ -804,7 +840,7 @@ class MambaRadixCache(BasePrefixCache):
         )
 
     def _get_marconi_live_stats(self) -> dict:
-        self._marconi_poll_tuning_future()
+        self._marconi_poll_tuning_future("runtime_stats")
         hit_rate = (
             self.marconi_live_hit_count / self.marconi_live_match_count
             if self.marconi_live_match_count > 0
@@ -877,6 +913,8 @@ class MambaRadixCache(BasePrefixCache):
             "autotune_rounds": self.marconi_live_autotune_rounds,
             "autotune_failures": self.marconi_live_autotune_failures,
             "autotune_last_skip_reason": self.marconi_last_autotune_skip_reason,
+            "autotune_last_poll_source": self.marconi_last_autotune_poll_source,
+            "autotune_last_apply_source": self.marconi_last_autotune_apply_source,
             "autotune_last_started_request_count": self.marconi_last_autotune_started_request_count,
             "autotune_last_finished_request_count": self.marconi_last_autotune_finished_request_count,
             "autotune_last_applied_request_count": self.marconi_last_autotune_applied_request_count,
@@ -892,6 +930,8 @@ class MambaRadixCache(BasePrefixCache):
                 else None
             ),
             "last_tuned_eff_weight": self.marconi_last_tuned_eff_weight,
+            "scheduler_running_req_count": self.marconi_last_running_req_count,
+            "scheduler_queue_req_count": self.marconi_last_queue_req_count,
             "last_recurrent_flops_saved": self.marconi_last_recurrent_flops_saved,
             "last_attention_flops_saved": self.marconi_last_attention_flops_saved,
             "last_ffn_flops_saved": self.marconi_last_ffn_flops_saved,
@@ -981,6 +1021,8 @@ class MambaRadixCache(BasePrefixCache):
         self.marconi_live_autotune_failures = 0
         self.marconi_last_autotune_status = "idle"
         self.marconi_last_autotune_skip_reason = None
+        self.marconi_last_autotune_poll_source = None
+        self.marconi_last_autotune_apply_source = None
         self.marconi_last_autotune_started_request_count = None
         self.marconi_last_autotune_finished_request_count = None
         self.marconi_last_autotune_applied_request_count = None
@@ -996,6 +1038,9 @@ class MambaRadixCache(BasePrefixCache):
         self.marconi_first_eviction_request_count = None
         self.marconi_bootstrap_window_size = None
         self.marconi_bootstrap_window_uncapped_size = None
+        self.marconi_last_running_req_count = None
+        self.marconi_last_queue_req_count = None
+        self.marconi_log_next_eviction_after_apply = False
         self.marconi_tuning_future: Optional[Future] = None
         self.marconi_tuning_snapshot = self._marconi_snapshot_tree()
         self.marconi_live_log_interval = 50
@@ -1945,9 +1990,26 @@ class MambaRadixCache(BasePrefixCache):
         if self.disable or mamba_num <= 0:
             return 0
         if self.marconi_eviction_enabled:
-            self._marconi_poll_tuning_future()
             before = self.marconi_live_evict_mamba
             self._marconi_evict_mamba(mamba_num)
+            if self.marconi_log_next_eviction_after_apply:
+                self.marconi_log_next_eviction_after_apply = False
+                logger.info(
+                    "Marconi autotune post-apply eviction: kind=mamba "
+                    "completed_requests=%d current_eff_weight=%.4f "
+                    "running_req=%s queue_req=%s evict_full=%d evict_mamba=%d "
+                    "evict_mamba_leaf=%d evict_mamba_internal=%d "
+                    "evict_mamba_no_candidate=%d",
+                    self.marconi_completed_request_count,
+                    self.marconi_eff_weight,
+                    self.marconi_last_running_req_count,
+                    self.marconi_last_queue_req_count,
+                    self.marconi_live_evict_full,
+                    self.marconi_live_evict_mamba,
+                    self.marconi_live_evict_mamba_leaf_count,
+                    self.marconi_live_evict_mamba_internal_count,
+                    self.marconi_live_evict_mamba_no_candidate_count,
+                )
             return self.marconi_live_evict_mamba - before
         x = self.mamba_lru_list.get_lru_no_lock()
         mamba_num_evicted = 0
@@ -1980,9 +2042,26 @@ class MambaRadixCache(BasePrefixCache):
         if self.disable or full_num_tokens <= 0:
             return 0
         if self.marconi_eviction_enabled:
-            self._marconi_poll_tuning_future()
             before = self.marconi_live_evict_full
             self._marconi_evict_full(full_num_tokens)
+            if self.marconi_log_next_eviction_after_apply:
+                self.marconi_log_next_eviction_after_apply = False
+                logger.info(
+                    "Marconi autotune post-apply eviction: kind=full "
+                    "completed_requests=%d current_eff_weight=%.4f "
+                    "running_req=%s queue_req=%s evict_full=%d evict_mamba=%d "
+                    "evict_mamba_leaf=%d evict_mamba_internal=%d "
+                    "evict_mamba_no_candidate=%d",
+                    self.marconi_completed_request_count,
+                    self.marconi_eff_weight,
+                    self.marconi_last_running_req_count,
+                    self.marconi_last_queue_req_count,
+                    self.marconi_live_evict_full,
+                    self.marconi_live_evict_mamba,
+                    self.marconi_live_evict_mamba_leaf_count,
+                    self.marconi_live_evict_mamba_internal_count,
+                    self.marconi_live_evict_mamba_no_candidate_count,
+                )
             return self.marconi_live_evict_full - before
 
         full_num_evicted = 0
