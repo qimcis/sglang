@@ -616,6 +616,18 @@ class MambaRadixCache(BasePrefixCache):
             return self.marconi_bootstrap_window_size
         return self.marconi_tuning_config.tuning_interval
 
+    def _marconi_get_tuning_weight_grid(self) -> tuple[float, ...]:
+        assert self.marconi_tuning_config is not None
+        weight_grid = self.marconi_tuning_config.weight_grid
+        if self.marconi_live_autotune_rounds > 0 or len(weight_grid) <= 5:
+            return weight_grid
+
+        # Keep the first round cheap by probing a small number of evenly spaced
+        # weights over the configured range. Later rounds use the full grid.
+        last_index = len(weight_grid) - 1
+        coarse_indices = {round(last_index * fraction / 4) for fraction in range(5)}
+        return tuple(weight_grid[idx] for idx in sorted(coarse_indices))
+
     def _marconi_note_autotune_skip(self, reason: str) -> None:
         self.marconi_live_autotune_skips += 1
         self.marconi_last_autotune_status = "skipped"
@@ -776,7 +788,7 @@ class MambaRadixCache(BasePrefixCache):
             return
         snapshot = self.marconi_tuning_snapshot
         request_history = list(self.marconi_request_history_window)
-        weight_grid = self.marconi_tuning_config.weight_grid
+        weight_grid = self._marconi_get_tuning_weight_grid()
         self.marconi_tuning_future = self.marconi_tuner_pool.submit(
             tune_marconi_eff_weight,
             snapshot=snapshot,
@@ -790,13 +802,15 @@ class MambaRadixCache(BasePrefixCache):
             self.marconi_completed_request_count
         )
         self.marconi_last_autotune_window_size = len(request_history)
+        self.marconi_last_autotune_weight_grid_size = len(weight_grid)
         logger.info(
             "Marconi autotune started: round=%d completed_requests=%d "
-            "window_requests=%d target=%d current_eff_weight=%.4f",
+            "window_requests=%d target=%d grid_size=%d current_eff_weight=%.4f",
             self.marconi_live_autotune_rounds + 1,
             self.marconi_completed_request_count,
             len(request_history),
             target,
+            len(weight_grid),
             self.marconi_eff_weight,
         )
         self.marconi_tuning_snapshot = self._marconi_snapshot_tree()
@@ -919,6 +933,7 @@ class MambaRadixCache(BasePrefixCache):
             "autotune_last_finished_request_count": self.marconi_last_autotune_finished_request_count,
             "autotune_last_applied_request_count": self.marconi_last_autotune_applied_request_count,
             "autotune_last_window_size": self.marconi_last_autotune_window_size,
+            "autotune_last_weight_grid_size": self.marconi_last_autotune_weight_grid_size,
             "autotune_window_request_count": self.marconi_window_request_count,
             "autotune_target_window_size": self._marconi_get_autotune_target(),
             "requests_before_first_eviction": self.marconi_first_eviction_request_count,
@@ -1027,6 +1042,7 @@ class MambaRadixCache(BasePrefixCache):
         self.marconi_last_autotune_finished_request_count = None
         self.marconi_last_autotune_applied_request_count = None
         self.marconi_last_autotune_window_size = None
+        self.marconi_last_autotune_weight_grid_size = None
         self.marconi_last_tuned_eff_weight = None
         self.marconi_last_recurrent_flops_saved = 0.0
         self.marconi_last_attention_flops_saved = 0.0
