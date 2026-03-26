@@ -20,9 +20,10 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 """
 
 import heapq
+import multiprocessing as mp
 import os
 from collections import defaultdict
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -83,6 +84,7 @@ logger = logging.getLogger(__name__)
 MARCONI_TUNER_MAX_WORKERS = max(
     1, min(get_int_env_var("SGLANG_MARCONI_TUNER_MAX_WORKERS", 1), os.cpu_count() or 1)
 )
+MARCONI_TUNER_MP_CONTEXT = mp.get_context("spawn")
 
 
 class TreeNode:
@@ -480,7 +482,10 @@ class MambaRadixCache(BasePrefixCache):
             self.marconi_eff_weight = self.marconi_config.eff_weight
             self.marconi_tuning_config = self.marconi_config.tuning
             self.marconi_tuner_pool = (
-                ThreadPoolExecutor(max_workers=MARCONI_TUNER_MAX_WORKERS)
+                ProcessPoolExecutor(
+                    max_workers=MARCONI_TUNER_MAX_WORKERS,
+                    mp_context=MARCONI_TUNER_MP_CONTEXT,
+                )
                 if self.marconi_tuning_config.enabled
                 else None
             )
