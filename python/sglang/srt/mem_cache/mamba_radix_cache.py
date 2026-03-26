@@ -20,6 +20,7 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 """
 
 import heapq
+import math
 import multiprocessing as mp
 import os
 from collections import defaultdict
@@ -61,6 +62,7 @@ from sglang.srt.mem_cache.marconi_tuner import (
     MarconiReplayNodeSnapshot,
     MarconiReplayRequest,
     MarconiReplaySnapshot,
+    MarconiTuneResult,
     tune_marconi_eff_weight,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
@@ -654,7 +656,7 @@ class MambaRadixCache(BasePrefixCache):
         self.marconi_tuning_future = None
         self.marconi_last_autotune_poll_source = source
         try:
-            tuned_weight = future.result()
+            tuning_result = future.result()
         except Exception:
             self.marconi_live_autotune_failures += 1
             self.marconi_last_autotune_status = "failed"
@@ -668,22 +670,57 @@ class MambaRadixCache(BasePrefixCache):
                 self.marconi_completed_request_count,
             )
             return
+        if tuning_result is None:
+            self._marconi_note_autotune_skip("empty_result")
+            return
+        assert isinstance(tuning_result, MarconiTuneResult)
+        tuned_weight = tuning_result.best_weight
         self.marconi_live_autotune_finishes += 1
         self.marconi_last_autotune_status = "finished"
         self.marconi_last_autotune_finished_request_count = (
             self.marconi_completed_request_count
         )
+        score_summary = ", ".join(
+            f"{weight:.1f}:{score:.3e}" for weight, score in tuning_result.weight_scores
+        )
+        old_weight = self.marconi_eff_weight
+        active_weight_score = next(
+            (
+                score
+                for weight, score in tuning_result.weight_scores
+                if math.isclose(weight, old_weight, rel_tol=0.0, abs_tol=1e-9)
+            ),
+            None,
+        )
+        stabilized_to_current = (
+            tuned_weight != old_weight
+            and active_weight_score is not None
+            and math.isclose(
+                active_weight_score,
+                tuning_result.best_flops_saved,
+                rel_tol=1e-9,
+                abs_tol=0.0,
+            )
+        )
+        if stabilized_to_current:
+            tuned_weight = old_weight
         logger.info(
             "Marconi autotune finished: source=%s tuned_weight=%s "
-            "completed_requests=%d",
+            "completed_requests=%d window_requests=%d input_tokens=%d "
+            "output_tokens=%d insert_events=%d current_weight=%.4f "
+            "current_score=%s stabilized_to_current=%s scores=[%s]",
             source,
             tuned_weight,
             self.marconi_completed_request_count,
+            tuning_result.request_count,
+            tuning_result.input_token_count,
+            tuning_result.output_token_count,
+            tuning_result.insert_event_count,
+            old_weight,
+            (f"{active_weight_score:.3e}" if active_weight_score is not None else None),
+            stabilized_to_current,
+            score_summary,
         )
-        if tuned_weight is None:
-            self._marconi_note_autotune_skip("empty_result")
-            return
-        old_weight = self.marconi_eff_weight
         self.marconi_eff_weight = tuned_weight
         self.marconi_last_tuned_eff_weight = tuned_weight
         self.marconi_live_autotune_rounds += 1
@@ -694,6 +731,14 @@ class MambaRadixCache(BasePrefixCache):
             self.marconi_completed_request_count
         )
         self.marconi_log_next_eviction_after_apply = True
+        discarded_window_requests = 0
+        if tuned_weight != old_weight:
+            discarded_window_requests = self.marconi_window_request_count
+            # Start the next tuning round from the post-apply cache state so
+            # later windows reflect the active weight instead of mixed history.
+            self.marconi_tuning_snapshot = self._marconi_snapshot_tree()
+            self.marconi_request_history_window = []
+            self.marconi_window_request_count = 0
         target = self._marconi_get_autotune_target()
         next_round_ready = (
             target is not None
@@ -704,6 +749,7 @@ class MambaRadixCache(BasePrefixCache):
             "Marconi autotune applied: old_weight=%.4f new_weight=%.4f "
             "round=%d completed_requests=%d source=%s running_req=%s "
             "queue_req=%s window_requests=%d target=%s next_round_ready=%s "
+            "discarded_window_requests=%d "
             "evict_full=%d evict_mamba=%d evict_mamba_leaf=%d "
             "evict_mamba_internal=%d evict_mamba_no_candidate=%d",
             old_weight,
@@ -716,6 +762,7 @@ class MambaRadixCache(BasePrefixCache):
             self.marconi_window_request_count,
             target,
             next_round_ready,
+            discarded_window_requests,
             self.marconi_live_evict_full,
             self.marconi_live_evict_mamba,
             self.marconi_live_evict_mamba_leaf_count,

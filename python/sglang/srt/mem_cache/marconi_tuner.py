@@ -62,6 +62,17 @@ class MarconiReplayRequest:
         return self.input_ids + self.output_ids
 
 
+@dataclass(frozen=True)
+class MarconiTuneResult:
+    best_weight: float
+    best_flops_saved: float
+    weight_scores: tuple[tuple[float, float], ...]
+    request_count: int
+    input_token_count: int
+    output_token_count: int
+    insert_event_count: int
+
+
 @dataclass
 class _ReplayNode:
     key: tuple[int, ...]
@@ -416,17 +427,20 @@ def tune_marconi_eff_weight(
     snapshot: Optional[MarconiReplaySnapshot],
     request_history_window: list[MarconiReplayRequest],
     weight_grid: tuple[float, ...],
-) -> Optional[float]:
+) -> Optional[MarconiTuneResult]:
     if snapshot is None or not request_history_window or not weight_grid:
         return None
 
     best_weight = None
     best_flops_saved = float("-inf")
+    weight_scores: list[tuple[float, float]] = []
     for eff_weight in weight_grid:
         replay_cache = _ReplayCache(snapshot=snapshot, eff_weight=eff_weight)
         total_flops_saved = 0.0
         for request in request_history_window:
-            matched_len = replay_cache.match_prefix(request.input_ids, request.extra_key)
+            matched_len = replay_cache.match_prefix(
+                request.input_ids, request.extra_key
+            )
             total_flops_saved += replay_cache.cost_profile.recurrent_flops(matched_len)
             total_flops_saved += replay_cache.cost_profile.attn_flops_delta(
                 matched_len, 0
@@ -441,8 +455,24 @@ def tune_marconi_eff_weight(
                     event.branch_checkpoint_len,
                 )
 
+        weight_scores.append((eff_weight, total_flops_saved))
         if total_flops_saved > best_flops_saved:
             best_flops_saved = total_flops_saved
             best_weight = eff_weight
 
-    return best_weight
+    assert best_weight is not None
+    return MarconiTuneResult(
+        best_weight=best_weight,
+        best_flops_saved=best_flops_saved,
+        weight_scores=tuple(weight_scores),
+        request_count=len(request_history_window),
+        input_token_count=sum(
+            len(request.input_ids) for request in request_history_window
+        ),
+        output_token_count=sum(
+            len(request.output_ids) for request in request_history_window
+        ),
+        insert_event_count=sum(
+            len(request.insert_events) for request in request_history_window
+        ),
+    )
