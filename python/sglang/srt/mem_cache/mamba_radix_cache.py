@@ -46,10 +46,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.marconi_admission_cache import MarconiAdmissionTree
-from sglang.srt.mem_cache.marconi_cost_model import MarconiCostProfile
 from sglang.srt.mem_cache.marconi_config import (
     get_marconi_branch_align_interval,
 )
+from sglang.srt.mem_cache.marconi_cost_model import MarconiCostProfile
 from sglang.srt.mem_cache.marconi_replay_core import (
     MarconiReplayCandidateMetrics,
     build_marconi_candidate_metrics,
@@ -678,7 +678,10 @@ class MambaRadixCache(BasePrefixCache):
         )
         if self.marconi_window_request_count < max(1, target):
             return
-        if not self.marconi_request_history_window or self.marconi_tuning_snapshot is None:
+        if (
+            not self.marconi_request_history_window
+            or self.marconi_tuning_snapshot is None
+        ):
             return
         snapshot = self.marconi_tuning_snapshot
         request_history = list(self.marconi_request_history_window)
@@ -1229,9 +1232,7 @@ class MambaRadixCache(BasePrefixCache):
                             )
                         )
                         mamba_exist = result.mamba_exist
-                        self._marconi_record_insert_event(
-                            req, token_ids_sub, cache_len
-                        )
+                        self._marconi_record_insert_event(req, token_ids_sub, cache_len)
                         if mamba_exist:
                             self.req_to_token_pool.mamba_pool.free(secondary_forked)
 
@@ -1344,8 +1345,8 @@ class MambaRadixCache(BasePrefixCache):
             if page_aligned_len == req.mamba_branching_seqlen:
                 branch_checkpoint_len = req.mamba_branching_seqlen
             else:
-                branch_align_interval = get_marconi_branch_align_interval(
-                    self.page_size
+                branch_align_interval = (
+                    self.marconi_branch_align_interval or self.page_size
                 )
                 if (
                     page_aligned_len < req.mamba_branching_seqlen
@@ -2134,7 +2135,7 @@ class MambaRadixCache(BasePrefixCache):
                 dst_index = req.mamba_pool_idx.unsqueeze(0)
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
 
-        value = value_full if use_attn_only else value_full[:mamba_len]
+        value = value_full[:mamba_len]
 
         if self.marconi_enabled:
             matched_len = int(value.numel())

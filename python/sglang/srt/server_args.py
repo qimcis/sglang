@@ -32,8 +32,8 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.mem_cache.marconi_config import (
-    DEFAULT_MARCONI_EFF_WEIGHT,
     DEFAULT_MARCONI_BOOTSTRAP_MULTIPLIER,
+    DEFAULT_MARCONI_EFF_WEIGHT,
     DEFAULT_MARCONI_TUNING_INTERVAL,
     get_marconi_branch_align_interval,
 )
@@ -47,7 +47,6 @@ from sglang.srt.utils.common import (
     get_device_memory_capacity,
     get_device_name,
     get_device_sm,
-    get_free_port,
     get_int_env_var,
     get_quantization_config,
     is_blackwell_supported,
@@ -69,11 +68,10 @@ from sglang.srt.utils.common import (
     nullable_str,
     parse_connector_type,
     torch_release,
-    wait_port_available,
     xpu_has_xmx_support,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
-from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -378,6 +376,7 @@ class ServerArgs:
     pp_async_batch_depth: int = 0
     stream_interval: int = 1
     stream_output: bool = False
+    incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
@@ -514,6 +513,7 @@ class ServerArgs:
     speculative_ngram_max_bfs_breadth: int = 10
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_branch_length: int = 18
+    speculative_ngram_max_trie_depth: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     enable_multi_layer_eagle: bool = False
 
@@ -570,6 +570,8 @@ class ServerArgs:
 
     # Hierarchical sparse attention
     hierarchical_sparse_attention_extra_config: Optional[str] = None
+    enable_hisparse: bool = False
+    hisparse_config: Optional[str] = None
 
     # LMCache
     enable_lmcache: bool = False
@@ -625,6 +627,7 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
+    pre_warm_nccl: bool = dataclasses.field(default_factory=lambda: is_hip())
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -672,6 +675,10 @@ class ServerArgs:
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
 
+    # Context parallelism
+    enable_prefill_context_parallel: bool = False
+    prefill_cp_mode: str = "in-seq-split"
+
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
     dynamic_batch_tokenizer_batch_size: int = 32
@@ -710,6 +717,7 @@ class ServerArgs:
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
     remote_instance_weight_loader_backend: Literal["transfer_engine", "nccl"] = "nccl"
     remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
+    modelexpress_config: Optional[str] = None
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -3088,9 +3096,7 @@ class ServerArgs:
 
         if self.radix_eviction_policy == "marconi":
             if self.disable_radix_cache:
-                raise ValueError(
-                    "Cannot enable Marconi when radix cache is disabled."
-                )
+                raise ValueError("Cannot enable Marconi when radix cache is disabled.")
             if self.marconi_eff_weight < 0.0:
                 raise ValueError("marconi_eff_weight must be non-negative.")
             if self.marconi_bootstrap_multiplier <= 0:
@@ -4885,6 +4891,18 @@ class ServerArgs:
 
         # Hierarchical sparse attention
         parser.add_argument(
+            "--enable-hisparse",
+            action="store_true",
+            help="Enable hierarchical sparse attention",
+        )
+        parser.add_argument(
+            "--hisparse-config",
+            type=str,
+            default=ServerArgs.hisparse_config,
+            help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
+            'Example: \'{"top_k": 2048, "device_buffer_size": 4096}\'',
+        )
+        parser.add_argument(
             "--hierarchical-sparse-attention-extra-config",
             type=str,
             default=ServerArgs.hierarchical_sparse_attention_extra_config,
@@ -5643,8 +5661,19 @@ class ServerArgs:
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
-        return cls(**{attr: getattr(args, attr) for attr in attrs})
+        kwargs = {}
+        for field in dataclasses.fields(cls):
+            if hasattr(args, field.name):
+                kwargs[field.name] = getattr(args, field.name)
+            elif field.default is not dataclasses.MISSING:
+                kwargs[field.name] = field.default
+            elif field.default_factory is not dataclasses.MISSING:
+                kwargs[field.name] = field.default_factory()
+            else:
+                raise AttributeError(
+                    f"Namespace is missing required argument '{field.name}'"
+                )
+        return cls(**kwargs)
 
     def url(self):
         scheme = "https" if self.ssl_certfile else "http"
@@ -6150,6 +6179,32 @@ class ServerArgs:
             return True
         else:
             return False
+
+    @property
+    def _parsed_modelexpress_config(self) -> dict:
+        cache = getattr(self, "_mx_config_cache", None)
+        if cache is not None:
+            return cache
+        if self.modelexpress_config is None:
+            result = {}
+        elif isinstance(self.modelexpress_config, str):
+            result = json.loads(self.modelexpress_config)
+        else:
+            result = self.modelexpress_config
+        object.__setattr__(self, "_mx_config_cache", result)
+        return result
+
+    @property
+    def modelexpress_url(self) -> Optional[str]:
+        return self._parsed_modelexpress_config.get("url")
+
+    @property
+    def modelexpress_model_name(self) -> Optional[str]:
+        return self._parsed_modelexpress_config.get("model_name")
+
+    @property
+    def modelexpress_source(self) -> bool:
+        return self._parsed_modelexpress_config.get("source", False)
 
 
 # NOTE: This is a global variable to hold the server args for scheduler.
