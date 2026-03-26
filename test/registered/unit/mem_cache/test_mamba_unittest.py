@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -13,17 +14,45 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
-from sglang.srt.mem_cache.marconi_config import MarconiConfig
+from sglang.srt.mem_cache.marconi_config import MarconiConfig, MarconiTuningConfig
+from sglang.srt.mem_cache.marconi_cost_model import (
+    MarconiCostProfile,
+    MarconiFFNCost,
+    MarconiRecurrentCost,
+    build_marconi_cost_profile,
+)
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.marconi_tuner import MarconiReplayInsertEvent
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=9, suite="stage-b-test-1-gpu-small")
-register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=9, suite="stage-b-test-small-1-gpu-amd")
+
+
+class _FakeMambaCache:
+    def __init__(self, total_bytes: int):
+        self._total_bytes = total_bytes
+
+    def mem_usage_bytes(self) -> int:
+        return self._total_bytes
+
+
+class _FakeMambaPool:
+    def __init__(self, *, total_bytes: int, size: int, num_layers: int):
+        self.mamba_cache = _FakeMambaCache(total_bytes)
+        self.size = size
+        self.num_mamba_layers = num_layers
+
+
+class _KimiLinearCacheParams:
+    def __init__(self, *, shape, layers):
+        self.shape = shape
+        self.layers = layers
 
 
 class TestMamba(unittest.TestCase):
@@ -35,19 +64,38 @@ class TestMamba(unittest.TestCase):
     def tearDownClass(cls):
         pass
 
-    def _make_marconi_tree(self):
-        set_global_server_args_for_scheduler(
-            ServerArgs(model_path="dummy", page_size=1, radix_eviction_policy="marconi")
+    def _make_dummy_req(self, req_to_token_pool, rid: int):
+        sampling_params = SamplingParams(
+            temperature=0,
+            max_new_tokens=1,
         )
-        size = 32
+        req = Req(
+            rid=rid,
+            origin_input_text="",
+            origin_input_ids=[],
+            sampling_params=sampling_params,
+        )
+        req_to_token_pool.alloc([req])
+        return req
+
+    def _make_marconi_tree(self, eff_weight: float = 4.0):
+        set_global_server_args_for_scheduler(
+            ServerArgs(
+                model_path="dummy",
+                page_size=1,
+                enable_marconi=True,
+                radix_eviction_policy="marconi",
+            )
+        )
+        size = 64
         dtype = torch.bfloat16
         head_num = 2
         head_dim = 64
         num_layers = 8
         global_interval = 4
-        max_num_reqs = 16
-        mamba_cache_size = 16
-        max_context_len = 32
+        max_num_reqs = 32
+        mamba_cache_size = 32
+        max_context_len = 64
         device = get_device()
         full_attention_layer_ids = [
             i for i in range(global_interval - 1, num_layers, global_interval)
@@ -97,16 +145,178 @@ class TestMamba(unittest.TestCase):
             kvcache=pool,
             need_sort=False,
         )
-        tree = MambaRadixCache(
-            params=CacheInitParams(
-                req_to_token_pool=req_to_token_pool,
-                token_to_kv_pool_allocator=allocator,
-                page_size=1,
-                disable=False,
-                marconi_config=MarconiConfig.enabled(),
+        marconi_config = MarconiConfig.enabled(
+            eviction_enabled=True,
+            eff_weight=eff_weight,
+            cost_profile=MarconiCostProfile(
+                recurrent_family="mamba2",
+                recurrent=MarconiRecurrentCost(
+                    family="mamba2",
+                    num_layers=len(mamba_layers),
+                    model_dim=64,
+                    state_size=16,
+                    state_size_bytes=16,
+                ),
+                ffn=MarconiFFNCost(
+                    family="dense_mlp",
+                    num_layers=num_layers,
+                    model_dim=64,
+                    intermediate_size=128,
+                ),
+                num_attn_layers=len(full_attention_layer_ids),
+                model_dim=64,
+                kv_cache_dtype_size=2,
+            ),
+            tuning=MarconiTuningConfig(enabled=False),
+        )
+        params = CacheInitParams(
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            disable=False,
+            marconi_config=marconi_config,
+        )
+        tree = MambaRadixCache(params=params)
+        return tree, req_to_token_pool, allocator
+
+    def _insert_cached_path(
+        self,
+        tree: MambaRadixCache,
+        req_to_token_pool: HybridReqToTokenPool,
+        allocator: TokenToKVPoolAllocator,
+        rid: int,
+        token_ids: list[int],
+        *,
+        branch_token_ids: list[int] | None = None,
+    ):
+        req = self._make_dummy_req(req_to_token_pool, rid)
+        kv_indices = allocator.alloc(len(token_ids))
+        branch_mamba_value = None
+        if branch_token_ids is not None:
+            branch_req = self._make_dummy_req(req_to_token_pool, rid + 10_000)
+            branch_mamba_value = branch_req.mamba_pool_idx.unsqueeze(0)
+        result = tree.insert(
+            InsertParams(
+                key=RadixKey(token_ids),
+                value=kv_indices,
+                mamba_value=req.mamba_pool_idx.unsqueeze(0),
+                branchoff_mamba_value=branch_mamba_value,
+                branch_checkpoint_len=(
+                    len(branch_token_ids) if branch_token_ids is not None else None
+                ),
             )
         )
-        return tree, allocator
+        return req, result
+
+    def test_build_marconi_cost_profile_exact_mamba2_dense(self):
+        hf_config = SimpleNamespace(
+            mamba2_cache_params=SimpleNamespace(
+                shape=SimpleNamespace(state_size=16),
+                layers=[0, 1, 2],
+            ),
+            num_hidden_layers=6,
+            hidden_size=64,
+            intermediate_size=128,
+            full_attention_layer_ids=[1, 3, 5],
+        )
+        model_runner = SimpleNamespace(
+            kv_cache_dtype=torch.bfloat16,
+            hybrid_gdn_config=None,
+        )
+        req_to_token_pool = SimpleNamespace(
+            mamba_pool=_FakeMambaPool(total_bytes=33 * 3 * 16, size=32, num_layers=3)
+        )
+
+        profile = build_marconi_cost_profile(
+            hf_config=hf_config,
+            model_runner=model_runner,
+            req_to_token_pool=req_to_token_pool,
+        )
+
+        self.assertEqual(profile.recurrent_family, "mamba2")
+        self.assertEqual(profile.ffn.family, "dense_mlp")
+
+    def test_build_marconi_cost_profile_exact_gdn_moe(self):
+        hf_config = SimpleNamespace(
+            mamba2_cache_params=SimpleNamespace(
+                shape=SimpleNamespace(state_size=16),
+                layers=[0, 1],
+            ),
+            num_hidden_layers=4,
+            hidden_size=64,
+            moe_intermediate_size=128,
+            num_experts_per_tok=2,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            layers_block_type=["linear", "attention", "linear", "attention"],
+        )
+        model_runner = SimpleNamespace(
+            kv_cache_dtype=torch.bfloat16,
+            hybrid_gdn_config=object(),
+        )
+        req_to_token_pool = SimpleNamespace(
+            mamba_pool=_FakeMambaPool(total_bytes=17 * 2 * 16, size=16, num_layers=2)
+        )
+
+        profile = build_marconi_cost_profile(
+            hf_config=hf_config,
+            model_runner=model_runner,
+            req_to_token_pool=req_to_token_pool,
+        )
+
+        self.assertEqual(profile.recurrent_family, "gdn")
+        self.assertEqual(profile.ffn.family, "moe_topk")
+
+    def test_build_marconi_cost_profile_rejects_unsupported_kda(self):
+        hf_config = SimpleNamespace(
+            mamba2_cache_params=_KimiLinearCacheParams(
+                shape=SimpleNamespace(state_size=16),
+                layers=[0, 1],
+            ),
+            num_hidden_layers=4,
+            hidden_size=64,
+            intermediate_size=128,
+            full_attention_layer_ids=[1, 3],
+        )
+        model_runner = SimpleNamespace(
+            kv_cache_dtype=torch.bfloat16,
+            hybrid_gdn_config=None,
+        )
+        req_to_token_pool = SimpleNamespace(
+            mamba_pool=_FakeMambaPool(total_bytes=17 * 2 * 16, size=16, num_layers=2)
+        )
+
+        profile = build_marconi_cost_profile(
+            hf_config=hf_config,
+            model_runner=model_runner,
+            req_to_token_pool=req_to_token_pool,
+        )
+
+        self.assertIsNone(profile)
+
+    def test_marconi_records_exact_insert_events_for_tuner(self):
+        tree, req_to_token_pool, _ = self._make_marconi_tree()
+        req = self._make_dummy_req(req_to_token_pool, 50)
+        req.origin_input_ids = [1, 2]
+        req.output_ids = [3, 4]
+
+        tree._marconi_record_insert_event(req, [1, 2, 3], 2)
+        tree._marconi_record_insert_event(req, [1, 2, 3, 4], None)
+        tree._marconi_record_finished_request(req)
+
+        replay_request = tree.marconi_request_history_window[-1]
+        self.assertEqual(
+            replay_request.insert_events,
+            (
+                MarconiReplayInsertEvent(token_ids=(1, 2, 3), branch_checkpoint_len=2),
+                MarconiReplayInsertEvent(
+                    token_ids=(1, 2, 3, 4), branch_checkpoint_len=None
+                ),
+            ),
+        )
+        self.assertIsNone(tree.marconi_pending_insert_events.get(req.rid))
 
     def test_hybrid_linear_kv_pool(self):
         size = 16
@@ -195,12 +405,6 @@ class TestMamba(unittest.TestCase):
         assert req_to_token_pool.available_size() == max_num_reqs - 1
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
 
-    def test_marconi_admission_uses_runtime_chunk_alignment_and_capacity(self):
-        tree, allocator = self._make_marconi_tree()
-        self.assertEqual(tree.marconi_branch_align_interval, 64)
-        self.assertIsNotNone(tree.marconi_admission_tree)
-        self.assertEqual(tree.marconi_admission_tree.max_tokens, allocator.size)
-
         req_to_token_pool.free_mamba_cache(req)
         req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
@@ -217,9 +421,91 @@ class TestMamba(unittest.TestCase):
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
 
     def test_mamba_radix_cache_1(self):
-        tree, allocator, req_to_token_pool, make_dummy_req = (
-            self._setup_tree_and_allocator()
+        set_global_server_args_for_scheduler(
+            ServerArgs(model_path="dummy", page_size=1)
         )
+        size = 128
+        dtype = torch.bfloat16
+        head_num = 2
+        head_dim = 256
+        num_layers = 48
+        global_interval = 4
+        max_num_reqs = 10
+        mamba_cache_size = 20
+        max_context_len = 128
+        device = get_device()
+        full_attention_layer_ids = [
+            i for i in range(global_interval - 1, num_layers, global_interval)
+        ]
+
+        mamba_layers = [
+            i for i in range(num_layers) if i not in full_attention_layer_ids
+        ]
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            shape = Mamba2StateShape.create(
+                tp_world_size=1,
+                intermediate_size=4096,
+                n_groups=16,
+                num_heads=32,
+                head_dim=128,
+                state_size=128,
+                conv_kernel=4,
+            )
+            mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
+
+        req_to_token_pool = HybridReqToTokenPool(
+            size=max_num_reqs,
+            mamba_size=mamba_cache_size,
+            mamba_spec_state_size=max_num_reqs,
+            max_context_len=max_context_len,
+            device=device,
+            enable_memory_saver=False,
+            cache_params=mamba2_cache_params,
+            enable_mamba_extra_buffer=False,
+            speculative_num_draft_tokens=3,
+        )
+        pool = HybridLinearKVPool(
+            size=size,
+            dtype=dtype,
+            page_size=1,
+            head_num=head_num,
+            head_dim=head_dim,
+            full_attention_layer_ids=full_attention_layer_ids,
+            enable_kvcache_transpose=False,
+            device=device,
+            enable_memory_saver=False,
+            mamba_pool=req_to_token_pool.mamba_pool,
+        )
+
+        allocator = TokenToKVPoolAllocator(
+            size=size,
+            dtype=dtype,
+            device=device,
+            kvcache=pool,
+            need_sort=False,
+        )
+        params = CacheInitParams(
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            disable=False,
+        )
+        tree = MambaRadixCache(params=params)
+
+        def make_dummy_req():
+            sampling_params = SamplingParams(
+                temperature=0,
+                max_new_tokens=1,
+            )
+            req = Req(
+                rid=0,
+                origin_input_text="",
+                origin_input_ids=[],
+                sampling_params=sampling_params,
+            )
+            req_to_token_pool.alloc([req])
+            return req
+
         mamba_pool = req_to_token_pool.mamba_pool
         print(
             f"[Start] allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
@@ -374,163 +660,68 @@ class TestMamba(unittest.TestCase):
         print(available_and_evictable_str(tree))
         tree.sanity_check()
 
-    def _setup_tree_and_allocator(self):
-        """Helper to create a MambaRadixCache with allocator for testing."""
-        set_global_server_args_for_scheduler(
-            ServerArgs(model_path="dummy", page_size=1)
+    def test_marconi_replay_tokens_use_nearest_live_ancestor(self):
+        tree, req_to_token_pool, allocator = self._make_marconi_tree()
+        self._insert_cached_path(
+            tree, req_to_token_pool, allocator, 1, [1, 2, 5, 7]
         )
-        size = 128
-        dtype = torch.bfloat16
-        head_num = 2
-        head_dim = 256
-        num_layers = 48
-        global_interval = 4
-        max_num_reqs = 10
-        mamba_cache_size = 20
-        max_context_len = 128
-        device = get_device()
-        full_attention_layer_ids = [
-            i for i in range(global_interval - 1, num_layers, global_interval)
-        ]
-        mamba_layers = [
-            i for i in range(num_layers) if i not in full_attention_layer_ids
-        ]
-        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
-            shape = Mamba2StateShape.create(
-                tp_world_size=1,
-                intermediate_size=4096,
-                n_groups=16,
-                num_heads=32,
-                head_dim=128,
-                state_size=128,
-                conv_kernel=4,
-            )
-            mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
-
-        req_to_token_pool = HybridReqToTokenPool(
-            size=max_num_reqs,
-            mamba_size=mamba_cache_size,
-            mamba_spec_state_size=max_num_reqs,
-            max_context_len=max_context_len,
-            device=device,
-            enable_memory_saver=False,
-            cache_params=mamba2_cache_params,
-            enable_mamba_extra_buffer=False,
-            speculative_num_draft_tokens=3,
+        self._insert_cached_path(
+            tree,
+            req_to_token_pool,
+            allocator,
+            2,
+            [1, 2, 3, 4],
+            branch_token_ids=[1, 2],
         )
-        pool = HybridLinearKVPool(
-            size=size,
-            dtype=dtype,
-            page_size=1,
-            head_num=head_num,
-            head_dim=head_dim,
-            full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
-            device=device,
-            enable_memory_saver=False,
-            mamba_pool=req_to_token_pool.mamba_pool,
-        )
-        allocator = TokenToKVPoolAllocator(
-            size=size,
-            dtype=dtype,
-            device=device,
-            kvcache=pool,
-            need_sort=False,
-        )
-        params = CacheInitParams(
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=allocator,
-            page_size=1,
-            disable=False,
-        )
-        tree = MambaRadixCache(params=params)
-
-        def make_dummy_req():
-            sampling_params = SamplingParams(
-                temperature=0,
-                max_new_tokens=1,
-            )
-            req = Req(
-                rid=0,
-                origin_input_text="",
-                origin_input_ids=[],
-                sampling_params=sampling_params,
-            )
-            req_to_token_pool.alloc([req])
-            return req
-
-        return tree, allocator, req_to_token_pool, make_dummy_req
-
-    def test_insert_prev_prefix_len(self):
-        """Test that prev_prefix_len correctly controls which KV indices are freed
-        during insert, covering: full free, partial free across multi-node, and no free.
-        """
-        tree, allocator, req_to_token_pool, make_dummy_req = (
-            self._setup_tree_and_allocator()
+        self._insert_cached_path(
+            tree,
+            req_to_token_pool,
+            allocator,
+            3,
+            [1, 2, 5, 6],
+            branch_token_ids=[1, 2, 5],
         )
 
-        initial_avail = allocator.available_size()
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 5, 7])))
+        leaf_node = result.last_device_node
+        internal_node = leaf_node.parent
+        self.assertEqual(internal_node.prefix_len, 3)
+        self.assertEqual(len(leaf_node.key), 1)
 
-        # Step 1: Insert [1,2,3] to create first node
-        req1 = make_dummy_req()
-        tree.insert(
-            InsertParams(
-                key=RadixKey([1, 2, 3]),
-                value=allocator.alloc(3),
-                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
-            )
+        tree.req_to_token_pool.mamba_pool.free(internal_node.mamba_value)
+        tree.mamba_lru_list.remove_node(internal_node)
+        tree._tombstone_internal_node(internal_node)
+
+        self.assertEqual(tree._marconi_replay_tokens(leaf_node), 2)
+
+    def test_marconi_mamba_eviction_can_tombstone_internal_node(self):
+        tree, req_to_token_pool, allocator = self._make_marconi_tree(eff_weight=8.0)
+        self._insert_cached_path(
+            tree, req_to_token_pool, allocator, 10, [1, 2, 5, 6]
         )
-        assert allocator.available_size() == initial_avail - 3
-
-        # Step 2: Insert [1,2,3,4,5,6,7] with prev_prefix_len=0 (free all matched)
-        # Creates tree: [1,2,3] -> [4,5,6,7]
-        req2 = make_dummy_req()
-        result = tree.insert(
-            InsertParams(
-                key=RadixKey([1, 2, 3, 4, 5, 6, 7]),
-                value=allocator.alloc(7),
-                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
-                prev_prefix_len=0,
-            )
+        self._insert_cached_path(
+            tree,
+            req_to_token_pool,
+            allocator,
+            11,
+            [1, 2, 3, 4],
+            branch_token_ids=[1, 2],
         )
-        assert result.prefix_len == 3
-        # alloc 7, freed 3 (dup prefix [0..2]), stored 4 in new node => net -4
-        assert allocator.available_size() == initial_avail - 3 - 4
-        avail_after_step2 = allocator.available_size()
 
-        # Step 3: Insert [1,2,3,4,5,6,7,8] with prev_prefix_len=2
-        # Matched prefix = 7 (across two nodes: [1,2,3] len=3, [4,5,6,7] len=4)
-        # Protected [0..1], freed [2..6] = 5 slots, new [7] = 1 slot stored
-        req3 = make_dummy_req()
-        result = tree.insert(
-            InsertParams(
-                key=RadixKey([1, 2, 3, 4, 5, 6, 7, 8]),
-                value=allocator.alloc(8),
-                mamba_value=req3.mamba_pool_idx.unsqueeze(0),
-                prev_prefix_len=2,
-            )
-        )
-        assert result.prefix_len == 7
-        # alloc 8, freed 5, stored 1 => net -3
-        assert allocator.available_size() == avail_after_step2 - 3
-        avail_after_step3 = allocator.available_size()
+        branch_node = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey([1, 2, 5, 6]))
+        ).last_device_node.parent
+        branch_node.last_access_time = 100.0
+        leaf_node = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey([1, 2, 5, 6]))
+        ).last_device_node
+        leaf_node.last_access_time = 100.0
 
-        # Step 4: Insert [1,2,3,4,5,6,7,8,9] with prev_prefix_len=8 (covers all matched)
-        # Matched prefix = 8, prev_prefix_len=8 => nothing freed
-        req4 = make_dummy_req()
-        result = tree.insert(
-            InsertParams(
-                key=RadixKey([1, 2, 3, 4, 5, 6, 7, 8, 9]),
-                value=allocator.alloc(9),
-                mamba_value=req4.mamba_pool_idx.unsqueeze(0),
-                prev_prefix_len=8,
-            )
-        )
-        assert result.prefix_len == 8
-        # alloc 9, freed 0, stored 1 => net -9
-        assert allocator.available_size() == avail_after_step3 - 9
-
-        tree.sanity_check()
+        result = tree.evict(EvictParams(mamba_num=1))
+        self.assertEqual(result.mamba_num_evicted, 1)
+        self.assertIsNone(branch_node.mamba_value)
+        self.assertIn(branch_node, tree.root_node.children.values())
+        self.assertIsNotNone(leaf_node.mamba_value)
 
 
 if __name__ == "__main__":

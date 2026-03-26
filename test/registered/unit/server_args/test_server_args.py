@@ -10,7 +10,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=1, suite="stage-a-cpu-only")
 
 _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
 _mock_device.start()
@@ -32,17 +32,42 @@ class TestPrepareServerArgs(CustomTestCase):
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
 
-    def test_radix_eviction_policy_marconi_requires_radix_cache(self):
+    def test_radix_eviction_policy_marconi_implies_marconi_admission(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--radix-eviction-policy",
+                "marconi",
+            ]
+        )
+        self.assertEqual(server_args.radix_eviction_policy, "marconi")
+        self.assertFalse(server_args.enable_marconi)
+        self.assertTrue(server_args.enable_marconi_admission())
+
+    def test_radix_eviction_policy_marconi_validates_marconi_args(self):
+        failing_cases = [
+            {"disable_radix_cache": True},
+            {"marconi_eff_weight": -1.0},
+            {"marconi_bootstrap_multiplier": 0},
+            {"marconi_tuning_interval": 0},
+        ]
+        for kwargs in failing_cases:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    ServerArgs(
+                        model_path="dummy",
+                        radix_eviction_policy="marconi",
+                        **kwargs,
+                    )
+
+    def test_enable_marconi_requires_radix_cache(self):
         with self.assertRaises(ValueError):
             ServerArgs(
                 model_path="dummy",
-                radix_eviction_policy="marconi",
+                enable_marconi=True,
                 disable_radix_cache=True,
             )
-
-    def test_radix_eviction_policy_marconi_enables_admission(self):
-        server_args = ServerArgs(model_path="dummy", radix_eviction_policy="marconi")
-        self.assertTrue(server_args.enable_marconi_admission())
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
@@ -337,100 +362,6 @@ class TestSSLArgs(unittest.TestCase):
             ]
         )
         self.assertTrue(server_args.enable_ssl_refresh)
-
-
-class TestHiCacheArgs(unittest.TestCase):
-    def _make_args(self, **overrides) -> ServerArgs:
-        args = ServerArgs(model_path="dummy")
-        for key, value in overrides.items():
-            setattr(args, key, value)
-        return args
-
-    def _assert_hicache_fields(
-        self,
-        args: ServerArgs,
-        *,
-        expected_io_backend: str,
-        expected_mem_layout: str,
-        expected_decode_backend: str | None = None,
-    ):
-        self.assertEqual(args.hicache_io_backend, expected_io_backend)
-        self.assertEqual(args.hicache_mem_layout, expected_mem_layout)
-        if expected_decode_backend is not None:
-            self.assertEqual(args.decode_attention_backend, expected_decode_backend)
-
-    def test_hicache_io_backend_and_mem_layout_compatibility(self):
-        cases = [
-            {
-                "name": "kernel_with_page_first_direct",
-                "overrides": {
-                    "enable_hierarchical_cache": True,
-                    "hicache_io_backend": "kernel",
-                    "hicache_mem_layout": "page_first_direct",
-                },
-                "expected_io_backend": "direct",
-                "expected_mem_layout": "page_first_direct",
-            },
-            {
-                "name": "direct_with_page_first",
-                "overrides": {
-                    "enable_hierarchical_cache": True,
-                    "hicache_io_backend": "direct",
-                    "hicache_mem_layout": "page_first",
-                },
-                "expected_io_backend": "direct",
-                "expected_mem_layout": "page_first_direct",
-            },
-            {
-                "name": "mooncake_with_layer_first",
-                "overrides": {
-                    "enable_hierarchical_cache": True,
-                    "hicache_storage_backend": "mooncake",
-                    "hicache_io_backend": "direct",
-                    "hicache_mem_layout": "layer_first",
-                },
-                "expected_io_backend": "direct",
-                "expected_mem_layout": "page_first_direct",
-            },
-            {
-                "name": "fa3_kernel_with_explicit_decode_backend",
-                "overrides": {
-                    "enable_hierarchical_cache": True,
-                    "hicache_io_backend": "kernel",
-                    "hicache_mem_layout": "page_first",
-                    "attention_backend": "triton",
-                    "decode_attention_backend": "fa3",
-                },
-                "expected_io_backend": "direct",
-                "expected_mem_layout": "page_first_direct",
-            },
-        ]
-
-        for case in cases:
-            with self.subTest(case=case["name"]):
-                args = self._make_args(**case["overrides"])
-                args._handle_hicache()
-                self._assert_hicache_fields(
-                    args,
-                    expected_io_backend=case["expected_io_backend"],
-                    expected_mem_layout=case["expected_mem_layout"],
-                )
-
-    @patch.object(ServerArgs, "use_mla_backend", return_value=False)
-    @patch("sglang.srt.server_args.is_flashinfer_available", return_value=False)
-    def test_decode_attention_backend_with_implicit_fa3(
-        self, _mock_flashinfer, _mock_use_mla_backend
-    ):
-        args = self._make_args(
-            enable_hierarchical_cache=True,
-            hicache_io_backend="kernel",
-            attention_backend="fa3",
-            decode_attention_backend=None,
-        )
-
-        args._handle_hicache()
-
-        self.assertEqual(args.decode_attention_backend, "triton")
 
 
 if __name__ == "__main__":

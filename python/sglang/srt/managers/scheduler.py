@@ -178,9 +178,14 @@ from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.marconi_cost_model import (
+    build_marconi_cost_profile,
+)
 from sglang.srt.mem_cache.marconi_config import (
+    DEFAULT_MARCONI_BOOTSTRAP_MULTIPLIER,
+    DEFAULT_MARCONI_TUNING_INTERVAL,
     MarconiConfig,
-    MarconiModelStats,
+    MarconiTuningConfig,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
@@ -220,7 +225,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
-from sglang.srt.utils.common import is_float4_e2m1fn_x2, is_npu
+from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -692,188 +697,48 @@ class Scheduler(
         )
 
         marconi_config = None
-        if server_args.enable_marconi_admission():
+        marconi_requested = server_args.enable_marconi_admission()
+        marconi_eviction_enabled = server_args.radix_eviction_policy == "marconi"
+        if marconi_requested or marconi_eviction_enabled:
             if not self.is_hybrid_ssm:
                 raise ValueError(
-                    "Marconi admission requires a hybrid SSM model with Mamba radix cache."
+                    "Marconi requires a hybrid SSM model with Mamba radix cache."
                 )
-            else:
-                marconi_eviction_enabled = (
-                    server_args.radix_eviction_policy == "marconi"
+
+            cost_profile = None
+            if marconi_eviction_enabled:
+                hf_config = self.model_config.hf_text_config or self.model_config.hf_config
+                cost_profile = build_marconi_cost_profile(
+                    hf_config=hf_config,
+                    model_runner=self.tp_worker.model_runner,
+                    req_to_token_pool=self.req_to_token_pool,
                 )
-                marconi_model_stats = None
-                if marconi_eviction_enabled:
-                    cache_params = None
-                    hf_config = (
-                        self.model_config.hf_text_config or self.model_config.hf_config
+                if cost_profile is None:
+                    raise ValueError(
+                        "Marconi eviction does not support this hybrid model yet."
                     )
-                    try:
-                        cache_params = getattr(hf_config, "mamba2_cache_params", None)
-                    except Exception:
-                        cache_params = None
 
-                    kv_cache_dtype = getattr(
-                        self.tp_worker.model_runner, "kv_cache_dtype", None
-                    )
-                    if kv_cache_dtype is not None:
-                        kv_cache_dtype_size = torch._utils._element_size(kv_cache_dtype)
-                        if is_float4_e2m1fn_x2(kv_cache_dtype):
-                            kv_cache_dtype_size = max(1, kv_cache_dtype_size // 2)
-                    else:
-                        kv_cache_dtype_size = 2
-
-                    mamba_state_size_bytes = None
-                    mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
-                    if mamba_pool is not None and getattr(
-                        mamba_pool, "num_mamba_layers", None
-                    ):
-                        try:
-                            total_bytes = mamba_pool.mamba_cache.mem_usage_bytes()
-                            slots = max(1, getattr(mamba_pool, "size", 0) + 1)
-                            mamba_state_size_bytes = int(
-                                total_bytes
-                                / (slots * max(mamba_pool.num_mamba_layers, 1))
-                            )
-                        except Exception:
-                            mamba_state_size_bytes = None
-
-                    if cache_params is not None:
-                        num_mamba_layers = len(cache_params.layers)
-                        if mamba_state_size_bytes is None:
-                            mamba_state_size_bytes = int(
-                                cache_params.mamba_cache_per_req
-                                // max(num_mamba_layers, 1)
-                            )
-                        shape = cache_params.shape
-                        ssm_state_size = getattr(shape, "state_size", None) or getattr(
-                            shape, "head_dim", None
-                        )
-                        model_dim = (
-                            getattr(hf_config, "hidden_size", None)
-                            or getattr(hf_config, "d_model", None)
-                            or getattr(hf_config, "n_embd", None)
-                        )
-                        if (
-                            model_dim is None
-                            and hasattr(shape, "num_heads")
-                            and hasattr(shape, "head_dim")
-                        ):
-                            model_dim = shape.num_heads * shape.head_dim
-                        num_hidden_layers = getattr(
-                            hf_config, "num_hidden_layers", None
-                        )
-                        if hasattr(hf_config, "full_attention_layer_ids"):
-                            num_attn_layers = len(list(hf_config.full_attention_layer_ids))
-                        elif getattr(hf_config, "layers_block_type", None):
-                            num_attn_layers = sum(
-                                1
-                                for layer_type in hf_config.layers_block_type
-                                if layer_type == "attention"
-                            )
-                        elif num_hidden_layers is not None:
-                            num_attn_layers = max(
-                                0, num_hidden_layers - num_mamba_layers
-                            )
-                        else:
-                            num_attn_layers = 0
-                        num_mlp_layers = num_hidden_layers or (
-                            num_mamba_layers + num_attn_layers
-                        )
-                        if (
-                            model_dim is not None
-                            and ssm_state_size is not None
-                            and mamba_state_size_bytes is not None
-                        ):
-                            marconi_model_stats = MarconiModelStats(
-                                model_dim=model_dim,
-                                ssm_state_size=ssm_state_size,
-                                num_mamba_layers=num_mamba_layers,
-                                num_attn_layers=num_attn_layers,
-                                num_mlp_layers=num_mlp_layers,
-                                kv_cache_dtype_size=kv_cache_dtype_size,
-                                mamba_state_size_bytes=mamba_state_size_bytes,
-                            )
-                    if marconi_model_stats is None:
-                        hybrid_pattern = getattr(
-                            hf_config, "hybrid_override_pattern", None
-                        )
-                        if hybrid_pattern:
-                            num_mamba_layers = hybrid_pattern.count("M")
-                            num_attn_layers = hybrid_pattern.count("*")
-                            num_hidden_layers = getattr(
-                                hf_config, "num_hidden_layers", None
-                            )
-                            num_mlp_layers = num_hidden_layers or (
-                                num_mamba_layers + num_attn_layers
-                            )
-                            ssm_state_size = getattr(
-                                hf_config, "ssm_state_size", None
-                            ) or getattr(hf_config, "mamba_state_dim", None)
-                            model_dim = (
-                                getattr(hf_config, "hidden_size", None)
-                                or getattr(hf_config, "d_model", None)
-                                or getattr(hf_config, "n_embd", None)
-                            )
-                            if (
-                                model_dim is not None
-                                and ssm_state_size is not None
-                                and mamba_state_size_bytes is not None
-                            ):
-                                marconi_model_stats = MarconiModelStats(
-                                    model_dim=model_dim,
-                                    ssm_state_size=ssm_state_size,
-                                    num_mamba_layers=num_mamba_layers,
-                                    num_attn_layers=num_attn_layers,
-                                    num_mlp_layers=num_mlp_layers,
-                                    kv_cache_dtype_size=kv_cache_dtype_size,
-                                    mamba_state_size_bytes=mamba_state_size_bytes,
-                                )
-                    if marconi_model_stats is None:
-                        layers_block_type = getattr(hf_config, "layers_block_type", None)
-                        if layers_block_type:
-                            num_attn_layers = sum(
-                                1
-                                for layer_type in layers_block_type
-                                if layer_type == "attention"
-                            )
-                            num_mamba_layers = len(layers_block_type) - num_attn_layers
-                            num_hidden_layers = getattr(
-                                hf_config, "num_hidden_layers", None
-                            ) or len(layers_block_type)
-                            num_mlp_layers = num_hidden_layers
-                            ssm_state_size = (
-                                getattr(hf_config, "linear_key_head_dim", None)
-                                or getattr(hf_config, "ssm_state_size", None)
-                                or getattr(hf_config, "mamba_state_dim", None)
-                            )
-                            model_dim = (
-                                getattr(hf_config, "hidden_size", None)
-                                or getattr(hf_config, "d_model", None)
-                                or getattr(hf_config, "n_embd", None)
-                            )
-                            if (
-                                model_dim is not None
-                                and ssm_state_size is not None
-                                and mamba_state_size_bytes is not None
-                            ):
-                                marconi_model_stats = MarconiModelStats(
-                                    model_dim=model_dim,
-                                    ssm_state_size=ssm_state_size,
-                                    num_mamba_layers=num_mamba_layers,
-                                    num_attn_layers=num_attn_layers,
-                                    num_mlp_layers=num_mlp_layers,
-                                    kv_cache_dtype_size=kv_cache_dtype_size,
-                                    mamba_state_size_bytes=mamba_state_size_bytes,
-                                )
-                    if marconi_model_stats is None:
-                        logger.warning(
-                            "Marconi eviction is enabled but model stats could not be derived."
-                        )
-                marconi_config = MarconiConfig.enabled(
-                    model_stats=marconi_model_stats,
-                    eff_weight=server_args.marconi_eff_weight,
-                    eviction_enabled=marconi_eviction_enabled,
-                )
+            tuning_enabled = (
+                marconi_eviction_enabled and not server_args.disable_marconi_autotune
+            )
+            marconi_config = MarconiConfig.enabled(
+                cost_profile=cost_profile,
+                eff_weight=server_args.marconi_eff_weight,
+                eviction_enabled=marconi_eviction_enabled,
+                tuning=MarconiTuningConfig(
+                    enabled=tuning_enabled,
+                    bootstrap_multiplier=max(
+                        1,
+                        server_args.marconi_bootstrap_multiplier
+                        or DEFAULT_MARCONI_BOOTSTRAP_MULTIPLIER,
+                    ),
+                    tuning_interval=max(
+                        1,
+                        server_args.marconi_tuning_interval
+                        or DEFAULT_MARCONI_TUNING_INTERVAL,
+                    ),
+                ),
+            )
 
         # Create cache
         params = CacheInitParams(
