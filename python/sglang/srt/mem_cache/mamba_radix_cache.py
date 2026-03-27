@@ -841,6 +841,7 @@ class MambaRadixCache(BasePrefixCache):
             snapshot=snapshot,
             request_history_window=request_history,
             weight_grid=weight_grid,
+            is_bootstrap_round=self.marconi_live_autotune_rounds == 0,
         )
         self.marconi_live_autotune_starts += 1
         self.marconi_last_autotune_status = "running"

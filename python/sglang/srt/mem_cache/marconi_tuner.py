@@ -422,14 +422,88 @@ class _ReplayCache:
         self.mamba_used_states -= 1
 
 
+def _select_shortest_recent_suffix(
+    request_history_window: list[MarconiReplayRequest],
+    *,
+    min_requests: int,
+    min_insert_events: int,
+    min_output_tokens: int = 0,
+) -> list[MarconiReplayRequest]:
+    if not request_history_window:
+        return request_history_window
+
+    suffix: list[MarconiReplayRequest] = []
+    suffix_insert_events = 0
+    suffix_output_tokens = 0
+    for request in reversed(request_history_window):
+        suffix.append(request)
+        suffix_insert_events += len(request.insert_events)
+        suffix_output_tokens += len(request.output_ids)
+        if (
+            len(suffix) >= min_requests
+            and suffix_insert_events >= min_insert_events
+            and suffix_output_tokens >= min_output_tokens
+        ):
+            break
+
+    if len(suffix) >= len(request_history_window):
+        return request_history_window
+    return list(reversed(suffix))
+
+
+def _select_replay_request_window(
+    request_history_window: list[MarconiReplayRequest],
+    *,
+    is_bootstrap_round: bool,
+) -> list[MarconiReplayRequest]:
+    if len(request_history_window) <= 32:
+        return request_history_window
+
+    total_insert_events = sum(
+        len(request.insert_events) for request in request_history_window
+    )
+    if total_insert_events <= 0:
+        return request_history_window
+
+    total_output_tokens = sum(
+        len(request.output_ids) for request in request_history_window
+    )
+    if is_bootstrap_round:
+        return _select_shortest_recent_suffix(
+            request_history_window,
+            min_requests=max(
+                24,
+                min(
+                    len(request_history_window), (len(request_history_window) + 2) // 3
+                ),
+            ),
+            min_insert_events=max(
+                1,
+                min(total_insert_events, (total_insert_events + 1) // 2),
+            ),
+            min_output_tokens=max(
+                128,
+                min(total_output_tokens, max(1, total_output_tokens // 3)),
+            ),
+        )
+
+    return request_history_window
+
+
 def tune_marconi_eff_weight(
     *,
     snapshot: Optional[MarconiReplaySnapshot],
     request_history_window: list[MarconiReplayRequest],
     weight_grid: tuple[float, ...],
+    is_bootstrap_round: bool = False,
 ) -> Optional[MarconiTuneResult]:
     if snapshot is None or not request_history_window or not weight_grid:
         return None
+
+    replay_window = _select_replay_request_window(
+        request_history_window,
+        is_bootstrap_round=is_bootstrap_round,
+    )
 
     best_weight = None
     best_flops_saved = float("-inf")
@@ -437,7 +511,7 @@ def tune_marconi_eff_weight(
     for eff_weight in weight_grid:
         replay_cache = _ReplayCache(snapshot=snapshot, eff_weight=eff_weight)
         total_flops_saved = 0.0
-        for request in request_history_window:
+        for request in replay_window:
             matched_len = replay_cache.match_prefix(
                 request.input_ids, request.extra_key
             )
@@ -465,14 +539,8 @@ def tune_marconi_eff_weight(
         best_weight=best_weight,
         best_flops_saved=best_flops_saved,
         weight_scores=tuple(weight_scores),
-        request_count=len(request_history_window),
-        input_token_count=sum(
-            len(request.input_ids) for request in request_history_window
-        ),
-        output_token_count=sum(
-            len(request.output_ids) for request in request_history_window
-        ),
-        insert_event_count=sum(
-            len(request.insert_events) for request in request_history_window
-        ),
+        request_count=len(replay_window),
+        input_token_count=sum(len(request.input_ids) for request in replay_window),
+        output_token_count=sum(len(request.output_ids) for request in replay_window),
+        insert_event_count=sum(len(request.insert_events) for request in replay_window),
     )
