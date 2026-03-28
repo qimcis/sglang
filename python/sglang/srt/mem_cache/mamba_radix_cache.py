@@ -906,11 +906,6 @@ class MambaRadixCache(BasePrefixCache):
             * self.marconi_tuning_config.bootstrap_multiplier,
         )
         self.marconi_bootstrap_window_uncapped_size = bootstrap_window_uncapped_size
-        # The first useful round should happen materially earlier than the full
-        # pre-eviction history size. Once real pressure begins, a smaller
-        # pressure-bearing bootstrap window is usually enough to find a healthy
-        # nonzero weight, and it avoids spending a large fraction of the run at
-        # the default recency-only policy.
         bootstrap_target_cap = min(
             self.marconi_tuning_config.tuning_interval,
             max(128, self.marconi_first_eviction_request_count // 2),
@@ -919,11 +914,6 @@ class MambaRadixCache(BasePrefixCache):
             bootstrap_window_uncapped_size,
             bootstrap_target_cap,
         )
-        # Start the bootstrap phase with the smallest positive coarse-grid
-        # weight. This escapes the known recency-only regime while the first
-        # replay round is still collecting evidence, but keeps the live policy
-        # close to the configured search space and lets autotune override it
-        # quickly if the replay surface disagrees.
         positive_bootstrap_weights = [
             weight for weight in self._marconi_get_tuning_weight_grid() if weight > 0.0
         ]
