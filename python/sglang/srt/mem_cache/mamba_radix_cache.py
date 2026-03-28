@@ -692,8 +692,35 @@ class MambaRadixCache(BasePrefixCache):
             ),
             None,
         )
+        bootstrap_escape_weight = None
+        if (
+            self.marconi_live_autotune_rounds == 0
+            and math.isclose(old_weight, 0.0, rel_tol=0.0, abs_tol=1e-9)
+            and active_weight_score is not None
+            and math.isclose(
+                active_weight_score,
+                tuning_result.best_flops_saved,
+                rel_tol=1e-9,
+                abs_tol=0.0,
+            )
+        ):
+            near_best_positive_weights = [
+                weight
+                for weight, score in tuning_result.weight_scores
+                if weight > 0.0
+                and math.isclose(
+                    score,
+                    tuning_result.best_flops_saved,
+                    rel_tol=1e-9,
+                    abs_tol=0.0,
+                )
+            ]
+            if near_best_positive_weights:
+                bootstrap_escape_weight = min(near_best_positive_weights)
+                tuned_weight = bootstrap_escape_weight
         stabilized_to_current = (
-            tuned_weight != old_weight
+            bootstrap_escape_weight is None
+            and tuned_weight != old_weight
             and active_weight_score is not None
             and math.isclose(
                 active_weight_score,
@@ -879,13 +906,41 @@ class MambaRadixCache(BasePrefixCache):
             * self.marconi_tuning_config.bootstrap_multiplier,
         )
         self.marconi_bootstrap_window_uncapped_size = bootstrap_window_uncapped_size
+        # The first useful round should happen materially earlier than the full
+        # pre-eviction history size. Once real pressure begins, a smaller
+        # pressure-bearing bootstrap window is usually enough to find a healthy
+        # nonzero weight, and it avoids spending a large fraction of the run at
+        # the default recency-only policy.
+        bootstrap_target_cap = min(
+            self.marconi_tuning_config.tuning_interval,
+            max(128, self.marconi_first_eviction_request_count // 2),
+        )
         self.marconi_bootstrap_window_size = min(
             bootstrap_window_uncapped_size,
-            max(
-                self.marconi_first_eviction_request_count,
-                self.marconi_tuning_config.tuning_interval,
-            ),
+            bootstrap_target_cap,
         )
+        # Start the bootstrap phase with the smallest positive coarse-grid
+        # weight. This escapes the known recency-only regime while the first
+        # replay round is still collecting evidence, but keeps the live policy
+        # close to the configured search space and lets autotune override it
+        # quickly if the replay surface disagrees.
+        positive_bootstrap_weights = [
+            weight for weight in self._marconi_get_tuning_weight_grid() if weight > 0.0
+        ]
+        bootstrap_warm_weight = (
+            positive_bootstrap_weights[(len(positive_bootstrap_weights) - 1) // 2]
+            if positive_bootstrap_weights
+            else None
+        )
+        if bootstrap_warm_weight is not None and math.isclose(
+            self.marconi_eff_weight, 0.0, rel_tol=0.0, abs_tol=1e-9
+        ):
+            self.marconi_eff_weight = bootstrap_warm_weight
+            logger.info(
+                "Marconi autotune bootstrap warm start: first_eviction_request=%d warm_weight=%.4f",
+                self.marconi_first_eviction_request_count,
+                self.marconi_eff_weight,
+            )
         # Start the first replay window from the first real eviction. Pre-eviction
         # traffic does not exercise eviction and only makes the bootstrap replay
         # later and more expensive.
