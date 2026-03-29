@@ -503,6 +503,12 @@ class MambaRadixCache(BasePrefixCache):
             self._make_marconi_admission_tree() if self.marconi_enabled else None
         )
 
+        self.tp_group = params.tp_cache_group
+        self.tp_world_size = (
+            1
+            if self.tp_group is None
+            else torch.distributed.get_world_size(group=self.tp_group)
+        )
         self.page_size = params.page_size
         self.disable = params.disable
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
@@ -650,9 +656,22 @@ class MambaRadixCache(BasePrefixCache):
         self.marconi_last_queue_req_count = int(queue_req_count)
 
     def _marconi_poll_tuning_future(self, source: str) -> None:
-        if self.marconi_tuning_future is None or not self.marconi_tuning_future.done():
+        if self.marconi_tuning_future is None:
             return
         future = self.marconi_tuning_future
+        if self.tp_world_size > 1:
+            ready = torch.tensor(
+                [1 if future.done() else 0], dtype=torch.int64, device="cpu"
+            )
+            torch.distributed.all_reduce(
+                ready,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+            if ready.item() == 0:
+                return
+        elif not future.done():
+            return
         self.marconi_tuning_future = None
         self.marconi_last_autotune_poll_source = source
         try:
@@ -718,6 +737,11 @@ class MambaRadixCache(BasePrefixCache):
             if near_best_positive_weights:
                 bootstrap_escape_weight = min(near_best_positive_weights)
                 tuned_weight = bootstrap_escape_weight
+        best_gain_over_current = None
+        if active_weight_score is not None and active_weight_score != 0.0:
+            best_gain_over_current = (
+                tuning_result.best_flops_saved - active_weight_score
+            ) / abs(active_weight_score)
         stabilized_to_current = (
             bootstrap_escape_weight is None
             and tuned_weight != old_weight
@@ -729,13 +753,28 @@ class MambaRadixCache(BasePrefixCache):
                 abs_tol=0.0,
             )
         )
-        if stabilized_to_current:
+        low_signal_keep_current = (
+            bootstrap_escape_weight is None
+            and self.marconi_live_autotune_rounds > 0
+            and tuned_weight != old_weight
+            and best_gain_over_current is not None
+            and best_gain_over_current < 0.015
+        )
+        queue_free_keep_current = (
+            bootstrap_escape_weight is None
+            and tuned_weight != old_weight
+            and self.marconi_last_queue_req_count == 0
+            and old_weight > 0.0
+        )
+        if stabilized_to_current or low_signal_keep_current or queue_free_keep_current:
             tuned_weight = old_weight
         logger.info(
             "Marconi autotune finished: source=%s tuned_weight=%s "
             "completed_requests=%d window_requests=%d input_tokens=%d "
             "output_tokens=%d insert_events=%d current_weight=%.4f "
-            "current_score=%s stabilized_to_current=%s scores=[%s]",
+            "current_score=%s best_gain_over_current=%s "
+            "stabilized_to_current=%s low_signal_keep_current=%s "
+            "queue_free_keep_current=%s scores=[%s]",
             source,
             tuned_weight,
             self.marconi_completed_request_count,
@@ -745,7 +784,14 @@ class MambaRadixCache(BasePrefixCache):
             tuning_result.insert_event_count,
             old_weight,
             (f"{active_weight_score:.3e}" if active_weight_score is not None else None),
+            (
+                f"{best_gain_over_current:.4%}"
+                if best_gain_over_current is not None
+                else None
+            ),
             stabilized_to_current,
+            low_signal_keep_current,
+            queue_free_keep_current,
             score_summary,
         )
         self.marconi_eff_weight = tuned_weight
@@ -896,6 +942,7 @@ class MambaRadixCache(BasePrefixCache):
         if (
             not self.marconi_eviction_enabled
             or self.marconi_tuning_config is None
+            or not self.marconi_tuning_config.enabled
             or self.marconi_first_eviction_request_count is not None
         ):
             return
