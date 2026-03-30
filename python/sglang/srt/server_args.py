@@ -357,7 +357,6 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
-    enable_marconi: bool = False
     marconi_eff_weight: float = DEFAULT_MARCONI_EFF_WEIGHT
     disable_marconi_autotune: bool = False
     marconi_bootstrap_multiplier: int = DEFAULT_MARCONI_BOOTSTRAP_MULTIPLIER
@@ -812,9 +811,6 @@ class ServerArgs:
 
         # Handle speculative decoding logic.
         self._handle_speculative_decoding()
-
-        # Handle Marconi mode defaults.
-        self._handle_marconi_mode()
 
         # Handle model loading format.
         self._handle_load_format()
@@ -2904,12 +2900,8 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
-    def _handle_marconi_mode(self):
-        if self.enable_marconi and self.disable_radix_cache:
-            raise ValueError("Cannot enable Marconi when radix cache is disabled.")
-
     def enable_marconi_admission(self) -> bool:
-        return self.enable_marconi or self.radix_eviction_policy == "marconi"
+        return self.radix_eviction_policy == "marconi"
 
     def _handle_load_format(self):
         if (
@@ -3739,12 +3731,7 @@ class ServerArgs:
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'slru' stands for Segmented Least Recently Used, and 'marconi' enables Marconi eviction for hybrid radix cache.",
-        )
-        parser.add_argument(
-            "--enable-marconi",
-            action="store_true",
-            help="Enable Marconi admission for hybrid radix cache. This is implied when --radix-eviction-policy=marconi.",
+            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'slru' stands for Segmented Least Recently Used, and 'marconi' enables Marconi admission and FLOP-aware eviction for hybrid radix cache.",
         )
         parser.add_argument(
             "--marconi-eff-weight",

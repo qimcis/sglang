@@ -42,7 +42,6 @@ class TestPrepareServerArgs(CustomTestCase):
             ]
         )
         self.assertEqual(server_args.radix_eviction_policy, "marconi")
-        self.assertFalse(server_args.enable_marconi)
         self.assertTrue(server_args.enable_marconi_admission())
 
     def test_radix_eviction_policy_marconi_validates_marconi_args(self):
@@ -60,15 +59,6 @@ class TestPrepareServerArgs(CustomTestCase):
                         radix_eviction_policy="marconi",
                         **kwargs,
                     )
-
-    def test_enable_marconi_requires_radix_cache(self):
-        with self.assertRaises(ValueError):
-            ServerArgs(
-                model_path="dummy",
-                enable_marconi=True,
-                disable_radix_cache=True,
-            )
-
 
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):

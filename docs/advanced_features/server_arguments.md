@@ -140,18 +140,17 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--page-size` | The number of tokens in a page. | `1` | Type: int |
 | `--swa-full-tokens-ratio` | The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens. | `0.8` | Type: float |
 | `--disable-hybrid-swa-memory` | Disable the hybrid SWA memory. | `False` | bool flag (set to enable) |
-| `--radix-eviction-policy` | The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'slru' stands for Segmented Least Recently Used, and 'marconi' enables Marconi FLOP-aware eviction for hybrid radix cache. | `lru` | `lru`, `lfu`, `slru`, `marconi` |
-| `--enable-marconi` | Enable Marconi admission for the hybrid radix cache. This is implied by `--radix-eviction-policy marconi`. | `False` | bool flag (set to enable) |
+| `--radix-eviction-policy` | The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'slru' stands for Segmented Least Recently Used, and 'marconi' enables Marconi admission and FLOP-aware eviction for hybrid radix cache. | `lru` | `lru`, `lfu`, `slru`, `marconi` |
 | `--marconi-eff-weight` | FLOP-efficiency weight for Marconi eviction utility when `--radix-eviction-policy=marconi`. | `0.0` | Type: float |
 | `--disable-marconi-autotune` | Disable Marconi eviction autotuning and keep `--marconi-eff-weight` fixed. | `False` | bool flag (set to enable) |
 | `--marconi-bootstrap-multiplier` | Bootstrap window multiplier used after the first Marconi eviction. | `5` | Type: int |
 | `--marconi-tuning-interval` | Number of completed requests between Marconi tuning attempts after bootstrap. | `500` | Type: int |
 
 ### Marconi defaults
-Marconi eviction is enabled with `--radix-eviction-policy marconi`.
+Marconi is enabled with `--radix-eviction-policy marconi`.
 Marconi eviction requires a supported hybrid SSM model with an exact Marconi cost profile.
-When Marconi admission is enabled, two-pass branch prefill is always enabled.
-When Marconi admission is enabled and `--mamba-scheduler-strategy` is left at `auto`, it is promoted to `extra_buffer`.
+When Marconi is enabled, two-pass branch prefill is always enabled.
+When Marconi is enabled and `--mamba-scheduler-strategy` is left at `auto`, it is promoted to `extra_buffer`.
 Marconi uses the runtime Mamba cache chunk size as its branch-alignment interval.
 Marconi derives admission-tree token limits from the active KV cache capacity.
 | `--enable-prefill-delayer` | Enable prefill delayer for DP attention to reduce idle time. | `False` | bool flag (set to enable) |

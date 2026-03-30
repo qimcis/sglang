@@ -83,7 +83,6 @@ class TestMamba(unittest.TestCase):
             ServerArgs(
                 model_path="dummy",
                 page_size=1,
-                enable_marconi=True,
                 radix_eviction_policy="marconi",
             )
         )
