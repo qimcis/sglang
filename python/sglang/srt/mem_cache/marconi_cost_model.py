@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.marconi_utils import (
     get_attn_flops,
     get_dense_mlp_flops,
     get_gdn_flops,
+    get_kda_flops,
     get_kv_cache_size_bytes,
     get_mamba2_flops,
     get_moe_mlp_flops,
@@ -28,21 +29,32 @@ class _MarconiProfileBuildContext:
 
 @dataclass(frozen=True, kw_only=True)
 class MarconiRecurrentCost:
-    family: Literal["mamba2", "gdn"]
+    family: Literal["mamba2", "gdn", "kda"]
     num_layers: int
     model_dim: int
     state_size: int
     state_size_bytes: int
+    intermediate_size: int | None = None
+    conv_dim: int | None = None
     key_dim: int | None = None
     value_dim: int | None = None
     num_value_heads: int | None = None
+    num_heads: int | None = None
+    projection_dim: int | None = None
+    conv_kernel: int | None = None
 
     def flops(self, replay_tokens: int) -> float:
         if replay_tokens <= 0 or self.num_layers <= 0:
             return 0.0
         if self.family == "mamba2":
             return self.num_layers * get_mamba2_flops(
-                replay_tokens, self.model_dim, self.state_size
+                replay_tokens,
+                self.model_dim,
+                self.state_size,
+                self.intermediate_size,
+                self.conv_dim,
+                self.num_heads,
+                self.conv_kernel,
             )
         if self.family == "gdn":
             if (
@@ -58,6 +70,24 @@ class MarconiRecurrentCost:
                 self.value_dim,
                 self.state_size,
                 self.num_value_heads,
+                self.conv_kernel,
+            )
+        if self.family == "kda":
+            if (
+                self.num_heads is None
+                or self.projection_dim is None
+                or self.conv_kernel is None
+            ):
+                raise ValueError(
+                    "KDA cost profile is missing head/projection/conv dimensions."
+                )
+            return self.num_layers * get_kda_flops(
+                replay_tokens,
+                self.model_dim,
+                self.projection_dim,
+                self.state_size,
+                self.num_heads,
+                self.conv_kernel,
             )
         raise ValueError(f"Unsupported Marconi recurrent family: {self.family}")
 
@@ -207,6 +237,13 @@ def _build_marconi_ffn_cost(hf_config, model_dim: int) -> MarconiFFNCost | None:
         or getattr(hf_config, "moe_shared_expert_intermediate_size", None)
         or 0
     )
+    if shared_expert_intermediate_size == 0 and moe_intermediate_size is not None:
+        num_shared_experts = (
+            getattr(hf_config, "num_shared_experts", None)
+            or getattr(hf_config, "n_shared_experts", None)
+            or 0
+        )
+        shared_expert_intermediate_size = num_shared_experts * moe_intermediate_size
     if moe_top_k is not None and moe_intermediate_size is not None:
         return MarconiFFNCost(
             family="moe_topk",
@@ -253,6 +290,10 @@ def _build_exact_mamba2_recurrent_cost(
         model_dim=model_dim,
         state_size=state_size,
         state_size_bytes=state_size_bytes,
+        intermediate_size=getattr(shape, "intermediate_size", None),
+        conv_dim=getattr(shape, "conv_dim", None),
+        num_heads=getattr(shape, "num_heads", None),
+        conv_kernel=getattr(shape, "conv_kernel", None),
     )
 
 
@@ -286,12 +327,42 @@ def _build_exact_gdn_recurrent_cost(
         key_dim=key_heads * key_head_dim,
         value_dim=value_heads * value_head_dim,
         num_value_heads=value_heads,
+        conv_kernel=getattr(hf_config, "linear_conv_kernel_dim", None),
+    )
+
+
+def _build_exact_kda_recurrent_cost(
+    *,
+    hf_config,
+    cache_params,
+    state_size_bytes: int,
+    model_dim: int,
+) -> Optional[MarconiRecurrentCost]:
+    shape = getattr(cache_params, "shape", None)
+    linear_attn_config = getattr(hf_config, "linear_attn_config", None) or {}
+    state_size = getattr(shape, "head_dim", None)
+    num_heads = getattr(shape, "num_heads", None) or linear_attn_config.get("num_heads")
+    conv_kernel = getattr(shape, "conv_kernel", None) or linear_attn_config.get(
+        "short_conv_kernel_size"
+    )
+    if state_size is None or num_heads is None or conv_kernel is None:
+        return None
+    return MarconiRecurrentCost(
+        family="kda",
+        num_layers=len(cache_params.layers),
+        model_dim=model_dim,
+        state_size=state_size,
+        state_size_bytes=state_size_bytes,
+        num_heads=num_heads,
+        projection_dim=num_heads * state_size,
+        conv_kernel=conv_kernel,
     )
 
 
 _EXACT_RECURRENT_BUILDERS = {
     "mamba2": _build_exact_mamba2_recurrent_cost,
     "gdn": _build_exact_gdn_recurrent_cost,
+    "kda": _build_exact_kda_recurrent_cost,
 }
 
 

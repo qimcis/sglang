@@ -3,7 +3,12 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.configs.mamba_utils import (
+    KimiLinearCacheParams,
+    KimiLinearStateShape,
+    Mamba2CacheParams,
+    Mamba2StateShape,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
@@ -47,12 +52,6 @@ class _FakeMambaPool:
         self.mamba_cache = _FakeMambaCache(total_bytes)
         self.size = size
         self.num_mamba_layers = num_layers
-
-
-class _KimiLinearCacheParams:
-    def __init__(self, *, shape, layers):
-        self.shape = shape
-        self.layers = layers
 
 
 class TestMamba(unittest.TestCase):
@@ -210,7 +209,13 @@ class TestMamba(unittest.TestCase):
     def test_build_marconi_cost_profile_exact_mamba2_dense(self):
         hf_config = SimpleNamespace(
             mamba2_cache_params=SimpleNamespace(
-                shape=SimpleNamespace(state_size=16),
+                shape=SimpleNamespace(
+                    state_size=16,
+                    intermediate_size=128,
+                    conv_dim=160,
+                    num_heads=8,
+                    conv_kernel=4,
+                ),
                 layers=[0, 1, 2],
             ),
             num_hidden_layers=6,
@@ -234,6 +239,10 @@ class TestMamba(unittest.TestCase):
 
         self.assertEqual(profile.recurrent_family, "mamba2")
         self.assertEqual(profile.ffn.family, "dense_mlp")
+        self.assertEqual(profile.recurrent.intermediate_size, 128)
+        self.assertEqual(profile.recurrent.conv_dim, 160)
+        self.assertEqual(profile.recurrent.num_heads, 8)
+        self.assertEqual(profile.recurrent.conv_kernel, 4)
 
     def test_build_marconi_cost_profile_exact_gdn_moe(self):
         hf_config = SimpleNamespace(
@@ -245,10 +254,12 @@ class TestMamba(unittest.TestCase):
             hidden_size=64,
             moe_intermediate_size=128,
             num_experts_per_tok=2,
+            num_shared_experts=2,
             linear_num_key_heads=2,
             linear_num_value_heads=2,
             linear_key_head_dim=8,
             linear_value_head_dim=8,
+            linear_conv_kernel_dim=4,
             layers_block_type=["linear", "attention", "linear", "attention"],
         )
         model_runner = SimpleNamespace(
@@ -267,17 +278,31 @@ class TestMamba(unittest.TestCase):
 
         self.assertEqual(profile.recurrent_family, "gdn")
         self.assertEqual(profile.ffn.family, "moe_topk")
+        self.assertEqual(profile.recurrent.conv_kernel, 4)
+        self.assertEqual(profile.ffn.shared_expert_intermediate_size, 256)
 
-    def test_build_marconi_cost_profile_rejects_unsupported_kda(self):
+    def test_build_marconi_cost_profile_exact_kda_dense(self):
         hf_config = SimpleNamespace(
-            mamba2_cache_params=_KimiLinearCacheParams(
-                shape=SimpleNamespace(state_size=16),
+            mamba2_cache_params=KimiLinearCacheParams(
+                shape=KimiLinearStateShape.create(
+                    tp_world_size=1,
+                    num_heads=8,
+                    head_dim=16,
+                    conv_kernel_size=4,
+                ),
                 layers=[0, 1],
             ),
             num_hidden_layers=4,
             hidden_size=64,
             intermediate_size=128,
             full_attention_layer_ids=[1, 3],
+            linear_attn_config={
+                "num_heads": 8,
+                "head_dim": 16,
+                "short_conv_kernel_size": 4,
+                "kda_layers": [1, 2],
+                "full_attn_layers": [3, 4],
+            },
         )
         model_runner = SimpleNamespace(
             kv_cache_dtype=torch.bfloat16,
@@ -293,7 +318,14 @@ class TestMamba(unittest.TestCase):
             req_to_token_pool=req_to_token_pool,
         )
 
-        self.assertIsNone(profile)
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile.recurrent_family, "kda")
+        self.assertEqual(profile.recurrent.family, "kda")
+        self.assertEqual(profile.recurrent.num_heads, 8)
+        self.assertEqual(profile.recurrent.state_size, 16)
+        self.assertEqual(profile.recurrent.projection_dim, 128)
+        self.assertEqual(profile.recurrent.conv_kernel, 4)
+        self.assertEqual(profile.ffn.family, "dense_mlp")
 
     def test_marconi_records_exact_insert_events_for_tuner(self):
         tree, req_to_token_pool, _ = self._make_marconi_tree()
