@@ -173,6 +173,7 @@ class TestMamba(unittest.TestCase):
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
+            mamba_layer_ids=mamba_layers,
             enable_mamba_extra_buffer=False,
             speculative_num_draft_tokens=3,
         )
@@ -415,6 +416,7 @@ class TestMamba(unittest.TestCase):
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
+            mamba_layer_ids=mamba_layers,
             enable_mamba_extra_buffer=False,
             speculative_num_draft_tokens=3,
         )
