@@ -646,6 +646,7 @@ def apply_qk_norm(
     k_out = k_norm(k.view(-1, head_dim)).view(k_shape)
     return q_out, k_out
 
+
 def apply_qk_norm_with_optional_rope(
     q: torch.Tensor,
     k: torch.Tensor,
