@@ -5,6 +5,10 @@ from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
     fused_norm_tanh_mul_add,
     fused_norm_tanh_mul_add_norm_scale,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=45, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=180, suite="nightly-kernel-1-gpu", nightly=True)
 
 BSD_CONFIG = [
     (1, 3648, 3840),  # Z-image
