@@ -61,14 +61,11 @@ def _get_ltx2_component_search_roots(*roots: str | None) -> list[str]:
     return resolved_roots
 
 
-def _find_first_existing_path(
-    search_roots: list[str], candidate_names: tuple[str, ...]
-) -> str | None:
-    for candidate_name in candidate_names:
-        for root in search_roots:
-            candidate_path = os.path.join(root, candidate_name)
-            if os.path.exists(candidate_path):
-                return candidate_path
+def _find_existing_path(search_roots: list[str], file_name: str) -> str | None:
+    for root in search_roots:
+        candidate_path = os.path.join(root, file_name)
+        if os.path.exists(candidate_path):
+            return candidate_path
     return None
 
 
@@ -89,9 +86,9 @@ def _resolve_ltx2_two_stage_component_paths(
         resolved["latent_upsampler"] = resolved["spatial_upsampler"]
 
     if "spatial_upsampler" not in resolved:
-        spatial_candidate = _find_first_existing_path(
+        spatial_candidate = _find_existing_path(
             search_roots,
-            pipeline_config.get_spatial_upsampler_weight_candidates(),
+            pipeline_config.get_spatial_upsampler_weight_name(),
         )
         if spatial_candidate is not None:
             resolved["spatial_upsampler"] = spatial_candidate
@@ -104,9 +101,9 @@ def _resolve_ltx2_two_stage_component_paths(
         resolved["stage_2_distilled_lora"] = resolved["distilled_lora"]
 
     if "distilled_lora" not in resolved:
-        distilled_lora = _find_first_existing_path(
+        distilled_lora = _find_existing_path(
             search_roots,
-            pipeline_config.get_stage_2_distilled_lora_weight_candidates(),
+            pipeline_config.get_stage_2_distilled_lora_weight_name(),
         )
         if distilled_lora is not None:
             resolved["distilled_lora"] = distilled_lora

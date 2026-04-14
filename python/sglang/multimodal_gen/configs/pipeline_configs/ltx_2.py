@@ -223,41 +223,20 @@ class LTX2PipelineConfig(PipelineConfig):
         0.0,
     )
     stage_2_distilled_lora_nickname: str = "stage_2_distilled"
-    stage_2_distilled_lora_weight_name: str = "ltx-2-19b-distilled-lora-384.safetensors"
+    stage_2_distilled_lora_weight_name: str | None = None
 
-    def get_stage_2_distilled_lora_weight_candidates(self) -> tuple[str, ...]:
+    def get_stage_2_distilled_lora_weight_name(self) -> str:
         configured = str(self.stage_2_distilled_lora_weight_name or "").strip()
-        if is_ltx23_native_variant(self.vae_config.arch_config):
-            default_legacy_weight = "ltx-2-19b-distilled-lora-384.safetensors"
-            candidates = []
-            if configured and configured != default_legacy_weight:
-                candidates.append(configured)
-            candidates.extend(
-                [
-                    "ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
-                    "ltx-2.3-22b-distilled-lora-384.safetensors",
-                    "ltx-2.3-20b-distilled-lora-384.safetensors",
-                ]
-            )
-            return tuple(dict.fromkeys(candidates))
-
         if configured:
-            return tuple(
-                dict.fromkeys([configured, "ltx-2-19b-distilled-lora-384.safetensors"])
-            )
-        return ("ltx-2-19b-distilled-lora-384.safetensors",)
-
-    def get_spatial_upsampler_weight_candidates(self) -> tuple[str, ...]:
+            return configured
         if is_ltx23_native_variant(self.vae_config.arch_config):
-            return (
-                "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
-                "ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
-                "latent_upsampler",
-            )
-        return (
-            "ltx-2-spatial-upscaler-x2-1.0.safetensors",
-            "latent_upsampler",
-        )
+            return "ltx-2.3-22b-distilled-lora-384.safetensors"
+        return "ltx-2-19b-distilled-lora-384.safetensors"
+
+    def get_spatial_upsampler_weight_name(self) -> str:
+        if is_ltx23_native_variant(self.vae_config.arch_config):
+            return "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+        return "ltx-2-spatial-upscaler-x2-1.0.safetensors"
 
     @property
     def vae_scale_factor(self):
