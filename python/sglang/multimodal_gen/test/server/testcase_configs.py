@@ -1047,7 +1047,7 @@ TWO_GPU_CASES_B = [
             model_path="Lightricks/LTX-2",
             modality="video",
             num_gpus=2,
-            extras=["--pipeline-class-name LTX2ImageToVideoPipeline"],
+            extras=["--pipeline-class-name LTX2Pipeline"],
         ),
         TI2V_sampling_params,
     ),
