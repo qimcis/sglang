@@ -3,6 +3,7 @@ import os
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import is_ltx23_native_variant
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -50,12 +51,26 @@ class LTX2Stage2LoRAControlStage(PipelineStage):
             transformer.reset_runtime_attention_cache()
 
     @staticmethod
+    def _should_use_legacy_ltx2_stage2_lora_control(
+        server_args: ServerArgs,
+    ) -> bool:
+        arch_config = getattr(
+            server_args.pipeline_config.vae_config, "arch_config", None
+        )
+        return arch_config is not None and not is_ltx23_native_variant(arch_config)
+
+    @staticmethod
     def _synchronize_device() -> None:
         device_module = torch.get_device_module()
         if hasattr(device_module, "is_available") and device_module.is_available():
             device_module.synchronize()
 
-    def _ensure_preloaded(self) -> None:
+    def _ensure_preloaded(
+        self,
+        *,
+        merge_weights: bool = False,
+        deactivate_after_preload: bool = False,
+    ) -> None:
         if self._is_preloaded():
             return
 
@@ -65,11 +80,26 @@ class LTX2Stage2LoRAControlStage(PipelineStage):
             self.lora_path,
             target="transformer",
             strength=1.0,
-            merge_weights=False,
+            merge_weights=merge_weights,
         )
+        if deactivate_after_preload and hasattr(self.pipeline, "is_lora_effective"):
+            if self.pipeline.is_lora_effective("transformer"):
+                self.pipeline.unmerge_lora_weights(target="transformer")
+        elif deactivate_after_preload and hasattr(
+            self.pipeline, "deactivate_lora_weights"
+        ):
+            self.pipeline.deactivate_lora_weights(target="transformer")
+        self._reset_runtime_attention_cache()
         self._mark_preloaded()
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        use_legacy_lora_control = self._should_use_legacy_ltx2_stage2_lora_control(
+            server_args
+        )
+
+        if use_legacy_lora_control and server_args.lora_path is not None:
+            return batch
+
         if not (
             hasattr(self.pipeline, "set_lora")
             and hasattr(self.pipeline, "deactivate_lora_weights")
@@ -77,6 +107,31 @@ class LTX2Stage2LoRAControlStage(PipelineStage):
             raise TypeError(
                 "LTX2 stage-2 LoRA control requires an LoRA-capable pipeline."
             )
+
+        if use_legacy_lora_control:
+            if not (
+                hasattr(self.pipeline, "merge_lora_weights")
+                and hasattr(self.pipeline, "unmerge_lora_weights")
+                and hasattr(self.pipeline, "is_lora_effective")
+            ):
+                raise TypeError(
+                    "Legacy LTX2 stage-2 LoRA control requires merge/unmerge APIs."
+                )
+
+            if not self.enable:
+                self._ensure_preloaded(
+                    merge_weights=True, deactivate_after_preload=True
+                )
+                if self.pipeline.is_lora_effective("transformer"):
+                    self.pipeline.unmerge_lora_weights(target="transformer")
+                    self._reset_runtime_attention_cache()
+                return batch
+
+            self._ensure_preloaded(merge_weights=True, deactivate_after_preload=True)
+            if not self.pipeline.is_lora_effective("transformer"):
+                self.pipeline.merge_lora_weights(target="transformer", strength=1.0)
+                self._reset_runtime_attention_cache()
+            return batch
 
         if not self.enable:
             if server_args.lora_path is not None:
@@ -311,57 +366,107 @@ class LTX2RefinementLatentPreparationStage(PipelineStage):
             raise ValueError("Missing `stage_2_distilled_sigmas` in pipeline config.")
         noise_scale = float(sigma_values[0])
         batch.extra["ltx2_phase"] = "stage2"
-        self._reset_stage2_generators(batch)
+        use_legacy_ltx2_ti2v_refinement = not is_ltx23_native_variant(
+            server_args.pipeline_config.vae_config.arch_config
+        ) and self._has_image_conditioning(batch)
+        if not use_legacy_ltx2_ti2v_refinement:
+            self._reset_stage2_generators(batch)
         device = get_local_torch_device()
         dtype = batch.latents.dtype
         video_latents = batch.latents.to(device=device, dtype=dtype)
         normalized_video_latents = self._normalize_video_latents(
             self.vae, video_latents
         )
-        packed_video_latents = server_args.pipeline_config.maybe_pack_latents(
-            normalized_video_latents, normalized_video_latents.shape[0], batch
-        )
-        noised_video_latents = self._create_noised_state(
-            packed_video_latents,
-            noise_scale,
-            generator=batch.generator,
-        )
-        stage2_condition_latent = None
-        preserved_tokens = 0
-        if self.preserve_conditioned_first_frame and self._has_image_conditioning(
-            batch
-        ):
-            seq_len = int(packed_video_latents.shape[1])
-            latent_frames, tokens_per_frame = (
-                server_args.pipeline_config._infer_video_latent_frames_and_tokens_per_frame(
-                    batch, seq_len
-                )
+        if use_legacy_ltx2_ti2v_refinement:
+            packed_clean_latents = server_args.pipeline_config.maybe_pack_latents(
+                normalized_video_latents, normalized_video_latents.shape[0], batch
             )
-            preserve_frames = 1
-            preserve_frames = max(1, min(preserve_frames, int(latent_frames)))
-            preserved_tokens = int(tokens_per_frame) * int(preserve_frames)
-            stage1_condition_tokens = int(getattr(batch, "ltx2_num_image_tokens", 0))
-            if batch.debug and stage1_condition_tokens not in {
-                0,
-                preserved_tokens,
-            }:
-                logger.info(
-                    "LTX-2 stage2 preserving %d latent frames (%d tokens); stage1 conditioning used %d tokens",
-                    preserve_frames,
+            conditioning_mask = torch.zeros(
+                (
+                    normalized_video_latents.shape[0],
+                    1,
+                    normalized_video_latents.shape[2],
+                    normalized_video_latents.shape[3],
+                    normalized_video_latents.shape[4],
+                ),
+                device=device,
+                dtype=normalized_video_latents.dtype,
+            )
+            conditioning_mask[:, :, 0] = 1.0
+            noised_video_latents = self._create_noised_state(
+                normalized_video_latents,
+                noise_scale * (1 - conditioning_mask),
+                generator=batch.generator,
+            )
+            packed_latents = server_args.pipeline_config.maybe_pack_latents(
+                noised_video_latents, noised_video_latents.shape[0], batch
+            )
+            batch.latents = packed_latents
+            batch.raw_latent_shape = packed_latents.shape
+            preserved_tokens = 0
+            stage2_condition_latent = None
+            if self.preserve_conditioned_first_frame and self._has_image_conditioning(
+                batch
+            ):
+                seq_len = int(packed_clean_latents.shape[1])
+                _, tokens_per_frame = (
+                    server_args.pipeline_config._infer_video_latent_frames_and_tokens_per_frame(
+                        batch, seq_len
+                    )
+                )
+                preserved_tokens = int(tokens_per_frame)
+                stage2_condition_latent = (
+                    packed_clean_latents[:, :preserved_tokens, :].detach().clone()
+                )
+            batch.image_latent = stage2_condition_latent
+            batch.ltx2_num_image_tokens = int(preserved_tokens)
+        else:
+            packed_video_latents = server_args.pipeline_config.maybe_pack_latents(
+                normalized_video_latents, normalized_video_latents.shape[0], batch
+            )
+            noised_video_latents = self._create_noised_state(
+                packed_video_latents,
+                noise_scale,
+                generator=batch.generator,
+            )
+            stage2_condition_latent = None
+            preserved_tokens = 0
+            if self.preserve_conditioned_first_frame and self._has_image_conditioning(
+                batch
+            ):
+                seq_len = int(packed_video_latents.shape[1])
+                latent_frames, tokens_per_frame = (
+                    server_args.pipeline_config._infer_video_latent_frames_and_tokens_per_frame(
+                        batch, seq_len
+                    )
+                )
+                preserve_frames = 1
+                preserve_frames = max(1, min(preserve_frames, int(latent_frames)))
+                preserved_tokens = int(tokens_per_frame) * int(preserve_frames)
+                stage1_condition_tokens = int(
+                    getattr(batch, "ltx2_num_image_tokens", 0)
+                )
+                if batch.debug and stage1_condition_tokens not in {
+                    0,
                     preserved_tokens,
-                    stage1_condition_tokens,
+                }:
+                    logger.info(
+                        "LTX-2 stage2 preserving %d latent frames (%d tokens); stage1 conditioning used %d tokens",
+                        preserve_frames,
+                        preserved_tokens,
+                        stage1_condition_tokens,
+                    )
+                stage2_condition_latent = (
+                    packed_video_latents[:, :preserved_tokens, :].detach().clone()
                 )
-            stage2_condition_latent = (
-                packed_video_latents[:, :preserved_tokens, :].detach().clone()
-            )
-            noised_video_latents[:, :preserved_tokens, :] = packed_video_latents[
-                :, :preserved_tokens, :
-            ]
+                noised_video_latents[:, :preserved_tokens, :] = packed_video_latents[
+                    :, :preserved_tokens, :
+                ]
 
-        batch.latents = noised_video_latents
-        batch.raw_latent_shape = noised_video_latents.shape
-        batch.image_latent = stage2_condition_latent
-        batch.ltx2_num_image_tokens = int(preserved_tokens)
+            batch.latents = noised_video_latents
+            batch.raw_latent_shape = noised_video_latents.shape
+            batch.image_latent = stage2_condition_latent
+            batch.ltx2_num_image_tokens = int(preserved_tokens)
         batch.condition_image = None
 
         if batch.audio_latents is not None:
@@ -385,17 +490,3 @@ class LTX2RefinementLatentPreparationStage(PipelineStage):
 
 
 LTX2TwoStageSetupStage = LTX2TwoStagePreparationStage
-
-
-def build_ltx2_two_stage_pipeline_cls(base_cls, pipeline_config_cls):
-    class LTX2TwoStagePipeline(base_cls):
-        pipeline_name = "LTX2TwoStagePipeline"
-
-        def create_pipeline_stages(self, server_args: ServerArgs):
-            self._create_two_stage_pipeline_stages(
-                server_args, preserve_conditioned_first_frame=False
-            )
-
-    LTX2TwoStagePipeline.pipeline_config_cls = pipeline_config_cls
-    LTX2TwoStagePipeline.__module__ = __name__
-    return LTX2TwoStagePipeline

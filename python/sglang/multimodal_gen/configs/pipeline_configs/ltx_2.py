@@ -225,6 +225,40 @@ class LTX2PipelineConfig(PipelineConfig):
     stage_2_distilled_lora_nickname: str = "stage_2_distilled"
     stage_2_distilled_lora_weight_name: str = "ltx-2-19b-distilled-lora-384.safetensors"
 
+    def get_stage_2_distilled_lora_weight_candidates(self) -> tuple[str, ...]:
+        configured = str(self.stage_2_distilled_lora_weight_name or "").strip()
+        if is_ltx23_native_variant(self.vae_config.arch_config):
+            default_legacy_weight = "ltx-2-19b-distilled-lora-384.safetensors"
+            candidates = []
+            if configured and configured != default_legacy_weight:
+                candidates.append(configured)
+            candidates.extend(
+                [
+                    "ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
+                    "ltx-2.3-22b-distilled-lora-384.safetensors",
+                    "ltx-2.3-20b-distilled-lora-384.safetensors",
+                ]
+            )
+            return tuple(dict.fromkeys(candidates))
+
+        if configured:
+            return tuple(
+                dict.fromkeys([configured, "ltx-2-19b-distilled-lora-384.safetensors"])
+            )
+        return ("ltx-2-19b-distilled-lora-384.safetensors",)
+
+    def get_spatial_upsampler_weight_candidates(self) -> tuple[str, ...]:
+        if is_ltx23_native_variant(self.vae_config.arch_config):
+            return (
+                "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+                "ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
+                "latent_upsampler",
+            )
+        return (
+            "ltx-2-spatial-upscaler-x2-1.0.safetensors",
+            "latent_upsampler",
+        )
+
     @property
     def vae_scale_factor(self):
         return self.vae_config.arch_config.spatial_compression_ratio
@@ -798,18 +832,3 @@ class LTX2PipelineConfig(PipelineConfig):
         )
 
         return latents, audio_latents
-
-
-@dataclasses.dataclass
-class LTX2I2VPipelineConfig(LTX2PipelineConfig):
-    task_type: ModelTaskType = ModelTaskType.TI2V
-
-
-@dataclasses.dataclass
-class LTX2ImageToVideoPipelineConfig(LTX2I2VPipelineConfig):
-    pass
-
-
-@dataclasses.dataclass
-class LTX2ImageToVideoTwoStagesPipelineConfig(LTX2I2VPipelineConfig):
-    pass

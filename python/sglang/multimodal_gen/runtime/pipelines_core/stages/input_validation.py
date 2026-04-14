@@ -12,6 +12,9 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    is_ltx23_native_variant,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -47,6 +50,27 @@ class InputValidationStage(PipelineStage):
     def __init__(self, vae_image_processor=None):
         super().__init__()
         self.vae_image_processor = vae_image_processor
+
+    @classmethod
+    def _validate_ltx2_ti2v_compatibility(
+        cls, batch: Req, server_args: ServerArgs
+    ) -> None:
+        if batch.image_path is None:
+            return
+
+        pipeline_config = getattr(server_args, "pipeline_config", None)
+        if pipeline_config is None or not type(pipeline_config).__name__.startswith(
+            "LTX2"
+        ):
+            return
+
+        arch_config = getattr(
+            getattr(pipeline_config, "vae_config", None), "arch_config", None
+        )
+        if arch_config is None or is_ltx23_native_variant(arch_config):
+            return
+
+        return
 
     @staticmethod
     def _calculate_dimensions_from_area(
@@ -316,6 +340,8 @@ class InputValidationStage(PipelineStage):
         # for i2v, get image from image_path
         # @TODO(Wei) hard-coded for wan2.2 5b ti2v for now. Should put this in image_encoding stage
         if batch.image_path is not None:
+            self._validate_ltx2_ti2v_compatibility(batch, server_args)
+
             if isinstance(batch.image_path, list):
                 batch.condition_image = []
                 for path in batch.image_path:

@@ -40,10 +40,10 @@ default parameters when initializing and generating videos.
 **Note**:
 1. Wan2.2 TI2V 5B has some quality issues when performing I2V generation. We are working on fixing this issue.
 2. SageSLA is based on SpargeAttn. Install it first with `pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation`
-3. LTX-2 two-stage generation uses `--pipeline-class-name LTX2TwoStagePipeline`. The spatial upsampler and distilled LoRA are auto-resolved from the model snapshot by default, and can still be overridden with `--spatial-upsampler-path` and `--distilled-lora-path`.
-4. `Lightricks/LTX-2.3` is supported through the bundled native overlay materialization path. One-stage generation uses the default `LTX2Pipeline`; two-stage generation uses `--pipeline-class-name LTX2TwoStagePipeline`.
+3. LTX two-stage generation uses `--pipeline-class-name LTX2TwoStagePipeline`. Stage-2 spatial upsampler and distilled LoRA defaults are resolved from the model snapshot by variant, and can still be overridden with `--spatial-upsampler-path` and `--distilled-lora-path`.
+4. `Lightricks/LTX-2.3` is supported through the bundled native overlay materialization path. One-stage generation uses the default `LTX2Pipeline`; two-stage generation uses `--pipeline-class-name LTX2TwoStagePipeline` and keeps native `LTX-2.3` stage-2 conditioning semantics.
 5. For LTX models, the `Resolutions` column uses output video `width×height` semantics, matching `sglang generate --width ... --height ...`. One-stage generation is validated at `768×512`; two-stage generation is validated at `1536×1024`.
-6. LTX-2 image-to-video uses `--pipeline-class-name LTX2ImageToVideoPipeline` (one-stage) or `--pipeline-class-name LTX2ImageToVideoTwoStagesPipeline` (two-stage), with `--image-path` to specify the input image.
+6. LTX TI2V uses the same public pipelines as T2V: `LTX2Pipeline` for one-stage and `LTX2TwoStagePipeline` for two-stage, with `--image-path` to specify the input image. The runtime selects `LTX-2` versus `LTX-2.3` TI2V behavior from the loaded model variant.
 
 ### Image Generation Models
 

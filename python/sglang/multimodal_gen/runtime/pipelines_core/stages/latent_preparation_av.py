@@ -21,6 +21,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+def _is_ltx2_two_stage_pipeline_class(pipeline_class_name: str | None) -> bool:
+    return pipeline_class_name == "LTX2TwoStagePipeline"
+
+
 class LTX2AVLatentPreparationStage(LatentPreparationStage):
     """
     LTX-2 specific latent preparation stage that handles both video and audio latents.
@@ -62,7 +66,7 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
         server_args: ServerArgs,
     ):
         if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
-            if server_args.pipeline_class_name == "LTX2TwoStagePipeline":
+            if _is_ltx2_two_stage_pipeline_class(server_args.pipeline_class_name):
                 return server_args.pipeline_config.get_latent_dtype(
                     batch.prompt_embeds[0].dtype
                 )

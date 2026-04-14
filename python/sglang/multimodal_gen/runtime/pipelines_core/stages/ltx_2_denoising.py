@@ -146,19 +146,48 @@ class LTX2DenoisingStage(DenoisingStage):
         if stage != "stage1":
             return None
 
-        if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
-            return batch.extra.get("ltx2_stage1_guider_params")
-
-        pipeline_ref = getattr(self, "pipeline", None)
-        pipeline = pipeline_ref() if callable(pipeline_ref) else pipeline_ref
-        pipeline_name = getattr(pipeline, "pipeline_name", None)
-        if pipeline_name not in {
-            "LTX2ImageToVideoPipeline",
-            "LTX2ImageToVideoTwoStagesPipeline",
-        }:
+        if not self._is_ltx2_ti2v_request(batch):
             return None
 
         return batch.extra.get("ltx2_stage1_guider_params")
+
+    @staticmethod
+    def _is_ltx2_ti2v_request(batch: Req) -> bool:
+        return bool(
+            batch.image_path is not None
+            or int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
+        )
+
+    @staticmethod
+    def _should_use_legacy_ltx2_ti2v_semantics(
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> bool:
+        return not is_ltx23_native_variant(
+            server_args.pipeline_config.vae_config.arch_config
+        ) and LTX2DenoisingStage._is_ltx2_ti2v_request(batch)
+
+    @staticmethod
+    def _should_prepare_ltx2_image_latent_for_phase(
+        server_args: ServerArgs,
+        phase: str | None,
+    ) -> bool:
+        if phase != "stage2":
+            return True
+        if not is_ltx23_native_variant(
+            server_args.pipeline_config.vae_config.arch_config
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _is_ltx2_two_stage_pipeline_name(
+        pipeline_name: str | None,
+        pipeline_class_name: str | None,
+    ) -> bool:
+        return pipeline_name == "LTX2TwoStagePipeline" or (
+            pipeline_class_name == "LTX2TwoStagePipeline"
+        )
 
     @staticmethod
     def _ltx2_should_skip_step(step_index: int, skip_step: int) -> bool:
@@ -277,9 +306,11 @@ class LTX2DenoisingStage(DenoisingStage):
             server_args.pipeline_config.vae_config.arch_config
         ):
             return False
-        if server_args.pipeline_class_name == "LTX2TwoStagePipeline":
+        if cls._is_ltx2_two_stage_pipeline_name(
+            pipeline_name, server_args.pipeline_class_name
+        ):
             return False
-        return pipeline_name != "LTX2TwoStagePipeline"
+        return True
 
     @classmethod
     def _should_shard_ltx23_legacy_one_stage_audio_latents(
@@ -392,6 +423,34 @@ class LTX2DenoisingStage(DenoisingStage):
         )
         top, left = (new_h - height) // 2, (new_w - width) // 2
         tensor = tensor[:, :, top : top + height, left : left + width]
+        return ((tensor / 127.5 - 1.0).to(dtype=dtype)).unsqueeze(2)
+
+    @staticmethod
+    def _resize_tensor(
+        img: PIL.Image.Image,
+        *,
+        width: int,
+        height: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        apply_codec_compression: bool = True,
+        codec_crf: int = 33,
+    ) -> torch.Tensor:
+        """Resize and normalize to [1, C, 1, H, W] tensor in [-1, 1]."""
+        img_array = np.array(img).astype(np.uint8)[..., :3]
+        if apply_codec_compression:
+            img_array = LTX2DenoisingStage._apply_video_codec_compression(
+                img_array, crf=codec_crf
+            )
+        tensor = (
+            torch.from_numpy(img_array.astype(np.float32))
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(device=device)
+        )
+        tensor = torch.nn.functional.interpolate(
+            tensor, size=(height, width), mode="bilinear", align_corners=False
+        )
         return ((tensor / 127.5 - 1.0).to(dtype=dtype)).unsqueeze(2)
 
     @staticmethod
@@ -512,14 +571,23 @@ class LTX2DenoisingStage(DenoisingStage):
             if isinstance(batch.image_path, list)
             else batch.image_path
         )
+        use_legacy_i2v_semantics = self._should_use_legacy_ltx2_ti2v_semantics(
+            batch, server_args
+        )
 
         conditioned_img = load_image(image_path).convert("RGB")
         img_array = np.array(conditioned_img).astype(np.uint8)[..., :3]
         img_array = self._apply_video_codec_compression(img_array, crf=33)
         conditioned_img = PIL.Image.fromarray(img_array)
-        batch.condition_image = self._resize_center_crop(
-            conditioned_img, width=int(batch.width), height=int(batch.height)
-        )
+        if use_legacy_i2v_semantics:
+            batch.condition_image = conditioned_img.resize(
+                (int(batch.width), int(batch.height)),
+                resample=PIL.Image.Resampling.BILINEAR,
+            )
+        else:
+            batch.condition_image = self._resize_center_crop(
+                conditioned_img, width=int(batch.width), height=int(batch.height)
+            )
 
         latents_device = (
             batch.latents.device
@@ -537,14 +605,24 @@ class LTX2DenoisingStage(DenoisingStage):
         if condition_image_encoder is None:
             self.vae = self.vae.to(device=latents_device, dtype=encode_dtype)
 
-        video_condition = self._resize_center_crop_tensor(
-            conditioned_img,
-            width=int(batch.width),
-            height=int(batch.height),
-            device=latents_device,
-            dtype=encode_dtype,
-            apply_codec_compression=False,
-        )
+        if use_legacy_i2v_semantics:
+            video_condition = self._resize_tensor(
+                conditioned_img,
+                width=int(batch.width),
+                height=int(batch.height),
+                device=latents_device,
+                dtype=encode_dtype,
+                apply_codec_compression=False,
+            )
+        else:
+            video_condition = self._resize_center_crop_tensor(
+                conditioned_img,
+                width=int(batch.width),
+                height=int(batch.height),
+                device=latents_device,
+                dtype=encode_dtype,
+                apply_codec_compression=False,
+            )
 
         with torch.autocast(
             device_type=current_platform.device_type,
@@ -653,7 +731,7 @@ class LTX2DenoisingStage(DenoisingStage):
         # Video and audio keep separate scheduler state throughout the denoising loop.
         ctx.audio_scheduler = copy.deepcopy(self.scheduler)
 
-        if phase != "stage2":
+        if self._should_prepare_ltx2_image_latent_for_phase(server_args, phase):
             self._prepare_ltx2_image_latent(batch, server_args)
         do_ti2v = self._should_apply_ltx2_ti2v(batch)
 
@@ -757,6 +835,9 @@ class LTX2DenoisingStage(DenoisingStage):
             raise ValueError("LTX-2 requires audio latents for denoising.")
         if ctx.audio_scheduler is None:
             raise ValueError("LTX-2 audio scheduler was not prepared.")
+        use_legacy_i2v_semantics = self._should_use_legacy_ltx2_ti2v_semantics(
+            batch, server_args
+        )
 
         # 1. Read the scheduler sigma pair and derive the Euler delta.
         sigmas = getattr(self.scheduler, "sigmas", None)
@@ -1012,14 +1093,22 @@ class LTX2DenoisingStage(DenoisingStage):
                 )
 
             num_img_tokens = self._get_ltx2_local_num_image_tokens(batch)
-            if num_img_tokens > 0 and ctx.clean_latent is not None:
+            if (
+                not use_legacy_i2v_semantics
+                and num_img_tokens > 0
+                and ctx.clean_latent is not None
+            ):
                 model_video = model_video.clone()
                 model_video[:, :num_img_tokens, :] = 0
 
             ctx.latents = self.scheduler.step(
                 model_video, step.t_device, ctx.latents, return_dict=False
             )[0]
-            if num_img_tokens > 0 and ctx.clean_latent is not None:
+            if (
+                not use_legacy_i2v_semantics
+                and num_img_tokens > 0
+                and ctx.clean_latent is not None
+            ):
                 ctx.latents[:, :num_img_tokens, :] = ctx.clean_latent[
                     :, :num_img_tokens, :
                 ].to(device=ctx.latents.device, dtype=ctx.latents.dtype)
@@ -1136,7 +1225,14 @@ class LTX2DenoisingStage(DenoisingStage):
             # Instead we check the rank-invariant attribute that is always set on every
             # rank when the request is a TI2V request.
             use_split_two_stage_ti2v_guider = (
-                server_args.pipeline_class_name == "LTX2TwoStagePipeline"
+                self._is_ltx2_two_stage_pipeline_name(
+                    getattr(
+                        self.pipeline() if self.pipeline else None,
+                        "pipeline_name",
+                        None,
+                    ),
+                    server_args.pipeline_class_name,
+                )
                 and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
             )
 

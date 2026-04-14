@@ -28,8 +28,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
-    LTX2ImageToVideoPipelineConfig,
-    LTX2ImageToVideoTwoStagesPipelineConfig,
     LTX2PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
@@ -70,6 +68,4 @@ __all__ = [
     "SelfForcingWanT2V480PConfig",
     "ZImagePipelineConfig",
     "LTX2PipelineConfig",
-    "LTX2ImageToVideoPipelineConfig",
-    "LTX2ImageToVideoTwoStagesPipelineConfig",
 ]
