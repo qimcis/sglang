@@ -146,6 +146,9 @@ class LTX2DenoisingStage(DenoisingStage):
         if stage != "stage1":
             return None
 
+        if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
+            return batch.extra.get("ltx2_stage1_guider_params")
+
         if not self._is_ltx2_ti2v_request(batch):
             return None
 
