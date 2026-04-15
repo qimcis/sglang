@@ -207,6 +207,9 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
         original_clean_latent_background = getattr(
             batch, "ltx2_ti2v_clean_latent_background", None
         )
+        is_native_variant = is_ltx23_native_variant(
+            server_args.pipeline_config.vae_config.arch_config
+        )
         has_stage2_condition_tokens = (
             isinstance(batch.image_latent, torch.Tensor)
             and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
@@ -216,21 +219,26 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
         )
         is_legacy_stage2_ti2v = (
             not is_native_ti2v
-            and not is_ltx23_native_variant(
-                server_args.pipeline_config.vae_config.arch_config
-            )
+            and not is_native_variant
             and has_stage2_condition_tokens
             and isinstance(batch.latents, torch.Tensor)
+        )
+        legacy_stage2_latents_already_prepared = (
+            not is_native_variant
+            and not has_stage2_condition_tokens
+            and batch.extra.get("ltx2_stage_2_noise_scale") is not None
         )
         if is_native_ti2v or is_legacy_stage2_ti2v:
             batch.ltx2_ti2v_clean_latent_background = batch.latents.detach().clone()
         else:
             batch.ltx2_ti2v_clean_latent_background = None
-        if (not is_legacy_stage2_ti2v) and self._should_reset_stage2_generators(
-            server_args
+        if (
+            not is_legacy_stage2_ti2v
+            and not legacy_stage2_latents_already_prepared
+            and self._should_reset_stage2_generators(server_args)
         ):
             self._reset_stage2_generators(batch)
-        if not is_legacy_stage2_ti2v:
+        if not is_legacy_stage2_ti2v and not legacy_stage2_latents_already_prepared:
             noise_scale = float(self.distilled_sigmas[0].item())
             if is_native_ti2v:
                 prepared_latents, denoise_mask, _ = self._prepare_ltx2_ti2v_clean_state(
@@ -270,9 +278,7 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                     audio_noise * audio_scaled_mask
                     + batch.audio_latents * (1 - audio_scaled_mask)
                 ).to(batch.audio_latents.dtype)
-            if not is_ltx23_native_variant(
-                server_args.pipeline_config.vae_config.arch_config
-            ):
+            if not is_native_variant:
                 batch.latents = batch.latents.to(
                     device=batch.latents.device, dtype=torch.float32
                 )
