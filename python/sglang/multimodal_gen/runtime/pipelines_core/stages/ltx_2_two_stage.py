@@ -65,6 +65,38 @@ class LTX2Stage2LoRAControlStage(PipelineStage):
         if hasattr(device_module, "is_available") and device_module.is_available():
             device_module.synchronize()
 
+    def _reactivate_preloaded_unmerged_lora(
+        self,
+        *,
+        strength: float = 1.0,
+    ) -> None:
+        target_modules, error = self.pipeline._get_target_lora_layers("transformer")
+        if error:
+            logger.warning("reactivate_preloaded_unmerged_lora: %s", error)
+        if not target_modules:
+            return
+
+        for module_name, lora_layers_dict in target_modules:
+            has_lora_weights = False
+            for layer in lora_layers_dict.values():
+                if not (hasattr(layer, "lora_A") and layer.lora_A is not None):
+                    continue
+                has_lora_weights = True
+                if hasattr(layer, "disable_lora"):
+                    layer.disable_lora = False
+                if hasattr(layer, "strength"):
+                    layer.strength = strength
+            if not has_lora_weights:
+                continue
+            self.pipeline.is_lora_merged[module_name] = False
+            self.pipeline.cur_adapter_name[module_name] = self.lora_nickname
+            self.pipeline.cur_adapter_path[module_name] = str(self.lora_path or "")
+            self.pipeline.cur_adapter_strength[module_name] = strength
+            self.pipeline.cur_adapter_config[module_name] = (
+                [self.lora_nickname],
+                [float(strength)],
+            )
+
     def _ensure_preloaded(
         self,
         *,
@@ -109,28 +141,23 @@ class LTX2Stage2LoRAControlStage(PipelineStage):
             )
 
         if use_legacy_lora_control:
-            if not (
-                hasattr(self.pipeline, "merge_lora_weights")
-                and hasattr(self.pipeline, "unmerge_lora_weights")
-                and hasattr(self.pipeline, "is_lora_effective")
-            ):
-                raise TypeError(
-                    "Legacy LTX2 stage-2 LoRA control requires merge/unmerge APIs."
-                )
-
             if not self.enable:
                 self._ensure_preloaded(
-                    merge_weights=True, deactivate_after_preload=True
+                    merge_weights=False,
+                    deactivate_after_preload=True,
                 )
-                if self.pipeline.is_lora_effective("transformer"):
-                    self.pipeline.unmerge_lora_weights(target="transformer")
-                    self._reset_runtime_attention_cache()
+                self.pipeline.deactivate_lora_weights(target="transformer")
+                self._synchronize_device()
+                self._reset_runtime_attention_cache()
                 return batch
 
-            self._ensure_preloaded(merge_weights=True, deactivate_after_preload=True)
-            if not self.pipeline.is_lora_effective("transformer"):
-                self.pipeline.merge_lora_weights(target="transformer", strength=1.0)
-                self._reset_runtime_attention_cache()
+            self._ensure_preloaded(
+                merge_weights=False,
+                deactivate_after_preload=True,
+            )
+            self._reactivate_preloaded_unmerged_lora(strength=1.0)
+            self._synchronize_device()
+            self._reset_runtime_attention_cache()
             return batch
 
         if not self.enable:
