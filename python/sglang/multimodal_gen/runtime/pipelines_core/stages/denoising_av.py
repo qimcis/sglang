@@ -286,6 +286,15 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                     batch.audio_latents = batch.audio_latents.to(
                         device=batch.audio_latents.device, dtype=torch.float32
                     )
+        elif not is_native_variant:
+            if isinstance(batch.latents, torch.Tensor):
+                batch.latents = batch.latents.to(
+                    device=batch.latents.device, dtype=torch.float32
+                )
+            if isinstance(batch.audio_latents, torch.Tensor):
+                batch.audio_latents = batch.audio_latents.to(
+                    device=batch.audio_latents.device, dtype=torch.float32
+                )
 
         if not is_legacy_stage2_ti2v:
             batch.image_latent = None
