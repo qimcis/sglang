@@ -349,7 +349,7 @@ class DiffGenerator:
                 global_output_index += len(requests)
 
         total_gen_time = time.perf_counter() - total_start_time
-        if self.server_args.dynamic_batch_max_size > 1:
+        if self.server_args.batching_max_size > 1:
             log_batch_completion(
                 logger,
                 len(results),

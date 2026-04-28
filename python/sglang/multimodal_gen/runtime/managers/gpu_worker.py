@@ -318,6 +318,7 @@ class GPUWorker:
                 return result
 
             output_batch = self._to_output_batch(result)
+            self._record_output_peak_memory(output_batch)
 
             output_metrics = self._iter_output_metrics(output_batch)
             if self.rank == 0 and output_metrics and not current_platform.is_cpu():
@@ -377,7 +378,14 @@ class GPUWorker:
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing {error_context}: {e}"
+            self._record_output_peak_memory(output_batch)
         return output_batch
+
+    def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
+        if self.rank != 0 or current_platform.is_cpu():
+            return
+        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
+        output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:
         assert self.pipeline is not None

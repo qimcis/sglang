@@ -36,6 +36,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     UnmergeLoraWeightsReq,
 )
 from sglang.multimodal_gen.runtime.managers.cpu_worker import CPUWorker
+from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
+    BatchAdmissionController,
+)
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
@@ -72,6 +75,11 @@ class _BatchMetricsWindow:
     full_dispatches: int = 0
     wait_times_ms: list[float] = dataclasses.field(default_factory=list)
     reject_reasons: Counter[str] = dataclasses.field(default_factory=Counter)
+
+
+@dataclasses.dataclass
+class _SchedulerErrorReq:
+    error: str
 
 
 class Scheduler(SchedulerDisaggMixin):
@@ -134,6 +142,7 @@ class Scheduler(SchedulerDisaggMixin):
             Req: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
             ShutdownReq: self._handle_shutdown,
+            _SchedulerErrorReq: self._handle_scheduler_error,
             GetDisaggStatsReq: self._handle_get_disagg_stats,
             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
@@ -141,10 +150,11 @@ class Scheduler(SchedulerDisaggMixin):
 
         # FIFO queue entries: (identity, request, enqueue_ts_s)
         self.waiting_queue: deque[tuple[bytes | None, Any, float]] = deque()
-        self._dynamic_batch_max_size = server_args.dynamic_batch_max_size
-        self._dynamic_batch_delay_s = server_args.dynamic_batch_delay_ms / 1000.0
-        self._batch_metrics_enabled = server_args.enable_batch_metrics
+        self._batching_max_size = server_args.batching_max_size
+        self._batching_delay_s = server_args.batching_delay_ms / 1000.0
+        self._batch_metrics_enabled = server_args.enable_batching_metrics
         self._batch_metrics_window = _BatchMetricsWindow()
+        self._batch_admission = BatchAdmissionController(server_args, gpu_id=local_rank)
         self._poller = zmq.Poller()
         if self.receiver is not None:
             self._poller.register(self.receiver, zmq.POLLIN)
@@ -204,6 +214,9 @@ class Scheduler(SchedulerDisaggMixin):
     def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
         self._running = False
         return OutputBatch()
+
+    def _handle_scheduler_error(self, reqs: List[_SchedulerErrorReq]) -> OutputBatch:
+        return OutputBatch(error=reqs[0].error)
 
     def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
         """Handle update_weights_from_disk request for RL workflows."""
@@ -336,9 +349,10 @@ class Scheduler(SchedulerDisaggMixin):
                     )
 
                 logger.info(
-                    "Processed dynamic batch of %d request(s) with max_delay=%.2fms",
+                    "Processed dynamic batch of %d/%d request(s) with max_delay=%.2fms",
                     batch_size,
-                    self._dynamic_batch_delay_s * 1000.0,
+                    self._batching_max_size,
+                    self._batching_delay_s * 1000.0,
                 )
                 return split_outputs
             except Exception as e:
@@ -432,19 +446,25 @@ class Scheduler(SchedulerDisaggMixin):
         batch_size: int,
         queue_wait_ms: float,
         reject_reasons: list[str] | None = None,
+        stop_reason: str | None = None,
     ) -> None:
         if not self._batch_metrics_enabled:
             return
+
+        logger.info(
+            "Dynamic batch dispatch: size=%d/%d, queue_wait=%.2fms, stop_reason=%s",
+            batch_size,
+            self._batching_max_size,
+            max(queue_wait_ms, 0.0),
+            stop_reason or "unspecified",
+        )
 
         window = self._batch_metrics_window
         window.dispatches += 1
         window.total_requests += batch_size
         if batch_size > 1:
             window.merged_dispatches += 1
-        if (
-            self._dynamic_batching_enabled()
-            and batch_size >= self._dynamic_batch_max_size
-        ):
+        if self._dynamic_batching_enabled() and batch_size >= self._batching_max_size:
             window.full_dispatches += 1
         window.wait_times_ms.append(max(queue_wait_ms, 0.0))
         if reject_reasons:
@@ -462,7 +482,7 @@ class Scheduler(SchedulerDisaggMixin):
             return
 
         avg_size = window.total_requests / window.dispatches
-        max_batch_size = max(1, self._dynamic_batch_max_size)
+        max_batch_size = max(1, self._batching_max_size)
         utilization = avg_size / max_batch_size
         avg_wait_ms = sum(window.wait_times_ms) / len(window.wait_times_ms)
         p95_wait_ms = self._percentile(window.wait_times_ms, 95.0)
@@ -710,7 +730,7 @@ class Scheduler(SchedulerDisaggMixin):
         return outputs
 
     def _dynamic_batching_enabled(self) -> bool:
-        return self._dynamic_batch_max_size > 1
+        return self._batching_max_size > 1
 
     def get_next_batch_to_run(self) -> list[tuple[bytes | None, Any]] | None:
         """Pull one request or one dynamic batch from waiting_queue."""
@@ -723,6 +743,7 @@ class Scheduler(SchedulerDisaggMixin):
                 self._record_batch_dispatch_metrics(
                     batch_size=1,
                     queue_wait_ms=(time.monotonic() - enqueue_time) * 1000.0,
+                    stop_reason="dynamic_disabled",
                 )
             return [(identity, req)]
 
@@ -744,19 +765,45 @@ class Scheduler(SchedulerDisaggMixin):
                 batch_size=1,
                 queue_wait_ms=(time.monotonic() - head_enqueue_time) * 1000.0,
                 reject_reasons=reject_reasons,
+                stop_reason=reject_reasons[0] if reject_reasons else "head_ineligible",
             )
             return [(identity, req)]
 
+        try:
+            self._batch_admission.max_admissible_batch_size(req)
+        except RuntimeError as e:
+            identity, _req, _head_enqueue_time = self.waiting_queue.popleft()
+            error = f"Batching admission failed: {e}"
+            self._record_batch_dispatch_metrics(
+                batch_size=1,
+                queue_wait_ms=(time.monotonic() - enqueue_time) * 1000.0,
+                reject_reasons=["missing_config"],
+                stop_reason="missing_config",
+            )
+            return [(identity, _SchedulerErrorReq(error=error))]
+
         compatible_indices: list[int] = [0]
+        compatible_reqs: list[Req] = [req]
         reject_reasons: list[str] = []
         for idx in range(1, len(self.waiting_queue)):
-            if len(compatible_indices) >= self._dynamic_batch_max_size:
+            if len(
+                compatible_indices
+            ) >= self._batching_max_size or self._batch_admission.batch_is_full(
+                compatible_reqs
+            ):
                 break
             _identity, candidate_req, _enqueue_time = self.waiting_queue[idx]
             if isinstance(candidate_req, Req) and self._can_dynamic_batch(
                 req, candidate_req
             ):
-                compatible_indices.append(idx)
+                admission_reject = self._batch_admission.reject_reason_for_candidate(
+                    compatible_reqs, candidate_req
+                )
+                if admission_reject is None:
+                    compatible_indices.append(idx)
+                    compatible_reqs.append(candidate_req)
+                elif self._batch_metrics_enabled:
+                    reject_reasons.append(admission_reject)
             elif self._batch_metrics_enabled and isinstance(candidate_req, Req):
                 reason = self._get_dynamic_batch_reject_reason(req, candidate_req)
                 if reason is not None:
@@ -767,8 +814,9 @@ class Scheduler(SchedulerDisaggMixin):
         oldest_wait_s = time.monotonic() - enqueue_time
 
         should_wait_for_more = (
-            batch_len < self._dynamic_batch_max_size
-            and oldest_wait_s < self._dynamic_batch_delay_s
+            batch_len < self._batching_max_size
+            and not self._batch_admission.batch_is_full(compatible_reqs)
+            and oldest_wait_s < self._batching_delay_s
         )
         if should_wait_for_more:
             return None
@@ -778,10 +826,21 @@ class Scheduler(SchedulerDisaggMixin):
             item_identity, item_req, _ = self.waiting_queue[idx]
             batch_items[batch_len - 1 - pos] = (item_identity, item_req)
             del self.waiting_queue[idx]
+        stop_reason = self._batch_admission.limit_reason_for_batch(compatible_reqs)
+        if stop_reason is None:
+            if batch_len >= self._batching_max_size:
+                stop_reason = "max_size"
+            elif reject_reasons:
+                stop_reason = reject_reasons[0]
+            elif oldest_wait_s >= self._batching_delay_s:
+                stop_reason = "delay"
+            else:
+                stop_reason = "ready"
         self._record_batch_dispatch_metrics(
             batch_size=batch_len,
             queue_wait_ms=oldest_wait_s * 1000.0,
             reject_reasons=reject_reasons,
+            stop_reason=stop_reason,
         )
         return batch_items
 
@@ -1009,9 +1068,7 @@ class Scheduler(SchedulerDisaggMixin):
                 if self.waiting_queue and self._dynamic_batching_enabled():
                     oldest_ts = self.waiting_queue[0][2]
                     elapsed_ms = (time.monotonic() - oldest_ts) * 1000.0
-                    remaining_ms = max(
-                        0, self._dynamic_batch_delay_s * 1000.0 - elapsed_ms
-                    )
+                    remaining_ms = max(0, self._batching_delay_s * 1000.0 - elapsed_ms)
                     if remaining_ms > 0 and self.receiver is not None:
                         self._poller.poll(timeout=remaining_ms)
                     elif remaining_ms > 0:

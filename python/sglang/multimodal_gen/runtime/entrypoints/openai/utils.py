@@ -357,7 +357,7 @@ async def process_generation_batch(
             )
 
     total_time = time.perf_counter() - total_start_time
-    if get_global_server_args().dynamic_batch_max_size > 1:
+    if get_global_server_args().batching_max_size > 1:
         log_batch_completion(
             logger,
             len(save_file_path_list),
