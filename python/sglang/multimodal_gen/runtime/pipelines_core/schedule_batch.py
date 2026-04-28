@@ -71,6 +71,10 @@ class Req:
     negative_prompt_embeds: list[torch.Tensor] | None = None
     prompt_attention_mask: list[torch.Tensor | None] | None = None
     negative_attention_mask: list[torch.Tensor | None] | None = None
+    prompt_embeds_mask: list[torch.Tensor | None] | None = None
+    negative_prompt_embeds_mask: list[torch.Tensor | None] | None = None
+    prompt_seq_lens: list[list[int]] | None = None
+    negative_prompt_seq_lens: list[list[int]] | None = None
     clip_embedding_pos: list[torch.Tensor] | None = None
     clip_embedding_neg: list[torch.Tensor] | None = None
 

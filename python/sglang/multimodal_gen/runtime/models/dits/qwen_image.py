@@ -616,9 +616,9 @@ class QwenImageCrossAttention(nn.Module):
         **cross_attention_kwargs,
     ):
         seq_len_txt = encoder_hidden_states.shape[1]
-        attn_mask = cross_attention_kwargs.get("attn_mask")
-        if attn_mask is None:
-            attn_mask = cross_attention_kwargs.get("attention_mask")
+        encoder_hidden_states_mask = cross_attention_kwargs.get(
+            "encoder_hidden_states_mask"
+        )
 
         img_query, img_key, img_value, txt_query, txt_key, txt_value = (
             _get_qkv_projections(self, hidden_states, encoder_hidden_states)
@@ -677,13 +677,24 @@ class QwenImageCrossAttention(nn.Module):
         joint_query = torch.cat([txt_query, img_query], dim=1)
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
+        joint_mask = None
+        if encoder_hidden_states_mask is not None:
+            image_mask = torch.ones(
+                (hidden_states.shape[0], img_query.shape[1]),
+                device=encoder_hidden_states_mask.device,
+                dtype=torch.bool,
+            )
+            joint_mask = torch.cat(
+                [encoder_hidden_states_mask.to(dtype=torch.bool), image_mask],
+                dim=1,
+            )
 
         # Compute joint attention
         joint_hidden_states = self.attn(
             joint_query,
             joint_key,
             joint_value,
-            attn_mask=attn_mask,
+            attn_mask=joint_mask,
             num_replicated_prefix=seq_len_txt,
         )
 

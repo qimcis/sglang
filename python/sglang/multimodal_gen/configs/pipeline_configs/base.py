@@ -101,6 +101,35 @@ def postprocess_text(output: BaseEncoderOutput, _text_inputs) -> torch.tensor:
     raise NotImplementedError
 
 
+@dataclass(frozen=True)
+class TextConditioningOutput:
+    prompt_embeds: torch.Tensor
+    prompt_embeds_mask: torch.Tensor | None = None
+
+
+def pad_text_embeddings_with_mask(
+    text_embeds: list[torch.Tensor],
+) -> TextConditioningOutput:
+    if not text_embeds:
+        raise ValueError("text_embeds must contain at least one tensor")
+
+    max_seq_len = max(e.size(0) for e in text_embeds)
+    prompt_embeds = torch.stack(
+        [
+            torch.cat([e, e.new_zeros(max_seq_len - e.size(0), e.size(1))])
+            for e in text_embeds
+        ]
+    )
+    seq_lens = torch.tensor(
+        [e.size(0) for e in text_embeds],
+        device=prompt_embeds.device,
+        dtype=torch.long,
+    )
+    positions = torch.arange(max_seq_len, device=prompt_embeds.device).unsqueeze(0)
+    prompt_embeds_mask = positions < seq_lens.unsqueeze(1)
+    return TextConditioningOutput(prompt_embeds, prompt_embeds_mask)
+
+
 def shard_rotary_emb_for_sp(emb):
     """
     Shard rotary embeddings [S, D] along sequence for SP.
@@ -467,6 +496,87 @@ class PipelineConfig:
         Override to suppress (return None) or modify the mask per model.
         """
         return text_inputs.get("attention_mask")
+
+    def build_text_conditioning_mask(
+        self,
+        text_inputs: dict,
+        text_encoder_attention_mask: "torch.Tensor | None",
+        prompt_embeds: "torch.Tensor",
+        encoder_index: int,
+    ) -> "torch.Tensor":
+        """Return a mask aligned with post-processed prompt embeddings.
+
+        Dynamic batching must carry post-processed semantic text lengths
+        explicitly. If a model-specific postprocessor changes the sequence
+        length, it must return TextConditioningOutput with an
+        embedding-aligned mask.
+        """
+        if prompt_embeds.ndim < 2:
+            raise ValueError(
+                "prompt_embeds must have shape [batch, seq, ...] to build text conditioning mask"
+            )
+
+        if prompt_embeds.ndim == 2:
+            batch_size, embed_seq_len = 1, prompt_embeds.shape[0]
+        else:
+            batch_size, embed_seq_len = prompt_embeds.shape[:2]
+        device = prompt_embeds.device
+        if text_encoder_attention_mask is None:
+            return torch.ones(
+                (batch_size, embed_seq_len), dtype=torch.bool, device=device
+            )
+
+        raw_mask = text_encoder_attention_mask.to(device=device).bool()
+        if raw_mask.ndim != 2 or raw_mask.shape[0] != batch_size:
+            raise ValueError(
+                "text attention mask must have shape [batch, seq] matching prompt_embeds batch"
+            )
+
+        if raw_mask.shape[1] == embed_seq_len:
+            return raw_mask
+
+        if prompt_embeds.ndim == 2 and raw_mask.shape[0] == 1:
+            return torch.ones((1, embed_seq_len), dtype=torch.bool, device=device)
+
+        raise ValueError(
+            "text attention mask length does not match postprocessed prompt embeddings. "
+            "Postprocess functions that trim, pack, or otherwise change text sequence "
+            "length must return TextConditioningOutput with an embedding-aligned mask."
+        )
+
+    @staticmethod
+    def seq_lens_from_text_conditioning_mask(mask: "torch.Tensor") -> list[int]:
+        if mask.ndim != 2:
+            raise ValueError("text conditioning mask must have shape [batch, seq]")
+        return [int(x) for x in mask.to(torch.int64).sum(dim=1).tolist()]
+
+    def require_text_seq_lens(
+        self,
+        batch,
+        encoder_index: int,
+        *,
+        negative: bool = False,
+        expected_batch_size: int | None = None,
+    ) -> list[int]:
+        seq_lens_by_encoder = (
+            batch.negative_prompt_seq_lens if negative else batch.prompt_seq_lens
+        )
+        kind = "negative" if negative else "positive"
+        if seq_lens_by_encoder is None or encoder_index >= len(seq_lens_by_encoder):
+            raise ValueError(
+                f"Missing {kind} prompt_seq_lens for text encoder {encoder_index}; "
+                "dynamic text conditioning requires explicit sequence lengths."
+            )
+
+        seq_lens = [int(x) for x in seq_lens_by_encoder[encoder_index]]
+        if expected_batch_size is not None and len(seq_lens) != int(
+            expected_batch_size
+        ):
+            raise ValueError(
+                f"{kind} prompt_seq_lens for text encoder {encoder_index} has "
+                f"{len(seq_lens)} entries, expected {expected_batch_size}."
+            )
+        return seq_lens
 
     def get_text_encoder_pooler_output(
         self, outputs: "BaseEncoderOutput", encoder_index: int

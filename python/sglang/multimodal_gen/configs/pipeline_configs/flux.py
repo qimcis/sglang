@@ -91,6 +91,23 @@ class FluxPipelineConfig(ImagePipelineConfig):
         # Flux v1 does not use attention masks for text encoders.
         return None
 
+    def build_text_conditioning_mask(
+        self,
+        text_inputs: dict,
+        text_encoder_attention_mask: "torch.Tensor | None",
+        prompt_embeds: "torch.Tensor",
+        encoder_index: int,
+    ) -> "torch.Tensor":
+        if prompt_embeds.ndim < 2:
+            raise ValueError(
+                "prompt_embeds must have shape [batch, seq, ...] or [seq, ...]"
+            )
+        if prompt_embeds.ndim == 2:
+            shape = (1, prompt_embeds.shape[0])
+        else:
+            shape = prompt_embeds.shape[:2]
+        return torch.ones(shape, dtype=torch.bool, device=prompt_embeds.device)
+
     def get_text_encoder_pooler_output(self, outputs, encoder_index):
         return outputs.pooler_output
 
@@ -143,7 +160,27 @@ class FluxPipelineConfig(ImagePipelineConfig):
 
         return latent_image_ids
 
-    def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
+    @staticmethod
+    def _validate_fixed_text_seq_lens(prompt_embeds, txt_seq_lens):
+        if prompt_embeds.ndim < 3:
+            raise ValueError(
+                "Flux text conditioning expects prompt_embeds with shape [batch, seq, dim]"
+            )
+        batch_size, seq_len = prompt_embeds.shape[:2]
+        if len(txt_seq_lens) != batch_size:
+            raise ValueError(
+                f"Flux text sequence lengths have {len(txt_seq_lens)} entries, expected {batch_size}."
+            )
+        if any(int(seq_len_i) != seq_len for seq_len_i in txt_seq_lens):
+            raise ValueError(
+                "Flux currently requires fixed-length text conditioning; "
+                f"got seq_lens={txt_seq_lens}, expected all {seq_len}."
+            )
+
+    def get_freqs_cis(
+        self, prompt_embeds, width, height, device, rotary_emb, batch, txt_seq_lens
+    ):
+        self._validate_fixed_text_seq_lens(prompt_embeds, txt_seq_lens)
         txt_ids = torch.zeros(prompt_embeds.shape[1], 3, device=device)
         img_ids = self._prepare_latent_image_ids(
             original_height=height,
@@ -175,6 +212,12 @@ class FluxPipelineConfig(ImagePipelineConfig):
         return latents
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        txt_seq_lens = self.require_text_seq_lens(
+            batch,
+            1,
+            negative=False,
+            expected_batch_size=batch.prompt_embeds[1].shape[0],
+        )
         return {
             "freqs_cis": self.get_freqs_cis(
                 batch.prompt_embeds[1],
@@ -183,6 +226,7 @@ class FluxPipelineConfig(ImagePipelineConfig):
                 device,
                 rotary_emb,
                 batch,
+                txt_seq_lens,
             ),
             "pooled_projections": (
                 batch.pooled_embeds[0] if batch.pooled_embeds else None
@@ -190,6 +234,12 @@ class FluxPipelineConfig(ImagePipelineConfig):
         }
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        txt_seq_lens = self.require_text_seq_lens(
+            batch,
+            1,
+            negative=True,
+            expected_batch_size=batch.negative_prompt_embeds[1].shape[0],
+        )
         return {
             "freqs_cis": self.get_freqs_cis(
                 batch.negative_prompt_embeds[1],
@@ -198,6 +248,7 @@ class FluxPipelineConfig(ImagePipelineConfig):
                 device,
                 rotary_emb,
                 batch,
+                txt_seq_lens,
             ),
             "pooled_projections": (
                 batch.neg_pooled_embeds[0] if batch.neg_pooled_embeds else None
@@ -513,7 +564,10 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         image_latent_ids = image_latent_ids.repeat(batch.batch_size, 1, 1)
         batch.condition_image_latent_ids = image_latent_ids.to(get_local_torch_device())
 
-    def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
+    def get_freqs_cis(
+        self, prompt_embeds, width, height, device, rotary_emb, batch, txt_seq_lens
+    ):
+        self._validate_fixed_text_seq_lens(prompt_embeds, txt_seq_lens)
         txt_ids = _prepare_text_ids(prompt_embeds).to(device=device)
 
         img_ids = batch.latent_ids
@@ -544,6 +598,12 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         return cos, sin
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        txt_seq_lens = self.require_text_seq_lens(
+            batch,
+            0,
+            negative=False,
+            expected_batch_size=batch.prompt_embeds[0].shape[0],
+        )
         return {
             "freqs_cis": self.get_freqs_cis(
                 batch.prompt_embeds[0],
@@ -552,6 +612,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
                 device,
                 rotary_emb,
                 batch,
+                txt_seq_lens,
             )
         }
 

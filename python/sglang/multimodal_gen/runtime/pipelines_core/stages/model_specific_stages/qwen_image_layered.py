@@ -534,9 +534,11 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         is_rgb = torch.tensor([0]).to(device=device, dtype=torch.long)
 
         batch.prompt_embeds = [prompt_embeds]
-        batch.prompt_attention_mask = [prompt_embeds_mask]
+        batch.prompt_embeds_mask = [prompt_embeds_mask]
+        batch.prompt_seq_lens = [txt_seq_lens]
         batch.negative_prompt_embeds = [negative_prompt_embeds]
-        batch.negative_attention_mask = [negative_prompt_embeds_mask]
+        batch.negative_prompt_embeds_mask = [negative_prompt_embeds_mask]
+        batch.negative_prompt_seq_lens = [negative_txt_seq_lens]
         batch.latents = latents
         batch.image_latent = image_latents
         batch.timesteps = timesteps
