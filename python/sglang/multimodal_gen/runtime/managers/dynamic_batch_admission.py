@@ -13,6 +13,7 @@ import json
 import math
 import os
 from dataclasses import dataclass
+from difflib import get_close_matches
 from typing import TYPE_CHECKING, Any
 
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -25,6 +26,21 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 BYTES_PER_GIB = 1024**3
+_BATCHING_RULE_KEYS = frozenset(
+    {
+        "model",
+        "model_contains",
+        "resolution",
+        "device_memory_gb_min",
+        "device_memory_gb_max",
+        "offload",
+        "max_batch_size",
+        "max_cost",
+        # Free-form provenance/benchmark metadata. It is intentionally ignored
+        # by admission, but accepted so production configs can explain caps.
+        "calibration",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -62,6 +78,12 @@ class BatchingRule:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], *, source: str) -> "BatchingRule":
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"batching config rule from {source} must be an object, "
+                f"got {type(data).__name__}"
+            )
+        _validate_rule_keys(data, source=source)
         if "max_batch_size" not in data:
             raise ValueError("batching config rule requires max_batch_size")
 
@@ -323,6 +345,24 @@ def _config_entries(payload: Any) -> list[dict[str, Any]]:
     raise ValueError(
         "batching config must be a {'schema_version': 1, 'rules': [...]} object, "
         "a list of rules, or a mapping keyed by model|resolution"
+    )
+
+
+def _validate_rule_keys(data: dict[str, Any], *, source: str) -> None:
+    unknown = sorted(set(data) - _BATCHING_RULE_KEYS)
+    if not unknown:
+        return
+
+    hints = []
+    for key in unknown:
+        matches = get_close_matches(key, _BATCHING_RULE_KEYS, n=1)
+        if matches:
+            hints.append(f"{key!r} (did you mean {matches[0]!r}?)")
+        else:
+            hints.append(repr(key))
+    raise ValueError(
+        f"batching config rule from {source} contains unknown key(s): "
+        f"{', '.join(hints)}"
     )
 
 
