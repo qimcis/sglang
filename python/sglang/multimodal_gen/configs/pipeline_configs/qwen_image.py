@@ -310,9 +310,8 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
                 "img_shapes": img_shapes,
                 "txt_seq_lens": txt_seq_lens,
                 "freqs_cis": None,
+                "encoder_hidden_states_mask": encoder_hidden_states_mask,
             }
-            if encoder_hidden_states_mask is not None:
-                cond_kwargs["encoder_hidden_states_mask"] = encoder_hidden_states_mask
             return cond_kwargs
 
         freqs_cis = self.get_freqs_cis(
@@ -325,9 +324,8 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
             "txt_seq_lens": txt_seq_lens,
             "freqs_cis": (img_cache, txt_cache),
             "img_shapes": img_shapes,
+            "encoder_hidden_states_mask": encoder_hidden_states_mask,
         }
-        if encoder_hidden_states_mask is not None:
-            cond_kwargs["encoder_hidden_states_mask"] = encoder_hidden_states_mask
         return cond_kwargs
 
     def _prepare_encoder_hidden_states_mask(
@@ -445,9 +443,8 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
                 "img_shapes": img_shapes,
                 "txt_seq_lens": txt_seq_lens,
                 "freqs_cis": None,
+                "encoder_hidden_states_mask": encoder_hidden_states_mask,
             }
-            if encoder_hidden_states_mask is not None:
-                cond_kwargs["encoder_hidden_states_mask"] = encoder_hidden_states_mask
             return cond_kwargs
 
         freqs_cis = QwenImagePipelineConfig.get_freqs_cis(
@@ -466,9 +463,8 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
             "txt_seq_lens": txt_seq_lens,
             "freqs_cis": (img_cache, txt_cache),
             "img_shapes": img_shapes,
+            "encoder_hidden_states_mask": encoder_hidden_states_mask,
         }
-        if encoder_hidden_states_mask is not None:
-            cond_kwargs["encoder_hidden_states_mask"] = encoder_hidden_states_mask
         return cond_kwargs
 
     def preprocess_condition_image(
@@ -672,9 +668,8 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
                 freqs_cis, noisy_img_seq_len, device
             ),
             "img_shapes": img_shapes,
+            "encoder_hidden_states_mask": encoder_hidden_states_mask,
         }
-        if encoder_hidden_states_mask is not None:
-            cond_kwargs["encoder_hidden_states_mask"] = encoder_hidden_states_mask
         return cond_kwargs
 
 
@@ -742,9 +737,8 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
             "img_shapes": img_shapes,
             "freqs_cis": (img_cache, txt_cache),
             "additional_t_cond": torch.tensor([0], device=device, dtype=torch.long),
+            "encoder_hidden_states_mask": encoder_hidden_states_mask,
         }
-        if encoder_hidden_states_mask is not None:
-            cond_kwargs["encoder_hidden_states_mask"] = encoder_hidden_states_mask
         return cond_kwargs
 
     def _unpad_and_unpack_latents(self, latents, batch):
