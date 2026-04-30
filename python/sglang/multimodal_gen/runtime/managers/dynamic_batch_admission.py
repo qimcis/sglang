@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Deterministic admission control for native diffusion batching.
+"""Admission control for native diffusion batching.
 
 Native diffusion batching is model, resolution, device, and implementation
-dependent. The scheduler therefore treats `--batching-max-size` as a public
-ceiling and uses `--batching-config` as the source of truth for the executable
-and profitable per-shape cap.
+dependent. The scheduler treats `--batching-max-size` as the public ceiling;
+`--batching-config` can apply stricter caps for specific model and shape
+combinations.
 """
 
 from __future__ import annotations
@@ -197,7 +197,7 @@ class RequestCostEstimator:
 
 
 class BatchAdmissionController:
-    """Applies deterministic config rules before adding requests to a batch."""
+    """Applies configured caps before adding requests to a batch."""
 
     def __init__(self, server_args: "ServerArgs", gpu_id: int):
         self._mode = getattr(server_args, "batching_mode", "dynamic")
@@ -260,11 +260,7 @@ class BatchAdmissionController:
     def limit_for(self, req: Req) -> AdmissionLimit:
         rules = self._matching_rules(req)
         if not rules:
-            raise RuntimeError(
-                "No matching batching config rule for "
-                f"model={self._model_path!r}, resolution={_resolution_key(req)!r}, "
-                f"offload={self._offload}, device_memory_gb={self._device_memory_gb}."
-            )
+            return AdmissionLimit(max_batch_size=self._user_max_batch_size)
 
         config_cap = min(rule.max_batch_size for rule in rules)
         max_batch_size = min(self._user_max_batch_size, config_cap)

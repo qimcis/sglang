@@ -9,11 +9,13 @@ This section covers the main performance levers for SGLang Diffusion: attention 
 | **Cache-DiT** | Caching | Block-level caching with DBCache, TaylorSeer, and SCM |
 | **TeaCache** | Caching | Timestep-level caching based on temporal similarity |
 | **Attention Backends** | Kernel | Optimized attention implementations (FlashAttention, SageAttention, etc.) |
+| **Inference Batching** | Scheduler | Request batching for native diffusion serving |
 | **Profiling** | Diagnostics | PyTorch Profiler and Nsight Systems guidance |
 
 ## Start Here
 
 - Use [Attention Backends](attention_backends.md) to choose the best backend for your model and hardware.
+- Use [Inference Batching](dynamic_batching.md) to improve throughput for compatible concurrent requests.
 - Use [Caching Acceleration](cache/index.md) to reduce denoising cost with Cache-DiT or TeaCache.
 - Use [Profiling](profiling.md) when you need to diagnose a bottleneck rather than guess.
 
@@ -26,6 +28,7 @@ This section covers the main performance levers for SGLang Diffusion: attention 
 :maxdepth: 1
 
 attention_backends
+dynamic_batching
 cache/index
 profiling
 ```

@@ -1050,8 +1050,8 @@ class ServerArgs(DisaggArgsMixin):
             type=str,
             default=ServerArgs.batching_config,
             help=(
-                "JSON file with calibrated model/resolution batching admission "
-                "rules. Required when --batching-max-size > 1."
+                "Optional JSON file with model/resolution batching admission "
+                "rules that can cap specific shapes below --batching-max-size."
             ),
         )
         parser.add_argument(
@@ -1508,8 +1508,6 @@ class ServerArgs(DisaggArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
-        if self.batching_max_size > 1 and self.batching_config is None:
-            raise ValueError("batching_config is required when batching_max_size > 1")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""
