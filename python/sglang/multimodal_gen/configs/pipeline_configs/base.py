@@ -105,6 +105,7 @@ def postprocess_text(output: BaseEncoderOutput, _text_inputs) -> torch.tensor:
 class TextConditioningOutput:
     prompt_embeds: torch.Tensor
     prompt_embeds_mask: torch.Tensor | None = None
+    prompt_seq_lens: list[int] | None = None
 
 
 def pad_text_embeddings_with_mask(
@@ -120,14 +121,15 @@ def pad_text_embeddings_with_mask(
             for e in text_embeds
         ]
     )
-    seq_lens = torch.tensor(
-        [e.size(0) for e in text_embeds],
+    seq_lens = [int(e.size(0)) for e in text_embeds]
+    seq_lens_tensor = torch.tensor(
+        seq_lens,
         device=prompt_embeds.device,
         dtype=torch.long,
     )
     positions = torch.arange(max_seq_len, device=prompt_embeds.device).unsqueeze(0)
-    prompt_embeds_mask = positions < seq_lens.unsqueeze(1)
-    return TextConditioningOutput(prompt_embeds, prompt_embeds_mask)
+    prompt_embeds_mask = positions < seq_lens_tensor.unsqueeze(1)
+    return TextConditioningOutput(prompt_embeds, prompt_embeds_mask, seq_lens)
 
 
 def shard_rotary_emb_for_sp(emb):

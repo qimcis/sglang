@@ -433,9 +433,11 @@ class TextEncodingStage(PipelineStage):
                 outputs, text_inputs, **postprocess_kwargs
             )
             prompt_embeds_mask = None
+            prompt_seq_lens = None
             if isinstance(postprocess_result, TextConditioningOutput):
                 prompt_embeds = postprocess_result.prompt_embeds
                 prompt_embeds_mask = postprocess_result.prompt_embeds_mask
+                prompt_seq_lens = postprocess_result.prompt_seq_lens
             elif isinstance(postprocess_result, tuple):
                 if len(postprocess_result) != 2:
                     raise ValueError(
@@ -500,11 +502,20 @@ class TextEncodingStage(PipelineStage):
                         )
                     )
                 embeds_masks_list.append(embeds_mask)
-                seq_lens_list.append(
-                    server_args.pipeline_config.seq_lens_from_text_conditioning_mask(
-                        embeds_mask
+                if prompt_seq_lens is not None:
+                    seq_lens_list.append([int(x) for x in prompt_seq_lens])
+                elif embeds_mask is not None:
+                    seq_lens_list.append(
+                        server_args.pipeline_config.seq_lens_from_text_conditioning_mask(
+                            embeds_mask
+                        )
                     )
-                )
+                elif prompt_embeds.ndim == 2:
+                    seq_lens_list.append([int(prompt_embeds.shape[0])])
+                else:
+                    seq_lens_list.append(
+                        [int(prompt_embeds.shape[1])] * int(prompt_embeds.shape[0])
+                    )
 
         # Shape results according to return_type
         if return_type == "list":

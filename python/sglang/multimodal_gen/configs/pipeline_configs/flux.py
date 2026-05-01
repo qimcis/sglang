@@ -106,7 +106,13 @@ class FluxPipelineConfig(ImagePipelineConfig):
             shape = (1, prompt_embeds.shape[0])
         else:
             shape = prompt_embeds.shape[:2]
-        return torch.ones(shape, dtype=torch.bool, device=prompt_embeds.device)
+        return torch.ones(shape, dtype=torch.bool)
+
+    @staticmethod
+    def seq_lens_from_text_conditioning_mask(mask: "torch.Tensor") -> list[int]:
+        if mask.ndim != 2:
+            raise ValueError("text conditioning mask must have shape [batch, seq]")
+        return [int(mask.shape[1])] * int(mask.shape[0])
 
     def get_text_encoder_pooler_output(self, outputs, encoder_index):
         return outputs.pooler_output
