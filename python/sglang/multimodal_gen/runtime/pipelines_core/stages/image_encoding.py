@@ -335,9 +335,11 @@ class ImageEncodingStage(PipelineStage):
             batch.prompt_embeds_mask.append(
                 torch.cat(
                     [
-                        mask
-                        if mask is not None
-                        else self._default_text_mask(prompt_embeds)
+                        (
+                            mask
+                            if mask is not None
+                            else self._default_text_mask(prompt_embeds)
+                        )
                         for prompt_embeds, mask in zip(
                             all_prompt_embeds, all_prompt_embeds_masks, strict=True
                         )
@@ -355,9 +357,11 @@ class ImageEncodingStage(PipelineStage):
             batch.negative_prompt_embeds_mask.append(
                 torch.cat(
                     [
-                        mask
-                        if mask is not None
-                        else self._default_text_mask(neg_prompt_embeds)
+                        (
+                            mask
+                            if mask is not None
+                            else self._default_text_mask(neg_prompt_embeds)
+                        )
                         for neg_prompt_embeds, mask in zip(
                             all_neg_prompt_embeds,
                             all_neg_prompt_embeds_masks,
