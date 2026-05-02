@@ -338,6 +338,20 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         *,
         negative: bool = False,
     ):
+        """Return the text attention mask passed to the Qwen image DiT.
+
+        Qwen image batches can contain prompts with different semantic text
+        lengths after tokenization/postprocessing. The transformer still sees a
+        padded `encoder_hidden_states` tensor with shape [batch, text_seq_len,
+        dim], so we pass a [batch, text_seq_len] boolean mask to keep attention
+        on real text tokens and ignore padding.
+
+        If every request uses the full padded length, no mask is needed and this
+        returns None. Otherwise, prefer the embedding-aligned mask stored by the
+        text encoding stage. If that is unavailable, rebuild the same mask from
+        `txt_seq_lens`: position j is valid for row i when
+        `j < txt_seq_lens[i]`.
+        """
         if all(seq_len == text_seq_len for seq_len in txt_seq_lens):
             return None
 
@@ -353,6 +367,7 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
                 )
             return mask
 
+        # TODO: cache positions by (device, text_seq_len) if this allocation shows up hot.
         positions = torch.arange(text_seq_len, device=batch.prompt_embeds[0].device)
         seq_lens = torch.tensor(
             txt_seq_lens,

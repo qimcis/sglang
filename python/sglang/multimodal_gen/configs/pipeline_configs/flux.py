@@ -218,6 +218,15 @@ class FluxPipelineConfig(ImagePipelineConfig):
         return latents
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        """Build Flux positive-conditioning kwargs from encoded text state.
+
+        Flux v1 uses encoder index 1 (the T5 encoder) as the token stream that
+        is concatenated with image tokens for rotary position embeddings. The
+        text encoding stage stores per-request sequence lengths in
+        batch.prompt_seq_lens; read them here instead of inferring from padded
+        embeddings so grouped multi-output requests preserve their explicit
+        text-conditioning contract.
+        """
         txt_seq_lens = self.require_text_seq_lens(
             batch,
             1,
@@ -240,6 +249,7 @@ class FluxPipelineConfig(ImagePipelineConfig):
         }
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        """Build Flux negative-conditioning kwargs using T5 sequence lengths."""
         txt_seq_lens = self.require_text_seq_lens(
             batch,
             1,
@@ -604,6 +614,13 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         return cos, sin
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        """Build Flux2 positive-conditioning kwargs from encoded text state.
+
+        Flux2 uses encoder index 0 for the Mistral text stream. The stored
+        sequence lengths are passed through to rotary-position preparation so
+        grouped requests use the same text-length metadata that was produced
+        during text encoding.
+        """
         txt_seq_lens = self.require_text_seq_lens(
             batch,
             0,

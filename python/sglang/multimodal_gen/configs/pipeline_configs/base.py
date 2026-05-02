@@ -550,7 +550,7 @@ class PipelineConfig:
     def seq_lens_from_text_conditioning_mask(mask: "torch.Tensor") -> list[int]:
         if mask.ndim != 2:
             raise ValueError("text conditioning mask must have shape [batch, seq]")
-        return [int(x) for x in mask.to(torch.int64).sum(dim=1).tolist()]
+        return torch.count_nonzero(mask, dim=1).tolist()
 
     def require_text_seq_lens(
         self,

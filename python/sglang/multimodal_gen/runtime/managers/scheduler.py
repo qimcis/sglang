@@ -259,16 +259,30 @@ class Scheduler(SchedulerDisaggMixin):
         req = cls._first_generation_req(req_or_group)
         return req.is_warmup if req is not None else False
 
-    def _dispatch_request(self, reqs: list[Any]) -> OutputBatch | list[OutputBatch]:
-        """dispatch req to its registered handler"""
-        req_or_group = reqs[0]
+    def _dispatch_single_request(self, req_or_group: Any) -> OutputBatch:
+        """Dispatch one queue item."""
         if isinstance(req_or_group, list):
-            return self._handle_generation(reqs)
+            if not all(isinstance(req, Req) for req in req_or_group):
+                return OutputBatch(
+                    error=f"Unknown request group type: {type(req_or_group)}"
+                )
+            return self._handle_generation(req_or_group, allow_dynamic_batching=False)
 
         handler = self.request_handlers.get(type(req_or_group))
         if handler is None:
             return OutputBatch(error=f"Unknown request type: {type(req_or_group)}")
-        return handler(reqs)
+        return handler([req_or_group])
+
+    def _dispatch_items(
+        self, items: list[tuple[bytes | None, Any]]
+    ) -> OutputBatch | list[OutputBatch]:
+        """Dispatch queue entries; multiple Req entries represent a batch."""
+        reqs = [item[1] for item in items]
+        if len(reqs) > 1 and all(isinstance(req, Req) for req in reqs):
+            return self._handle_generation(reqs, allow_dynamic_batching=True)
+        if len(reqs) > 1:
+            return [self._dispatch_single_request(req) for req in reqs]
+        return self._dispatch_single_request(reqs[0])
 
     def _log_warmup_result(self, output_batch: OutputBatch, is_warmup: bool) -> None:
         if not is_warmup:
@@ -298,7 +312,9 @@ class Scheduler(SchedulerDisaggMixin):
             else:
                 logger.info("Warmup req processing failed")
 
-    def _handle_generation(self, reqs: list[Any]):
+    def _handle_generation(
+        self, reqs: list[Any], *, allow_dynamic_batching: bool = True
+    ):
         reqs = self._normalize_generation_reqs(reqs)
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
@@ -318,7 +334,7 @@ class Scheduler(SchedulerDisaggMixin):
             DiffStage.SCHEDULER_DISPATCH,
             thread_finish_flag=True,
         ):
-            if len(reqs) == 1:
+            if len(reqs) == 1 or not allow_dynamic_batching:
                 return self.worker.execute_forward(reqs)
 
             merged_req = self._try_merge_generation_reqs(reqs)
@@ -957,6 +973,22 @@ class Scheduler(SchedulerDisaggMixin):
             self.warmed_up = True
         return recv_reqs
 
+    @staticmethod
+    def _normalize_received_payload(
+        identity: bytes, reqs: Any
+    ) -> list[tuple[bytes, Any]]:
+        if not isinstance(reqs, list):
+            return [(identity, reqs)]
+        if not reqs:
+            return []
+        if all(isinstance(req, Req) for req in reqs):
+            # AsyncSchedulerClient sends ordinary single requests as [Req].
+            # Only multi-item list[Req] payloads represent a grouped multi-output request.
+            if len(reqs) == 1:
+                return [(identity, reqs[0])]
+            return [(identity, reqs)]
+        return [(identity, req) for req in reqs]
+
     def recv_reqs(self) -> List[tuple[bytes, Any]]:
         """
         For non-main schedulers, reqs are broadcasted from main using broadcast_pyobj
@@ -977,9 +1009,7 @@ class Scheduler(SchedulerDisaggMixin):
                     except (pickle.UnpicklingError, IndexError, EOFError):
                         continue
 
-                    if not isinstance(reqs, list):
-                        reqs = [reqs]
-                    recv_reqs.extend((identity, req) for req in reqs)
+                    recv_reqs.extend(self._normalize_received_payload(identity, reqs))
             except zmq.ZMQError:
                 # re-raise or handle appropriately to let the outer loop continue
                 raise
@@ -1075,10 +1105,8 @@ class Scheduler(SchedulerDisaggMixin):
                         time.sleep(remaining_ms / 1000.0)
                 continue
 
-            reqs = [item[1] for item in items]
-
             try:
-                handler_result = self._dispatch_request(reqs)
+                handler_result = self._dispatch_items(items)
             except Exception as e:
                 logger.error(
                     f"Error executing request in scheduler event loop: {e}",
