@@ -293,16 +293,8 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
                 )
             ]
         ] * batch_size
-        txt_seq_lens = self.require_text_seq_lens(
-            batch, 0, negative=negative, expected_batch_size=batch_size
-        )
-        encoder_hidden_states_mask = self._prepare_encoder_hidden_states_mask(
-            batch,
-            0,
-            txt_seq_lens,
-            text_seq_len,
-            batch_size,
-            negative=negative,
+        txt_seq_lens, encoder_hidden_states_mask = self._prepare_text_conditioning(
+            batch, 0, text_seq_len, batch_size, negative=negative
         )
 
         if rotary_emb is None:
@@ -327,6 +319,31 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
             "encoder_hidden_states_mask": encoder_hidden_states_mask,
         }
         return cond_kwargs
+
+    def _prepare_text_conditioning(
+        self,
+        batch,
+        encoder_index: int,
+        text_seq_len: int,
+        batch_size: int,
+        *,
+        negative: bool = False,
+    ):
+        if batch_size == 1:
+            return [text_seq_len], None
+
+        txt_seq_lens = self.require_text_seq_lens(
+            batch, encoder_index, negative=negative, expected_batch_size=batch_size
+        )
+        encoder_hidden_states_mask = self._prepare_encoder_hidden_states_mask(
+            batch,
+            encoder_index,
+            txt_seq_lens,
+            text_seq_len,
+            batch_size,
+            negative=negative,
+        )
+        return txt_seq_lens, encoder_hidden_states_mask
 
     def _prepare_encoder_hidden_states_mask(
         self,
@@ -441,16 +458,8 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
                 ),
             ],
         ] * batch_size
-        txt_seq_lens = self.require_text_seq_lens(
-            batch, 0, negative=negative, expected_batch_size=batch_size
-        )
-        encoder_hidden_states_mask = self._prepare_encoder_hidden_states_mask(
-            batch,
-            0,
-            txt_seq_lens,
-            text_seq_len,
-            batch_size,
-            negative=negative,
+        txt_seq_lens, encoder_hidden_states_mask = self._prepare_text_conditioning(
+            batch, 0, text_seq_len, batch_size, negative=negative
         )
 
         if rotary_emb is None:
@@ -656,16 +665,8 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
                 ],
             ],
         ] * batch_size
-        txt_seq_lens = self.require_text_seq_lens(
-            batch, 0, negative=negative, expected_batch_size=batch_size
-        )
-        encoder_hidden_states_mask = self._prepare_encoder_hidden_states_mask(
-            batch,
-            0,
-            txt_seq_lens,
-            text_seq_len,
-            batch_size,
-            negative=negative,
+        txt_seq_lens, encoder_hidden_states_mask = self._prepare_text_conditioning(
+            batch, 0, text_seq_len, batch_size, negative=negative
         )
 
         freqs_cis = QwenImageEditPlusPipelineConfig.get_freqs_cis(
@@ -720,16 +721,8 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
         vae_scale_factor = self.get_vae_scale_factor()
 
         img_shapes = batch.img_shapes
-        txt_seq_lens = self.require_text_seq_lens(
-            batch, 0, negative=negative, expected_batch_size=batch_size
-        )
-        encoder_hidden_states_mask = self._prepare_encoder_hidden_states_mask(
-            batch,
-            0,
-            txt_seq_lens,
-            text_seq_len,
-            batch_size,
-            negative=negative,
+        txt_seq_lens, encoder_hidden_states_mask = self._prepare_text_conditioning(
+            batch, 0, text_seq_len, batch_size, negative=negative
         )
 
         freqs_cis = QwenImageEditPlusPipelineConfig.get_freqs_cis(
