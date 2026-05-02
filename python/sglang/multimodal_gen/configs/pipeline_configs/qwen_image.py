@@ -43,14 +43,19 @@ def qwen_image_preprocess_text(prompt):
     return txt
 
 
-def qwen_image_postprocess_text(outputs, _text_inputs, drop_idx=34):
+def qwen_image_postprocess_text(
+    outputs, _text_inputs, drop_idx=34, return_attention_mask=False
+):
     # squeeze the batch dim
     hidden_states = outputs.hidden_states[-1]
     split_hidden_states = _extract_masked_hidden(
         hidden_states, _text_inputs.attention_mask
     )
     split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
-    return pad_text_embeddings_with_mask(split_hidden_states)
+    conditioning = pad_text_embeddings_with_mask(split_hidden_states)
+    if return_attention_mask:
+        return conditioning
+    return conditioning.prompt_embeds
 
 
 def qwen_image_edit_postprocess_text(outputs, _text_inputs):
