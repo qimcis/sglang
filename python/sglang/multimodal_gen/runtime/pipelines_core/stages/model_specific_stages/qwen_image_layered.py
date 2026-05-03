@@ -22,6 +22,7 @@ logger = init_logger(__name__)
 def _seq_lens_from_optional_mask(
     prompt_embeds: torch.Tensor, prompt_embeds_mask: torch.Tensor | None
 ) -> list[int]:
+    """Return real text lengths, treating a missing mask as all tokens valid."""
     if prompt_embeds_mask is None:
         return [int(prompt_embeds.shape[1])] * int(prompt_embeds.shape[0])
     return [int(x) for x in prompt_embeds_mask.sum(dim=1).tolist()]

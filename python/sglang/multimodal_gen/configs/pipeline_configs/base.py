@@ -369,7 +369,7 @@ class PipelineConfig:
         return False
 
     def supports_dynamic_batching(self):
-        """Return whether this pipeline has request types that can be batched.
+        """Return whether this pipeline can opt in to dynamic batching.
 
         The scheduler still checks each request before merging it into a batch.
         """
@@ -551,10 +551,10 @@ class PipelineConfig:
     ) -> "torch.Tensor":
         """Return a mask aligned with post-processed prompt embeddings.
 
-        Dynamic batching must carry post-processed semantic text lengths
-        explicitly. If a model-specific postprocessor changes the sequence
-        length, it must return TextConditioningOutput with an
-        embedding-aligned mask.
+        True values mark valid text tokens. Dynamic batching must carry
+        post-processed semantic text lengths explicitly; if a model-specific
+        postprocessor changes the sequence length, it must return
+        TextConditioningOutput with an embedding-aligned mask.
         """
         if prompt_embeds.ndim < 2:
             raise ValueError(
@@ -603,7 +603,11 @@ class PipelineConfig:
         negative: bool = False,
         expected_batch_size: int | None = None,
     ) -> list[int]:
-        """Return stored text lengths for one text encoder."""
+        """Return postprocessed text lengths captured during text encoding.
+
+        Dynamic batches use these lengths for model masks, RoPE, and cache
+        sizing after text embeddings have been padded.
+        """
         seq_lens_by_encoder = (
             batch.negative_prompt_seq_lens if negative else batch.prompt_seq_lens
         )

@@ -618,8 +618,8 @@ class QwenImageCrossAttention(nn.Module):
         """Run joint text-image attention.
 
         `attn_mask` or `attention_mask` takes precedence. Otherwise,
-        `encoder_hidden_states_mask` masks text tokens in the joint text-image
-        sequence.
+        `encoder_hidden_states_mask` keeps valid text tokens in the joint
+        text-image sequence.
         """
         seq_len_txt = encoder_hidden_states.shape[1]
         attn_mask = cross_attention_kwargs.get("attn_mask")
@@ -1221,7 +1221,7 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             encoder_hidden_states (`torch.Tensor` of shape `(batch_size, text_sequence_length, joint_attention_dim)`):
                 Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
             encoder_hidden_states_mask (`torch.Tensor` of shape `(batch_size, text_sequence_length)`):
-                Mask of the input conditions.
+                Valid-token mask of the input conditions, where True keeps a text token.
             timestep ( `torch.LongTensor`):
                 Used to indicate denoising step.
             attention_kwargs (`dict`, *optional*):

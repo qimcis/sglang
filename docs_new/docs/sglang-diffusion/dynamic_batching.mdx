@@ -137,7 +137,7 @@ An initial implementation of dynamic batching for T2I and T2V models can be foun
 - Use `--enable-batching-metrics` to inspect realized batches:
 
 ```text
-Dynamic batch dispatch: size=2/8, queue_wait=5.12ms, stop_reason=delay
-Dynamic batch dispatch: size=1/8, queue_wait=0.04ms, stop_reason=config_cap:1
+Dynamic batch dispatch: size=2/8, user_max=8, queue_wait=5.12ms, stop_reason=delay
+Dynamic batch dispatch: size=1/8, user_max=8, queue_wait=0.04ms, stop_reason=config_cap:1
 Dynamic batch stats (last 5 dispatches): avg_size=2.80, merged_rate=60.0%, full_rate=20.0%, utilization=35.0%, wait_avg=3.21ms, wait_p95=5.12ms, top_rejects=none
 ```

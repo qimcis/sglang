@@ -14,6 +14,7 @@ from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
+    TextConditioningOutput,
     pad_text_embeddings_with_mask,
 )
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
@@ -33,7 +34,9 @@ def zimage_preprocess_text(prompt: str):
     return messages
 
 
-def zimage_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+def zimage_postprocess_text(
+    outputs: BaseEncoderOutput, _text_inputs
+) -> torch.Tensor | TextConditioningOutput:
     """Return unpadded Z-Image text embeddings.
 
     Batched outputs return TextConditioningOutput to preserve per-prompt text
@@ -191,7 +194,7 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
         return plan
 
     def _split_text_embeds_for_dit(self, batch, *, negative: bool = False):
-        """Return per-request text tensors from padded batched embeddings."""
+        """Return per-request text tensors, trimming padded batched embeddings."""
         embeds = batch.negative_prompt_embeds if negative else batch.prompt_embeds
         if embeds is None:
             return None
@@ -223,7 +226,7 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
         ]
 
     def _caption_rope_length(self, prompt_embeds, batch, *, negative: bool = False):
-        """Return the caption length used for Z-Image RoPE caches."""
+        """Return the shared caption RoPE length for current text embeddings."""
         if torch.is_tensor(prompt_embeds):
             if prompt_embeds.ndim == 2:
                 return int(prompt_embeds.shape[0])

@@ -89,6 +89,7 @@ class Req:
     negative_prompt_embeds: list[torch.Tensor] | None = None
     prompt_attention_mask: list[torch.Tensor | None] | None = None
     negative_attention_mask: list[torch.Tensor | None] | None = None
+    # Masks and lengths aligned to postprocessed embeddings, one entry per text encoder.
     prompt_embeds_mask: list[torch.Tensor | None] | None = None
     negative_prompt_embeds_mask: list[torch.Tensor | None] | None = None
     prompt_seq_lens: list[list[int]] | None = None

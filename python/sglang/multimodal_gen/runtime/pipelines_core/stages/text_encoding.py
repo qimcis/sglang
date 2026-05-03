@@ -156,6 +156,7 @@ class TextEncodingStage(PipelineStage):
 
             assert batch.negative_prompt_embeds is not None
 
+            # A single negative prompt can be shared across positive prompts.
             target_batch_sizes = [pe.shape[0] for pe in prompt_embeds_list]
 
             def align_negative_batch_dim(

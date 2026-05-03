@@ -782,8 +782,10 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     ):
         """Patchify images and pad image/caption tokens to batch targets.
 
-        Each image is [C, F, H, W] and has one [L, D] caption. Returned valid
-        lengths mark real tokens before learned pad tokens are restored.
+        Each image is [C, F, H, W] and has one [L, D] caption. Returned tensors
+        are stacked as [B, S, D], while valid lengths keep track of real tokens
+        before learned pad tokens are restored. `image_seq_len_target`, when
+        set, is the SP-local padded image-token target.
         """
         if len(all_image) != len(all_cap_feats):
             raise ValueError(
@@ -935,7 +937,6 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         x = self._replace_padding_with_token(x, x_valid_lens, self.x_pad_token)
         x_freqs_cis = freqs_cis[1]
 
-        x_freqs_cis = x_freqs_cis
         for layer_id, layer in enumerate(self.noise_refiner):
             x = layer(x, x_freqs_cis, adaln_input)
 
@@ -946,7 +947,6 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         cap_freqs_cis = freqs_cis[0]
 
-        cap_input_dtype = cap_feats.dtype
         for layer_id, layer in enumerate(self.context_refiner):
             cap_feats = layer(
                 cap_feats,

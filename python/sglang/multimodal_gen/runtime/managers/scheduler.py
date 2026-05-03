@@ -683,7 +683,7 @@ class Scheduler(SchedulerDisaggMixin):
     def _split_batched_output(
         self, output_batch: OutputBatch, reqs: List[Req]
     ) -> List[OutputBatch] | None:
-        """Split a merged worker result back into client-sized `OutputBatch` objects."""
+        """Split a merged result only when outputs map one-to-one to requests."""
         per_req_counts = [req.num_outputs_per_prompt for req in reqs]
         total_items = sum(per_req_counts)
         output_items = self._count_first_dim(output_batch.output)

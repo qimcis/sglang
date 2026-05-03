@@ -98,6 +98,7 @@ class FluxPipelineConfig(ImagePipelineConfig):
         prompt_embeds: "torch.Tensor",
         encoder_index: int,
     ) -> "torch.Tensor":
+        """Use all-valid fixed-length masks for Flux v1 text embeddings."""
         if prompt_embeds.ndim < 2:
             raise ValueError(
                 "prompt_embeds must have shape [batch, seq, ...] or [seq, ...]"

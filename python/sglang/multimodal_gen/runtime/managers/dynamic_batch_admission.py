@@ -44,6 +44,8 @@ _BATCHING_RULE_KEYS = frozenset(
 
 @dataclass(frozen=True)
 class AdmissionLimit:
+    """Effective batch size and cost caps after matching batching rules."""
+
     max_batch_size: int
     max_cost: float | None = None
     cap_reason: str | None = None
@@ -63,6 +65,8 @@ class AdmissionLimit:
 
 @dataclass(frozen=True)
 class BatchingRule:
+    """One user-provided batching admission rule loaded from batching config."""
+
     model: str | None = None
     model_contains: str | None = None
     resolution: str | None = None
