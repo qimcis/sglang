@@ -92,7 +92,6 @@ Its core features include:
    diffusion/performance/index
    diffusion/performance/ring_sp_performance
    diffusion/performance/attention_backends
-   diffusion/performance/dynamic_batching
    diffusion/performance/cache/index
    diffusion/quantization
    diffusion/contributing

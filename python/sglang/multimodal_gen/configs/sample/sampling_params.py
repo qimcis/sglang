@@ -89,6 +89,9 @@ class DataType(Enum):
 class SamplingParams:
     """
     Sampling parameters for generation.
+
+    Fields with `batch_sig_exclude` metadata are ignored in dynamic batching
+    compatibility checks.
     """
 
     data_type: DataType = DataType.VIDEO

@@ -10,12 +10,12 @@ combinations.
 from __future__ import annotations
 
 import json
-import math
 import os
 from dataclasses import dataclass
 from difflib import get_close_matches
 from typing import TYPE_CHECKING, Any
 
+from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -25,7 +25,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-BYTES_PER_GIB = 1024**3
 _BATCHING_RULE_KEYS = frozenset(
     {
         "model",
@@ -57,8 +56,6 @@ class AdmissionLimit:
         return None
 
     def stop_reason_for_next_cost(self, next_batch_cost: float) -> str | None:
-        if self.cap_reason is not None:
-            return self.cap_reason
         if self.max_cost is not None and next_batch_cost > self.max_cost:
             return f"cost_budget_next:{next_batch_cost:.0f}>{self.max_cost:.0f}"
         return None
@@ -152,50 +149,6 @@ class BatchingRule:
         return True
 
 
-class RequestCostEstimator:
-    def __init__(self, pipeline_config: Any):
-        self._pipeline_config = pipeline_config
-
-    def batch_cost(self, reqs: list[Req]) -> float:
-        return sum(self.request_cost(req) for req in reqs)
-
-    def request_cost(self, req: Req) -> float:
-        latent_tokens = float(getattr(req, "n_tokens", None) or 0)
-        if latent_tokens <= 0:
-            latent_tokens = self._estimate_latent_tokens(req)
-
-        num_frames = max(1, int(getattr(req, "num_frames", 1) or 1))
-        num_outputs = max(1, int(getattr(req, "num_outputs_per_prompt", 1) or 1))
-        return latent_tokens * num_frames * num_outputs
-
-    def _estimate_latent_tokens(self, req: Req) -> float:
-        width = int(getattr(req, "width", 0) or 0)
-        height = int(getattr(req, "height", 0) or 0)
-        if width <= 0 or height <= 0:
-            return 0.0
-
-        compression = self._spatial_compression_factor()
-        latent_w = max(1, math.ceil(width / compression))
-        latent_h = max(1, math.ceil(height / compression))
-        return float(latent_w * latent_h)
-
-    def _spatial_compression_factor(self) -> int:
-        vae_scale = None
-        try:
-            vae_config = getattr(self._pipeline_config, "vae_config", None)
-            arch_config = getattr(vae_config, "arch_config", None)
-            vae_scale = getattr(arch_config, "vae_scale_factor", None)
-            if vae_scale is None and hasattr(vae_config, "get_vae_scale_factor"):
-                vae_scale = vae_config.get_vae_scale_factor()
-        except Exception:
-            vae_scale = None
-
-        try:
-            return max(1, int(vae_scale))
-        except Exception:
-            return 1
-
-
 class BatchAdmissionController:
     """Applies configured caps before adding requests to a batch."""
 
@@ -206,7 +159,7 @@ class BatchAdmissionController:
         self._offload = bool(server_args.dit_layerwise_offload)
         self._device_memory_gb = self._get_device_memory_gb(gpu_id)
         self._rules = load_batching_config(server_args.batching_config)
-        self._cost_estimator = RequestCostEstimator(server_args.pipeline_config)
+        self._pipeline_config = server_args.pipeline_config
 
         if self.enabled:
             logger.info(
@@ -277,19 +230,17 @@ class BatchAdmissionController:
         )
 
     def estimate_batch_cost(self, reqs: list[Req]) -> float:
-        return self._cost_estimator.batch_cost(reqs)
-
-    def estimate_request_cost(self, req: Req) -> float:
-        return self._cost_estimator.request_cost(req)
+        return sum(
+            float(self._pipeline_config.estimate_request_cost(req)) for req in reqs
+        )
 
     def _matching_rules(self, req: Req) -> list[BatchingRule]:
-        resolution = _resolution_key(req)
         return [
             rule
             for rule in self._rules
             if rule.matches(
                 model_path=self._model_path,
-                resolution=resolution,
+                resolution=req.resolution_key,
                 device_memory_gb=self._device_memory_gb,
                 offload=self._offload,
             )
@@ -298,7 +249,7 @@ class BatchAdmissionController:
     @staticmethod
     def _get_device_memory_gb(gpu_id: int) -> float | None:
         try:
-            return current_platform.get_device_total_memory(gpu_id) / BYTES_PER_GIB
+            return current_platform.get_device_total_memory(gpu_id) / BYTES_PER_GB
         except Exception:
             return None
 
@@ -360,14 +311,6 @@ def _validate_rule_keys(data: dict[str, Any], *, source: str) -> None:
         f"batching config rule from {source} contains unknown key(s): "
         f"{', '.join(hints)}"
     )
-
-
-def _resolution_key(req: Req) -> str | None:
-    width = getattr(req, "width", None)
-    height = getattr(req, "height", None)
-    if width is None or height is None:
-        return None
-    return f"{int(width)}x{int(height)}"
 
 
 def _optional_str(value: Any) -> str | None:

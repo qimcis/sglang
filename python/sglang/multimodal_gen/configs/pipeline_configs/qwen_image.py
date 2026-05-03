@@ -46,6 +46,11 @@ def qwen_image_preprocess_text(prompt):
 def qwen_image_postprocess_text(
     outputs, _text_inputs, drop_idx=34, return_attention_mask=False
 ):
+    """Postprocess Qwen text embeddings.
+
+    Returns padded embeddings by default, or TextConditioningOutput when
+    embedding-aligned masks are requested.
+    """
     # squeeze the batch dim
     hidden_states = outputs.hidden_states[-1]
     split_hidden_states = _extract_masked_hidden(
@@ -283,6 +288,11 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
     def _prepare_cond_kwargs(
         self, batch, prompt_embeds, rotary_emb, device, dtype, *, negative=False
     ):
+        """Build Qwen DiT conditioning kwargs for positive or negative prompts.
+
+        The kwargs include text lengths for RoPE construction and optional
+        encoder masks for cross-attention.
+        """
         batch_size = prompt_embeds[0].shape[0]
         text_seq_len = prompt_embeds[0].shape[1]
         height = batch.height
@@ -334,6 +344,11 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         *,
         negative: bool = False,
     ):
+        """Return Qwen text lengths and an optional DiT attention mask.
+
+        Single-request execution uses the full padded length. Batched execution
+        uses stored per-request lengths and masks from text encoding.
+        """
         if batch_size == 1:
             return [text_seq_len], None
 

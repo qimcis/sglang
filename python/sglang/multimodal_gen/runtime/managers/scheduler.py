@@ -7,7 +7,7 @@ import os
 import pickle
 import tempfile
 import time
-from collections import Counter, deque
+from collections import deque
 from copy import deepcopy
 from enum import Enum
 from typing import Any, List
@@ -41,7 +41,10 @@ from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    BatchMetricsWindow,
+    OutputBatch,
+)
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
     ServerArgs,
@@ -65,16 +68,6 @@ DEFAULT_PLACEHOLDER_PROMPT = "warmup"
 
 _MAX_RECV_REQS_PER_POLL = 1024
 _BATCH_METRICS_LOG_INTERVAL = 5
-
-
-@dataclasses.dataclass
-class _BatchMetricsWindow:
-    dispatches: int = 0
-    total_requests: int = 0
-    merged_dispatches: int = 0
-    full_dispatches: int = 0
-    wait_times_ms: list[float] = dataclasses.field(default_factory=list)
-    reject_reasons: Counter[str] = dataclasses.field(default_factory=Counter)
 
 
 @dataclasses.dataclass
@@ -153,7 +146,7 @@ class Scheduler(SchedulerDisaggMixin):
         self._batching_max_size = server_args.batching_max_size
         self._batching_delay_s = server_args.batching_delay_ms / 1000.0
         self._batch_metrics_enabled = server_args.enable_batching_metrics
-        self._batch_metrics_window = _BatchMetricsWindow()
+        self._batch_metrics_window = BatchMetricsWindow()
         self._batch_admission = BatchAdmissionController(server_args, gpu_id=local_rank)
         self._poller = zmq.Poller()
         if self.receiver is not None:
@@ -260,7 +253,6 @@ class Scheduler(SchedulerDisaggMixin):
         return req.is_warmup if req is not None else False
 
     def _dispatch_single_request(self, req_or_group: Any) -> OutputBatch:
-        """Dispatch one queue item."""
         if isinstance(req_or_group, list):
             if not all(isinstance(req, Req) for req in req_or_group):
                 return OutputBatch(
@@ -276,7 +268,7 @@ class Scheduler(SchedulerDisaggMixin):
     def _dispatch_items(
         self, items: list[tuple[bytes | None, Any]]
     ) -> OutputBatch | list[OutputBatch]:
-        """Dispatch queue entries; multiple Req entries represent a batch."""
+        """Dispatch ready queue items; several plain `Req`s form one dynamic batch."""
         reqs = [item[1] for item in items]
         if len(reqs) > 1 and all(isinstance(req, Req) for req in reqs):
             return self._handle_generation(reqs, allow_dynamic_batching=True)
@@ -315,6 +307,7 @@ class Scheduler(SchedulerDisaggMixin):
     def _handle_generation(
         self, reqs: list[Any], *, allow_dynamic_batching: bool = True
     ):
+        """Dispatch generation requests, merging compatible requests when allowed."""
         reqs = self._normalize_generation_reqs(reqs)
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
@@ -396,34 +389,91 @@ class Scheduler(SchedulerDisaggMixin):
         )
         return ordered[index]
 
-    def _find_sampling_param_mismatch_field(
-        self, base_req: Req, candidate_req: Req
-    ) -> str | None:
-        base_sp = base_req.sampling_params
-        candidate_sp = candidate_req.sampling_params
-        if base_sp is None or candidate_sp is None:
+    def _freeze_signature_value(self, value: Any):
+        if isinstance(value, (str, int, float, bool, type(None))):
+            return value
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, dict):
+            return {
+                str(k): self._freeze_signature_value(v)
+                for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
+            }
+        if isinstance(value, (list, tuple)):
+            return tuple(self._freeze_signature_value(v) for v in value)
+        return repr(value)
+
+    def _sampling_param_signature_items(self, req: Req) -> list[tuple[str, Any]] | None:
+        sp = req.sampling_params
+        if sp is None:
             return None
 
         try:
-            sp_fields = dataclasses.fields(base_sp)
+            sp_fields = dataclasses.fields(sp)
         except Exception:
             return None
 
-        for f in sp_fields:
-            if f.metadata.get("batch_sig_exclude", False):
-                continue
-            base_value = self._freeze_signature_value(getattr(base_sp, f.name, None))
-            candidate_value = self._freeze_signature_value(
-                getattr(candidate_sp, f.name, None)
-            )
-            if base_value != candidate_value:
-                return f"sampling_params.{f.name}"
+        return [
+            (f.name, self._freeze_signature_value(getattr(sp, f.name, None)))
+            for f in sp_fields
+            if not f.metadata.get("batch_sig_exclude", False)
+        ]
 
-        base_diffusers_kwargs = self._freeze_signature_value(
-            (base_req.extra or {}).get("diffusers_kwargs")
-        )
-        candidate_diffusers_kwargs = self._freeze_signature_value(
-            (candidate_req.extra or {}).get("diffusers_kwargs")
+    def _diffusers_kwargs_signature_value(self, req: Req) -> Any:
+        return self._freeze_signature_value((req.extra or {}).get("diffusers_kwargs"))
+
+    def _build_dynamic_batch_signature(self, req: Req) -> tuple[Any, ...] | None:
+        """Build the request compatibility signature for dynamic batching.
+
+        Fields marked with `batch_sig_exclude` are ignored. Pipeline kwargs
+        that affect generation remain part of the signature.
+        """
+        signature_items = self._sampling_param_signature_items(req)
+        if signature_items is None:
+            return None
+
+        if req.extra:
+            diffusers_kwargs = req.extra.get("diffusers_kwargs")
+            if diffusers_kwargs:
+                signature_items.append(
+                    (
+                        "diffusers_kwargs",
+                        self._freeze_signature_value(diffusers_kwargs),
+                    )
+                )
+
+        return tuple(signature_items)
+
+    def _get_cached_signature(self, req: Req) -> tuple[Any, ...] | None:
+        cached = getattr(req, "_dynamic_batch_sig", None)
+        if cached is not None:
+            return cached
+        sig = self._build_dynamic_batch_signature(req)
+        req._dynamic_batch_sig = sig  # type: ignore[attr-defined]
+        return sig
+
+    def _find_sampling_param_mismatch_field(
+        self, base_req: Req, candidate_req: Req
+    ) -> str | None:
+        base_items = self._sampling_param_signature_items(base_req)
+        candidate_items = self._sampling_param_signature_items(candidate_req)
+        if base_items is None or candidate_items is None:
+            return None
+
+        if len(base_items) != len(candidate_items):
+            return "sampling_params"
+
+        for (name, base_value), (candidate_name, candidate_value) in zip(
+            base_items, candidate_items
+        ):
+            if name != candidate_name:
+                return "sampling_params"
+            if base_value != candidate_value:
+                return f"sampling_params.{name}"
+
+        base_diffusers_kwargs = self._diffusers_kwargs_signature_value(base_req)
+        candidate_diffusers_kwargs = self._diffusers_kwargs_signature_value(
+            candidate_req
         )
         if base_diffusers_kwargs != candidate_diffusers_kwargs:
             return "extra.diffusers_kwargs"
@@ -457,19 +507,40 @@ class Scheduler(SchedulerDisaggMixin):
             or "signature_mismatch"
         )
 
+    def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
+        if base_req.is_warmup or candidate_req.is_warmup:
+            return False
+
+        if not isinstance(base_req.prompt, str) or not isinstance(
+            candidate_req.prompt, str
+        ):
+            return False
+
+        if base_req.image_path is not None or candidate_req.image_path is not None:
+            return False
+        if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
+            return False
+
+        base_sig = self._get_cached_signature(base_req)
+        cand_sig = self._get_cached_signature(candidate_req)
+        return base_sig is not None and base_sig == cand_sig
+
     def _record_batch_dispatch_metrics(
         self,
         batch_size: int,
         queue_wait_ms: float,
+        effective_max_batch_size: int,
         reject_reasons: list[str] | None = None,
         stop_reason: str | None = None,
     ) -> None:
         if not self._batch_metrics_enabled:
             return
 
+        effective_max_batch_size = max(1, effective_max_batch_size)
         logger.info(
-            "Dynamic batch dispatch: size=%d/%d, queue_wait=%.2fms, stop_reason=%s",
+            "Dynamic batch dispatch: size=%d/%d, user_max=%d, queue_wait=%.2fms, stop_reason=%s",
             batch_size,
+            effective_max_batch_size,
             self._batching_max_size,
             max(queue_wait_ms, 0.0),
             stop_reason or "unspecified",
@@ -478,9 +549,10 @@ class Scheduler(SchedulerDisaggMixin):
         window = self._batch_metrics_window
         window.dispatches += 1
         window.total_requests += batch_size
+        window.total_capacity += effective_max_batch_size
         if batch_size > 1:
             window.merged_dispatches += 1
-        if self._dynamic_batching_enabled() and batch_size >= self._batching_max_size:
+        if self._dynamic_batching_enabled() and batch_size >= effective_max_batch_size:
             window.full_dispatches += 1
         window.wait_times_ms.append(max(queue_wait_ms, 0.0))
         if reject_reasons:
@@ -498,8 +570,7 @@ class Scheduler(SchedulerDisaggMixin):
             return
 
         avg_size = window.total_requests / window.dispatches
-        max_batch_size = max(1, self._batching_max_size)
-        utilization = avg_size / max_batch_size
+        utilization = window.total_requests / max(1, window.total_capacity)
         avg_wait_ms = sum(window.wait_times_ms) / len(window.wait_times_ms)
         p95_wait_ms = self._percentile(window.wait_times_ms, 95.0)
         merged_rate = window.merged_dispatches / window.dispatches
@@ -522,7 +593,7 @@ class Scheduler(SchedulerDisaggMixin):
             p95_wait_ms,
             top_rejects,
         )
-        self._batch_metrics_window = _BatchMetricsWindow()
+        self._batch_metrics_window = BatchMetricsWindow()
 
     def _build_dynamic_batch_error_outputs(
         self,
@@ -543,77 +614,12 @@ class Scheduler(SchedulerDisaggMixin):
         if not is_warmup and self.receiver is not None and identity is not None:
             self.receiver.send_multipart([identity, b"", pickle.dumps(output_batch)])
 
-    def _freeze_signature_value(self, value: Any):
-        if isinstance(value, (str, int, float, bool, type(None))):
-            return value
-        if isinstance(value, Enum):
-            return value.value
-        if isinstance(value, dict):
-            return {
-                str(k): self._freeze_signature_value(v)
-                for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
-            }
-        if isinstance(value, (list, tuple)):
-            return tuple(self._freeze_signature_value(v) for v in value)
-        return repr(value)
-
-    def _build_dynamic_batch_signature(self, req: Req) -> tuple[Any, ...] | None:
-        sp = req.sampling_params
-        if sp is None:
-            return None
-
-        try:
-            sp_fields = dataclasses.fields(sp)
-        except Exception:
-            return None
-
-        signature_items: list[tuple[str, Any]] = []
-        for f in sp_fields:
-            if f.metadata.get("batch_sig_exclude", False):
-                continue
-            signature_items.append(
-                (f.name, self._freeze_signature_value(getattr(sp, f.name, None)))
-            )
-
-        if req.extra:
-            diffusers_kwargs = req.extra.get("diffusers_kwargs")
-            if diffusers_kwargs:
-                signature_items.append(
-                    (
-                        "diffusers_kwargs",
-                        self._freeze_signature_value(diffusers_kwargs),
-                    )
-                )
-
-        return tuple(signature_items)
-
-    def _get_cached_signature(self, req: Req) -> tuple[Any, ...] | None:
-        cached = getattr(req, "_dynamic_batch_sig", None)
-        if cached is not None:
-            return cached
-        sig = self._build_dynamic_batch_signature(req)
-        req._dynamic_batch_sig = sig  # type: ignore[attr-defined]
-        return sig
-
-    def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
-        if base_req.is_warmup or candidate_req.is_warmup:
-            return False
-
-        if not isinstance(base_req.prompt, str) or not isinstance(
-            candidate_req.prompt, str
-        ):
-            return False
-
-        if base_req.image_path is not None or candidate_req.image_path is not None:
-            return False
-        if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
-            return False
-
-        base_sig = self._get_cached_signature(base_req)
-        cand_sig = self._get_cached_signature(candidate_req)
-        return base_sig is not None and base_sig == cand_sig
-
     def _try_merge_generation_reqs(self, reqs: List[Req]) -> Req | None:
+        """Create a batched generation request from compatible requests.
+
+        Per-request seeds and output paths are stored in `extra` so downstream
+        stages can preserve request ordering.
+        """
         if len(reqs) <= 1:
             return reqs[0] if reqs else None
 
@@ -681,6 +687,7 @@ class Scheduler(SchedulerDisaggMixin):
     def _split_batched_output(
         self, output_batch: OutputBatch, reqs: List[Req]
     ) -> List[OutputBatch] | None:
+        """Split a merged worker result back into client-sized `OutputBatch` objects."""
         per_req_counts = [req.num_outputs_per_prompt for req in reqs]
         total_items = sum(per_req_counts)
         output_items = self._count_first_dim(output_batch.output)
@@ -746,10 +753,25 @@ class Scheduler(SchedulerDisaggMixin):
         return outputs
 
     def _dynamic_batching_enabled(self) -> bool:
-        return self._batching_max_size > 1
+        """Return whether this server and pipeline can use dynamic batching.
+
+        This is the coarse gate; request-level checks decide which requests can
+        actually be merged.
+        """
+        pipeline_config = self.server_args.pipeline_config
+        supports_dynamic_batching = getattr(
+            pipeline_config, "supports_dynamic_batching", None
+        )
+        if callable(supports_dynamic_batching):
+            return self._batch_admission.enabled and supports_dynamic_batching()
+        return self._batch_admission.enabled
 
     def get_next_batch_to_run(self) -> list[tuple[bytes | None, Any]] | None:
-        """Pull one request or one dynamic batch from waiting_queue."""
+        """Return the next dispatchable queue item or dynamic batch.
+
+        Returns None when the head request is waiting for more compatible
+        requests within the configured batching delay.
+        """
         if not self.waiting_queue:
             return None
 
@@ -759,6 +781,7 @@ class Scheduler(SchedulerDisaggMixin):
                 self._record_batch_dispatch_metrics(
                     batch_size=1,
                     queue_wait_ms=(time.monotonic() - enqueue_time) * 1000.0,
+                    effective_max_batch_size=1,
                     stop_reason="dynamic_disabled",
                 )
             return [(identity, req)]
@@ -780,6 +803,7 @@ class Scheduler(SchedulerDisaggMixin):
             self._record_batch_dispatch_metrics(
                 batch_size=1,
                 queue_wait_ms=(time.monotonic() - head_enqueue_time) * 1000.0,
+                effective_max_batch_size=1,
                 reject_reasons=reject_reasons,
                 stop_reason=reject_reasons[0] if reject_reasons else "head_ineligible",
             )
@@ -793,6 +817,7 @@ class Scheduler(SchedulerDisaggMixin):
             self._record_batch_dispatch_metrics(
                 batch_size=1,
                 queue_wait_ms=(time.monotonic() - enqueue_time) * 1000.0,
+                effective_max_batch_size=1,
                 reject_reasons=["missing_config"],
                 stop_reason="missing_config",
             )
@@ -855,6 +880,9 @@ class Scheduler(SchedulerDisaggMixin):
         self._record_batch_dispatch_metrics(
             batch_size=batch_len,
             queue_wait_ms=oldest_wait_s * 1000.0,
+            effective_max_batch_size=self._batch_admission.max_admissible_batch_size(
+                compatible_reqs[0]
+            ),
             reject_reasons=reject_reasons,
             stop_reason=stop_reason,
         )
@@ -977,6 +1005,11 @@ class Scheduler(SchedulerDisaggMixin):
     def _normalize_received_payload(
         identity: bytes, reqs: Any
     ) -> list[tuple[bytes, Any]]:
+        """Normalize client payloads into queue entries.
+
+        A single-item `[Req]` is one request; a multi-item `list[Req]` remains
+        grouped as one logical request.
+        """
         if not isinstance(reqs, list):
             return [(identity, reqs)]
         if not reqs:

@@ -479,6 +479,14 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         # Flux2 does not use pooler output.
         return None
 
+    def supports_dynamic_batching(self):
+        """Allow batching for Flux2 text-only requests.
+
+        Flux2 is a TI2I pipeline, so image-input requests are rejected by the
+        scheduler's request-level batching checks.
+        """
+        return True
+
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
         messages = build_flux2_text_messages(prompts)
         inputs = tokenizer.apply_chat_template(

@@ -32,7 +32,6 @@ sglang serve --model-path Qwen/Qwen-Image --port 30010
 - [CLI](api/cli.md): run one-off generation jobs or launch a persistent server
 - [OpenAI-Compatible API](api/openai_api.md): send image and video requests to the HTTP server
 - [Attention Backends](performance/attention_backends.md): choose the best backend for your model and hardware
-- [Inference Batching](performance/dynamic_batching.md): batch compatible native diffusion requests during serving
 - [Caching Acceleration](performance/cache/index.md): use Cache-DiT or TeaCache to reduce denoising cost
 - [Quantization](quantization.md): load quantized transformer checkpoints
 - [Contributing](contributing.md): contribution workflow, adding new models, and CI perf baselines

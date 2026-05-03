@@ -1,9 +1,9 @@
 ---
-title: "Dynamic Batching"
-description: "Batch compatible native SGLang Diffusion requests during serving."
+title: "Inference Batching"
+description: "Batch compatible native SGLang-Diffusion requests during serving."
 mode: wide
 ---
-Dynamic batching is an opt-in mode for `sglang.multimodal_gen` that merges compatible queued diffusion requests into one native pipeline batch. It is separate from LLM continuous batching and tokenizer batching.
+Dynamic batching is an opt-in SGLang-Diffusion serving mode that merges compatible queued requests into one native pipeline batch. It is separate from LLM continuous batching and tokenizer batching.
 
 Use it for concurrent T2I or T2V traffic with the same model and sampling shape. Keep singleton serving for latency-sensitive or highly mixed traffic.
 

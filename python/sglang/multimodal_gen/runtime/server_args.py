@@ -1050,8 +1050,9 @@ class ServerArgs(DisaggArgsMixin):
             type=str,
             default=ServerArgs.batching_config,
             help=(
-                "Optional JSON file with model/resolution batching admission "
-                "rules that can cap specific shapes below --batching-max-size."
+                "Optional JSON file with {'schema_version': 1, 'rules': [...]} "
+                "batching admission rules that can cap model/resolution shapes "
+                "below --batching-max-size."
             ),
         )
         parser.add_argument(

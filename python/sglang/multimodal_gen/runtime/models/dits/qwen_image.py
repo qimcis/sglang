@@ -615,6 +615,12 @@ class QwenImageCrossAttention(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
         **cross_attention_kwargs,
     ):
+        """Run joint text-image attention.
+
+        `attn_mask` or `attention_mask` takes precedence. Otherwise,
+        `encoder_hidden_states_mask` masks text tokens in the joint text-image
+        sequence.
+        """
         seq_len_txt = encoder_hidden_states.shape[1]
         attn_mask = cross_attention_kwargs.get("attn_mask")
         if attn_mask is None:

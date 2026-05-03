@@ -780,6 +780,11 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         f_patch_size: int,
         image_seq_len_target: int | None = None,
     ):
+        """Patchify images and pad image/caption tokens to batch targets.
+
+        Each image is [C, F, H, W] and has one [L, D] caption. Returned valid
+        lengths mark real tokens before learned pad tokens are restored.
+        """
         if len(all_image) != len(all_cap_feats):
             raise ValueError(
                 f"Z-Image expects one caption embedding per image, got {len(all_image)} images and {len(all_cap_feats)} captions"
@@ -850,6 +855,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
     @staticmethod
     def _as_image_list(hidden_states) -> list[torch.Tensor]:
+        """Normalize 4D/5D image latents into per-sample tensors."""
         if torch.is_tensor(hidden_states):
             if hidden_states.dim() == 5:
                 return list(hidden_states.unbind(dim=0))
@@ -859,6 +865,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
     @staticmethod
     def _as_caption_list(encoder_hidden_states) -> list[torch.Tensor]:
+        """Normalize caption tensors into per-sample tensors."""
         if torch.is_tensor(encoder_hidden_states):
             if encoder_hidden_states.dim() == 3:
                 return list(encoder_hidden_states.unbind(dim=0))
@@ -879,6 +886,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         valid_lens: list[int],
         pad_token: torch.Tensor,
     ) -> torch.Tensor:
+        """Replace padded token rows after each valid sequence length."""
         positions = torch.arange(tensor.shape[1], device=tensor.device).unsqueeze(0)
         lengths = torch.tensor(valid_lens, device=tensor.device).unsqueeze(1)
         pad_mask = positions >= lengths

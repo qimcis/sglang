@@ -34,6 +34,11 @@ def zimage_preprocess_text(prompt: str):
 
 
 def zimage_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+    """Return unpadded Z-Image text embeddings.
+
+    Batched outputs return TextConditioningOutput to preserve per-prompt text
+    lengths.
+    """
     device = outputs.hidden_states[-2].device
     prompt_mask = _text_inputs.attention_mask.to(device).bool()
     hidden_states = outputs.hidden_states[-2]
@@ -186,6 +191,7 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
         return plan
 
     def _split_text_embeds_for_dit(self, batch, *, negative: bool = False):
+        """Return per-request text tensors from padded batched embeddings."""
         embeds = batch.negative_prompt_embeds if negative else batch.prompt_embeds
         if embeds is None:
             return None
@@ -217,6 +223,7 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
         ]
 
     def _caption_rope_length(self, prompt_embeds, batch, *, negative: bool = False):
+        """Return the caption length used for Z-Image RoPE caches."""
         if torch.is_tensor(prompt_embeds):
             if prompt_embeds.ndim == 2:
                 return int(prompt_embeds.shape[0])
@@ -333,6 +340,12 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
         *,
         negative: bool = False,
     ):
+        """Build caption and image RoPE caches for Z-Image conditioning.
+
+        Batched prompts use stored text lengths. SP mode builds image caches for
+        the local spatial shard.
+        """
+
         def create_coordinate_grid(size, start=None, device=None):
             if start is None:
                 start = (0 for _ in size)

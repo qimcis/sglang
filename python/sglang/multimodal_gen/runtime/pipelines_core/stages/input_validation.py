@@ -68,7 +68,11 @@ class InputValidationStage(PipelineStage):
         return width, height
 
     def _generate_seeds(self, batch: Req, server_args: ServerArgs):
-        """Generate seeds for the inference"""
+        """Generate deterministic per-output seeds.
+
+        Batched requests pass one base seed per prompt through `extra`; each
+        prompt expands to `num_outputs_per_prompt` consecutive seeds.
+        """
         seed = batch.seed
         num_videos_per_prompt = batch.num_outputs_per_prompt
 

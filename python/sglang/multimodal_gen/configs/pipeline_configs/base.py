@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import json
+import math
 import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
@@ -103,6 +104,12 @@ def postprocess_text(output: BaseEncoderOutput, _text_inputs) -> torch.tensor:
 
 @dataclass(frozen=True)
 class TextConditioningOutput:
+    """Text embeddings and masks aligned to postprocessed sequence length.
+
+    `prompt_embeds_mask` and `prompt_seq_lens` describe real text tokens after
+    model-specific trimming or packing, not the raw tokenizer output.
+    """
+
     prompt_embeds: torch.Tensor
     prompt_embeds_mask: torch.Tensor | None = None
     prompt_seq_lens: list[int] | None = None
@@ -111,6 +118,7 @@ class TextConditioningOutput:
 def pad_text_embeddings_with_mask(
     text_embeds: list[torch.Tensor],
 ) -> TextConditioningOutput:
+    """Pad variable-length text embeddings and return the valid-token mask."""
     if not text_embeds:
         raise ValueError("text_embeds must contain at least one tensor")
 
@@ -360,6 +368,40 @@ class PipelineConfig:
     def allow_set_num_frames(self):
         return False
 
+    def supports_dynamic_batching(self):
+        """Return whether this pipeline has request types that can be batched.
+
+        The scheduler still checks each request before merging it into a batch.
+        """
+        return self.task_type in (ModelTaskType.T2I, ModelTaskType.T2V)
+
+    def estimate_request_cost(self, batch) -> float:
+        """Return the relative cost used for batching admission caps.
+
+        This is compared with `max_cost` from the batching config; it is not a
+        memory estimate.
+        """
+        latent_tokens = float(getattr(batch, "n_tokens", None) or 0)
+        if latent_tokens <= 0:
+            width = int(getattr(batch, "width", 0) or 0)
+            height = int(getattr(batch, "height", 0) or 0)
+            if width > 0 and height > 0:
+                vae_scale = getattr(
+                    self.vae_config.arch_config, "vae_scale_factor", None
+                )
+                if vae_scale is None and hasattr(
+                    self.vae_config, "get_vae_scale_factor"
+                ):
+                    vae_scale = self.vae_config.get_vae_scale_factor()
+                vae_scale = max(1, int(vae_scale or 1))
+                latent_tokens = math.ceil(width / vae_scale) * math.ceil(
+                    height / vae_scale
+                )
+
+        num_frames = max(1, int(getattr(batch, "num_frames", 1) or 1))
+        num_outputs = max(1, int(getattr(batch, "num_outputs_per_prompt", 1) or 1))
+        return latent_tokens * num_frames * num_outputs
+
     def get_decode_scale_and_shift(self, device, dtype, vae):
         vae_arch_config = self.vae_config.arch_config
         scaling_factor = getattr(vae_arch_config, "scaling_factor", None)
@@ -560,6 +602,7 @@ class PipelineConfig:
         negative: bool = False,
         expected_batch_size: int | None = None,
     ) -> list[int]:
+        """Return stored text lengths for one text encoder."""
         seq_lens_by_encoder = (
             batch.negative_prompt_seq_lens if negative else batch.prompt_seq_lens
         )
