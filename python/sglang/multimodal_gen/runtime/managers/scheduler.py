@@ -418,8 +418,9 @@ class Scheduler(SchedulerDisaggMixin):
     def _build_dynamic_batch_signature(self, req: Req) -> tuple[Any, ...] | None:
         """Build the request compatibility signature for dynamic batching.
 
-        Fields marked with `batch_sig_exclude` are ignored. Pipeline kwargs
-        that affect generation remain part of the signature.
+        The signature is built from `SamplingParams` fields, excluding fields
+        marked with `batch_sig_exclude`, plus generation-affecting
+        `extra.diffusers_kwargs`.
         """
         signature_items = self._sampling_param_signature_items(req)
         if signature_items is None:

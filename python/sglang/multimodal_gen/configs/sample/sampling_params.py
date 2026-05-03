@@ -90,8 +90,8 @@ class SamplingParams:
     """
     Sampling parameters for generation.
 
-    Fields with `batch_sig_exclude` metadata are ignored in dynamic batching
-    compatibility checks.
+    Dynamic batching compares these fields for compatibility, except fields
+    marked with `batch_sig_exclude`.
     """
 
     data_type: DataType = DataType.VIDEO
