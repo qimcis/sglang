@@ -87,34 +87,6 @@ class TextEncodingStage(PipelineStage):
             for i in range(len(self.text_encoders))
         ]
 
-    @staticmethod
-    def _target_batch_size(batch_sizes: list[int], idx: int) -> int:
-        return batch_sizes[min(idx, len(batch_sizes) - 1)]
-
-    @staticmethod
-    def _align_negative_batch_dim(
-        tensor: torch.Tensor, target_batch: int, name: str
-    ) -> torch.Tensor:
-        if tensor.shape[0] == target_batch:
-            return tensor
-        if tensor.shape[0] == 1 and target_batch > 1:
-            return tensor.expand(target_batch, *tensor.shape[1:])
-        raise ValueError(
-            f"{name} batch dimension mismatch: got {tensor.shape[0]}, expected 1 or {target_batch}"
-        )
-
-    @staticmethod
-    def _align_negative_seq_lens(
-        seq_lens: list[int], target_batch: int, name: str
-    ) -> list[int]:
-        if len(seq_lens) == target_batch:
-            return [int(x) for x in seq_lens]
-        if len(seq_lens) == 1 and target_batch > 1:
-            return [int(seq_lens[0])] * target_batch
-        raise ValueError(
-            f"{name} batch dimension mismatch: got {len(seq_lens)}, expected 1 or {target_batch}"
-        )
-
     @torch.no_grad()
     def forward(
         self,
@@ -186,24 +158,48 @@ class TextEncodingStage(PipelineStage):
 
             target_batch_sizes = [pe.shape[0] for pe in prompt_embeds_list]
 
+            def align_negative_batch_dim(
+                tensor: torch.Tensor, target_batch: int, name: str
+            ) -> torch.Tensor:
+                if tensor.shape[0] == target_batch:
+                    return tensor
+                if tensor.shape[0] == 1 and target_batch > 1:
+                    return tensor.expand(target_batch, *tensor.shape[1:])
+                raise ValueError(
+                    f"{name} batch dimension mismatch: got {tensor.shape[0]}, expected 1 or {target_batch}"
+                )
+
+            def align_negative_seq_lens(
+                seq_lens: list[int], target_batch: int, name: str
+            ) -> list[int]:
+                if len(seq_lens) == target_batch:
+                    return [int(x) for x in seq_lens]
+                if len(seq_lens) == 1 and target_batch > 1:
+                    return [int(seq_lens[0])] * target_batch
+                raise ValueError(
+                    f"{name} batch dimension mismatch: got {len(seq_lens)}, expected 1 or {target_batch}"
+                )
+
             for idx, ne in enumerate(neg_embeds_list):
-                target_batch = self._target_batch_size(target_batch_sizes, idx)
-                ne = self._align_negative_batch_dim(
+                target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
+                ne = align_negative_batch_dim(
                     ne, target_batch, "negative_prompt_embeds"
                 )
                 batch.negative_prompt_embeds.append(ne)
 
             for idx, pe in enumerate(neg_pooler_embeds_list):
-                target_batch = self._target_batch_size(target_batch_sizes, idx)
-                pe = self._align_negative_batch_dim(
+                target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
+                pe = align_negative_batch_dim(
                     pe, target_batch, "negative_pooled_embeds"
                 )
                 batch.neg_pooled_embeds.append(pe)
             if batch.negative_attention_mask is None:
                 batch.negative_attention_mask = []
                 for idx, nm in enumerate(neg_masks_list):
-                    target_batch = self._target_batch_size(target_batch_sizes, idx)
-                    nm = self._align_negative_batch_dim(
+                    target_batch = target_batch_sizes[
+                        min(idx, len(target_batch_sizes) - 1)
+                    ]
+                    nm = align_negative_batch_dim(
                         nm, target_batch, "negative_attention_mask"
                     )
                     batch.negative_attention_mask.append(nm)
@@ -211,15 +207,15 @@ class TextEncodingStage(PipelineStage):
             batch.negative_prompt_embeds_mask = []
             batch.negative_prompt_seq_lens = []
             for idx, nm in enumerate(neg_embeds_masks_list):
-                target_batch = self._target_batch_size(target_batch_sizes, idx)
-                nm = self._align_negative_batch_dim(
+                target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
+                nm = align_negative_batch_dim(
                     nm, target_batch, "negative_prompt_embeds_mask"
                 )
                 batch.negative_prompt_embeds_mask.append(nm)
             for idx, seq_lens in enumerate(neg_seq_lens_list):
-                target_batch = self._target_batch_size(target_batch_sizes, idx)
+                target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
                 batch.negative_prompt_seq_lens.append(
-                    self._align_negative_seq_lens(
+                    align_negative_seq_lens(
                         seq_lens, target_batch, "negative_prompt_seq_lens"
                     )
                 )
