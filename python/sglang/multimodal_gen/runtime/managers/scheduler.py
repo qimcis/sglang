@@ -70,11 +70,6 @@ _MAX_RECV_REQS_PER_POLL = 1024
 _BATCH_METRICS_LOG_INTERVAL = 5
 
 
-@dataclasses.dataclass
-class _SchedulerErrorReq:
-    error: str
-
-
 class Scheduler(SchedulerDisaggMixin):
     """
     Runs the main event loop for the rank 0 worker.
@@ -135,7 +130,6 @@ class Scheduler(SchedulerDisaggMixin):
             Req: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
             ShutdownReq: self._handle_shutdown,
-            _SchedulerErrorReq: self._handle_scheduler_error,
             GetDisaggStatsReq: self._handle_get_disagg_stats,
             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
@@ -207,9 +201,6 @@ class Scheduler(SchedulerDisaggMixin):
     def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
         self._running = False
         return OutputBatch()
-
-    def _handle_scheduler_error(self, reqs: List[_SchedulerErrorReq]) -> OutputBatch:
-        return OutputBatch(error=reqs[0].error)
 
     def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
         """Handle update_weights_from_disk request for RL workflows."""
@@ -390,6 +381,7 @@ class Scheduler(SchedulerDisaggMixin):
         return ordered[index]
 
     def _freeze_signature_value(self, value: Any):
+        """Convert a value into a hashable, order-stable form for signature comparison."""
         if isinstance(value, (str, int, float, bool, type(None))):
             return value
         if isinstance(value, Enum):
@@ -404,6 +396,7 @@ class Scheduler(SchedulerDisaggMixin):
         return repr(value)
 
     def _sampling_param_signature_items(self, req: Req) -> list[tuple[str, Any]] | None:
+        """Return per-field sampling-param signature items, skipping batch_sig_exclude fields."""
         sp = req.sampling_params
         if sp is None:
             return None
@@ -483,6 +476,7 @@ class Scheduler(SchedulerDisaggMixin):
     def _get_dynamic_batch_reject_reason(
         self, base_req: Req, candidate_req: Req
     ) -> str | None:
+        """Return the first reason `candidate_req` cannot batch with `base_req`, or None."""
         if self._can_dynamic_batch(base_req, candidate_req):
             return None
 
@@ -508,6 +502,7 @@ class Scheduler(SchedulerDisaggMixin):
         )
 
     def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
+        """Return whether `candidate_req` can be merged into a batch with `base_req`."""
         if base_req.is_warmup or candidate_req.is_warmup:
             return False
 
@@ -808,20 +803,6 @@ class Scheduler(SchedulerDisaggMixin):
                 stop_reason=reject_reasons[0] if reject_reasons else "head_ineligible",
             )
             return [(identity, req)]
-
-        try:
-            self._batch_admission.max_admissible_batch_size(req)
-        except RuntimeError as e:
-            identity, _req, _head_enqueue_time = self.waiting_queue.popleft()
-            error = f"Batching admission failed: {e}"
-            self._record_batch_dispatch_metrics(
-                batch_size=1,
-                queue_wait_ms=(time.monotonic() - enqueue_time) * 1000.0,
-                effective_max_batch_size=1,
-                reject_reasons=["missing_config"],
-                stop_reason="missing_config",
-            )
-            return [(identity, _SchedulerErrorReq(error=error))]
 
         compatible_indices: list[int] = [0]
         compatible_reqs: list[Req] = [req]

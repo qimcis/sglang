@@ -186,6 +186,7 @@ class BatchAdmissionController:
         )
 
     def batch_is_full(self, reqs: list[Req]) -> bool:
+        """Return whether another roughly similar request would exceed the cap."""
         if not self.enabled or not reqs:
             return len(reqs) >= self._user_max_batch_size
 
@@ -211,6 +212,7 @@ class BatchAdmissionController:
         return self.limit_for(req).max_batch_size
 
     def limit_for(self, req: Req) -> AdmissionLimit:
+        """Return the effective admission limit for the request's model and shape."""
         rules = self._matching_rules(req)
         if not rules:
             return AdmissionLimit(max_batch_size=self._user_max_batch_size)

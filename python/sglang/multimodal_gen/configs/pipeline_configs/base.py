@@ -379,7 +379,8 @@ class PipelineConfig:
         """Return the relative cost used for batching admission caps.
 
         This is compared with `max_cost` from the batching config; it is not a
-        memory estimate.
+        memory estimate. The default cost is latent tokens times frames times
+        outputs; pipelines can override it for model-specific admission.
         """
         latent_tokens = float(getattr(batch, "n_tokens", None) or 0)
         if latent_tokens <= 0:
