@@ -382,10 +382,10 @@ class PipelineConfig:
         memory estimate. The default cost is latent tokens times frames times
         outputs; pipelines can override it for model-specific admission.
         """
-        latent_tokens = float(getattr(batch, "n_tokens", None) or 0)
+        latent_tokens = float(batch.n_tokens or 0)
         if latent_tokens <= 0:
-            width = int(getattr(batch, "width", 0) or 0)
-            height = int(getattr(batch, "height", 0) or 0)
+            width = int(batch.width or 0)
+            height = int(batch.height or 0)
             if width > 0 and height > 0:
                 vae_scale = getattr(
                     self.vae_config.arch_config, "vae_scale_factor", None
@@ -399,8 +399,8 @@ class PipelineConfig:
                     height / vae_scale
                 )
 
-        num_frames = max(1, int(getattr(batch, "num_frames", 1) or 1))
-        num_outputs = max(1, int(getattr(batch, "num_outputs_per_prompt", 1) or 1))
+        num_frames = max(1, int(batch.num_frames or 1))
+        num_outputs = max(1, int(batch.num_outputs_per_prompt or 1))
         return latent_tokens * num_frames * num_outputs
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
