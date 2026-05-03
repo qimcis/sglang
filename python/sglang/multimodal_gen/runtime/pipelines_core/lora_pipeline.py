@@ -900,12 +900,21 @@ class LoRAPipeline(ComposedPipelineBase):
             if not self.is_lora_merged.get(module_name, False):
                 return None
             else:
+                nicknames, strengths = self.cur_adapter_config.get(
+                    module_name,
+                    (
+                        [self.cur_adapter_name.get(module_name, None)],
+                        [self.cur_adapter_strength.get(module_name, None)],
+                    ),
+                )
                 return [
                     {
                         "nickname": self.cur_adapter_name.get(module_name, None),
+                        "nicknames": nicknames,
                         "path": self.cur_adapter_path.get(module_name, None),
                         "merged": self.is_lora_merged.get(module_name, False),
                         "strength": self.cur_adapter_strength.get(module_name, None),
+                        "strengths": strengths,
                     }
                 ]
 

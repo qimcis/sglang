@@ -1078,7 +1078,7 @@ class ServerArgs(DisaggArgsMixin):
             "--enable-metrics",
             action=StoreBoolean,
             default=ServerArgs.enable_metrics,
-            help="Enable Prometheus metrics endpoint at /metrics.",
+            help="Enable Prometheus metrics collection and expose /metrics.",
         )
         parser.add_argument(
             "--strict-ports",
