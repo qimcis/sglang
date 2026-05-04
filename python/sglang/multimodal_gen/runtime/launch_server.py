@@ -396,6 +396,7 @@ def launch_pool_disagg_server(
         decoder_result_endpoint=decoder_result_ep,
         dispatch_policy_name=server_args.disagg_dispatch_policy,
         timeout_s=float(server_args.disagg_timeout),
+        server_args=server_args,
     )
     diffusion_server.start()
 
@@ -407,7 +408,10 @@ def launch_pool_disagg_server(
             "Starting FastAPI server (connected to DiffusionServer at port %d).",
             server_args.scheduler_port,
         )
-        launch_http_server_only(server_args)
+        try:
+            launch_http_server_only(server_args)
+        finally:
+            diffusion_server.stop()
 
     return all_processes
 
@@ -528,6 +532,7 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder_result_endpoint=decoder_result_ep,
         dispatch_policy_name=server_args.disagg_dispatch_policy,
         timeout_s=float(server_args.disagg_timeout),
+        server_args=server_args,
     )
     diffusion_server.start()
 
@@ -538,7 +543,10 @@ def launch_disagg_server(server_args: ServerArgs):
         "Starting HTTP server (connected to DiffusionServer at port %d).",
         base_port,
     )
-    launch_http_server_only(server_args)
+    try:
+        launch_http_server_only(server_args)
+    finally:
+        diffusion_server.stop()
 
 
 def launch_disagg_role(server_args: ServerArgs):
@@ -555,7 +563,7 @@ def launch_disagg_role(server_args: ServerArgs):
     role_type = server_args.disagg_role
     if server_args.disagg_server_addr is None:
         raise ValueError(
-            "--disagg-server-addr is required for --disagg-role " f"{role_type.value}"
+            f"--disagg-server-addr is required for --disagg-role {role_type.value}"
         )
 
     # Derive endpoints

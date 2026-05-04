@@ -15,6 +15,7 @@ import torch.distributed as dist
 from setproctitle import setproctitle
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.disaggregation.memory import attach_object_memory
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_tp_rank,
@@ -115,6 +116,7 @@ class GPUWorker:
 
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
+        self._peak_memory_reduce_buf = None
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
@@ -338,6 +340,7 @@ class GPUWorker:
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
             # before converting it to OutputBatch
             if return_req and isinstance(result, Req):
+                self._record_req_peak_memory(result)
                 return result
 
             output_batch = self._to_output_batch(result)
@@ -407,8 +410,29 @@ class GPUWorker:
         return output_batch
 
     def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
-        if current_platform.is_cpu():
+        peaks = self._collect_peak_memory(
+            reduce_across_ranks=output_batch.error is None
+        )
+        if peaks is None:
             return
+        output_batch.peak_memory_mb, output_batch.peak_allocated_memory_mb = peaks
+
+    def _record_req_peak_memory(self, req: Req) -> None:
+        peaks = self._collect_peak_memory(reduce_across_ranks=True)
+        if peaks is None:
+            return
+        peak_memory_mb, peak_allocated_memory_mb = peaks
+        attach_object_memory(
+            req,
+            peak_memory_mb=peak_memory_mb,
+            peak_allocated_memory_mb=peak_allocated_memory_mb,
+        )
+
+    def _collect_peak_memory(
+        self, *, reduce_across_ranks: bool
+    ) -> tuple[float, float] | None:
+        if current_platform.is_cpu():
+            return None
         device_module = torch.get_device_module()
         peak_reserved_mb = float(device_module.max_memory_reserved()) / (1024**2)
         max_memory_allocated = getattr(device_module, "max_memory_allocated", None)
@@ -418,21 +442,21 @@ class GPUWorker:
             else peak_reserved_mb
         )
 
-        if output_batch.error is None and dist.is_available() and dist.is_initialized():
+        if reduce_across_ranks and dist.is_available() and dist.is_initialized():
             device = torch.device(current_platform.device_type, self.local_rank)
-            peaks = torch.tensor(
-                [peak_reserved_mb, peak_allocated_mb],
-                dtype=torch.float64,
-                device=device,
-            )
+            peaks = self._peak_memory_reduce_buf
+            if peaks is None or peaks.device != device:
+                peaks = torch.empty(2, dtype=torch.float64, device=device)
+                self._peak_memory_reduce_buf = peaks
+            peaks[0] = peak_reserved_mb
+            peaks[1] = peak_allocated_mb
             dist.all_reduce(peaks, op=dist.ReduceOp.MAX)
             peak_reserved_mb = float(peaks[0].item())
             peak_allocated_mb = float(peaks[1].item())
 
         if self.rank != 0:
-            return
-        output_batch.peak_memory_mb = peak_reserved_mb
-        output_batch.peak_allocated_memory_mb = peak_allocated_mb
+            return None
+        return peak_reserved_mb, peak_allocated_mb
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:
         assert self.pipeline is not None

@@ -23,6 +23,10 @@ import torch
 import zmq
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.disaggregation.memory import (
+    attach_role_memory_fields,
+    role_memory_from_object,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     TransferTensorBuffer,
@@ -47,10 +51,12 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     encode_transfer_msg,
     is_transfer_message,
 )
+from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -126,6 +132,18 @@ for _f in dataclasses.fields(SamplingParams):
     if _f.default is not dataclasses.MISSING:
         _BASE_SP_DEFAULTS[_f.name] = _f.default
 
+_FIELD_CACHE: dict[tuple[type, frozenset[str]], tuple[Any, ...]] = {}
+
+
+def _cached_dataclass_fields(obj, excluded: frozenset[str]) -> tuple[Any, ...]:
+    key = (type(obj), excluded)
+    cached = _FIELD_CACHE.get(key)
+    if cached is not None:
+        return cached
+    cached = tuple(f for f in dataclasses.fields(obj) if f.name not in excluded)
+    _FIELD_CACHE[key] = cached
+    return cached
+
 
 def _is_tensor_like(value) -> bool:
     if isinstance(value, torch.Tensor):
@@ -168,6 +186,20 @@ def _extract_extra_fields(extra: dict, scalar_fields: dict) -> None:
             scalar_fields[f"_extra_{key}"] = value
         except (TypeError, ValueError, OverflowError):
             pass
+
+
+def _disagg_device_name(gpu_id: int) -> str | None:
+    try:
+        return str(current_platform.get_device_name(gpu_id))
+    except Exception:
+        return None
+
+
+def _disagg_device_memory_gb(gpu_id: int) -> float | None:
+    try:
+        return current_platform.get_device_total_memory(gpu_id) / BYTES_PER_GB
+    except Exception:
+        return None
 
 
 def _init_request_scheduler_from_template(
@@ -215,10 +247,7 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
     scalar_fields = {}
     _debug_transfer = logger.isEnabledFor(logging.DEBUG)
 
-    for f in dataclasses.fields(req):
-        if f.name in _EXCLUDE_FIELDS:
-            continue
-
+    for f in _cached_dataclass_fields(req, _EXCLUDE_FIELDS):
         value = getattr(req, f.name, None)
         if value is None:
             continue
@@ -245,10 +274,8 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
         # Qwen-Image's true_cfg_scale (and any future feature added to
         # SamplingParams). Using a field-walk keeps the disagg boundary
         # feature-complete without needing to edit this list.
-        for f in dataclasses.fields(sp):
+        for f in _cached_dataclass_fields(sp, _SAMPLING_PARAMS_EXCLUDE_FIELDS):
             name = f.name
-            if name in _SAMPLING_PARAMS_EXCLUDE_FIELDS:
-                continue
             if name in scalar_fields:
                 # Req-level field already took precedence (or upstream Req
                 # explicitly set it).
@@ -498,6 +525,16 @@ class SchedulerDisaggMixin:
             pool_ptr=self._transfer_manager.pool_data_ptr,
             pool_size=self._transfer_manager.pool_size,
             work_endpoint=sa.pool_work_endpoint,
+            device_name=_disagg_device_name(physical_gpu_id),
+            device_memory_gb=_disagg_device_memory_gb(physical_gpu_id),
+            parallel={
+                "num_gpus": getattr(sa, "num_gpus", None),
+                "tp_size": getattr(sa, "tp_size", None),
+                "sp_degree": getattr(sa, "sp_degree", None),
+                "ulysses_degree": getattr(sa, "ulysses_degree", None),
+                "ring_degree": getattr(sa, "ring_degree", None),
+                "enable_cfg_parallel": getattr(sa, "enable_cfg_parallel", None),
+            },
             preallocated_slots=preallocated_slot_info,
         )
         self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
@@ -984,7 +1021,7 @@ class SchedulerDisaggMixin:
         )
         use_prefetch = self._compute_ready_queue is not None
         logger.info(
-            "Pool mode %s rank %d event loop started " "(multi_rank=%s, prefetch=%s)",
+            "Pool mode %s rank %d event loop started (multi_rank=%s, prefetch=%s)",
             role_name,
             self.gpu_id,
             is_multi_rank,
@@ -1381,7 +1418,13 @@ class SchedulerDisaggMixin:
 
         if not isinstance(result, Req):
             error_msg = getattr(result, "error", "denoiser error")
-            done_msg = TransferDoneMsg(request_id=request_id, error=str(error_msg))
+            done_msg = TransferDoneMsg(
+                request_id=request_id,
+                error=str(error_msg),
+                memory=role_memory_from_object(
+                    result, role=RoleType.DENOISER.value, error=str(error_msg)
+                ),
+            )
             self._pool_result_push.send_multipart(encode_transfer_msg(done_msg))
             if self._disagg_metrics:
                 self._disagg_metrics.record_request_failed(request_id)
@@ -1389,6 +1432,11 @@ class SchedulerDisaggMixin:
 
         # Stage denoiser output for decoder transfer (async staging)
         tensor_fields, scalar_fields = extract_transfer_fields(result)
+        attach_role_memory_fields(
+            scalar_fields,
+            result,
+            role=RoleType.DENOISER.value,
+        )
 
         # 1. Stage tensors on transfer_stream (non-blocking)
         staged, stage_event = self._transfer_manager.stage_tensors_async(
@@ -1402,6 +1450,11 @@ class SchedulerDisaggMixin:
             done_msg = TransferDoneMsg(
                 request_id=request_id,
                 error="Failed to stage denoiser output for decoder",
+                memory=role_memory_from_object(
+                    result,
+                    role=RoleType.DENOISER.value,
+                    error="Failed to stage denoiser output for decoder",
+                ),
             )
             self._pool_result_push.send_multipart(encode_transfer_msg(done_msg))
             if self._disagg_metrics:
@@ -1483,6 +1536,11 @@ class SchedulerDisaggMixin:
             scalar_fields["audio_sample_rate"] = output_batch.audio_sample_rate
         if output_batch.error is not None:
             scalar_fields["error"] = output_batch.error
+        attach_role_memory_fields(
+            scalar_fields,
+            output_batch,
+            role=RoleType.DECODER.value,
+        )
 
         if self._pool_result_push is not None:
             send_tensors(self._pool_result_push, tensor_fields, scalar_fields)
@@ -1523,10 +1581,19 @@ class SchedulerDisaggMixin:
             # Error — send error via scalar fields (rank 0 only)
             if self._pool_result_push is not None:
                 error_msg = getattr(req_result, "error", "encoder error")
+                scalar_fields = {
+                    "request_id": request_id,
+                    "_disagg_error": str(error_msg),
+                }
+                attach_role_memory_fields(
+                    scalar_fields,
+                    req_result,
+                    role=RoleType.ENCODER.value,
+                )
                 send_tensors_fn(
                     self._pool_result_push,
                     {},
-                    {"request_id": request_id, "_disagg_error": str(error_msg)},
+                    scalar_fields,
                 )
             if self._disagg_metrics:
                 self._disagg_metrics.record_request_failed(request_id)
@@ -1534,6 +1601,11 @@ class SchedulerDisaggMixin:
 
         # Pack and send encoder output (rank 0 only sends)
         tensor_fields, scalar_fields = extract_transfer_fields(req_result)
+        attach_role_memory_fields(
+            scalar_fields,
+            req_result,
+            role=RoleType.ENCODER.value,
+        )
 
         if self._pool_result_push is not None:
             if self._transfer_manager is not None:

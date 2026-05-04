@@ -229,8 +229,7 @@ class ServerArgs(DisaggArgsMixin):
     batching_max_size: int = 1
     batching_delay_ms: float = 0.0
     batching_config: str | None = None
-    batching_memory_aware: bool = False
-    batching_memory_safety_factor: float = 1.15
+    batching_memory_safety_factor: float = 1.0
     batching_memory_reserve_gb: float = 2.0
     batching_memory_profile_cache: str | None = "auto"
     enable_batching_metrics: bool = False
@@ -1056,19 +1055,13 @@ class ServerArgs(DisaggArgsMixin):
             ),
         )
         parser.add_argument(
-            "--batching-memory-aware",
-            action="store_true",
-            default=ServerArgs.batching_memory_aware,
-            help=(
-                "Enable adaptive memory-aware dynamic batch admission using "
-                "observed peak memory from completed batches."
-            ),
-        )
-        parser.add_argument(
             "--batching-memory-safety-factor",
             type=float,
             default=ServerArgs.batching_memory_safety_factor,
-            help="Multiplier applied to learned dynamic batching memory estimates.",
+            help=(
+                "Minimum multiplier floor for learned dynamic batching memory "
+                "headroom."
+            ),
         )
         parser.add_argument(
             "--batching-memory-reserve-gb",

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import math
 import os
 import tempfile
 from collections import deque
@@ -32,6 +33,8 @@ logger = init_logger(__name__)
 
 # Bounds per-profile state and defines the OOM recovery window.
 _MEMORY_PROFILE_HISTORY_SIZE = 32
+# Use a high quantile of recent prediction misses instead of one fixed margin.
+_MEMORY_RESIDUAL_HEADROOM_QUANTILE = 0.95
 
 _BATCHING_RULE_KEYS = frozenset(
     {
@@ -183,13 +186,17 @@ class MemoryProfile:
             maxlen=_MEMORY_PROFILE_HISTORY_SIZE
         )
         self.residual_factors: deque[float] = deque(maxlen=_MEMORY_PROFILE_HISTORY_SIZE)
+        self.residual_memory_mb: deque[float] = deque(
+            maxlen=_MEMORY_PROFILE_HISTORY_SIZE
+        )
         self._danger_cost: float | None = None
         self._recovery_cost: float | None = None
         self._recovery_successes = 0
         self._cache_dirty = True
         self._cached_distinct_cost_count = 0
         self._cached_max_batch_size = 0
-        self._cached_residual_max = 1.0
+        self._cached_residual_factor = 1.0
+        self._cached_residual_memory_mb = 0.0
         self._cached_monotone_points: list[tuple[float, float]] = []
         self._cached_monotone_costs: list[float] = []
         self._cached_regression: tuple[float, float] | None = None
@@ -204,6 +211,7 @@ class MemoryProfile:
         predicted_peak_mb = self._estimate_peak_memory_base(batch_cost)
         if predicted_peak_mb is not None and predicted_peak_mb > 0.0:
             self.residual_factors.append(max(1.0, peak_memory_mb / predicted_peak_mb))
+            self.residual_memory_mb.append(max(0.0, peak_memory_mb - predicted_peak_mb))
         self.successes.append(MemoryObservation(batch_cost, peak_memory_mb, batch_size))
         self._cache_dirty = True
         self._maybe_clear_danger_cost(batch_cost)
@@ -227,13 +235,17 @@ class MemoryProfile:
         *,
         safety_factor: float,
     ) -> float | None:
-        """Estimate peak memory for a batch cost with configured headroom."""
+        """Estimate peak memory with adaptive headroom from recent prediction error."""
         peak_memory_mb = self._estimate_peak_memory_base(
             batch_cost, use_observed_floor=True
         )
         if peak_memory_mb is None:
             return None
-        return peak_memory_mb * max(safety_factor, self._residual_safety_factor())
+        residual_factor, residual_memory_mb = self._prediction_headroom()
+        return max(
+            peak_memory_mb * max(safety_factor, residual_factor),
+            peak_memory_mb + residual_memory_mb,
+        )
 
     def _estimate_peak_memory_base(
         self, batch_cost: float, *, use_observed_floor: bool = False
@@ -281,9 +293,9 @@ class MemoryProfile:
             return None
         return max(obs.batch_cost for obs in self.successes)
 
-    def _residual_safety_factor(self) -> float:
+    def _prediction_headroom(self) -> tuple[float, float]:
         self._rebuild_cache()
-        return self._cached_residual_max
+        return self._cached_residual_factor, self._cached_residual_memory_mb
 
     def _recovery_successes_required(self) -> int:
         return self.successes.maxlen or _MEMORY_PROFILE_HISTORY_SIZE
@@ -311,7 +323,10 @@ class MemoryProfile:
         points = _monotone_upper_points(sorted(by_cost.items()))
         self._cached_distinct_cost_count = len(by_cost)
         self._cached_max_batch_size = max_batch_size
-        self._cached_residual_max = max(self.residual_factors, default=1.0)
+        self._cached_residual_factor = max(1.0, _high_quantile(self.residual_factors))
+        self._cached_residual_memory_mb = max(
+            0.0, _high_quantile(self.residual_memory_mb)
+        )
         self._cached_monotone_points = points
         self._cached_monotone_costs = [cost for cost, _peak in points]
         self._cached_regression = _fit_peak_regression(points)
@@ -328,6 +343,7 @@ class MemoryProfile:
                 for obs in self.successes
             ],
             "residual_factors": list(self.residual_factors),
+            "residual_memory_mb": list(self.residual_memory_mb),
         }
 
     @classmethod
@@ -343,15 +359,24 @@ class MemoryProfile:
             )
         for value in data.get("residual_factors", []):
             profile.residual_factors.append(max(1.0, float(value)))
+        for value in data.get("residual_memory_mb", []):
+            profile.residual_memory_mb.append(max(0.0, float(value)))
         profile._cache_dirty = True
         return profile
 
 
 class BatchAdmissionController:
-    """Applies configured caps before adding requests to a batch."""
+    """Applies batch caps and records optional memory profile observations."""
 
-    def __init__(self, server_args: "ServerArgs", gpu_id: int):
+    def __init__(
+        self,
+        server_args: "ServerArgs",
+        gpu_id: int | None,
+        *,
+        record_only: bool = False,
+    ):
         self._mode = getattr(server_args, "batching_mode", "dynamic")
+        self._record_only = bool(record_only)
         self._user_max_batch_size = max(1, int(server_args.batching_max_size))
         self._model_path = server_args.model_path
         self._offload = bool(server_args.dit_layerwise_offload)
@@ -366,8 +391,9 @@ class BatchAdmissionController:
             device_name=self._device_name,
             device_memory_gb=self._device_memory_gb,
         )
+        self._base_runtime_memory_key = self._runtime_memory_key
+        self._runtime_memory_key_extras: dict[str, Any] = {}
         self._lora_revision = 0
-        self._memory_aware = bool(server_args.batching_memory_aware)
         self._memory_safety_factor = max(
             1.0, float(server_args.batching_memory_safety_factor)
         )
@@ -379,37 +405,44 @@ class BatchAdmissionController:
         self._memory_budget_missing_adjustment_logged = False
         self._memory_profiles: dict[tuple[Any, ...], MemoryProfile] = {}
         self._memory_profiles_dirty = False
-        self._memory_profile_cache_path = self._resolve_memory_profile_cache_path(
-            server_args
+        self._memory_profile_cache_setting = getattr(
+            server_args, "batching_memory_profile_cache", "auto"
         )
-        if self._memory_aware:
-            self._load_memory_profiles()
+        self._memory_profile_cache_path = self._resolve_memory_profile_cache_path()
+        self._load_memory_profiles()
         self._memory_budget_mb: float | None = None
         self.refresh_memory_budget()
 
         if self.enabled:
             logger.info(
-                "Batch admission enabled: user_max=%d, device_memory=%.1fGiB, rules=%d, memory_aware=%s",
+                "Batch admission enabled: user_max=%d, device_memory=%.1fGiB, rules=%d",
                 self._user_max_batch_size,
                 self._device_memory_gb or 0.0,
                 len(self._rules),
-                self._memory_aware,
             )
 
     @property
     def enabled(self) -> bool:
-        return self._mode == "dynamic" and self._user_max_batch_size > 1
+        return (
+            not self._record_only
+            and self._mode == "dynamic"
+            and self._user_max_batch_size > 1
+        )
 
     def reject_reason_for_candidate(
-        self, current_reqs: list[Req], candidate_req: Req
+        self,
+        current_reqs: list[Req],
+        candidate_req: Req,
+        *,
+        current_batch_cost: float | None = None,
     ) -> str | None:
         if not self.enabled:
             return None
         head_req = current_reqs[0] if current_reqs else candidate_req
         batch_size = len(current_reqs) + 1
-        batch_cost = self.estimate_batch_cost(current_reqs) + self._request_cost(
-            candidate_req
-        )
+        if current_batch_cost is None:
+            current_batch_cost = self.estimate_batch_cost(current_reqs)
+        batch_cost = current_batch_cost + self._request_cost(candidate_req)
         limit = self.limit_for(head_req)
         reject_reason = limit.reject_reason(
             batch_size=batch_size,
@@ -423,7 +456,9 @@ class BatchAdmissionController:
             memory_key=self._memory_key(head_req),
         )
 
-    def batch_is_full(self, reqs: list[Req]) -> bool:
+    def batch_is_full(
+        self, reqs: list[Req], *, batch_cost: float | None = None
+    ) -> bool:
         """Return whether another roughly similar request would exceed the cap."""
         if not self.enabled or not reqs:
             return len(reqs) >= self._user_max_batch_size
@@ -432,7 +467,9 @@ class BatchAdmissionController:
         if len(reqs) >= limit.max_batch_size:
             return True
 
-        next_cost = self.estimate_batch_cost(reqs) + self._request_cost(reqs[0])
+        if batch_cost is None:
+            batch_cost = self.estimate_batch_cost(reqs)
+        next_cost = batch_cost + self._request_cost(reqs[0])
         return (
             limit.max_cost is not None and next_cost > limit.max_cost
         ) or self._memory_reject_reason(
@@ -441,7 +478,9 @@ class BatchAdmissionController:
             memory_key=self._memory_key(reqs[0]),
         ) is not None
 
-    def limit_reason_for_batch(self, reqs: list[Req]) -> str | None:
+    def limit_reason_for_batch(
+        self, reqs: list[Req], *, batch_cost: float | None = None
+    ) -> str | None:
         if not self.enabled or not reqs:
             return None
 
@@ -449,7 +488,9 @@ class BatchAdmissionController:
         if len(reqs) >= limit.max_batch_size:
             return limit.cap_reason or f"config_cap:{limit.max_batch_size}"
 
-        next_cost = self.estimate_batch_cost(reqs) + self._request_cost(reqs[0])
+        if batch_cost is None:
+            batch_cost = self.estimate_batch_cost(reqs)
+        next_cost = batch_cost + self._request_cost(reqs[0])
         return limit.stop_reason_for_next_cost(next_cost) or self._memory_reject_reason(
             batch_size=len(reqs) + 1,
             batch_cost=next_cost,
@@ -461,8 +502,6 @@ class BatchAdmissionController:
         """Return the largest same-shape batch allowed by config and memory caps."""
         limit = self.limit_for(req)
         max_batch_size = limit.max_batch_size
-        if not self._memory_aware:
-            return max_batch_size
 
         cost_per_req = self._request_cost(req)
         memory_key = self._memory_key(req)
@@ -518,6 +557,9 @@ class BatchAdmissionController:
     def estimate_batch_cost(self, reqs: list[Req]) -> float:
         return sum(self._request_cost(req) for req in reqs)
 
+    def estimate_request_cost(self, req: Req) -> float:
+        return self._request_cost(req)
+
     def _request_cost(self, req: Req) -> float:
         cached_cost = getattr(req, "_batch_admission_cost", None)
         if cached_cost is not None:
@@ -528,7 +570,7 @@ class BatchAdmissionController:
         return cost
 
     def refresh_memory_budget(self) -> None:
-        if not self._memory_aware:
+        if not self.enabled and not self._record_only:
             return
 
         budget_mb = self._measure_memory_budget_mb()
@@ -548,20 +590,21 @@ class BatchAdmissionController:
 
         Only typed OOMs update the danger cost; error strings are not parsed.
         """
-        if not self._memory_aware or not reqs:
+        if (not self.enabled and not self._record_only) or not reqs:
             return
 
-        profile = self._memory_profile_for(reqs[0])
         batch_cost = self.estimate_batch_cost(reqs)
         if error is None:
+            profile = self._memory_profile_for(reqs[0])
             profile.observe_success(batch_cost, peak_memory_mb, batch_size=len(reqs))
             if self._memory_profile_cache_path is not None:
                 self._memory_profiles_dirty = True
         elif is_oom:
+            profile = self._memory_profile_for(reqs[0])
             profile.observe_oom(batch_cost)
 
     def save_memory_profiles_if_dirty(self) -> None:
-        if not self._memory_aware or not self._memory_profiles_dirty:
+        if not self._memory_profiles_dirty:
             return
         self._save_memory_profiles_now()
 
@@ -570,6 +613,22 @@ class BatchAdmissionController:
         self.save_memory_profiles_if_dirty()
         self._lora_revision += 1
         self._memory_profiles.clear()
+
+    def update_runtime_memory_key_extra(self, name: str, value: Any) -> None:
+        """Refresh persisted memory profiles when runtime topology becomes known."""
+        self._runtime_memory_key_extras[name] = _freeze_key_value(value)
+        runtime_key = self._base_runtime_memory_key + tuple(
+            (key, self._runtime_memory_key_extras[key])
+            for key in sorted(self._runtime_memory_key_extras)
+        )
+        if runtime_key == self._runtime_memory_key:
+            return
+
+        self.save_memory_profiles_if_dirty()
+        self._runtime_memory_key = runtime_key
+        self._memory_profiles.clear()
+        self._memory_profile_cache_path = self._resolve_memory_profile_cache_path()
+        self._load_memory_profiles()
 
     def _matching_rules(self, req: Req) -> list[BatchingRule]:
         return [
@@ -600,9 +659,6 @@ class BatchAdmissionController:
         next_batch: bool = False,
     ) -> str | None:
         """Return the memory admission reason for a precomputed candidate batch."""
-        if not self._memory_aware:
-            return None
-
         profile = self._memory_profiles.get(memory_key)
         if profile is not None:
             failed_cost = profile.known_oom_cost(batch_cost)
@@ -726,7 +782,7 @@ class BatchAdmissionController:
 
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            # Cache schema v1 stores successful observations and residual factors.
+            # Cache schema v1 stores successful observations and prediction residuals.
             payload = {"schema_version": 1, "profiles": profiles}
             fd, tmp_path = tempfile.mkstemp(
                 prefix=".tmp-", suffix=".json", dir=os.path.dirname(path)
@@ -764,23 +820,25 @@ class BatchAdmissionController:
         )
 
     @staticmethod
-    def _get_device_memory_gb(gpu_id: int) -> float | None:
+    def _get_device_memory_gb(gpu_id: int | None) -> float | None:
+        if gpu_id is None:
+            return None
         try:
             return current_platform.get_device_total_memory(gpu_id) / BYTES_PER_GB
         except Exception:
             return None
 
     @staticmethod
-    def _get_device_name(gpu_id: int) -> str | None:
+    def _get_device_name(gpu_id: int | None) -> str | None:
+        if gpu_id is None:
+            return None
         try:
             return str(current_platform.get_device_name(gpu_id))
         except Exception:
             return None
 
-    def _resolve_memory_profile_cache_path(
-        self, server_args: "ServerArgs"
-    ) -> str | None:
-        cache_setting = getattr(server_args, "batching_memory_profile_cache", "auto")
+    def _resolve_memory_profile_cache_path(self) -> str | None:
+        cache_setting = self._memory_profile_cache_setting
         if cache_setting in (None, ""):
             return None
         cache_root = (
@@ -1119,6 +1177,14 @@ def _sampling_memory_key(req: Req) -> tuple[Any, ...] | None:
         for f in sp_fields
         if not f.metadata.get("batch_sig_exclude", False)
     )
+
+
+def _high_quantile(values: deque[float] | list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    idx = math.ceil(_MEMORY_RESIDUAL_HEADROOM_QUANTILE * len(ordered)) - 1
+    return ordered[min(max(idx, 0), len(ordered) - 1)]
 
 
 def _monotone_upper_points(

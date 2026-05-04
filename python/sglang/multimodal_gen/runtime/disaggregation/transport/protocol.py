@@ -100,6 +100,7 @@ class TransferDoneMsg:
     msg_type: str = TransferMsgType.DONE
     request_id: str = ""
     error: str | None = None
+    memory: dict | None = None
 
 
 @dataclass
@@ -115,6 +116,9 @@ class TransferRegisterMsg:
     # data plane cannot drift when instances register in a different order
     # than --*-urls.
     work_endpoint: str = ""
+    device_name: str | None = None
+    device_memory_gb: float | None = None
+    parallel: dict = field(default_factory=dict)
     # Pre-allocated receive slots: [{"offset": int, "size": int, "slot_id": int, "addr": int}]
     preallocated_slots: list = field(default_factory=list)
 

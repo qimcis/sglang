@@ -8,11 +8,16 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from typing import Any
 
 import zmq
 
 from sglang.multimodal_gen.runtime.disaggregation.dispatch_policy import (
     PoolDispatcher,
+)
+from sglang.multimodal_gen.runtime.disaggregation.memory import (
+    aggregate_role_memory,
+    role_memory_from_scalar_fields,
 )
 from sglang.multimodal_gen.runtime.disaggregation.request_state import (
     RequestState,
@@ -30,6 +35,9 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     decode_transfer_msg,
     encode_transfer_msg,
     is_transfer_message,
+)
+from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
+    BatchAdmissionController,
 )
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 
@@ -92,6 +100,7 @@ class DiffusionServer:
         denoiser_capacity: int = 2,
         decoder_capacity: int = 4,
         p2p_mode: bool = True,
+        server_args=None,
     ):
         self._frontend_endpoint = frontend_endpoint
         self._encoder_work_endpoints = encoder_work_endpoints
@@ -120,7 +129,16 @@ class DiffusionServer:
         self._thread: threading.Thread | None = None
 
         self._pending: dict[str, bytes] = {}  # request_id -> client ZMQ identity
+        self._pending_reqs: dict[str, list[Any]] = {}
+        self._role_memory: dict[str, dict[str, dict[str, Any]]] = {}
         self._lock = threading.Lock()
+        # The disagg head records aggregate role peaks for persistence; it does
+        # not enforce admission because the head has no local worker GPU budget.
+        self._batch_memory_recorder = (
+            BatchAdmissionController(server_args, gpu_id=None, record_only=True)
+            if server_args is not None
+            else None
+        )
 
         # FreeBufferSlots per instance
         self._encoder_free_slots = [encoder_capacity] * self._num_encoders
@@ -193,6 +211,8 @@ class DiffusionServer:
         return self._ready.wait(timeout=timeout)
 
     def stop(self) -> None:
+        if self._batch_memory_recorder is not None:
+            self._batch_memory_recorder.save_memory_profiles_if_dirty()
         self._running = False
         if self._thread is not None:
             self._thread.join(timeout=5.0)
@@ -271,6 +291,8 @@ class DiffusionServer:
         except Exception:
             logger.exception("DiffusionServer event loop error")
         finally:
+            if self._batch_memory_recorder is not None:
+                self._batch_memory_recorder.save_memory_profiles_if_dirty()
             for sock in all_sockets:
                 sock.close()
             self._context.destroy(linger=0)
@@ -306,6 +328,9 @@ class DiffusionServer:
 
         request_id = scalar_fields.get("request_id")
         disagg_error = scalar_fields.get("_disagg_error")
+
+        if request_id:
+            self._record_role_memory_from_scalar_fields(request_id, scalar_fields, role)
 
         if request_id and disagg_error:
             logger.error(
@@ -364,6 +389,7 @@ class DiffusionServer:
         request_id = getattr(req, "request_id", None)
         if request_id is None:
             request_id = f"ds-{time.monotonic()}"
+            setattr(req, "request_id", request_id)
 
         try:
             self._tracker.submit(request_id)
@@ -373,6 +399,7 @@ class DiffusionServer:
 
         with self._lock:
             self._pending[request_id] = client_identity
+            self._pending_reqs[request_id] = reqs
 
         try:
             self._tracker.transition(request_id, RequestState.ENCODER_WAITING)
@@ -406,6 +433,9 @@ class DiffusionServer:
             self._decoder_free_slots[record.decoder_instance] += 1
 
         tensor_fields, scalar_fields = unpack_tensors(frames, device="cpu")
+        self._record_role_memory_from_scalar_fields(
+            request_id, scalar_fields, RoleType.DECODER
+        )
 
         output_batch = OutputBatch(
             output=tensor_fields.get("output"),
@@ -413,6 +443,7 @@ class DiffusionServer:
             audio_sample_rate=scalar_fields.get("audio_sample_rate"),
             error=scalar_fields.get("error"),
         )
+        self._finalize_output_batch(request_id, output_batch)
 
         try:
             if output_batch.error:
@@ -536,10 +567,12 @@ class DiffusionServer:
             client_identity = self._pending.pop(request_id, None)
 
         if client_identity is None:
+            self._cleanup_request_memory(request_id)
             self._tracker.remove(request_id)
             return
 
         error_batch = OutputBatch(error=error_msg)
+        self._finalize_output_batch(request_id, error_batch)
         try:
             self._frontend.send_multipart(
                 [client_identity, b"", pickle.dumps(error_batch)]
@@ -663,6 +696,9 @@ class DiffusionServer:
             "pool_ptr": msg.get("pool_ptr", 0),
             "pool_size": msg.get("pool_size", 0),
             "work_endpoint": work_endpoint,
+            "device_name": msg.get("device_name"),
+            "device_memory_gb": msg.get("device_memory_gb"),
+            "parallel": msg.get("parallel", {}),
         }
         prealloc = msg.get("preallocated_slots", [])
         info["free_preallocated_slots"] = list(prealloc)
@@ -678,10 +714,14 @@ class DiffusionServer:
             info["pool_ptr"],
             len(prealloc),
         )
+        self._refresh_disagg_memory_profile_key()
 
     def _handle_transfer_staged(self, msg: dict) -> None:
         request_id = msg["request_id"]
         logger.debug("DiffusionServer transfer: encoder staged %s", request_id)
+        self._record_role_memory_from_scalar_fields(
+            request_id, msg.get("scalar_fields", {}), RoleType.ENCODER
+        )
         record = self._tracker.get(request_id)
         encoder_idx = record.encoder_instance if record else 0
 
@@ -934,6 +974,10 @@ class DiffusionServer:
         )
         error = msg.get("error")
         p2p = self._transfer_state.get(request_id)
+        self._record_role_memory(request_id, role, msg.get("memory"))
+        self._record_role_memory_from_scalar_fields(
+            request_id, msg.get("scalar_fields", {}), role
+        )
 
         if role == RoleType.DENOISER:
             record = self._tracker.get(request_id)
@@ -1038,6 +1082,8 @@ class DiffusionServer:
             return
 
         output_batch = OutputBatch(error=msg.get("error"))
+        self._record_role_memory(request_id, RoleType.DECODER, msg.get("memory"))
+        self._finalize_output_batch(request_id, output_batch)
 
         try:
             self._frontend.send_multipart(
@@ -1050,6 +1096,96 @@ class DiffusionServer:
                 e,
             )
         self._tracker.remove(request_id)
+
+    def _record_role_memory(
+        self,
+        request_id: str,
+        role: RoleType,
+        memory: dict[str, Any] | None,
+    ) -> None:
+        if not request_id or not memory:
+            return
+        role_name = str(memory.get("role") or role.value)
+        self._role_memory.setdefault(request_id, {})[role_name] = {
+            "role": role_name,
+            "peak_memory_mb": float(memory.get("peak_memory_mb") or 0.0),
+            "peak_allocated_memory_mb": float(
+                memory.get("peak_allocated_memory_mb") or 0.0
+            ),
+            "is_oom": bool(memory.get("is_oom", False)),
+            "error": memory.get("error"),
+        }
+
+    def _record_role_memory_from_scalar_fields(
+        self,
+        request_id: str,
+        scalar_fields: dict[str, Any] | None,
+        role: RoleType,
+    ) -> None:
+        memory = role_memory_from_scalar_fields(scalar_fields, default_role=role.value)
+        self._record_role_memory(request_id, role, memory)
+
+    def _finalize_output_batch(self, request_id: str, output_batch) -> None:
+        memory = aggregate_role_memory(self._role_memory.get(request_id, {}))
+        output_batch.peak_memory_mb = max(
+            float(output_batch.peak_memory_mb or 0.0),
+            memory["peak_memory_mb"],
+        )
+        output_batch.peak_allocated_memory_mb = max(
+            float(output_batch.peak_allocated_memory_mb or 0.0),
+            memory["peak_allocated_memory_mb"],
+        )
+        output_batch.is_oom = bool(output_batch.is_oom or memory["is_oom"])
+
+        if self._batch_memory_recorder is not None:
+            reqs = self._pending_reqs.get(request_id)
+            if reqs:
+                self._batch_memory_recorder.observe_batch_result(
+                    reqs,
+                    peak_memory_mb=(
+                        output_batch.peak_allocated_memory_mb
+                        or output_batch.peak_memory_mb
+                    ),
+                    error=output_batch.error,
+                    is_oom=output_batch.is_oom,
+                )
+        self._cleanup_request_memory(request_id)
+
+    def _cleanup_request_memory(self, request_id: str) -> None:
+        self._pending_reqs.pop(request_id, None)
+        self._role_memory.pop(request_id, None)
+
+    def _refresh_disagg_memory_profile_key(self) -> None:
+        if self._batch_memory_recorder is None:
+            return
+        if (
+            len(self._encoder_peers) < self._num_encoders
+            or len(self._denoiser_peers) < self._num_denoisers
+            or len(self._decoder_peers) < self._num_decoders
+        ):
+            return
+        self._batch_memory_recorder.update_runtime_memory_key_extra(
+            "disagg_roles", self._disagg_role_profile_key()
+        )
+
+    def _disagg_role_profile_key(self) -> tuple[Any, ...]:
+        entries = []
+        for role_name, peers in (
+            ("encoder", self._encoder_peers),
+            ("denoiser", self._denoiser_peers),
+            ("decoder", self._decoder_peers),
+        ):
+            for idx, info in sorted(peers.items()):
+                entries.append(
+                    (
+                        role_name,
+                        idx,
+                        info.get("device_name"),
+                        info.get("device_memory_gb"),
+                        info.get("parallel", {}),
+                    )
+                )
+        return tuple(entries)
 
     def get_stats(self) -> dict:
         with self._lock:

@@ -797,6 +797,8 @@ class Scheduler(SchedulerDisaggMixin):
                     output_batch.noise_pred, start, end, total_items
                 ),
                 peak_memory_mb=output_batch.peak_memory_mb,
+                peak_allocated_memory_mb=output_batch.peak_allocated_memory_mb,
+                is_oom=output_batch.is_oom,
             )
             if split.metrics is not None:
                 split.metrics.request_id = req.request_id
@@ -866,12 +868,14 @@ class Scheduler(SchedulerDisaggMixin):
 
         compatible_indices: list[int] = [0]
         compatible_reqs: list[Req] = [req]
+        compatible_cost = self._batch_admission.estimate_batch_cost(compatible_reqs)
         reject_reasons: list[str] = []
         for idx in range(1, len(self.waiting_queue)):
             if len(
                 compatible_indices
             ) >= self._batching_max_size or self._batch_admission.batch_is_full(
-                compatible_reqs
+                compatible_reqs,
+                batch_cost=compatible_cost,
             ):
                 break
             _identity, candidate_req, _enqueue_time = self.waiting_queue[idx]
@@ -879,11 +883,16 @@ class Scheduler(SchedulerDisaggMixin):
                 req, candidate_req
             ):
                 admission_reject = self._batch_admission.reject_reason_for_candidate(
-                    compatible_reqs, candidate_req
+                    compatible_reqs,
+                    candidate_req,
+                    current_batch_cost=compatible_cost,
                 )
                 if admission_reject is None:
                     compatible_indices.append(idx)
                     compatible_reqs.append(candidate_req)
+                    compatible_cost += self._batch_admission.estimate_request_cost(
+                        candidate_req
+                    )
                 elif self._batch_metrics_enabled:
                     reject_reasons.append(admission_reject)
             elif self._batch_metrics_enabled and isinstance(candidate_req, Req):
@@ -897,7 +906,10 @@ class Scheduler(SchedulerDisaggMixin):
 
         should_wait_for_more = (
             batch_len < self._batching_max_size
-            and not self._batch_admission.batch_is_full(compatible_reqs)
+            and not self._batch_admission.batch_is_full(
+                compatible_reqs,
+                batch_cost=compatible_cost,
+            )
             and oldest_wait_s < self._batching_delay_s
         )
         if should_wait_for_more:
@@ -908,7 +920,10 @@ class Scheduler(SchedulerDisaggMixin):
             item_identity, item_req, _ = self.waiting_queue[idx]
             batch_items[batch_len - 1 - pos] = (item_identity, item_req)
             del self.waiting_queue[idx]
-        stop_reason = self._batch_admission.limit_reason_for_batch(compatible_reqs)
+        stop_reason = self._batch_admission.limit_reason_for_batch(
+            compatible_reqs,
+            batch_cost=compatible_cost,
+        )
         if stop_reason is None:
             if batch_len >= self._batching_max_size:
                 stop_reason = "max_size"
@@ -918,12 +933,15 @@ class Scheduler(SchedulerDisaggMixin):
                 stop_reason = "delay"
             else:
                 stop_reason = "ready"
+        effective_max_batch_size = (
+            self._batch_admission.max_admissible_batch_size(compatible_reqs[0])
+            if self._batch_metrics_enabled
+            else 1
+        )
         self._record_batch_dispatch_metrics(
             batch_size=batch_len,
             queue_wait_ms=oldest_wait_s * 1000.0,
-            effective_max_batch_size=self._batch_admission.max_admissible_batch_size(
-                compatible_reqs[0]
-            ),
+            effective_max_batch_size=effective_max_batch_size,
             reject_reasons=reject_reasons,
             stop_reason=stop_reason,
         )
