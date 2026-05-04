@@ -55,6 +55,7 @@ class BatchMetricsWindow:
     full_dispatches: int = 0
     wait_times_ms: list[float] = field(default_factory=list)
     reject_reasons: Counter[str] = field(default_factory=Counter)
+    stop_reasons: Counter[str] = field(default_factory=Counter)
 
 
 @dataclass(init=False)
@@ -392,6 +393,7 @@ class OutputBatch:
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
     output_file_paths: list[str] | None = None
+    is_oom: bool = False
 
     # logged metrics info, directly from Req.timings
     metrics: Optional["RequestMetrics"] = None
@@ -400,3 +402,4 @@ class OutputBatch:
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None
     peak_memory_mb: float = 0.0
+    peak_allocated_memory_mb: float = 0.0

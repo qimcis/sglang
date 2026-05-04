@@ -229,6 +229,10 @@ class ServerArgs(DisaggArgsMixin):
     batching_max_size: int = 1
     batching_delay_ms: float = 0.0
     batching_config: str | None = None
+    batching_memory_aware: bool = False
+    batching_memory_safety_factor: float = 1.15
+    batching_memory_reserve_gb: float = 2.0
+    batching_memory_profile_cache: str | None = "auto"
     enable_batching_metrics: bool = False
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
@@ -1052,6 +1056,27 @@ class ServerArgs(DisaggArgsMixin):
             ),
         )
         parser.add_argument(
+            "--batching-memory-aware",
+            action="store_true",
+            default=ServerArgs.batching_memory_aware,
+            help=(
+                "Enable adaptive memory-aware dynamic batch admission using "
+                "observed peak memory from completed batches."
+            ),
+        )
+        parser.add_argument(
+            "--batching-memory-safety-factor",
+            type=float,
+            default=ServerArgs.batching_memory_safety_factor,
+            help="Multiplier applied to learned dynamic batching memory estimates.",
+        )
+        parser.add_argument(
+            "--batching-memory-reserve-gb",
+            type=float,
+            default=ServerArgs.batching_memory_reserve_gb,
+            help="GiB of device memory to leave unused for memory-aware batching admission.",
+        )
+        parser.add_argument(
             "--enable-batching-metrics",
             action="store_true",
             default=ServerArgs.enable_batching_metrics,
@@ -1505,6 +1530,15 @@ class ServerArgs(DisaggArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
+        if self.batching_memory_safety_factor < 1.0:
+            raise ValueError("batching_memory_safety_factor must be >= 1.0")
+        if self.batching_memory_safety_factor > 2.0:
+            logger.warning(
+                "batching_memory_safety_factor is high (%.2f); memory-aware batching may reject most batches.",
+                self.batching_memory_safety_factor,
+            )
+        if self.batching_memory_reserve_gb < 0:
+            raise ValueError("batching_memory_reserve_gb must be >= 0")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""

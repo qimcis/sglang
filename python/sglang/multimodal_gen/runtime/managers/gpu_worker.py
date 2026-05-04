@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, List, Union
 
 import torch
+import torch.distributed as dist
 from setproctitle import setproctitle
 
 from sglang.multimodal_gen import envs
@@ -192,7 +193,12 @@ class GPUWorker:
         peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
         peak_allocated_bytes = torch.get_device_module().max_memory_allocated()
 
-        output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
+        output_batch.peak_memory_mb = max(
+            output_batch.peak_memory_mb, peak_reserved_bytes / (1024**2)
+        )
+        output_batch.peak_allocated_memory_mb = max(
+            output_batch.peak_allocated_memory_mb, peak_allocated_bytes / (1024**2)
+        )
         peak_reserved_gb = peak_reserved_bytes / (1024**3)
         peak_allocated_gb = peak_allocated_bytes / (1024**3)
 
@@ -306,7 +312,7 @@ class GPUWorker:
         """
         output_batch = None
         try:
-            if self.rank == 0 and not current_platform.is_cpu():
+            if not current_platform.is_cpu():
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
@@ -390,19 +396,43 @@ class GPUWorker:
                 f"Error executing {error_context}: {e}",
                 exc_info=True,
             )
-            if isinstance(e, _oom_exceptions()):
+            is_oom = isinstance(e, _oom_exceptions())
+            if is_oom:
                 logger.warning(OOM_MSG)
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing {error_context}: {e}"
+            output_batch.is_oom = is_oom
             self._record_output_peak_memory(output_batch)
         return output_batch
 
     def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
-        if self.rank != 0 or current_platform.is_cpu():
+        if current_platform.is_cpu():
             return
-        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
-        output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
+        device_module = torch.get_device_module()
+        peak_reserved_mb = float(device_module.max_memory_reserved()) / (1024**2)
+        max_memory_allocated = getattr(device_module, "max_memory_allocated", None)
+        peak_allocated_mb = (
+            float(max_memory_allocated()) / (1024**2)
+            if max_memory_allocated is not None
+            else peak_reserved_mb
+        )
+
+        if output_batch.error is None and dist.is_available() and dist.is_initialized():
+            device = torch.device(current_platform.device_type, self.local_rank)
+            peaks = torch.tensor(
+                [peak_reserved_mb, peak_allocated_mb],
+                dtype=torch.float64,
+                device=device,
+            )
+            dist.all_reduce(peaks, op=dist.ReduceOp.MAX)
+            peak_reserved_mb = float(peaks[0].item())
+            peak_allocated_mb = float(peaks[1].item())
+
+        if self.rank != 0:
+            return
+        output_batch.peak_memory_mb = peak_reserved_mb
+        output_batch.peak_allocated_memory_mb = peak_allocated_mb
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:
         assert self.pipeline is not None
@@ -570,7 +600,11 @@ class GPUWorker:
     ) -> None:
         if output_batch.error is not None and merged.error is None:
             merged.error = output_batch.error
+        merged.is_oom = merged.is_oom or output_batch.is_oom
         merged.peak_memory_mb = max(merged.peak_memory_mb, output_batch.peak_memory_mb)
+        merged.peak_allocated_memory_mb = max(
+            merged.peak_allocated_memory_mb, output_batch.peak_allocated_memory_mb
+        )
         if (
             merged.trajectory_timesteps is None
             and output_batch.trajectory_timesteps is not None

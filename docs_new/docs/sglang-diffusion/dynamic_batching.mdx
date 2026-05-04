@@ -38,6 +38,12 @@ Use `--batching-config /path/to/batching_config.json` to load JSON rules when a 
 }
 ```
 
+Use `--batching-memory-aware` to let admission learn from completed batches and cap future batches when the observed peak memory suggests the next batch would exceed available VRAM. This is an adaptive guard below `--batching-max-size` and any `--batching-config` rules, not a byte-exact startup predictor.
+
+`--batching-memory-reserve-gb` controls how much device memory to leave unused, and `--batching-memory-safety-factor` applies extra headroom to learned estimates. The default safety factor is `1.15`. Memory profiles are scoped by model/runtime settings, precision, quantization, attention backend, parallelism, offload mode, LoRA revision, text-layout settings, and request shape. A new memory profile ramps geometrically from singleton execution to batch size two, then four, then eight, while using observed peaks, OOM records, interpolation within the observed cost range, and linear extrapolation for larger batches. Successful calibration profiles are cached under `${SGLANG_DIFFUSION_BATCH_MEMORY_CACHE:-~/.cache/sglang/diffusion_batch_memory}` using `schema_version: 1`.
+
+When `--enable-batching-metrics` is set, memory-aware admission appears in `stop_reason`, `top_stops`, and `top_rejects` as `memory_uncalibrated`, `memory_budget`, or `memory_oom`.
+
 ## Compatibility
 
 An initial implementation of dynamic batching for T2I and T2V models can be found in [#18764](https://github.com/sgl-project/sglang/pull/18764). The current compatibility grid is below and will be updated as more coverage is added. See [Supported Models](./compatibility_matrix) for full model IDs.
@@ -132,12 +138,12 @@ An initial implementation of dynamic batching for T2I and T2V models can be foun
 ## Notes
 
 - Requests batch only when model inputs, sampling parameters, output handling, and any configured rules are compatible.
-- There is no startup probing, runtime learning, OOM retry, or automatic fallback to singletons. If a merged batch fails or cannot be split, every request in that batch receives an error.
+- By default there is no startup probing, runtime learning, OOM retry, or automatic fallback to singletons. With `--batching-memory-aware`, admission starts each new profile with a singleton ramp and uses completed batch peak memory and recorded OOMs to cap future batches, but it does not retry a failed merged batch.
 - Batch shape can change kernels, so singleton and dynamic outputs are not expected to be bit-exact.
 - Use `--enable-batching-metrics` to inspect realized batches:
 
 ```text
 Dynamic batch dispatch: size=2/8, user_max=8, queue_wait=5.12ms, stop_reason=delay
 Dynamic batch dispatch: size=1/8, user_max=8, queue_wait=0.04ms, stop_reason=config_cap:1
-Dynamic batch stats (last 5 dispatches): avg_size=2.80, merged_rate=60.0%, full_rate=20.0%, utilization=35.0%, wait_avg=3.21ms, wait_p95=5.12ms, top_rejects=none
+Dynamic batch stats (last 5 dispatches): avg_size=2.80, merged_rate=60.0%, full_rate=20.0%, utilization=35.0%, wait_avg=3.21ms, wait_p95=5.12ms, top_stops=delay=3, config_cap=1, top_rejects=none
 ```

@@ -183,22 +183,44 @@ class Scheduler(SchedulerDisaggMixin):
         # TODO: return set status
         # TODO: return with SetLoRAResponse or something more appropriate
         req = reqs[0]
-        return self.worker.set_lora(
-            req.lora_nickname, req.lora_path, req.target, req.strength
-        )
+        try:
+            output = self.worker.set_lora(
+                req.lora_nickname, req.lora_path, req.target, req.strength
+            )
+        except Exception:
+            self._batch_admission.invalidate_runtime_memory_profiles()
+            raise
+        if output.error is None:
+            self._batch_admission.invalidate_runtime_memory_profiles()
+        return output
 
-    def _handle_merge_lora(self, reqs: List[Any]):
+    def _handle_merge_lora(self, reqs: List[Any]) -> OutputBatch:
         req = reqs[0]
-        return self.worker.merge_lora_weights(req.target, req.strength)
+        try:
+            output = self.worker.merge_lora_weights(req.target, req.strength)
+        except Exception:
+            self._batch_admission.invalidate_runtime_memory_profiles()
+            raise
+        if output.error is None:
+            self._batch_admission.invalidate_runtime_memory_profiles()
+        return output
 
     def _handle_unmerge_lora(self, reqs: List[Any]) -> OutputBatch:
         req = reqs[0]
-        return self.worker.unmerge_lora_weights(req.target)
+        try:
+            output = self.worker.unmerge_lora_weights(req.target)
+        except Exception:
+            self._batch_admission.invalidate_runtime_memory_profiles()
+            raise
+        if output.error is None:
+            self._batch_admission.invalidate_runtime_memory_profiles()
+        return output
 
     def _handle_list_loras(self, _reqs: List[Any]) -> OutputBatch:
         return self.worker.list_loras()
 
     def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
+        self._batch_admission.save_memory_profiles_if_dirty()
         self._running = False
         return OutputBatch()
 
@@ -319,7 +341,10 @@ class Scheduler(SchedulerDisaggMixin):
             thread_finish_flag=True,
         ):
             if len(reqs) == 1 or not allow_dynamic_batching:
-                return self.worker.execute_forward(reqs)
+                output_batch = self.worker.execute_forward(reqs)
+                if len(reqs) == 1:
+                    self._observe_batch_memory(reqs, output_batch)
+                return output_batch
 
             merged_req = self._try_merge_generation_reqs(reqs)
             if merged_req is None:
@@ -328,6 +353,7 @@ class Scheduler(SchedulerDisaggMixin):
             batch_size = len(reqs)
             try:
                 output_batch = self.worker.execute_forward([merged_req])
+                self._observe_batch_memory(reqs, output_batch)
                 if output_batch.error:
                     logger.error(
                         "Dynamic batch execution returned error. Skipping sequential fallback and returning errors: %s",
@@ -367,7 +393,22 @@ class Scheduler(SchedulerDisaggMixin):
                 )
 
     def _execute_generation_sequential(self, reqs: List[Req]) -> List[OutputBatch]:
-        return [self.worker.execute_forward([req]) for req in reqs]
+        outputs = []
+        for req in reqs:
+            output_batch = self.worker.execute_forward([req])
+            self._observe_batch_memory([req], output_batch)
+            outputs.append(output_batch)
+        return outputs
+
+    def _observe_batch_memory(self, reqs: list[Req], output_batch: OutputBatch) -> None:
+        self._batch_admission.observe_batch_result(
+            reqs,
+            peak_memory_mb=(
+                output_batch.peak_allocated_memory_mb or output_batch.peak_memory_mb
+            ),
+            error=output_batch.error,
+            is_oom=output_batch.is_oom,
+        )
 
     @staticmethod
     def _percentile(values: list[float], percentile: float) -> float:
@@ -551,8 +592,12 @@ class Scheduler(SchedulerDisaggMixin):
         if self._dynamic_batching_enabled() and batch_size >= effective_max_batch_size:
             window.full_dispatches += 1
         window.wait_times_ms.append(max(queue_wait_ms, 0.0))
+        if stop_reason:
+            window.stop_reasons.update([self._batch_metric_reason_key(stop_reason)])
         if reject_reasons:
-            window.reject_reasons.update(reject_reasons)
+            window.reject_reasons.update(
+                self._batch_metric_reason_key(reason) for reason in reject_reasons
+            )
 
         if window.dispatches >= _BATCH_METRICS_LOG_INTERVAL:
             self._log_batch_metrics_summary()
@@ -577,9 +622,14 @@ class Scheduler(SchedulerDisaggMixin):
         )
         if not top_rejects:
             top_rejects = "none"
+        top_stops = ", ".join(
+            f"{reason}={count}" for reason, count in window.stop_reasons.most_common(5)
+        )
+        if not top_stops:
+            top_stops = "none"
 
         logger.info(
-            "Dynamic batch stats (last %d dispatches): avg_size=%.2f, merged_rate=%.1f%%, full_rate=%.1f%%, utilization=%.1f%%, wait_avg=%.2fms, wait_p95=%.2fms, top_rejects=%s",
+            "Dynamic batch stats (last %d dispatches): avg_size=%.2f, merged_rate=%.1f%%, full_rate=%.1f%%, utilization=%.1f%%, wait_avg=%.2fms, wait_p95=%.2fms, top_stops=%s, top_rejects=%s",
             window.dispatches,
             avg_size,
             merged_rate * 100.0,
@@ -587,9 +637,16 @@ class Scheduler(SchedulerDisaggMixin):
             utilization * 100.0,
             avg_wait_ms,
             p95_wait_ms,
+            top_stops,
             top_rejects,
         )
         self._batch_metrics_window = BatchMetricsWindow()
+
+    @staticmethod
+    def _batch_metric_reason_key(reason: str) -> str:
+        reason = reason.removeprefix("head:")
+        reason = reason.split(":", 1)[0]
+        return reason.removesuffix("_next")
 
     def _build_dynamic_batch_error_outputs(
         self,
@@ -770,6 +827,8 @@ class Scheduler(SchedulerDisaggMixin):
         """
         if not self.waiting_queue:
             return None
+
+        self._batch_admission.refresh_memory_budget()
 
         if not self._dynamic_batching_enabled():
             identity, req, enqueue_time = self.waiting_queue.popleft()
