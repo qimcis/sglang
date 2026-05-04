@@ -163,13 +163,20 @@ class BatchingRule:
 
 @dataclass(frozen=True)
 class MemoryObservation:
+    """One successful batch measurement used by memory-aware admission."""
+
     batch_cost: float
     peak_memory_mb: float
     batch_size: int = 1
 
 
 class MemoryProfile:
-    """Observed peak memory for one runtime and request profile."""
+    """Observed peak memory for one runtime and request profile.
+
+    Profiles interpolate within observed batch costs, extrapolate from the
+    observed trend, and remember typed OOMs until later safe batches recover the
+    profile.
+    """
 
     def __init__(self):
         self.successes: deque[MemoryObservation] = deque(
@@ -190,6 +197,7 @@ class MemoryProfile:
     def observe_success(
         self, batch_cost: float, peak_memory_mb: float, *, batch_size: int = 1
     ) -> None:
+        """Record a completed batch and update prediction headroom."""
         if batch_cost <= 0.0 or peak_memory_mb <= 0.0:
             return
         batch_size = max(1, int(batch_size))
@@ -201,6 +209,7 @@ class MemoryProfile:
         self._maybe_clear_danger_cost(batch_cost)
 
     def observe_oom(self, batch_cost: float) -> None:
+        """Record the lowest known OOM cost for this profile."""
         if batch_cost > 0.0:
             if self._danger_cost is None or batch_cost < self._danger_cost:
                 self._danger_cost = batch_cost
@@ -218,6 +227,7 @@ class MemoryProfile:
         *,
         safety_factor: float,
     ) -> float | None:
+        """Estimate peak memory for a batch cost with configured headroom."""
         peak_memory_mb = self._estimate_peak_memory_base(
             batch_cost, use_observed_floor=True
         )
@@ -448,6 +458,7 @@ class BatchAdmissionController:
         )
 
     def max_admissible_batch_size(self, req: Req) -> int:
+        """Return the largest same-shape batch allowed by config and memory caps."""
         limit = self.limit_for(req)
         max_batch_size = limit.max_batch_size
         if not self._memory_aware:
@@ -533,6 +544,10 @@ class BatchAdmissionController:
         error: str | None,
         is_oom: bool,
     ) -> None:
+        """Feed completed batch memory back into admission.
+
+        Only typed OOMs update the danger cost; error strings are not parsed.
+        """
         if not self._memory_aware or not reqs:
             return
 
@@ -584,6 +599,7 @@ class BatchAdmissionController:
         memory_key: tuple[Any, ...],
         next_batch: bool = False,
     ) -> str | None:
+        """Return the memory admission reason for a precomputed candidate batch."""
         if not self._memory_aware:
             return None
 
@@ -623,6 +639,7 @@ class BatchAdmissionController:
         batch_size: int,
         next_batch: bool,
     ) -> str | None:
+        """Gate new profiles through singleton, batch-two, then geometric ramp."""
         observed_costs = 0 if profile is None else profile.distinct_success_cost_count()
         max_observed_batch = 0 if profile is None else profile.max_success_batch_size()
         calibration_cap = max(observed_costs + 1, 2 * max_observed_batch)
@@ -731,6 +748,7 @@ class BatchAdmissionController:
             self._memory_profiles_dirty = False
 
     def _build_request_memory_key(self, req: Req) -> tuple[Any, ...]:
+        """Build the request-local portion of the persisted memory profile key."""
         return (
             ("resolution", req.resolution_key),
             ("num_frames", int(req.num_frames or 1)),
@@ -897,6 +915,7 @@ def _build_runtime_memory_key(
     device_name: str | None,
     device_memory_gb: float | None,
 ) -> tuple[Any, ...]:
+    """Build the runtime portion of the persisted memory profile key."""
     config = server_args.pipeline_config
     return (
         ("model_path", model_path),
