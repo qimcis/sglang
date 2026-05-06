@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
+    ScaleResidualLayerNormScaleShift,
     apply_qk_norm_with_optional_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -661,7 +662,9 @@ class Flux2TransformerBlock(nn.Module):
             prefix=f"{prefix}.attn" if prefix else "attn",
         )
 
-        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.norm2 = ScaleResidualLayerNormScaleShift(
+            dim, eps=eps, elementwise_affine=False
+        )
         self.ff = Flux2FeedForward(
             dim=dim,
             dim_out=dim,
@@ -671,7 +674,9 @@ class Flux2TransformerBlock(nn.Module):
             prefix=f"{prefix}.ff" if prefix else "ff",
         )
 
-        self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.norm2_context = ScaleResidualLayerNormScaleShift(
+            dim, eps=eps, elementwise_affine=False
+        )
         self.ff_context = Flux2FeedForward(
             dim=dim,
             dim_out=dim,
@@ -727,22 +732,24 @@ class Flux2TransformerBlock(nn.Module):
         attn_output, context_attn_output = attention_outputs
 
         # Process attention outputs for the image stream (`hidden_states`).
-        attn_output = gate_msa * attn_output
-        hidden_states = hidden_states + attn_output
-
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
+        norm_hidden_states, hidden_states = self.norm2(
+            hidden_states,
+            attn_output,
+            gate_msa,
+            shift_mlp,
+            scale_mlp,
+        )
 
         ff_output = self.ff(norm_hidden_states)
         hidden_states = hidden_states + gate_mlp * ff_output
 
         # Process attention outputs for the text stream (`encoder_hidden_states`).
-        context_attn_output = c_gate_msa * context_attn_output
-        encoder_hidden_states = encoder_hidden_states + context_attn_output
-
-        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-        norm_encoder_hidden_states = (
-            norm_encoder_hidden_states * (1 + c_scale_mlp) + c_shift_mlp
+        norm_encoder_hidden_states, encoder_hidden_states = self.norm2_context(
+            encoder_hidden_states,
+            context_attn_output,
+            c_gate_msa,
+            c_shift_mlp,
+            c_scale_mlp,
         )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)

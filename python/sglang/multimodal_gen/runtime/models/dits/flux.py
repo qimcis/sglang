@@ -31,6 +31,7 @@ from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
+    ScaleResidualLayerNormScaleShift,
     apply_qk_norm_with_optional_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -617,9 +618,6 @@ class FluxTransformerBlock(nn.Module):
             prefix=f"{prefix}.attn" if prefix else "attn",
         )
 
-        self.norm2 = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
-        self.norm2_context = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
-
         nunchaku_enabled = (
             quant_config is not None
             and hasattr(quant_config, "get_name")
@@ -627,6 +625,17 @@ class FluxTransformerBlock(nn.Module):
             and is_nunchaku_available()
         )
         self.use_nunchaku_structure = nunchaku_enabled
+        if self.use_nunchaku_structure:
+            self.norm2 = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
+            self.norm2_context = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
+        else:
+            self.norm2 = ScaleResidualLayerNormScaleShift(
+                dim, eps=1e-6, elementwise_affine=False
+            )
+            self.norm2_context = ScaleResidualLayerNormScaleShift(
+                dim, eps=1e-6, elementwise_affine=False
+            )
+
         self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
         self.ff_context = FeedForward(
             dim=dim,
@@ -676,17 +685,21 @@ class FluxTransformerBlock(nn.Module):
         elif len(attention_outputs) == 3:
             attn_output, context_attn_output, ip_attn_output = attention_outputs
 
-        # Process attention outputs for the `hidden_states`.
-        attn_output = gate_msa.unsqueeze(1) * attn_output
-        hidden_states = hidden_states + attn_output
-        norm_hidden_states = self.norm2(hidden_states)
         if self.use_nunchaku_structure:
+            # Nunchaku modulation uses scale directly instead of (1 + scale).
+            attn_output = gate_msa.unsqueeze(1) * attn_output
+            hidden_states = hidden_states + attn_output
+            norm_hidden_states = self.norm2(hidden_states)
             norm_hidden_states = (
                 norm_hidden_states * scale_mlp[:, None] + shift_mlp[:, None]
             )
         else:
-            norm_hidden_states = (
-                norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+            norm_hidden_states, hidden_states = self.norm2(
+                hidden_states,
+                attn_output,
+                gate_msa.unsqueeze(1),
+                shift_mlp[:, None],
+                scale_mlp[:, None],
             )
 
         ff_output = self.ff(norm_hidden_states)
@@ -696,19 +709,20 @@ class FluxTransformerBlock(nn.Module):
 
         if len(attention_outputs) == 3:
             hidden_states = hidden_states + ip_attn_output
-        # Process attention outputs for the `encoder_hidden_states`.
-        context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
-        encoder_hidden_states = encoder_hidden_states + context_attn_output
-
-        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
         if self.use_nunchaku_structure:
+            context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
+            encoder_hidden_states = encoder_hidden_states + context_attn_output
+            norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
             norm_encoder_hidden_states = (
                 norm_encoder_hidden_states * c_scale_mlp[:, None] + c_shift_mlp[:, None]
             )
         else:
-            norm_encoder_hidden_states = (
-                norm_encoder_hidden_states * (1 + c_scale_mlp[:, None])
-                + c_shift_mlp[:, None]
+            norm_encoder_hidden_states, encoder_hidden_states = self.norm2_context(
+                encoder_hidden_states,
+                context_attn_output,
+                c_gate_msa.unsqueeze(1),
+                c_shift_mlp[:, None],
+                c_scale_mlp[:, None],
             )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
