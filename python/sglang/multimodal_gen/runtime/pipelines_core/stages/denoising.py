@@ -64,7 +64,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
 from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.batch_compaction import (
-    compact_dynamic_batch,
+    compact_batch,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -782,17 +782,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if hasattr(scheduler, "timestep_list"):
                 scheduler.timestep_list = [None] * solver_order
 
-    def _compact_dynamic_batch_if_needed(
+    def _compact_batch_if_needed(
         self,
         ctx: Any,
         batch: Req,
         server_args: ServerArgs,
     ) -> bool:
         """Apply cooperative cancellation before launching the next denoise step."""
-        result = compact_dynamic_batch(batch=batch, ctx=ctx, server_args=server_args)
+        result = compact_batch(batch=batch, ctx=ctx, server_args=server_args)
         if result.compacted:
             self.log_info(
-                "Compacted dynamic batch after cancellation: %d -> %d active request(s)",
+                "Compacted batch after cancellation: %d -> %d active request(s)",
                 result.old_request_count,
                 result.new_request_count,
             )
@@ -1224,7 +1224,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         ):
             with self.progress_bar(total=ctx.num_inference_steps) as progress_bar:
                 for step_index, t_host in enumerate(timesteps_cpu):
-                    self._compact_dynamic_batch_if_needed(ctx, batch, server_args)
+                    self._compact_batch_if_needed(ctx, batch, server_args)
                     raise_if_cancelled(batch, server_args)
                     with StageProfiler(
                         f"denoising_step_{step_index}",
