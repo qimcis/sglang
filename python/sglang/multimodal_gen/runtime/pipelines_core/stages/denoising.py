@@ -63,7 +63,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
 )
 from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.pipelines_core.dynamic_batching import (
+from sglang.multimodal_gen.runtime.pipelines_core.batch_compaction import (
     compact_dynamic_batch,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -788,6 +788,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         batch: Req,
         server_args: ServerArgs,
     ) -> bool:
+        """Apply cooperative cancellation before launching the next denoise step."""
         result = compact_dynamic_batch(batch=batch, ctx=ctx, server_args=server_args)
         if result.compacted:
             self.log_info(

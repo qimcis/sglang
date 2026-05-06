@@ -16,7 +16,7 @@ from typing import Any, List
 import zmq
 
 from sglang.multimodal_gen.runtime.cancellation import (
-    DEFAULT_CANCEL_MESSAGE,
+    CLIENT_CANCELLED_MESSAGE,
     CancelGenerationReq,
     first_cancelled_request_id,
     get_cancel_reason,
@@ -234,7 +234,7 @@ class Scheduler(SchedulerDisaggMixin):
     @staticmethod
     def _cancelled_output(reason: str) -> OutputBatch:
         return OutputBatch(
-            error=DEFAULT_CANCEL_MESSAGE,
+            error=CLIENT_CANCELLED_MESSAGE,
             cancelled=True,
             cancel_reason=reason,
         )
@@ -404,9 +404,15 @@ class Scheduler(SchedulerDisaggMixin):
     def _handle_generation(
         self, reqs: list[Any], *, allow_dynamic_batching: bool = True
     ):
-        """Dispatch generation requests, merging compatible requests when allowed."""
+        """Dispatch generation requests, merging compatible requests when allowed.
+
+        Cancellation is checked before merge so already-cancelled queue entries
+        do not keep occupying slots in a new dynamic batch.
+        """
         reqs = self._normalize_generation_reqs(reqs)
         if len(reqs) > 1 and allow_dynamic_batching:
+            # Drop cancelled members before they ever enter a merged request.
+            # Running batches handle the same problem later by tensor compaction.
             cancelled_mask = [
                 is_payload_cancelled(
                     req,
@@ -440,6 +446,8 @@ class Scheduler(SchedulerDisaggMixin):
                         outputs.append(next(active_iter))
                 return outputs
 
+        # For non-dynamic paths, or when every member of a dynamic payload is
+        # already cancelled, return a cancellation result without invoking the worker.
         if is_payload_cancelled(
             reqs,
             self.server_args,
@@ -480,6 +488,8 @@ class Scheduler(SchedulerDisaggMixin):
             try:
                 output_batch = self.worker.execute_forward([merged_req])
                 if self.receiver is None:
+                    # Non-zero ranks execute the same forward through worker pipes.
+                    # Only rank 0 owns client ZMQ identities and can return real outputs.
                     return [OutputBatch() for _ in reqs]
                 if output_batch.cancelled:
                     return [
@@ -496,6 +506,9 @@ class Scheduler(SchedulerDisaggMixin):
                             int(index) for index in output_batch.active_request_indices
                         }
                         if len(active_request_indices) < len(reqs):
+                            # Some requests were compacted out, but an active member
+                            # still failed. Preserve cancelled results for removed
+                            # members and return the worker error only to survivors.
                             outputs: list[OutputBatch] = []
                             for req_index, original_req in enumerate(reqs):
                                 request_id = first_cancelled_request_id(
@@ -894,7 +907,12 @@ class Scheduler(SchedulerDisaggMixin):
     def _split_batched_output(
         self, output_batch: OutputBatch, reqs: List[Req]
     ) -> List[OutputBatch] | None:
-        """Split a merged result back into the original request order."""
+        """Split a merged result back into the original request order.
+
+        `active_request_indices` records which original requests survived
+        mid-denoise compaction. Missing indices are returned as cancelled and
+        never receive tensor or file-path outputs.
+        """
         per_req_counts = [req.num_outputs_per_prompt for req in reqs]
         if output_batch.active_request_indices is None:
             active_request_indices = list(range(len(reqs)))
@@ -977,7 +995,7 @@ class Scheduler(SchedulerDisaggMixin):
             )
             split = OutputBatch(
                 audio_sample_rate=output_batch.audio_sample_rate,
-                error=DEFAULT_CANCEL_MESSAGE if is_cancelled else output_batch.error,
+                error=CLIENT_CANCELLED_MESSAGE if is_cancelled else output_batch.error,
                 cancelled=is_cancelled,
                 cancel_reason=cancel_reason,
                 metrics=deepcopy(output_batch.metrics),
