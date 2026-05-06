@@ -738,6 +738,7 @@ def apply_qk_norm_rope(
 
     from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
         apply_flashinfer_rope_qk_inplace,
+        build_rope_positions,
     )
 
     if q.dim() != 4 or k.dim() != 4:
@@ -761,13 +762,9 @@ def apply_qk_norm_rope(
     }
 
     if positions is None:
-        pos_1d = torch.arange(
-            position_offset,
-            position_offset + seq_len,
-            device=q.device,
-            dtype=torch.int64,
+        positions = build_rope_positions(
+            batch_size, seq_len, q.device, position_offset=position_offset
         )
-        positions = pos_1d if batch_size == 1 else pos_1d.repeat(batch_size)
     else:
         if positions.dim() != 1 or positions.numel() != batch_size * seq_len:
             raise ValueError(

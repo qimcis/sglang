@@ -32,12 +32,16 @@ from .mrope import NDRotaryEmbedding
 from .utils import (
     _apply_rotary_emb,
     apply_flashinfer_rope_qk_inplace,
+    build_rope_cos_sin_cache,
+    build_rope_positions,
 )
 
 __all__ = [
     # _utils
     "_apply_rotary_emb",
     "apply_flashinfer_rope_qk_inplace",
+    "build_rope_cos_sin_cache",
+    "build_rope_positions",
     # _base
     "RotaryEmbedding",
     # _mrope

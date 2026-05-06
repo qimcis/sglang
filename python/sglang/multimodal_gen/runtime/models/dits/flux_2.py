@@ -41,6 +41,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     apply_flashinfer_rope_qk_inplace,
+    build_rope_cos_sin_cache,
+    build_rope_positions,
 )
 from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
@@ -293,6 +295,9 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        rope_positions: Optional[torch.Tensor] = None,
+        encoder_rope_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         query, key, value, encoder_query, encoder_key, encoder_value = (
             _get_qkv_projections(self, hidden_states, encoder_hidden_states)
@@ -302,16 +307,8 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         key = key.unflatten(-1, (self.local_heads, -1))
         value = value.unflatten(-1, (self.local_heads, -1))
 
-        cos_sin_cache = None
-        if freqs_cis is not None:
-            cos, sin = freqs_cis
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
+        if cos_sin_cache is None:
+            cos_sin_cache = build_rope_cos_sin_cache(freqs_cis)
 
         if self.added_kv_proj_dim is not None:
             encoder_query = encoder_query.unflatten(-1, (self.local_heads, -1))
@@ -327,6 +324,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 head_dim=self.head_dim,
                 cos_sin_cache=cos_sin_cache,
                 is_neox=False,
+                positions=encoder_rope_positions,
                 allow_inplace=True,
             )
             query, key = apply_qk_norm_with_optional_rope(
@@ -337,6 +335,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 head_dim=self.head_dim,
                 cos_sin_cache=cos_sin_cache,
                 is_neox=False,
+                positions=rope_positions,
                 position_offset=text_seq_len,
                 allow_inplace=True,
             )
@@ -353,6 +352,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 head_dim=self.head_dim,
                 cos_sin_cache=cos_sin_cache,
                 is_neox=False,
+                positions=rope_positions,
                 allow_inplace=True,
             )
 
@@ -498,6 +498,8 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         attention_mask: Optional[torch.Tensor] = None,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         num_replicated_prefix: int = 0,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        rope_positions: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         # Parallel in (QKV + MLP in) projection
@@ -521,17 +523,11 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         query = self.norm_q(query)
         key = self.norm_k(key)
 
-        if freqs_cis is not None:
-            cos, sin = freqs_cis
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
+        if cos_sin_cache is None:
+            cos_sin_cache = build_rope_cos_sin_cache(freqs_cis)
+        if cos_sin_cache is not None:
             query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
+                query, key, cos_sin_cache, is_neox=False, positions=rope_positions
             )
         hidden_states = self.attn(
             query, key, value, num_replicated_prefix=num_replicated_prefix
@@ -590,6 +586,8 @@ class Flux2SingleTransformerBlock(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor],
         temb_mod_params: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        rope_positions: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         split_hidden_states: bool = False,
         text_seq_len: Optional[int] = None,
@@ -610,6 +608,8 @@ class Flux2SingleTransformerBlock(nn.Module):
             hidden_states=norm_hidden_states,
             freqs_cis=freqs_cis,
             num_replicated_prefix=text_seq_len or 0,
+            cos_sin_cache=cos_sin_cache,
+            rope_positions=rope_positions,
             **joint_attention_kwargs,
         )
 
@@ -692,6 +692,9 @@ class Flux2TransformerBlock(nn.Module):
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...
         ],
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        rope_positions: Optional[torch.Tensor] = None,
+        encoder_rope_positions: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         joint_attention_kwargs = joint_attention_kwargs or {}
@@ -721,6 +724,9 @@ class Flux2TransformerBlock(nn.Module):
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             freqs_cis=freqs_cis,
+            cos_sin_cache=cos_sin_cache,
+            rope_positions=rope_positions,
+            encoder_rope_positions=encoder_rope_positions,
             **joint_attention_kwargs,
         )
 
@@ -1056,6 +1062,24 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
         # 3. Calculate RoPE embeddings from image and text tokens
         # NOTE: the below logic means that we can't support batched inference with images of different resolutions or
         # text prompts of different lengths. Is this a use case we want to support?
+        cos_sin_cache = build_rope_cos_sin_cache(freqs_cis)
+        encoder_rope_positions = image_rope_positions = joint_rope_positions = None
+        if cos_sin_cache is not None:
+            batch_size = hidden_states.shape[0]
+            image_seq_len = hidden_states.shape[1]
+            encoder_rope_positions = build_rope_positions(
+                batch_size, num_txt_tokens, hidden_states.device
+            )
+            image_rope_positions = build_rope_positions(
+                batch_size,
+                image_seq_len,
+                hidden_states.device,
+                position_offset=num_txt_tokens,
+            )
+            joint_rope_positions = build_rope_positions(
+                batch_size, num_txt_tokens + image_seq_len, hidden_states.device
+            )
+
         # 4. Double Stream Transformer Blocks
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
@@ -1064,6 +1088,9 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
                 temb_mod_params_img=double_stream_mod_img,
                 temb_mod_params_txt=double_stream_mod_txt,
                 freqs_cis=freqs_cis,
+                cos_sin_cache=cos_sin_cache,
+                rope_positions=image_rope_positions,
+                encoder_rope_positions=encoder_rope_positions,
                 joint_attention_kwargs=joint_attention_kwargs,
             )
         # Concatenate text and image streams for single-block inference
@@ -1076,6 +1103,8 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
                 encoder_hidden_states=None,
                 temb_mod_params=single_stream_mod,
                 freqs_cis=freqs_cis,
+                cos_sin_cache=cos_sin_cache,
+                rope_positions=joint_rope_positions,
                 joint_attention_kwargs=joint_attention_kwargs,
                 text_seq_len=num_txt_tokens,
             )

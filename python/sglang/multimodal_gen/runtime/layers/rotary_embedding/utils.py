@@ -33,6 +33,37 @@ else:
     flashinfer_apply_rope_inplace = None
 
 
+def build_rope_cos_sin_cache(
+    freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]],
+) -> Optional[torch.Tensor]:
+    if freqs_cis is None:
+        return None
+
+    cos, sin = freqs_cis
+    return torch.cat(
+        [
+            cos.to(dtype=torch.float32).contiguous(),
+            sin.to(dtype=torch.float32).contiguous(),
+        ],
+        dim=-1,
+    )
+
+
+def build_rope_positions(
+    batch_size: int,
+    seq_len: int,
+    device,
+    position_offset: int = 0,
+) -> torch.Tensor:
+    pos_1d = torch.arange(
+        position_offset,
+        position_offset + seq_len,
+        device=device,
+        dtype=torch.long,
+    )
+    return pos_1d if batch_size == 1 else pos_1d.repeat(batch_size)
+
+
 def _apply_rotary_emb(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -116,8 +147,7 @@ def apply_flashinfer_rope_qk_inplace(
         return q_rot.view(bsz, seqlen, nheads, d), k_rot.view(bsz, seqlen, nheads, d)
 
     if positions is None:
-        pos_1d = torch.arange(seqlen, device=q.device, dtype=torch.long)
-        positions = pos_1d if bsz == 1 else pos_1d.repeat(bsz)
+        positions = build_rope_positions(bsz, seqlen, q.device)
     else:
         if not (
             isinstance(positions, torch.Tensor)
