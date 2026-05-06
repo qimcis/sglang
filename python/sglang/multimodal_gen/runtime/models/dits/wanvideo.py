@@ -213,7 +213,48 @@ class WanT2VCrossAttention(WanSelfAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs, is_cross_attention=True)
 
-    def forward(self, x, context, context_lens):
+    def _project_context_kv(self, context):
+        k, _ = self.to_k(context)
+        if self.tp_rmsnorm:
+            k = tensor_parallel_rms_norm(k, self.norm_k)
+        else:
+            k = self.norm_k(k)
+        k = k.unflatten(2, (self.local_num_heads, self.head_dim))
+
+        v, _ = self.to_v(context)
+        v = v.unflatten(2, (self.local_num_heads, self.head_dim))
+        return k, v
+
+    def _context_kv(self, context, crossattn_cache):
+        batch_size, seq_len = context.shape[:2]
+        if crossattn_cache is not None and crossattn_cache.get("is_init", False):
+            if (
+                crossattn_cache.get("batch_size") == batch_size
+                and crossattn_cache.get("seq_len") == seq_len
+            ):
+                return (
+                    crossattn_cache["k"][:batch_size, :seq_len],
+                    crossattn_cache["v"][:batch_size, :seq_len],
+                )
+
+        k, v = self._project_context_kv(context)
+        if crossattn_cache is not None:
+            k_cache = crossattn_cache["k"]
+            v_cache = crossattn_cache["v"]
+            if (
+                k_cache.shape[0] >= batch_size
+                and k_cache.shape[1] >= seq_len
+                and k_cache.shape[2:] == k.shape[2:]
+                and v_cache.shape == k_cache.shape
+            ):
+                k_cache[:batch_size, :seq_len].copy_(k)
+                v_cache[:batch_size, :seq_len].copy_(v)
+                crossattn_cache["batch_size"] = batch_size
+                crossattn_cache["seq_len"] = seq_len
+                crossattn_cache["is_init"] = True
+        return k, v
+
+    def forward(self, x, context, context_lens, crossattn_cache: dict | None = None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -227,15 +268,7 @@ class WanT2VCrossAttention(WanSelfAttention):
             q = self.norm_q(q)
         q = q.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        k, _ = self.to_k(context)
-        if self.tp_rmsnorm:
-            k = tensor_parallel_rms_norm(k, self.norm_k)
-        else:
-            k = self.norm_k(k)
-        k = k.unflatten(2, (self.local_num_heads, self.head_dim))
-
-        v, _ = self.to_v(context)
-        v = v.unflatten(2, (self.local_num_heads, self.head_dim))
+        k, v = self._context_kv(context, crossattn_cache)
 
         # compute attention
         x = self.attn(q, k, v)
@@ -936,7 +969,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             config.out_channels * math.prod(config.patch_size),
             bias=True,
             gather_output=True,
-            prefix=f"proj_out",
+            prefix="proj_out",
             quant_config=quant_config,
         )
         self.scale_shift_table = nn.Parameter(

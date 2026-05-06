@@ -445,8 +445,13 @@ class CausalDMDDenoisingStage(DenoisingStage):
         Initialize a Per-GPU cross-attention cache aligned with the Wan model assumptions.
         """
         crossattn_cache = []
-        num_attention_heads = self.transformer.num_attention_heads
-        attention_head_dim = self.transformer.attention_head_dim
+        cross_attn = self.transformer.blocks[0].attn2
+        num_attention_heads = getattr(
+            cross_attn, "local_num_heads", self.transformer.num_attention_heads
+        )
+        attention_head_dim = getattr(
+            cross_attn, "head_dim", self.transformer.attention_head_dim
+        )
         for _ in range(self.num_transformer_blocks):
             crossattn_cache.append(
                 {
