@@ -317,6 +317,38 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 return True
         return False
 
+    def _cache_dit_scm_settings(
+        self,
+    ) -> tuple[str, list[int] | None, list[int] | None, str]:
+        scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
+        scm_compute_bins_str = envs.SGLANG_CACHE_DIT_SCM_COMPUTE_BINS
+        scm_cache_bins_str = envs.SGLANG_CACHE_DIT_SCM_CACHE_BINS
+        scm_policy = envs.SGLANG_CACHE_DIT_SCM_POLICY
+
+        scm_compute_bins = None
+        scm_cache_bins = None
+        if scm_compute_bins_str and scm_cache_bins_str:
+            try:
+                scm_compute_bins = [
+                    int(x.strip()) for x in scm_compute_bins_str.split(",")
+                ]
+                scm_cache_bins = [int(x.strip()) for x in scm_cache_bins_str.split(",")]
+            except ValueError as e:
+                logger.warning("Failed to parse SCM bins: %s. SCM disabled.", e)
+                scm_preset = "none"
+                scm_compute_bins = None
+                scm_cache_bins = None
+        elif scm_compute_bins_str or scm_cache_bins_str:
+            logger.warning(
+                "SCM custom bins require both compute_bins and cache_bins. "
+                "Only one was provided (compute=%s, cache=%s). Falling back to preset '%s'.",
+                scm_compute_bins_str,
+                scm_cache_bins_str,
+                scm_preset,
+            )
+
+        return scm_preset, scm_compute_bins, scm_cache_bins, scm_policy
+
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
     ) -> None:
@@ -334,21 +366,29 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:
-            scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
-            scm_preset = None if scm_preset == "none" else scm_preset
+            scm_preset, scm_compute_bins, scm_cache_bins, scm_policy = (
+                self._cache_dit_scm_settings()
+            )
+            refresh_scm_preset = None if scm_preset == "none" else scm_preset
             if isinstance(num_inference_steps, tuple):
                 refresh_context_on_dual_transformer(
                     self.transformer,
                     self.transformer_2,
                     num_high_noise_steps,
                     num_low_noise_steps,
-                    scm_preset=scm_preset,
+                    scm_preset=refresh_scm_preset,
+                    scm_compute_bins=scm_compute_bins,
+                    scm_cache_bins=scm_cache_bins,
+                    scm_policy=scm_policy,
                 )
             else:
                 refresh_context_on_transformer(
                     self.transformer,
                     num_inference_steps,
-                    scm_preset=scm_preset,
+                    scm_preset=refresh_scm_preset,
+                    scm_compute_bins=scm_compute_bins,
+                    scm_cache_bins=scm_cache_bins,
+                    scm_policy=scm_policy,
                 )
             return
 
@@ -382,32 +422,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
         # === Parse SCM configuration from envs ===
         # SCM is shared between primary and secondary transformers
-        scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
-        scm_compute_bins_str = envs.SGLANG_CACHE_DIT_SCM_COMPUTE_BINS
-        scm_cache_bins_str = envs.SGLANG_CACHE_DIT_SCM_CACHE_BINS
-        scm_policy = envs.SGLANG_CACHE_DIT_SCM_POLICY
-
-        # parse custom bins if provided (both must be set together)
-        scm_compute_bins = None
-        scm_cache_bins = None
-        if scm_compute_bins_str and scm_cache_bins_str:
-            try:
-                scm_compute_bins = [
-                    int(x.strip()) for x in scm_compute_bins_str.split(",")
-                ]
-                scm_cache_bins = [int(x.strip()) for x in scm_cache_bins_str.split(",")]
-            except ValueError as e:
-                logger.warning("Failed to parse SCM bins: %s. SCM disabled.", e)
-                scm_preset = "none"
-        elif scm_compute_bins_str or scm_cache_bins_str:
-            # Only one of the bins was provided - warn user
-            logger.warning(
-                "SCM custom bins require both compute_bins and cache_bins. "
-                "Only one was provided (compute=%s, cache=%s). Falling back to preset '%s'.",
-                scm_compute_bins_str,
-                scm_cache_bins_str,
-                scm_preset,
-            )
+        scm_preset, scm_compute_bins, scm_cache_bins, scm_policy = (
+            self._cache_dit_scm_settings()
+        )
 
         # generate SCM mask using cache-dit's steps_mask()
         # cache-dit handles step count validation and scaling internally

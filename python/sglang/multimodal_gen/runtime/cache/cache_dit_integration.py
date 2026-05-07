@@ -6,7 +6,7 @@ This module provides helper functions to enable cache-dit acceleration
 on transformer modules in SGLang's modular pipeline architecture.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional
 
 import torch
@@ -222,6 +222,80 @@ class CacheDitConfig:
     steps_computation_policy: str = "dynamic"
 
 
+def _copy_cache_dit_config(config: CacheDitConfig) -> CacheDitConfig:
+    copied = replace(config)
+    if config.steps_computation_mask is not None:
+        copied.steps_computation_mask = list(config.steps_computation_mask)
+    return copied
+
+
+def _build_db_cache_config(config: CacheDitConfig) -> DBCacheConfig:
+    return DBCacheConfig(
+        num_inference_steps=config.num_inference_steps,
+        Fn_compute_blocks=config.Fn_compute_blocks,
+        Bn_compute_blocks=config.Bn_compute_blocks,
+        max_warmup_steps=config.max_warmup_steps,
+        residual_diff_threshold=config.residual_diff_threshold,
+        max_continuous_cached_steps=config.max_continuous_cached_steps,
+        steps_computation_mask=config.steps_computation_mask,
+        steps_computation_policy=config.steps_computation_policy,
+    )
+
+
+def _build_calibrator_config(config: CacheDitConfig):
+    if not config.enable_taylorseer:
+        return None
+    return TaylorSeerCalibratorConfig(
+        taylorseer_order=config.taylorseer_order,
+    )
+
+
+def _get_refresh_config(
+    transformer: torch.nn.Module,
+    num_inference_steps: int,
+    scm_preset: str | None,
+    scm_compute_bins: Optional[List[int]],
+    scm_cache_bins: Optional[List[int]],
+    scm_policy: str,
+) -> CacheDitConfig:
+    base_config = getattr(
+        transformer,
+        "_sglang_cache_dit_config",
+        CacheDitConfig(enabled=True),
+    )
+    preset = scm_preset if scm_preset is not None else "none"
+    steps_computation_mask = get_scm_mask(
+        preset=preset,
+        num_inference_steps=num_inference_steps,
+        compute_bins=scm_compute_bins,
+        cache_bins=scm_cache_bins,
+    )
+    refreshed_config = replace(
+        base_config,
+        num_inference_steps=num_inference_steps,
+        steps_computation_mask=steps_computation_mask,
+        steps_computation_policy=scm_policy,
+    )
+    return _copy_cache_dit_config(refreshed_config)
+
+
+def _refresh_context(
+    transformer: torch.nn.Module,
+    config: CacheDitConfig,
+    verbose: bool,
+) -> None:
+    refresh_kwargs = {
+        "cache_config": _build_db_cache_config(config),
+        "verbose": verbose,
+    }
+    calibrator_config = _build_calibrator_config(config)
+    if calibrator_config is not None:
+        refresh_kwargs["calibrator_config"] = calibrator_config
+
+    cache_dit.refresh_context(transformer, **refresh_kwargs)
+    transformer._sglang_cache_dit_config = _copy_cache_dit_config(config)
+
+
 def enable_cache_on_transformer(
     transformer: torch.nn.Module,
     config: CacheDitConfig,
@@ -260,25 +334,8 @@ def enable_cache_on_transformer(
             "define a custom BlockAdapter."
         )
 
-    # Build cache config (including SCM fields if provided)
-    cache_config = DBCacheConfig(
-        num_inference_steps=config.num_inference_steps,
-        Fn_compute_blocks=config.Fn_compute_blocks,
-        Bn_compute_blocks=config.Bn_compute_blocks,
-        max_warmup_steps=config.max_warmup_steps,
-        residual_diff_threshold=config.residual_diff_threshold,
-        max_continuous_cached_steps=config.max_continuous_cached_steps,
-        # SCM fields
-        steps_computation_mask=config.steps_computation_mask,
-        steps_computation_policy=config.steps_computation_policy,
-    )
-
-    # Build calibrator config if TaylorSeer is enabled
-    calibrator_config = None
-    if config.enable_taylorseer:
-        calibrator_config = TaylorSeerCalibratorConfig(
-            taylorseer_order=config.taylorseer_order,
-        )
+    cache_config = _build_db_cache_config(config)
+    calibrator_config = _build_calibrator_config(config)
 
     # Enable cache-dit on the transformer
     logger.info(
@@ -318,6 +375,7 @@ def enable_cache_on_transformer(
         calibrator_config=calibrator_config,
         parallelism_config=None,
     )
+    transformer._sglang_cache_dit_config = _copy_cache_dit_config(config)
 
     if parallelism_config is not None:
         context_manager = getattr(transformer, "_context_manager", None)
@@ -375,42 +433,10 @@ def enable_cache_on_dual_transformer(
             "Please provide it in CacheDitConfig."
         )
 
-    # Build DBCacheConfig for primary transformer
-    primary_cache_config = DBCacheConfig(
-        num_inference_steps=primary_config.num_inference_steps,
-        Fn_compute_blocks=primary_config.Fn_compute_blocks,
-        Bn_compute_blocks=primary_config.Bn_compute_blocks,
-        max_warmup_steps=primary_config.max_warmup_steps,
-        residual_diff_threshold=primary_config.residual_diff_threshold,
-        max_continuous_cached_steps=primary_config.max_continuous_cached_steps,
-        steps_computation_mask=primary_config.steps_computation_mask,
-        steps_computation_policy=primary_config.steps_computation_policy,
-    )
-
-    # Build DBCacheConfig for secondary transformer
-    secondary_cache_config = DBCacheConfig(
-        num_inference_steps=secondary_config.num_inference_steps,
-        Fn_compute_blocks=secondary_config.Fn_compute_blocks,
-        Bn_compute_blocks=secondary_config.Bn_compute_blocks,
-        max_warmup_steps=secondary_config.max_warmup_steps,
-        residual_diff_threshold=secondary_config.residual_diff_threshold,
-        max_continuous_cached_steps=secondary_config.max_continuous_cached_steps,
-        steps_computation_mask=secondary_config.steps_computation_mask,
-        steps_computation_policy=secondary_config.steps_computation_policy,
-    )
-
-    # Build calibrator configs if TaylorSeer is enabled
-    primary_calibrator = None
-    if primary_config.enable_taylorseer:
-        primary_calibrator = TaylorSeerCalibratorConfig(
-            taylorseer_order=primary_config.taylorseer_order,
-        )
-
-    secondary_calibrator = None
-    if secondary_config.enable_taylorseer:
-        secondary_calibrator = TaylorSeerCalibratorConfig(
-            taylorseer_order=secondary_config.taylorseer_order,
-        )
+    primary_cache_config = _build_db_cache_config(primary_config)
+    secondary_cache_config = _build_db_cache_config(secondary_config)
+    primary_calibrator = _build_calibrator_config(primary_config)
+    secondary_calibrator = _build_calibrator_config(secondary_config)
 
     # Build ParamsModifier for each transformer
     primary_modifier = ParamsModifier(
@@ -521,6 +547,9 @@ def enable_cache_on_dual_transformer(
                         tp_sp_group = None
                 context_manager._sglang_tp_sp_group = tp_sp_group
 
+    transformer._sglang_cache_dit_config = _copy_cache_dit_config(primary_config)
+    transformer_2._sglang_cache_dit_config = _copy_cache_dit_config(secondary_config)
+
     return transformer, transformer_2
 
 
@@ -528,23 +557,21 @@ def refresh_context_on_transformer(
     transformer: torch.nn.Module,
     num_inference_steps: int,
     scm_preset: str | None = None,
+    scm_compute_bins: Optional[List[int]] = None,
+    scm_cache_bins: Optional[List[int]] = None,
+    scm_policy: str = "dynamic",
     verbose: bool = False,
 ) -> None:
     """Refresh cache-dit context for transformer."""
-    steps_computation_mask = None
-    if scm_preset is not None:
-        steps_computation_mask = cache_dit.steps_mask(
-            mask_policy=scm_preset, total_steps=num_inference_steps
-        )
-    cache_dit.refresh_context(
+    config = _get_refresh_config(
         transformer,
-        cache_config=DBCacheConfig().reset(
-            num_inference_steps=num_inference_steps,
-            steps_computation_mask=steps_computation_mask,
-            steps_computation_policy=scm_preset,
-        ),
-        verbose=verbose,
+        num_inference_steps,
+        scm_preset,
+        scm_compute_bins,
+        scm_cache_bins,
+        scm_policy,
     )
+    _refresh_context(transformer, config, verbose)
     logger.debug(f"cache-dit refreshed on transformer (steps={num_inference_steps})")
 
 
@@ -554,36 +581,30 @@ def refresh_context_on_dual_transformer(
     num_high_noise_steps: int,
     num_low_noise_steps: int,
     scm_preset: str | None = None,
+    scm_compute_bins: Optional[List[int]] = None,
+    scm_cache_bins: Optional[List[int]] = None,
+    scm_policy: str = "dynamic",
     verbose: bool = False,
 ) -> None:
     """Refresh cache-dit context for dual transformers."""
-    high_noise_steps_computation_mask = None
-    low_noise_steps_computation_mask = None
-    if scm_preset is not None:
-        high_noise_steps_computation_mask = cache_dit.steps_mask(
-            mask_policy=scm_preset, total_steps=num_high_noise_steps
-        )
-        low_noise_steps_computation_mask = cache_dit.steps_mask(
-            mask_policy=scm_preset, total_steps=num_low_noise_steps
-        )
-    cache_dit.refresh_context(
+    high_noise_config = _get_refresh_config(
         transformer,
-        cache_config=DBCacheConfig().reset(
-            num_inference_steps=num_high_noise_steps,
-            steps_computation_mask=high_noise_steps_computation_mask,
-            steps_computation_policy=scm_preset,
-        ),
-        verbose=verbose,
+        num_high_noise_steps,
+        scm_preset,
+        scm_compute_bins,
+        scm_cache_bins,
+        scm_policy,
     )
-    cache_dit.refresh_context(
+    low_noise_config = _get_refresh_config(
         transformer_2,
-        cache_config=DBCacheConfig().reset(
-            num_inference_steps=num_low_noise_steps,
-            steps_computation_mask=low_noise_steps_computation_mask,
-            steps_computation_policy=scm_preset,
-        ),
-        verbose=verbose,
+        num_low_noise_steps,
+        scm_preset,
+        scm_compute_bins,
+        scm_cache_bins,
+        scm_policy,
     )
+    _refresh_context(transformer, high_noise_config, verbose)
+    _refresh_context(transformer_2, low_noise_config, verbose)
     logger.debug(
         f"cache-dit refreshed on dual transformers (steps={num_high_noise_steps}, {num_low_noise_steps})"
     )
