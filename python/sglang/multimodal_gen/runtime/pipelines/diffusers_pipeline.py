@@ -286,11 +286,9 @@ class DiffusersExecutionStage(PipelineStage):
             kwargs["num_frames"] = batch.num_frames
 
         # Generator for reproducibility
-        if batch.generator is not None:
-            kwargs["generator"] = batch.generator
-        elif batch.seed is not None:
-            device = self._get_generator_device(batch)
-            kwargs["generator"] = torch.Generator(device=device).manual_seed(batch.seed)
+        generator = self._build_generator(batch)
+        if generator is not None:
+            kwargs["generator"] = generator
 
         # Image input for img2img or inpainting
         image = self._load_input_image(batch)
@@ -307,6 +305,63 @@ class DiffusersExecutionStage(PipelineStage):
                 kwargs.update(diffusers_kwargs)
 
         return kwargs
+
+    def _build_generator(
+        self, batch: Req
+    ) -> torch.Generator | list[torch.Generator] | None:
+        if batch.generator is not None:
+            return batch.generator
+
+        if batch.seed is None:
+            return None
+
+        dynamic_batch_seeds = (
+            batch.extra.get("dynamic_batch_seeds") if batch.extra else None
+        )
+        if dynamic_batch_seeds is not None:
+            seeds = self._expand_dynamic_batch_seeds(batch, dynamic_batch_seeds)
+        elif isinstance(batch.seed, list):
+            seeds = [int(seed) for seed in batch.seed]
+        else:
+            seeds = [int(batch.seed)]
+
+        device = self._get_generator_device(batch)
+        generators = [
+            torch.Generator(device=device).manual_seed(seed) for seed in seeds
+        ]
+        return generators[0] if len(generators) == 1 else generators
+
+    def _expand_dynamic_batch_seeds(
+        self, batch: Req, dynamic_batch_seeds: list[int | list[int]]
+    ) -> list[int]:
+        num_outputs = int(batch.num_outputs_per_prompt)
+        prompt_count = len(batch.prompt) if isinstance(batch.prompt, list) else 1
+
+        if (
+            not isinstance(dynamic_batch_seeds, list)
+            or len(dynamic_batch_seeds) != prompt_count
+        ):
+            raise ValueError(
+                "dynamic_batch_seeds must be a list with one seed per prompt"
+            )
+
+        seeds: list[int] = []
+        for prompt_seed in dynamic_batch_seeds:
+            seeds.extend(self._expand_prompt_seed(prompt_seed, num_outputs))
+        return seeds
+
+    @staticmethod
+    def _expand_prompt_seed(seed: int | list[int], num_outputs: int) -> list[int]:
+        if isinstance(seed, list):
+            if len(seed) != num_outputs:
+                raise ValueError(
+                    "per-prompt seed list length must match "
+                    f"num_outputs_per_prompt ({num_outputs}), got {len(seed)}"
+                )
+            return [int(item) for item in seed]
+
+        base_seed = int(seed)
+        return [base_seed + i for i in range(num_outputs)]
 
     def _get_generator_device(self, batch: Req) -> str:
         """Resolve RNG device consistently with the non-diffusers path.
