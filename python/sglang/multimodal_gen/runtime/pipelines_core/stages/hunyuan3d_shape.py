@@ -267,13 +267,16 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
             self.transformer = loader.load(
                 server_args.model_paths["transformer"], server_args, "transformer"
             )
-            self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
-            self._maybe_enable_torch_compile(self.transformer)
+            self._maybe_enable_cache_dit_and_torch_compile(
+                cache_dit_num_inference_steps, batch
+            )
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
         else:
-            self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
+            self._maybe_enable_cache_dit_and_torch_compile(
+                cache_dit_num_inference_steps, batch
+            )
 
         timesteps = batch.timesteps
         if timesteps is None:
