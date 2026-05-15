@@ -611,7 +611,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             num_low_noise_steps = num_inference_steps - num_high_noise_steps
             cache_dit_num_inference_steps = (num_high_noise_steps, num_low_noise_steps)
         else:
-            cache_dit_num_inference_steps = num_inference_steps
+            cache_dit_num_inference_steps = batch.extra.get(
+                "cache_dit_num_inference_steps", num_inference_steps
+            )
 
         transformer_was_loaded = server_args.model_loaded["transformer"]
         if not transformer_was_loaded:
