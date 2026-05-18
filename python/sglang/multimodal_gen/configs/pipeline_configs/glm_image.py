@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 
 import torch
-from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
@@ -21,7 +20,7 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     vae_precision: str = "bf16"
 
     should_use_guidance: bool = False
-    task_type: ModelTaskType = ModelTaskType.T2I
+    task_type: ModelTaskType = ModelTaskType.TI2I
 
     vae_tiling: bool = False
 
@@ -44,8 +43,18 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     enable_autocast: bool = False
 
     def __post_init__(self):
+        from diffusers.image_processor import VaeImageProcessor
+
         self.vae_scale_factor = self.vae_config.get_vae_scale_factor()
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+
+    def supports_dynamic_batching(self):
+        """Allow batching for GLM-Image text-only requests.
+
+        Image-conditioned requests are rejected by the scheduler's request-level
+        batching checks.
+        """
+        return True
 
     def get_freqs_cis(self, batch, device, rotary_emb, dtype):
         height = batch.height // self.vae_scale_factor

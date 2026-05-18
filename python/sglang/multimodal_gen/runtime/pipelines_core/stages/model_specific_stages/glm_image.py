@@ -105,7 +105,7 @@ def retrieve_latents(
 
 class GlmImageBeforeDenoisingStage(PipelineStage):
     r"""
-    Pipeline for text-to-image generation using GLM-Image.
+    Pipeline for text-to-image and image-to-image generation using GLM-Image.
 
     This pipeline integrates both the AR (autoregressive) model for token generation and the DiT (diffusion
     transformer) model for image decoding.
@@ -636,9 +636,12 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         prompt = batch.prompt
         num_inference_steps = batch.num_inference_steps
         if batch.image_path is not None:
-            ar_condition_images = [
-                load_image(img_path) for img_path in batch.image_path
-            ]
+            image_paths = (
+                [batch.image_path]
+                if isinstance(batch.image_path, str)
+                else batch.image_path
+            )
+            ar_condition_images = [load_image(img_path) for img_path in image_paths]
         else:
             ar_condition_images = None
 
@@ -656,10 +659,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         self._guidance_scale = guidance_scale
         self._current_timestep = None
         self._interrupt = False
-
-        batch_size = 1
-
-        device = get_local_torch_device()
 
         if ar_condition_images is not None:
             height = height or ar_condition_images[0].height
