@@ -343,6 +343,8 @@ def fuse_scale_shift_kernel(
 
     B, L, C = x.shape
     output = torch.empty_like(x)
+    if output.numel() == 0:
+        return output
 
     if scale.dim() == 4:
         # scale/shift: [B, F, 1, C]
@@ -470,6 +472,8 @@ def fuse_layernorm_scale_shift_gate_select01_kernel(
     B, L, C = x.shape
     output = torch.empty_like(x)
     gate_out = torch.empty_like(x)
+    if output.numel() == 0:
+        return output, gate_out
 
     if (
         scale0.dim() != 2
@@ -567,6 +571,8 @@ def fuse_residual_layernorm_scale_shift_gate_select01_kernel(
     output = torch.empty_like(x)
     residual_out = torch.empty_like(x)
     gate_out = torch.empty_like(x)
+    if output.numel() == 0:
+        return output, residual_out, gate_out
 
     if residual.shape != x.shape:
         raise ValueError("residual must have the same shape as x")

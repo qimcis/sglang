@@ -445,6 +445,9 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if x.numel() == 0:
+            return self.forward_native(residual, x, gate, shift, scale)
+
         if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
             import warnings
 
@@ -594,6 +597,9 @@ class _NormScaleShift(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
+        if x.numel() == 0:
+            return self.forward_native(x, shift, scale)
+
         if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
             import warnings
 

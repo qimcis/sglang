@@ -315,6 +315,9 @@ def fused_norm_scale_shift(
                 f"D={D} not supported, must be multiple of 256 and <= 8192"
             )
         y = torch.empty_like(x)  # create output tensor
+        if y.numel() == 0:
+            return y
+
         scale = broadcast_tensor_for_bsfd(scale, *x.shape)  # handle various shapes
         shift = broadcast_tensor_for_bsfd(shift, *x.shape)  # handle various shapes
         # Use scalar placeholders for None tensors as a workaround, since the CuTe DSL
@@ -396,6 +399,9 @@ def fused_scale_residual_norm_scale_shift(
             )
         y = torch.empty_like(x)  # create output tensor
         resi_out = torch.empty_like(x)  # create output tensor
+        if y.numel() == 0:
+            return y, resi_out
+
         gate = broadcast_tensor_for_bsfd(gate, *x.shape)  # handle various shapes
         scale = broadcast_tensor_for_bsfd(scale, *x.shape)  # handle various shapes
         shift = broadcast_tensor_for_bsfd(shift, *x.shape)  # handle various shapes
