@@ -327,6 +327,48 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         token_ids = token_ids.view(1, -1)
         return token_ids
 
+    @staticmethod
+    def _cat_image_feature_outputs(image_features, image_grid_thw) -> torch.Tensor:
+        expected_tokens = (
+            int(image_grid_thw.prod(dim=-1).sum().item())
+            if image_grid_thw is not None
+            else None
+        )
+
+        candidates = []
+        if isinstance(image_features, torch.Tensor):
+            candidates.append(image_features)
+
+        last_hidden_state = getattr(image_features, "last_hidden_state", None)
+        if isinstance(last_hidden_state, torch.Tensor):
+            candidates.append(last_hidden_state)
+
+        pooler_output = getattr(image_features, "pooler_output", None)
+        if isinstance(pooler_output, torch.Tensor):
+            candidates.append(pooler_output)
+        elif pooler_output is not None:
+            candidates.append(torch.cat(list(pooler_output), dim=0))
+
+        if not candidates:
+            candidates.append(torch.cat(list(image_features), dim=0))
+
+        if expected_tokens is not None:
+            for candidate in candidates:
+                if candidate.shape[0] == expected_tokens:
+                    return candidate
+
+        return candidates[0]
+
+    @staticmethod
+    def _split_image_token_ids(
+        image_token_ids: torch.Tensor, image_grid_thw
+    ) -> list[torch.Tensor]:
+        split_sizes = image_grid_thw.prod(dim=-1).tolist()
+        return [
+            token_ids.unsqueeze(0)
+            for token_ids in torch.split(image_token_ids, split_sizes, dim=0)
+        ]
+
     def generate_prior_tokens(
         self,
         prompt: str,
@@ -379,12 +421,18 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
 
         prior_token_image_ids = None
         if image is not None:
+            condition_image_grid_thw = image_grid_thw[:-1]
             prior_token_image_embed = self.vision_language_encoder.get_image_features(
                 inputs["pixel_values"], image_grid_thw[:-1]
             )
-            prior_token_image_embed = torch.cat(prior_token_image_embed, dim=0)
-            prior_token_image_ids = self.vision_language_encoder.get_image_tokens(
-                prior_token_image_embed, image_grid_thw[:-1]
+            prior_token_image_embed = self._cat_image_feature_outputs(
+                prior_token_image_embed, condition_image_grid_thw
+            )
+            prior_token_image_ids = self._split_image_token_ids(
+                self.vision_language_encoder.get_image_tokens(
+                    prior_token_image_embed, condition_image_grid_thw
+                ),
+                condition_image_grid_thw,
             )
 
         # For GLM-Image, greedy decoding is not allowed; it may cause repetitive outputs.
