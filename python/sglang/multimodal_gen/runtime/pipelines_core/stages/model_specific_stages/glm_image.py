@@ -364,10 +364,17 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         image_token_ids: torch.Tensor, image_grid_thw
     ) -> list[torch.Tensor]:
         split_sizes = image_grid_thw.prod(dim=-1).tolist()
-        return [
-            token_ids.unsqueeze(0)
-            for token_ids in torch.split(image_token_ids, split_sizes, dim=0)
-        ]
+        split_token_ids = []
+        for token_ids, grid_thw in zip(
+            torch.split(image_token_ids, split_sizes, dim=0), image_grid_thw
+        ):
+            grid_t, grid_h, grid_w = [int(v) for v in grid_thw.tolist()]
+            token_ids = token_ids.view(grid_t, 1, grid_h, grid_w)
+            token_ids = torch.nn.functional.interpolate(
+                token_ids.float(), scale_factor=2, mode="nearest"
+            ).to(dtype=torch.long)
+            split_token_ids.append(token_ids.view(1, -1))
+        return split_token_ids
 
     def generate_prior_tokens(
         self,
