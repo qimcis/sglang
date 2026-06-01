@@ -98,6 +98,7 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.ndlinear_moe import NdLinearFusedMoE
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -111,6 +112,7 @@ from sglang.srt.layers.moe.utils import (
     is_sbo_enabled,
     is_tbo_enabled,
 )
+from sglang.srt.layers.ndlinear import NdColumnParallelLinear, NdRowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -149,6 +151,10 @@ from sglang.srt.models.deepseek_common.attention_forward_methods import (
 )
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
+)
+from sglang.srt.models.deepseek_common.ndlinear import (
+    deepseek_v4_ndlinear_enabled,
+    deepseek_v4_ndlinear_shapes,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
@@ -220,30 +226,68 @@ class DeepseekV2MLP(nn.Module):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         swiglu_limit: Optional[float] = None,
+        ndlinear_config: Optional[PretrainedConfig] = None,
     ) -> None:
         super().__init__()
         self.tp_size = tp_size
         self.swiglu_limit = swiglu_limit
 
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=reduce_results,
-            prefix=add_prefix("down_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-        )
+        if ndlinear_config is not None and deepseek_v4_ndlinear_enabled(
+            ndlinear_config, "shared_experts.gate_up_proj"
+        ):
+            gate_up_input_shape, gate_up_output_shape = deepseek_v4_ndlinear_shapes(
+                ndlinear_config,
+                "shared_experts.gate_up_proj",
+                hidden_size,
+                intermediate_size * 2,
+            )
+            self.gate_up_proj = NdColumnParallelLinear(
+                gate_up_input_shape,
+                gate_up_output_shape,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                output_tp_axis=1 if len(gate_up_output_shape) == 3 else 0,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+            )
+        else:
+            self.gate_up_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [intermediate_size] * 2,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("gate_up_proj", prefix),
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+            )
+        if ndlinear_config is not None and deepseek_v4_ndlinear_enabled(
+            ndlinear_config, "shared_experts.down_proj"
+        ):
+            self.down_proj = NdRowParallelLinear(
+                *deepseek_v4_ndlinear_shapes(
+                    ndlinear_config,
+                    "shared_experts.down_proj",
+                    intermediate_size,
+                    hidden_size,
+                ),
+                bias=False,
+                params_dtype=torch.bfloat16,
+                reduce_results=reduce_results,
+                input_tp_axis=0,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+            )
+        else:
+            self.down_proj = RowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                reduce_results=reduce_results,
+                prefix=add_prefix("down_proj", prefix),
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+            )
         if not hasattr(self.gate_up_proj, "weight") and hasattr(
             self.gate_up_proj, "weight_packed"
         ):
@@ -252,6 +296,9 @@ class DeepseekV2MLP(nn.Module):
             self.down_proj, "weight_packed"
         ):
             self.down_proj.weight = self.down_proj.weight_packed
+        self.use_ndlinear = isinstance(
+            self.gate_up_proj, NdColumnParallelLinear
+        ) or isinstance(self.down_proj, NdRowParallelLinear)
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
@@ -278,6 +325,7 @@ class DeepseekV2MLP(nn.Module):
         if (
             gemm_output_zero_allocator is not None
             and x.shape[0] <= 256
+            and hasattr(self.gate_up_proj, "weight")
             and self.gate_up_proj.weight.dtype == torch.uint8
         ):
             y = gemm_output_zero_allocator.allocate(
@@ -291,6 +339,7 @@ class DeepseekV2MLP(nn.Module):
         # are fp8 (uint8 storage with weight_scale_inv).
         if (
             self.swiglu_limit is not None
+            and hasattr(self.down_proj, "weight")
             and not self.down_proj.reduce_results
             and self.down_proj.weight.dtype == torch.uint8
             and hasattr(self.down_proj, "weight_scale_inv")
@@ -571,22 +620,54 @@ class DeepseekV2MoE(nn.Module):
             # with fused_shared_experts
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
 
-        self.experts = get_moe_impl_class(quant_config)(
-            num_experts=num_experts_for_moe
-            + get_global_server_args().ep_num_redundant_experts,
-            num_fused_shared_experts=self.num_fused_shared_experts,
-            top_k=top_k_for_moe,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
-            layer_id=self.layer_id,
-            quant_config=quant_config,
-            routed_scaling_factor=self.routed_scaling_factor,
-            routing_method_type=getattr(
-                config, "routing_method_type", RoutingMethodType.DeepSeekV3
-            ),
-            swiglu_limit=getattr(config, "swiglu_limit", None),
-            prefix=add_prefix("experts", prefix),
+        use_ndlinear_experts = is_deepseek_v4 and (
+            deepseek_v4_ndlinear_enabled(config, "experts.gate_proj")
+            or deepseek_v4_ndlinear_enabled(config, "experts.up_proj")
+            or deepseek_v4_ndlinear_enabled(config, "experts.down_proj")
         )
+        if use_ndlinear_experts:
+            if not (
+                deepseek_v4_ndlinear_enabled(config, "experts.gate_proj")
+                and deepseek_v4_ndlinear_enabled(config, "experts.up_proj")
+                and deepseek_v4_ndlinear_enabled(config, "experts.down_proj")
+            ):
+                raise ValueError(
+                    "DeepSeek V4 NdLinear routed experts require all three expert "
+                    "projections: experts.gate_proj, experts.up_proj, "
+                    "experts.down_proj"
+                )
+            hidden_shape, inter_shape = deepseek_v4_ndlinear_shapes(
+                config,
+                "experts.gate_proj",
+                config.hidden_size,
+                config.moe_intermediate_size,
+            )
+            self.experts = NdLinearFusedMoE(
+                num_experts=num_experts_for_moe
+                + get_global_server_args().ep_num_redundant_experts,
+                hidden_shape=hidden_shape,
+                intermediate_shape=inter_shape,
+                params_dtype=torch.bfloat16,
+                swiglu_limit=getattr(config, "swiglu_limit", None),
+                layer_id=self.layer_id,
+            )
+        else:
+            self.experts = get_moe_impl_class(quant_config)(
+                num_experts=num_experts_for_moe
+                + get_global_server_args().ep_num_redundant_experts,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                top_k=top_k_for_moe,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                layer_id=self.layer_id,
+                quant_config=quant_config,
+                routed_scaling_factor=self.routed_scaling_factor,
+                routing_method_type=getattr(
+                    config, "routing_method_type", RoutingMethodType.DeepSeekV3
+                ),
+                swiglu_limit=getattr(config, "swiglu_limit", None),
+                prefix=add_prefix("experts", prefix),
+            )
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(
@@ -671,22 +752,28 @@ class DeepseekV2MoE(nn.Module):
                 reduce_results=False,
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 prefix=add_prefix("shared_experts", prefix),
+                ndlinear_config=config if is_deepseek_v4 else None,
                 **(dict(tp_rank=0, tp_size=1) if _shared_expert_use_tp1 else {}),
             )
             self._shared_expert_tp1 = _shared_expert_use_tp1
+            gate_up_quant_method = getattr(
+                self.shared_experts.gate_up_proj, "quant_method", None
+            )
             is_packed_weight = hasattr(
-                self.shared_experts.gate_up_proj.quant_method, "quant_config"
-            ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
+                gate_up_quant_method, "quant_config"
+            ) and gate_up_quant_method.quant_config.get_name() in {
                 "awq",
                 "awq_marlin",
                 "moe_wna16",
             }
             self.shared_experts_is_int8 = (
                 not is_packed_weight
+                and hasattr(self.shared_experts.gate_up_proj, "weight")
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
             )
             self.shared_experts_is_fp8 = (
                 not is_packed_weight
+                and hasattr(self.shared_experts.gate_up_proj, "weight")
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
             )
             if self.shared_experts_is_fp8:
@@ -739,6 +826,9 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_flashinfer()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+        if isinstance(self.experts, NdLinearFusedMoE):
+            self._enable_a2a_moe = False
+            self._fuse_shared_experts_inside_sbo = False
 
     def get_moe_weights(self):
         return [

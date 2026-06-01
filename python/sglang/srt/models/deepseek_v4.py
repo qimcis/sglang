@@ -63,6 +63,13 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.ndlinear_moe import NdLinearFusedMoE
+from sglang.srt.layers.ndlinear import (
+    NdColumnParallelLinear,
+    NdLinearProjection,
+    NdReplicatedLinear,
+    NdRowParallelLinear,
+)
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -88,6 +95,11 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     try_fused_hc_post_pre,
+)
+from sglang.srt.models.deepseek_common.ndlinear import (
+    deepseek_v4_ndlinear_enabled,
+    deepseek_v4_ndlinear_shapes,
+    deepseek_v4_wo_a_shapes,
 )
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
 
@@ -344,65 +356,139 @@ class MQALayer(nn.Module):
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
         self.fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        nd_dtype = torch.bfloat16
         if self.fuse_wqa_wkv:
-            self.wqkv_a = ReplicatedLinear(
-                self.hidden_size,
-                self.q_lora_rank + self.head_dim,
+            if deepseek_v4_ndlinear_enabled(config, "wqkv_a"):
+                self.wqkv_a = NdReplicatedLinear(
+                    *deepseek_v4_ndlinear_shapes(
+                        config,
+                        "wqkv_a",
+                        self.hidden_size,
+                        self.q_lora_rank + self.head_dim,
+                    ),
+                    bias=False,
+                    params_dtype=nd_dtype,
+                )
+            else:
+                self.wqkv_a = ReplicatedLinear(
+                    self.hidden_size,
+                    self.q_lora_rank + self.head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=add_prefix("wqkv_a", prefix),
+                )
+        else:
+            if deepseek_v4_ndlinear_enabled(config, "wq_a"):
+                self.wq_a = NdReplicatedLinear(
+                    *deepseek_v4_ndlinear_shapes(
+                        config, "wq_a", self.hidden_size, self.q_lora_rank
+                    ),
+                    bias=False,
+                    params_dtype=nd_dtype,
+                )
+            else:
+                self.wq_a = ReplicatedLinear(
+                    self.hidden_size,
+                    self.q_lora_rank,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=add_prefix("wq_a", prefix),
+                )
+            if deepseek_v4_ndlinear_enabled(config, "wkv"):
+                self.wkv = NdReplicatedLinear(
+                    *deepseek_v4_ndlinear_shapes(
+                        config, "wkv", self.hidden_size, self.head_dim
+                    ),
+                    bias=False,
+                    params_dtype=nd_dtype,
+                )
+            else:
+                self.wkv = ReplicatedLinear(
+                    self.hidden_size,
+                    self.head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=add_prefix("wkv", prefix),
+                )
+        self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
+        if deepseek_v4_ndlinear_enabled(config, "wq_b"):
+            self.wq_b = NdColumnParallelLinear(
+                *deepseek_v4_ndlinear_shapes(
+                    config,
+                    "wq_b",
+                    self.q_lora_rank,
+                    self.n_heads * self.head_dim,
+                ),
                 bias=False,
-                quant_config=quant_config,
-                prefix=add_prefix("wqkv_a", prefix),
+                params_dtype=nd_dtype,
+                output_tp_axis=0,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
             )
         else:
-            self.wq_a = ReplicatedLinear(
-                self.hidden_size,
+            self.wq_b = ColumnParallelLinear(
                 self.q_lora_rank,
+                self.n_heads * self.head_dim,
                 bias=False,
                 quant_config=quant_config,
-                prefix=add_prefix("wq_a", prefix),
+                prefix=add_prefix("wq_b", prefix),
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
             )
-            self.wkv = ReplicatedLinear(
-                self.hidden_size,
-                self.head_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=add_prefix("wkv", prefix),
-            )
-        self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
-        self.wq_b = ColumnParallelLinear(
-            self.q_lora_rank,
-            self.n_heads * self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("wq_b", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-        )
         self.kv_norm = RMSNorm(self.head_dim, eps=self.eps)
-        self.wo_a = ColumnParallelLinear(
-            self.n_heads * self.head_dim // self.n_groups,
-            self.n_groups * self.o_lora_rank,
-            bias=False,
-            quant_config=quant_config if _FP8_WO_A_GEMM else None,
-            prefix=add_prefix("wo_a", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            **({} if _FP8_WO_A_GEMM else {"params_dtype": torch.bfloat16}),
-        )
-        if _FP8_WO_A_GEMM:
+        self.wo_a_is_ndlinear = deepseek_v4_ndlinear_enabled(config, "wo_a")
+        if self.wo_a_is_ndlinear:
+            self.wo_a = NdLinearProjection(
+                *deepseek_v4_wo_a_shapes(config),
+                bias=False,
+                params_dtype=nd_dtype,
+                factor_input_shard_axis=0,
+                factor_output_shard_axis=0,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+            )
+        else:
+            self.wo_a = ColumnParallelLinear(
+                self.n_heads * self.head_dim // self.n_groups,
+                self.n_groups * self.o_lora_rank,
+                bias=False,
+                quant_config=quant_config if _FP8_WO_A_GEMM else None,
+                prefix=add_prefix("wo_a", prefix),
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                **({} if _FP8_WO_A_GEMM else {"params_dtype": torch.bfloat16}),
+            )
+        if _FP8_WO_A_GEMM and not self.wo_a_is_ndlinear:
             assert hasattr(
                 self.wo_a, "weight_scale_inv"
             ), "FP8 quant_config must create weight_scale_inv"
             self.wo_a.weight_scale_inv.format_ue8m0 = True
-        self.wo_b = RowParallelLinear(
-            self.n_groups * self.o_lora_rank,
-            self.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=attn_tp_size > 1,
-            prefix=add_prefix("wo_b", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-        )
+        if deepseek_v4_ndlinear_enabled(config, "wo_b"):
+            self.wo_b = NdRowParallelLinear(
+                *deepseek_v4_ndlinear_shapes(
+                    config,
+                    "wo_b",
+                    self.n_groups * self.o_lora_rank,
+                    self.hidden_size,
+                ),
+                bias=False,
+                params_dtype=nd_dtype,
+                reduce_results=attn_tp_size > 1,
+                input_tp_axis=0,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+            )
+        else:
+            self.wo_b = RowParallelLinear(
+                self.n_groups * self.o_lora_rank,
+                self.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                reduce_results=attn_tp_size > 1,
+                prefix=add_prefix("wo_b", prefix),
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+            )
 
         self.attn_mqa = RadixAttention(
             self.n_local_heads,
@@ -888,7 +974,11 @@ class MQALayer(nn.Module):
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
 
-        if _FP8_WO_A_GEMM:
+        if self.wo_a_is_ndlinear:
+            T, G, D = o.shape
+            o, _ = self.wo_a(o.reshape(T, G * D))
+            o = o.view(T, G, self.o_lora_rank)
+        elif _FP8_WO_A_GEMM:
             import deep_gemm
 
             T, G, D = o.shape
@@ -1559,6 +1649,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             ]
         for layer in layers:
             attn = layer.self_attn
+            if getattr(attn, "wo_a_is_ndlinear", False):
+                continue
             G = attn.n_local_groups
             R = attn.o_lora_rank
             D = attn.wo_a.weight.shape[1]
@@ -1681,14 +1773,42 @@ class DeepseekV4ForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
+        use_ndlinear_experts_for_loader = (
+            deepseek_v4_ndlinear_enabled(self.config, "experts.gate_proj")
+            or deepseek_v4_ndlinear_enabled(self.config, "experts.up_proj")
+            or deepseek_v4_ndlinear_enabled(self.config, "experts.down_proj")
         )
+        if use_ndlinear_experts_for_loader:
+            rank = len(
+                deepseek_v4_ndlinear_shapes(
+                    self.config,
+                    "experts.gate_proj",
+                    self.config.hidden_size,
+                    self.config.moe_intermediate_size,
+                )[0]
+            )
+            expert_params_mapping = NdLinearFusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=self.config.n_routed_experts
+                + self.num_fused_shared_experts,
+                rank=rank,
+            )
+        else:
+            expert_params_mapping = FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=self.config.n_routed_experts
+                + self.num_fused_shared_experts,
+            )
 
-        if self.quant_config and self.quant_config.get_name() == "w4afp8":
+        if (
+            not use_ndlinear_experts_for_loader
+            and self.quant_config
+            and self.quant_config.get_name() == "w4afp8"
+        ):
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
             )

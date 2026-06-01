@@ -637,6 +637,8 @@ class Envs:
     SGLANG_OPT_USE_FUSED_COMPRESS_TRITON = EnvBool(False)
     SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
     SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL = EnvBool(True)
+    SGLANG_ENABLE_DEEPSEEK_V4_NDLINEAR = EnvBool(False)
+    SGLANG_DEEPSEEK_V4_NDLINEAR_TARGETS = EnvTuple(tuple())
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
     # ====================================================================
 

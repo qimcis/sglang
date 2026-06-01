@@ -103,6 +103,7 @@ class DeepSeekV4Config(PretrainedConfig):
 
     compress_rope_theta: int = 40000
     compress_ratios: List[int] = field(default_factory=list)
+    ndlinear_config: Dict[str, object] = field(default_factory=dict)
 
     n_hash_layers: int = 3
     hc_mult: int = 4
