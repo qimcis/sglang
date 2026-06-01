@@ -1078,7 +1078,6 @@ class Cosmos3OmniTransformer(CachableDiT):
 
         batch_size, C, T, H, W = hidden_states.shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
-        max_real_len = int(text_mask.sum(dim=1).max().item())
 
         # Check if sequence parallelism is enabled
         sequence_shard_enabled = self.sp_size > 1
@@ -1142,15 +1141,23 @@ class Cosmos3OmniTransformer(CachableDiT):
         # Compute UND K/V cache for this cache_key if not already cached
         # This allows reusing the cache across denoising steps for the same text
         if cache_key not in self.cached_kv:
+            max_real_len = int(text_mask.sum(dim=1).max().item())
             freqs_und, freqs_gen = self._compute_rope_freqs(
                 text_mask, T, Hp, Wp, fps, hidden_states.device, hidden_states.dtype
             )
             # UND K/V cache is kept FULL on all ranks (not sharded). Text
             # sequence is short, so memory impact is minimal, and the GEN
             # cross-attention needs the full K/V on every SP rank.
-            self.cached_kv[cache_key] = self.language_model(
+            cached_kv = self.language_model(
                 text_ids, text_mask, freqs_und[0], freqs_und[1]
             )
+            self.cached_kv[cache_key] = [
+                (
+                    k[:, :max_real_len].contiguous(),
+                    v[:, :max_real_len].contiguous(),
+                )
+                for k, v in cached_kv
+            ]
             self.cached_freqs_gen[cache_key] = freqs_gen
 
         freqs_gen = self.cached_freqs_gen[cache_key]
@@ -1177,8 +1184,6 @@ class Cosmos3OmniTransformer(CachableDiT):
         residual: torch.Tensor | None = None
         for i, layer in enumerate(self.gen_layers):
             k_und, v_und = cached_kv_for_key[i]
-            k_und = k_und[:, :max_real_len]
-            v_und = v_und[:, :max_real_len]
             hidden_gen, residual = layer(
                 hidden_gen,
                 k_und,
