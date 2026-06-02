@@ -881,13 +881,24 @@ class Cosmos3DecodingStage(PipelineStage):
 
     @staticmethod
     def _postprocess_tensor(decoded: torch.Tensor) -> torch.Tensor:
-        return decoded.mul_(0.5).add_(0.5).clamp_(0, 1).float()
+        """Map VAE output from [-1, 1] to [0, 1] in-place, preserving dtype.
+
+        Keeping the decoded tensor in its native dtype (typically bf16) avoids
+        a fp32 upcast that doubles peak VRAM right before the CPU copy.
+        """
+        return decoded.mul_(0.5).add_(0.5).clamp_(0, 1)
 
     @staticmethod
     def _postprocess_video_np(video: torch.Tensor, is_image_gen: bool) -> np.ndarray:
+        """Cast a [0, 1] tensor to uint8 on device, then copy to numpy.
+
+        Casting before the D2H copy cuts transfer bytes 2-4x vs bf16/fp32 and
+        avoids numpy's missing bf16 dtype. Guardrails consume uint8 arrays.
+        """
+        video_u8 = video.mul_(255.0).clamp_(0, 255).to(torch.uint8)
         if is_image_gen:
-            return video.squeeze(2).permute(0, 2, 3, 1).cpu().numpy()
-        return video.permute(0, 2, 3, 4, 1).cpu().numpy()
+            return video_u8.squeeze(2).permute(0, 2, 3, 1).contiguous().cpu().numpy()
+        return video_u8.permute(0, 2, 3, 4, 1).contiguous().cpu().numpy()
 
     def forward(self, batch: Req, server_args: ServerArgs):
         """Decode latents to video, or to a single image for T2I."""
