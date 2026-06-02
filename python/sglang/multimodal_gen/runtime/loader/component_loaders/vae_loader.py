@@ -61,7 +61,9 @@ def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
 
 
 def _should_use_channels_last_3d(
-    server_args: ServerArgs | None, component_name: str
+    server_args: ServerArgs | None,
+    component_name: str,
+    vae: nn.Module | None = None,
 ) -> bool:
     if component_name not in (
         "vae",
@@ -79,8 +81,15 @@ def _should_use_channels_last_3d(
     pipeline_name = server_args.pipeline_config.__class__.__name__
     if pipeline_name.startswith("QwenImage"):
         return True
-    if "Wan" in pipeline_name and server_args.num_gpus == 1:
-        return True
+
+    # Pipelines using the Wan-class VAE (Wan, Cosmos3, ...) benefit on 1 GPU;
+    # match on the VAE class so future Wan-VAE pipelines pick this up too.
+    if server_args.num_gpus == 1 and vae is not None:
+        from sglang.multimodal_gen.runtime.models.vaes.wanvae import AutoencoderKLWan
+
+        if isinstance(vae, AutoencoderKLWan):
+            return True
+
     return False
 
 
@@ -145,7 +154,7 @@ class VAELoader(ComponentLoader):
                     trust_remote_code=server_args.trust_remote_code,
                 )
             vae = vae.to(device=target_device, dtype=vae_dtype)
-            if _should_use_channels_last_3d(server_args, component_name):
+            if _should_use_channels_last_3d(server_args, component_name, vae):
                 n = _convert_conv3d_weights_to_channels_last_3d(vae)
                 if n > 0:
                     logger.info(
@@ -188,7 +197,7 @@ class VAELoader(ComponentLoader):
         if unexpected_keys:
             logger.warning("VAE unexpected keys: %s", unexpected_keys)
 
-        if _should_use_channels_last_3d(server_args, component_name):
+        if _should_use_channels_last_3d(server_args, component_name, vae):
             n = _convert_conv3d_weights_to_channels_last_3d(vae)
             if n > 0:
                 logger.info("VAE: converted %d Conv3d weights to channels_last_3d", n)
