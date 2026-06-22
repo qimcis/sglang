@@ -285,6 +285,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/kvcacheio
    */
+  m.def("kv_checksum(Tensor rows, Tensor row_indices, Tensor positions, int num_lanes, bool include_positions) -> Tensor");
+  m.impl("kv_checksum", torch::kCUDA, &kv_checksum);
+
   m.def(
       "transfer_kv_per_layer(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
       "dst_indices, int item_size, int block_quota, int num_warps_per_block) -> ()");

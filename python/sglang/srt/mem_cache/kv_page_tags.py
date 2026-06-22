@@ -855,6 +855,16 @@ def hash_kv_rows(
     if token_indices.numel() == 0:
         return _splitmix64_scalar(_CKSUM_SEED)
 
+    fast = _try_cuda_checksum(
+        rows,
+        row_indices=token_indices,
+        positions=token_indices,
+        num_lanes=num_lanes,
+        include_positions=include_positions,
+    )
+    if fast is not None:
+        return fast
+
     lanes = _as_int64_lanes(rows)
     sel = lanes.index_select(0, token_indices.to(lanes.device, dtype=torch.long))
     positions = token_indices if include_positions else None
@@ -875,6 +885,17 @@ def hash_rows_with_positions(
     """
     if rows.numel() == 0 or rows.shape[0] == 0:
         return _splitmix64_scalar(_CKSUM_SEED)
+    if positions is not None:
+        row_indices = torch.arange(rows.shape[0], dtype=torch.long, device=rows.device)
+        fast = _try_cuda_checksum(
+            rows,
+            row_indices=row_indices,
+            positions=positions,
+            num_lanes=num_lanes,
+            include_positions=True,
+        )
+        if fast is not None:
+            return fast
     lanes = _as_int64_lanes(rows)
     if num_lanes is not None:
         lanes = lanes[:, :num_lanes]
@@ -897,6 +918,39 @@ def hash_rows_with_positions(
     total = _mix_scalar(_CKSUM_SEED, combined)
     total = _mix_scalar(total, int(lanes.shape[0]))
     return total
+
+
+def _try_cuda_checksum(
+    rows: torch.Tensor,
+    *,
+    row_indices: torch.Tensor,
+    positions: Optional[torch.Tensor],
+    num_lanes: Optional[int],
+    include_positions: bool,
+) -> Optional[int]:
+    """Try the sgl-kernel CUDA checksum op, returning None on fallback."""
+
+    if not rows.is_cuda:
+        return None
+    if include_positions and positions is None:
+        return None
+    try:
+        from sgl_kernel.kvcacheio import kv_checksum as _kv_checksum
+
+        row_indices = row_indices.to(dtype=torch.long, device=rows.device)
+        if positions is not None:
+            positions = positions.to(dtype=torch.long, device=rows.device)
+
+        return _kv_checksum(
+            rows,
+            row_indices,
+            positions,
+            -1 if num_lanes is None else int(num_lanes),
+            include_positions,
+        )
+    except Exception:
+        logger.debug("Falling back to Torch KV checksum path", exc_info=True)
+        return None
 
 
 def _xor_reduce(x: torch.Tensor) -> int:

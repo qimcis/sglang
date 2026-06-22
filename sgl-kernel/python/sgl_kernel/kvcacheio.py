@@ -10,6 +10,39 @@ def is_hip() -> bool:
 _is_hip = is_hip()
 
 
+def kv_checksum(
+    rows: torch.Tensor,
+    row_indices: torch.Tensor,
+    positions: torch.Tensor | None = None,
+    num_lanes: int = -1,
+    include_positions: bool = True,
+) -> int:
+    """Hash logical KV rows with the fused CUDA checksum kernel.
+
+    Args:
+        rows: contiguous tensor whose first dimension is logical token rows.
+        row_indices: int64 CUDA indices selecting rows to hash.
+        positions: int64 CUDA logical positions folded into the digest.  When
+            omitted and ``include_positions`` is true, ``row_indices`` is used.
+        num_lanes: number of leading int64 lanes per row to hash.  ``-1`` hashes
+            all lanes, with zero padding for a short tail lane.
+        include_positions: whether to fold logical positions into each row hash.
+
+    Returns:
+        Python int containing the signed int64 checksum bit pattern.  This is the
+        only host synchronization in the fused path.
+    """
+
+    if positions is None:
+        positions = row_indices
+    if not rows.is_contiguous():
+        rows = rows.contiguous()
+    out = torch.ops.sgl_kernel.kv_checksum.default(
+        rows, row_indices, positions, int(num_lanes), bool(include_positions)
+    )
+    return int(out.item())
+
+
 def transfer_kv_per_layer(
     src_k: torch.Tensor,
     dst_k: torch.Tensor,

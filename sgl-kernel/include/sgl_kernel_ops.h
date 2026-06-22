@@ -494,6 +494,13 @@ void segment_packbits(
 /*
  * From csrc/kvcacheio
  */
+torch::Tensor kv_checksum(
+    const torch::Tensor& rows,
+    const torch::Tensor& row_indices,
+    const torch::Tensor& positions,
+    int64_t num_lanes,
+    bool include_positions);
+
 void transfer_kv_per_layer(
     const at::Tensor src_k,
     at::Tensor dst_k,
