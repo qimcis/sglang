@@ -384,9 +384,11 @@ class MetadataBuffers:
 
             _checksum_mode_code = checksum_mode_to_code
             # ``plan`` is a kv_page_tags.ChecksumPlan computed on the prefill side.
-            self.bootstrap_room[req.metadata_buffer_index, 1] = int(plan.checksum) & (
-                (1 << 64) - 1
-            )
+            # bootstrap_room is an int64 tensor. ``plan.checksum`` is already the
+            # signed int64 bit-pattern representation used by kv_page_tags.
+            # Do not mask to unsigned uint64 here, or large values overflow when
+            # assigned back into the int64 metadata buffer.
+            self.bootstrap_room[req.metadata_buffer_index, 1] = int(plan.checksum)
             self.bootstrap_room[req.metadata_buffer_index, 2] = int(plan.num_tokens)
             self.bootstrap_room[req.metadata_buffer_index, 3] = _checksum_mode_code(
                 plan.mode
