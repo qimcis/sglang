@@ -135,6 +135,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_pages = self.free_pages[:num_pages]
         self.free_pages = self.free_pages[num_pages:]
 
+        # Newly allocated physical pages: bump their generation (gated; no-op
+        # unless a page-tag table is attached).
+        if self.page_tag_table is not None:
+            self._bump_page_generations(out_pages)
+
         out_indices = (
             out_pages[:, None] * self.page_size
             + torch.arange(self.page_size, device=self.device)
@@ -189,6 +194,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
+        if self.page_tag_table is not None and num_new_pages > 0:
+            self._bump_page_generations(self.free_pages[:num_new_pages])
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
@@ -228,6 +235,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
+        if self.page_tag_table is not None and num_new_pages > 0:
+            self._bump_page_generations(self.free_pages[:num_new_pages])
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 

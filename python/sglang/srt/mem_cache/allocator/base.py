@@ -47,6 +47,28 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.is_not_in_free_group = True
         self.free_group = []
 
+        # Optional sidecar KV page-tag table (PD disaggregation protection).
+        # Stays ``None`` unless explicitly attached, so the default allocator
+        # hot path is unchanged for non-PD / protection-disabled serving.
+        self.page_tag_table = None
+
+    def attach_page_tag_table(self, table) -> None:
+        """Attach a :class:`KVPageTagTable` so allocations bump page generations.
+
+        Only used when KV page protection is enabled for PD decode.
+        """
+        self.page_tag_table = table
+
+    def _bump_page_generations(self, page_ids) -> None:
+        """Bump allocation generations for newly allocated physical pages.
+
+        No-op unless a page-tag table is attached (one attribute check on the
+        disabled path).
+        """
+        if self.page_tag_table is None:
+            return
+        self.page_tag_table.bump_generations(page_ids)
+
     @property
     def size_full(self):
         return self.size

@@ -3080,7 +3080,130 @@ class Scheduler(
 
         # Update batch tensors
         batch.prepare_for_decode()
+
+        # Verify KV page tags before decode attention reads the pages (gated;
+        # no-op unless PD page protection is enabled). Aborts only the affected
+        # requests and rebuilds the batch for the survivors.
+        if getattr(self, "kv_protection_manager", None) is not None:
+            self._verify_decode_kv_page_tags(batch)
+            if batch.is_empty():
+                return batch
         return batch
+
+    def _verify_decode_kv_page_tags(self, batch: ScheduleBatch) -> None:
+        """Vectorized page-tag verification + per-request abort for PD decode.
+
+        Runs one batched gather+compare over cached page/tag/generation tensors,
+        aborts solely the requests whose pages no longer match, then refreshes
+        only survivor tail pages (O(1)/req) for the just-appended token.
+        """
+        manager = self.kv_protection_manager
+        if manager is None or not manager.config.enable_page_tags:
+            return
+        try:
+            page_size = manager.page_size
+            tail_page_ids = batch.out_cache_loc // page_size
+            items = []
+            pending_refreshes = []
+            for i, req in enumerate(batch.reqs):
+                manifest = getattr(req, "kv_page_manifest", None)
+                if manifest is None:
+                    continue
+                logical_pos = int(batch.seq_lens_cpu[i].item()) - 1
+                if logical_pos < 0:
+                    continue
+                token_id = (
+                    req.output_ids[-1]
+                    if len(req.output_ids)
+                    else req.origin_input_ids[-1]
+                )
+                items.append((req.rid, manifest))
+                pending_refreshes.append(
+                    (
+                        req.rid,
+                        manifest,
+                        logical_pos,
+                        token_id,
+                        tail_page_ids[i : i + 1],
+                    )
+                )
+            mismatches = manager.verify_batch(items)
+        except Exception as e:  # protection must never crash the decode loop
+            logger.error("KV page tag verification error: %s", e)
+            return
+
+        if not mismatches:
+            try:
+                for (
+                    _,
+                    manifest,
+                    logical_pos,
+                    token_id,
+                    physical_page_id,
+                ) in pending_refreshes:
+                    manager.refresh_tail_token(
+                        manifest,
+                        logical_pos=logical_pos,
+                        token_id=token_id,
+                        physical_page_id=physical_page_id,
+                    )
+            except Exception as e:
+                logger.error("KV page tag tail refresh error: %s", e)
+            return
+
+        bad_rids = {m.rid for m in mismatches}
+        rid_to_req = {req.rid: req for req in batch.reqs}
+        for m in mismatches:
+            req = rid_to_req.get(m.rid)
+            if req is None:
+                continue
+            logger.error("Aborting request due to %s", m)
+            req.finished_reason = FINISH_ABORT(
+                f"KV page tag mismatch: {m}",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "KVPageTagMismatch",
+            )
+            req.to_finish = None
+            if (
+                req.req_pool_idx is not None or self.tree_cache.supports_mamba()
+            ) and not getattr(req, "kv_committed_freed", False):
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+
+        keep_indices = [
+            i for i, req in enumerate(batch.reqs) if req.rid not in bad_rids
+        ]
+        prepared_out_cache_loc = batch.out_cache_loc
+        keep_indices_device = None
+        if keep_indices:
+            keep_indices_device = torch.tensor(
+                keep_indices,
+                dtype=torch.int64,
+                device=prepared_out_cache_loc.device,
+            )
+        batch.filter_batch(keep_indices=keep_indices)
+        if not batch.is_empty() and prepared_out_cache_loc is not None:
+            batch.out_cache_loc = prepared_out_cache_loc.index_select(
+                0, keep_indices_device
+            )
+            try:
+                for (
+                    rid,
+                    manifest,
+                    logical_pos,
+                    token_id,
+                    physical_page_id,
+                ) in pending_refreshes:
+                    if rid in bad_rids:
+                        continue
+                    manager.refresh_tail_token(
+                        manifest,
+                        logical_pos=logical_pos,
+                        token_id=token_id,
+                        physical_page_id=physical_page_id,
+                    )
+            except Exception as e:
+                logger.error("KV page tag tail refresh error: %s", e)
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC

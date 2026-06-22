@@ -334,6 +334,52 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
+        # KV page protection / transfer checksums (PD disaggregation, gated).
+        # Constructed PD-decode-side only; inert for non-PD serving.  Fails fast
+        # on unsupported allocators/backends rather than silently disabling.
+        self._init_kv_protection()
+
+    def _init_kv_protection(self) -> None:
+        from sglang.srt.mem_cache.kv_page_tags import (
+            KVPageProtectionManager,
+            KVProtectionConfig,
+        )
+
+        config = KVProtectionConfig.from_env(is_pd_decode=True)
+        if not config.enabled:
+            self.scheduler.kv_protection_manager = None
+            return
+
+        allocator = self.token_to_kv_pool_allocator
+        page_size = allocator.page_size
+        num_pages = max(1, allocator.size // max(page_size, 1))
+        metrics_collector = (
+            self.scheduler.metrics_collector
+            if getattr(self.scheduler, "metrics_reporter", None) is not None
+            and self.scheduler.metrics_reporter.enable_metrics
+            else None
+        )
+        manager = KVPageProtectionManager(
+            config,
+            allocator=allocator,
+            num_pages=num_pages,
+            page_size=page_size,
+            device=allocator.device,
+            metrics_collector=metrics_collector,
+            transfer_backend=(
+                str(self.transfer_backend.value)
+                if hasattr(self.transfer_backend, "value")
+                else str(self.transfer_backend)
+            ),
+            is_spec_decode=not self.scheduler.spec_algorithm.is_none(),
+        )
+        self.scheduler.kv_protection_manager = manager
+        logger.info(
+            "KV page protection enabled (page_tags=%s, checksum_mode=%s)",
+            config.enable_page_tags,
+            config.checksum_mode.value,
+        )
+
         if (
             self.scheduler.tp_worker.is_hybrid_swa
             and not self._uses_swa_tail_prealloc()
@@ -1580,10 +1626,103 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ].tolist()
             )
 
+        # Verify the KV transfer checksum (gated). Compares decode-side
+        # destination KV bytes against the prefill-side source checksum that was
+        # transmitted in the spare metadata slots. Aborts only this request on
+        # mismatch.
+        if self._verify_transfer_checksum(decode_req.req, output_bootstrap_room):
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            return
+
+        # Register baseline KV page tags for the transferred prompt pages so a
+        # later cross-request page reuse / mid-decode overwrite is detectable
+        # before decode attention reads them (gated; no-op when disabled).
+        self._register_kv_page_tags(decode_req.req)
+
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return
+
+    def _verify_transfer_checksum(self, req: Req, meta_bootstrap_room) -> bool:
+        """Return True if the request was aborted due to a checksum mismatch."""
+        manager = getattr(self.scheduler, "kv_protection_manager", None)
+        if manager is None or not manager.config.checksum_enabled:
+            return False
+        try:
+            from sglang.srt.mem_cache.kv_page_tags import (
+                ChecksumPlan,
+                checksum_code_to_mode,
+            )
+
+            # Slot map: 0=room 1=checksum 2=num_tokens 3=checksum_mode_code.
+            mode_code = int(meta_bootstrap_room[3].item())
+            mode = checksum_code_to_mode(mode_code)
+            if not mode.enabled:
+                return False
+            num_tokens = int(meta_bootstrap_room[2].item())
+            checksum_u64 = int(meta_bootstrap_room[1].item())
+            expected = ChecksumPlan(
+                bootstrap_room=req.bootstrap_room or 0,
+                num_tokens=num_tokens,
+                mode=mode,
+                num_lanes=None,
+                checksum=checksum_u64,
+            )
+            if num_tokens <= 0 or req.req_pool_idx is None:
+                return False
+            kv_loc = self.scheduler.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :num_tokens
+            ]
+            kv_pool = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
+            err = manager.verify_destination_checksum_from_loc(
+                kv_pool,
+                kv_loc,
+                bootstrap_room=req.bootstrap_room or 0,
+                num_tokens=num_tokens,
+                expected=expected,
+                rid=req.rid,
+            )
+        except Exception as e:
+            logger.error(
+                "KV transfer checksum verification error for rid=%s: %s", req.rid, e
+            )
+            return False
+        if err is None:
+            return False
+        logger.error(str(err))
+        prepare_abort(
+            req,
+            f"KV transfer checksum mismatch: {err}",
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+        return True
+
+    def _register_kv_page_tags(self, req: Req) -> None:
+        manager = getattr(self.scheduler, "kv_protection_manager", None)
+        if manager is None or not manager.config.enable_page_tags:
+            return
+        try:
+            page_size = manager.page_size
+            token_ids = req.origin_input_ids
+            seq_len = len(token_ids)
+            if seq_len == 0 or req.req_pool_idx is None:
+                return
+            kv_loc = self.scheduler.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :seq_len
+            ]
+            # First token's loc within each logical page -> physical page id.
+            first_locs = kv_loc[::page_size]
+            page_physical_ids = (first_locs // page_size).tolist()
+            req.kv_page_manifest = manager.register_pages(
+                token_ids=list(token_ids),
+                page_physical_ids=page_physical_ids,
+                bootstrap_room=req.bootstrap_room or 0,
+            )
+        except Exception as e:  # never break serving on a protection bookkeeping error
+            logger.error("KV page tag registration failed for rid=%s: %s", req.rid, e)
+            req.kv_page_manifest = None
 
     def _poll_with_metadata_gate(self) -> List[int]:
         pollers = (

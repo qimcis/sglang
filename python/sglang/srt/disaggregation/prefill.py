@@ -146,6 +146,42 @@ class PrefillBootstrapQueue:
             )
         self.kv_manager = self._init_kv_manager()
 
+        # KV transfer checksum (prefill side, gated). Page tags are a
+        # decode-side concept, so the prefill manager is checksum-only.
+        self._init_kv_protection()
+
+    def _init_kv_protection(self) -> None:
+        import dataclasses
+
+        from sglang.srt.mem_cache.kv_page_tags import (
+            KVPageProtectionManager,
+            KVProtectionConfig,
+        )
+
+        config = KVProtectionConfig.from_env(is_pd_decode=True)
+        # Prefill only needs the transfer-checksum half; disable page tags so we
+        # do not attach a sidecar table / bump generations on the prefill side.
+        config = dataclasses.replace(config, enable_page_tags=False)
+        if not config.checksum_enabled:
+            self.scheduler.kv_protection_manager = getattr(
+                self.scheduler, "kv_protection_manager", None
+            )
+            return
+        self.scheduler.kv_protection_manager = KVPageProtectionManager(
+            config,
+            allocator=None,
+            num_pages=0,
+            page_size=self.token_to_kv_pool.page_size,
+            device="cpu",
+            metrics_collector=None,
+            transfer_backend=(
+                str(self.transfer_backend.value)
+                if hasattr(self.transfer_backend, "value")
+                else str(self.transfer_backend)
+            ),
+            is_spec_decode=False,
+        )
+
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
@@ -953,6 +989,29 @@ class SchedulerDisaggregationPrefillMixin:
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
+    def _maybe_compute_transfer_checksum(self: Scheduler, req: Req) -> None:
+        manager = getattr(self, "kv_protection_manager", None)
+        if manager is None or not manager.config.checksum_enabled:
+            return
+        try:
+            seq_len = min(req.fill_len, len(req.origin_input_ids))
+            if seq_len <= 0 or req.req_pool_idx is None:
+                return
+            kv_loc = self.req_to_token_pool.req_to_token[req.req_pool_idx, :seq_len]
+            kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+            req.kv_transfer_checksum = manager.compute_source_checksum_from_loc(
+                kv_pool,
+                kv_loc,
+                bootstrap_room=req.bootstrap_room or 0,
+                num_tokens=seq_len,
+            )
+        except Exception as e:
+            # Never block prefill on a checksum bookkeeping error.
+            logger.error(
+                "KV transfer checksum (source) failed for rid=%s: %s", req.rid, e
+            )
+            req.kv_transfer_checksum = None
+
     def send_kv_chunk(
         self: Scheduler,
         req: Req,
@@ -990,6 +1049,10 @@ class SchedulerDisaggregationPrefillMixin:
         )
         state_indices: Optional[List] = None
         if last_chunk:
+            # Compute the source KV transfer checksum (gated) over the full
+            # prompt in logical token order before publishing metadata, so the
+            # decode side can prove the bytes copied correctly.
+            self._maybe_compute_transfer_checksum(req)
             self.disagg_metadata_buffers.set_buf(req)
 
             # fill_ids includes the token sampled during prefill, but decode

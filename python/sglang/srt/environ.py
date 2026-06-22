@@ -310,6 +310,19 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
 
+    # PD Disaggregation: KV page protection + transfer checksums.
+    # These only take effect in PD *decode* (gated in KVProtectionConfig.from_env);
+    # they are inert for non-PD serving, so the default path is unaffected.
+    # Enable a sidecar uint64 page-tag buffer that detects stale/wrong/mid-decode
+    # KV page reuse before decode attention reads pages.
+    SGLANG_KV_PAGE_PROTECTION = EnvBool(False)
+    # Transfer checksum strength: none | sampled_partial | sampled_full | always_full
+    SGLANG_KV_TRANSFER_CHECKSUM_MODE = EnvStr("none")
+    # Fraction of tokens sampled when the checksum mode is sampled_*.
+    SGLANG_KV_CHECKSUM_SAMPLE_RATE = EnvFloat(0.05)
+    # Fraction of each token's KV bytes hashed when mode is sampled_partial.
+    SGLANG_KV_CHECKSUM_PARTIAL_BYTE_RATE = EnvFloat(0.25)
+
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)

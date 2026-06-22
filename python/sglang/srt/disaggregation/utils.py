@@ -370,10 +370,29 @@ class MetadataBuffers:
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )
-        # Store bootstrap_room for validation on decode side
+        # Store bootstrap_room for validation on decode side.
+        # The bootstrap_room buffer is (size, 8) and only slot 0 is used for the
+        # room itself; slots 1-3 carry an optional KV transfer-checksum plan
+        # (1=checksum, 2=num_tokens, 3=mode code) so no new RDMA buffer is
+        # needed. Slot map: 0=room 1=checksum 2=num_tokens 3=checksum_mode_code.
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
         )
+        plan = getattr(req, "kv_transfer_checksum", None)
+        if plan is not None:
+            from sglang.srt.mem_cache.kv_page_tags import checksum_mode_to_code
+
+            _checksum_mode_code = checksum_mode_to_code
+            # ``plan`` is a kv_page_tags.ChecksumPlan computed on the prefill side.
+            self.bootstrap_room[req.metadata_buffer_index, 1] = int(plan.checksum) & (
+                (1 << 64) - 1
+            )
+            self.bootstrap_room[req.metadata_buffer_index, 2] = int(plan.num_tokens)
+            self.bootstrap_room[req.metadata_buffer_index, 3] = _checksum_mode_code(
+                plan.mode
+            )
+        else:
+            self.bootstrap_room[req.metadata_buffer_index, 3] = 0
 
 
 #########################
