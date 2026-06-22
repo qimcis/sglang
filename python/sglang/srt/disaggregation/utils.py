@@ -388,7 +388,10 @@ class MetadataBuffers:
             # signed int64 bit-pattern representation used by kv_page_tags.
             # Do not mask to unsigned uint64 here, or large values overflow when
             # assigned back into the int64 metadata buffer.
-            self.bootstrap_room[req.metadata_buffer_index, 1] = int(plan.checksum)
+            checksum_i64 = int(plan.checksum)
+            if checksum_i64 >= (1 << 63):
+                checksum_i64 -= 1 << 64
+            self.bootstrap_room[req.metadata_buffer_index, 1] = checksum_i64
             self.bootstrap_room[req.metadata_buffer_index, 2] = int(plan.num_tokens)
             self.bootstrap_room[req.metadata_buffer_index, 3] = _checksum_mode_code(
                 plan.mode
