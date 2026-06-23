@@ -827,6 +827,53 @@ def select_checksum_byte_count(
     return lanes
 
 
+def _try_cuda_checksum(
+    rows: torch.Tensor,
+    row_indices: torch.Tensor,
+    positions: Optional[torch.Tensor],
+    num_lanes: Optional[int],
+    *,
+    num_rows: int,
+) -> Optional[int]:
+    """Try the fused CUDA ``kv_checksum`` op; return ``None`` to fall back.
+
+    Returns the full uint64 checksum (matching the Torch path bit-for-bit) when
+    the op is available and succeeds for safe CUDA inputs, otherwise ``None`` so
+    the caller uses the Torch reference path.  Fallback triggers on: non-CUDA
+    rows, rows with >2 dims (the Torch path only supports 1D/2D), a missing/
+    unimportable op, or any runtime failure.
+
+    The kernel returns only the per-row XOR fold (``combined``); the two scalar
+    finishing mixes are applied here with the same primitives the Torch path
+    uses, so the hash constants have a single source of truth.
+    """
+    if not rows.is_cuda:
+        return None
+    # The Torch reference (`_as_int64_lanes`) only supports 1D/2D rows; restrict
+    # the CUDA path to the same shapes so behavior is identical everywhere.
+    if rows.dim() > 2:
+        return None
+    try:
+        from sgl_kernel.kvcacheio import kv_checksum as _kv_checksum_op
+    except Exception:
+        return None
+    try:
+        row_indices = row_indices.to(device=rows.device, dtype=torch.long)
+        if positions is not None:
+            positions = positions.to(device=rows.device, dtype=torch.long)
+        lanes_arg = -1 if num_lanes is None else int(num_lanes)
+        combined = _kv_checksum_op(rows, row_indices, positions, lanes_arg)
+    except Exception as e:  # pragma: no cover - depends on CUDA build
+        logger.warning(
+            "Fused CUDA kv_checksum failed (%s); falling back to the Torch path.",
+            e,
+        )
+        return None
+    total = _mix_scalar(_CKSUM_SEED, combined)
+    total = _mix_scalar(total, int(num_rows))
+    return total
+
+
 def hash_kv_rows(
     rows: torch.Tensor,
     token_indices: torch.Tensor,
@@ -855,10 +902,23 @@ def hash_kv_rows(
     if token_indices.numel() == 0:
         return _splitmix64_scalar(_CKSUM_SEED)
 
+    positions = token_indices if include_positions else None
+    # Fused CUDA path: the kernel gathers the selected rows itself, avoiding the
+    # host-side ``index_select`` materialization on the hot path.
+    if rows.is_cuda:
+        result = _try_cuda_checksum(
+            rows,
+            token_indices,
+            positions,
+            num_lanes,
+            num_rows=int(token_indices.numel()),
+        )
+        if result is not None:
+            return result
+
     lanes = _as_int64_lanes(rows)
     sel = lanes.index_select(0, token_indices.to(lanes.device, dtype=torch.long))
-    positions = token_indices if include_positions else None
-    return hash_rows_with_positions(sel, positions=positions, num_lanes=num_lanes)
+    return _hash_rows_with_positions_torch(sel, positions=positions, num_lanes=num_lanes)
 
 
 def hash_rows_with_positions(
@@ -872,7 +932,32 @@ def hash_rows_with_positions(
     ``rows`` are the (sampled) token rows in logical order; ``positions`` are
     their logical token indices (folded in for order-sensitivity).  Neither
     physical page ids nor physical slot indices ever enter the hash.
+
+    Uses the fused CUDA op when ``rows`` is a (1D/2D) CUDA tensor and the op is
+    available, falling back to the Torch reference otherwise.
     """
+    if rows.numel() == 0 or rows.shape[0] == 0:
+        return _splitmix64_scalar(_CKSUM_SEED)
+    if rows.is_cuda:
+        n = int(rows.shape[0])
+        row_indices = torch.arange(n, device=rows.device, dtype=torch.long)
+        result = _try_cuda_checksum(
+            rows, row_indices, positions, num_lanes, num_rows=n
+        )
+        if result is not None:
+            return result
+    return _hash_rows_with_positions_torch(
+        rows, positions=positions, num_lanes=num_lanes
+    )
+
+
+def _hash_rows_with_positions_torch(
+    rows: torch.Tensor,
+    *,
+    positions: Optional[torch.Tensor] = None,
+    num_lanes: Optional[int] = None,
+) -> int:
+    """Torch reference for :func:`hash_rows_with_positions` (no CUDA op)."""
     if rows.numel() == 0 or rows.shape[0] == 0:
         return _splitmix64_scalar(_CKSUM_SEED)
     lanes = _as_int64_lanes(rows)

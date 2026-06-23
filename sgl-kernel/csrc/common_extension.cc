@@ -341,6 +341,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "transfer_kv_all_layer_direct_lf_pf(Tensor[] src_ptrs, Tensor[] dst_ptrs, Tensor src_indices, "
       "Tensor dst_indices, int page_size) ->() ");
   m.impl("transfer_kv_all_layer_direct_lf_pf", torch::kCUDA, &transfer_kv_all_layer_direct_lf_pf);
+  m.def("kv_checksum(Tensor rows, Tensor row_indices, Tensor? positions, int num_lanes, Tensor! out) -> ()");
+  m.impl("kv_checksum", torch::kCUDA, &kv_checksum);
 
   /*
    * From csrc/memory
