@@ -1,0 +1,34 @@
+[06-18 06:14:19] Waiting for service at http://127.0.0.1:30312...
+[06-18 06:14:19] Service is ready.
+[06-18 06:14:19] Updated model name from server: ideogram-ai/ideogram-4-fp8
+[06-18 06:14:19] Using task from --task: text-to-image
+[06-18 06:14:19] Loading requests...
+[06-18 06:14:19] Prepared 4 requests from vbench dataset.
+[06-18 06:14:19] Running 1 warmup request(s) with num_inference_steps=1...
+[06-18 06:14:19] Warmup 1/1: latency=0.04s, success=False
+
+================= Serving Benchmark Result =================
+Task:                                         text-to-image                 
+Model:                                        ideogram-ai/ideogram-4-fp8    
+Dataset:                                      vbench                        
+--------------------------------------------------
+Benchmark duration (s):                       17.74                         
+Request rate:                                 inf                           
+Max request concurrency:                      4                             
+Successful requests:                          4/4                           
+Completed outputs:                            4                             
+Outputs per prompt:                           1                             
+--------------------------------------------------
+Request throughput (req/s):                   0.23                          
+Output throughput (outputs/s):                0.23                          
+Latency Mean (s):                             11.98                         
+Latency Median (s):                           11.99                         
+Latency P90 (s):                              16.59                         
+Latency P95 (s):                              17.17                         
+Latency P99 (s):                              17.63                         
+--------------------------------------------------
+Peak Memory Max (MB):                         28072.00                      
+Peak Memory Mean (MB):                        28018.50                      
+Peak Memory Median (MB):                      28072.00                      
+------------------------------------------------------------
+Metrics saved to /workspace/continuous-bench/results/fix_smokes/ideogram4_fp8_no_batch_512x512_smoke.json

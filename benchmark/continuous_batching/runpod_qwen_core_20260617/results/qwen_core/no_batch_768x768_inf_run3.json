@@ -1,0 +1,18 @@
+{
+  "duration": 550.9320709817111,
+  "completed_requests": 64,
+  "completed_outputs": 64,
+  "failed_requests": 0,
+  "throughput_qps": 0.11616677149681591,
+  "output_throughput_ops": 0.11616677149681591,
+  "latency_mean": 33.62716821132926,
+  "latency_median": 34.424512481316924,
+  "latency_p50": 34.424512481316924,
+  "latency_p90": 34.493238382600246,
+  "latency_p95": 34.5212302358821,
+  "latency_p99": 34.53747807333246,
+  "num_outputs_per_prompt": 1,
+  "peak_memory_mb_max": 56338.0,
+  "peak_memory_mb_mean": 56338.0,
+  "peak_memory_mb_median": 56338.0
+}

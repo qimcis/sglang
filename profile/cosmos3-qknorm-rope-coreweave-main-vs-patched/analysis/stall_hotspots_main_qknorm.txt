@@ -1,0 +1,42 @@
+===== Stall hotspots for main_qknorm =====
+Total distinct (file, line) entries: 1
+
+Rank      Total File                            Line  Breakdown (stall: count)
+------------------------------------------------------------------------------------------------------------------------------------------------------
+   0      16312 ?                                  0  long_scoreboard: 9837, wait: 1863, short_scoreboard: 1660, not_selected: 1242, selected: 896, math_pipe_throttle: 444, dispatch_stall: 155, branch_resolving: 152, no_instructions: 61, drain: 1, mio_throttle: 1
+
+
+===== Per-stall-type top lines =====
+
+--- long_scoreboard ---
+      9837  ?:0
+
+--- short_scoreboard ---
+      1660  ?:0
+
+--- wait ---
+      1863  ?:0
+
+--- math_pipe_throttle ---
+       444  ?:0
+
+--- mio_throttle ---
+         1  ?:0
+
+--- not_selected ---
+      1242  ?:0
+
+--- dispatch_stall ---
+       155  ?:0
+
+--- drain ---
+         1  ?:0
+
+--- no_instructions ---
+        61  ?:0
+
+--- selected ---
+       896  ?:0
+
+--- branch_resolving ---
+       152  ?:0

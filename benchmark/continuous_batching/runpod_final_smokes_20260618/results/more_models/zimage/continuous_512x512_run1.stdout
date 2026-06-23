@@ -1,0 +1,30 @@
+[06-18 01:18:18] Waiting for service at http://127.0.0.1:30230...
+[06-18 01:18:18] Service is ready.
+[06-18 01:18:18] Updated model name from server: Tongyi-MAI/Z-Image
+[06-18 01:18:18] Using task from --task: text-to-image
+[06-18 01:18:18] Loading requests...
+[06-18 01:18:18] Prepared 4 requests from vbench dataset.
+[06-18 01:18:18] Running 1 warmup request(s) with num_inference_steps=1...
+[06-18 01:18:23] Warmup 1/1: latency=4.18s, success=True
+
+================= Serving Benchmark Result =================
+Task:                                         text-to-image                 
+Model:                                        Tongyi-MAI/Z-Image            
+Dataset:                                      vbench                        
+--------------------------------------------------
+Benchmark duration (s):                       0.30                          
+Request rate:                                 inf                           
+Max request concurrency:                      4                             
+Successful requests:                          0/4                           
+Completed outputs:                            0                             
+Outputs per prompt:                           1                             
+--------------------------------------------------
+Request throughput (req/s):                   0.00                          
+Output throughput (outputs/s):                0.00                          
+Latency Mean (s):                             0                             
+Latency Median (s):                           0                             
+Latency P90 (s):                              0                             
+Latency P95 (s):                              0                             
+Latency P99 (s):                              0                             
+------------------------------------------------------------
+Metrics saved to /workspace/continuous-bench/results/more_models/zimage/continuous_512x512_inf_run1.json

@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: chi-misc-testing
+  namespace: staging
+  labels:
+    app.kubernetes.io/name: chi-misc-testing
+    app.kubernetes.io/component: ci-repro
+spec:
+  restartPolicy: Never
+  containers:
+    - name: worker
+      image: lmsysorg/sglang:dev
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "86400"]
+      resources:
+        requests:
+          cpu: "8"
+          memory: "64Gi"
+          nvidia.com/gpu: "1"
+        limits:
+          cpu: "16"
+          memory: "96Gi"
+          nvidia.com/gpu: "1"
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+  volumes:
+    - name: workspace
+      emptyDir: {}

@@ -1,0 +1,34 @@
+[06-18 01:20:09] Waiting for service at http://127.0.0.1:30231...
+[06-18 01:20:09] Service is ready.
+[06-18 01:20:09] Updated model name from server: Efficient-Large-Model/Sana_600M_512px_diffusers
+[06-18 01:20:09] Using task from --task: text-to-image
+[06-18 01:20:09] Loading requests...
+[06-18 01:20:09] Prepared 4 requests from vbench dataset.
+[06-18 01:20:09] Running 1 warmup request(s) with num_inference_steps=1...
+[06-18 01:20:17] Warmup 1/1: latency=8.07s, success=True
+
+================= Serving Benchmark Result =================
+Task:                                         text-to-image                 
+Model:                                        Efficient-Large-Model/Sana_600M_512px_diffusers
+Dataset:                                      vbench                        
+--------------------------------------------------
+Benchmark duration (s):                       3.31                          
+Request rate:                                 inf                           
+Max request concurrency:                      4                             
+Successful requests:                          4/4                           
+Completed outputs:                            4                             
+Outputs per prompt:                           1                             
+--------------------------------------------------
+Request throughput (req/s):                   1.21                          
+Output throughput (outputs/s):                1.21                          
+Latency Mean (s):                             2.08                          
+Latency Median (s):                           2.08                          
+Latency P90 (s):                              3.06                          
+Latency P95 (s):                              3.19                          
+Latency P99 (s):                              3.28                          
+--------------------------------------------------
+Peak Memory Max (MB):                         7692.00                       
+Peak Memory Mean (MB):                        7691.00                       
+Peak Memory Median (MB):                      7691.00                       
+------------------------------------------------------------
+Metrics saved to /workspace/continuous-bench/results/more_models/sana600m512/no_batch_512x512_inf_run1.json

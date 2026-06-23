@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cosmos3-qknorm-rope-ncu
+  namespace: staging
+  labels:
+    app.kubernetes.io/name: cosmos3-qknorm-rope-ncu
+    app.kubernetes.io/component: profiling
+spec:
+  restartPolicy: Never
+  containers:
+    - name: profiler
+      image: lmsysorg/sglang:dev
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "86400"]
+      resources:
+        requests:
+          cpu: "8"
+          memory: "64Gi"
+          nvidia.com/gpu: "1"
+        limits:
+          cpu: "16"
+          memory: "96Gi"
+          nvidia.com/gpu: "1"
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+  volumes:
+    - name: workspace
+      emptyDir: {}

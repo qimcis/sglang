@@ -1,0 +1,34 @@
+[06-18 01:17:02] Waiting for service at http://127.0.0.1:30230...
+[06-18 01:17:02] Service is ready.
+[06-18 01:17:02] Updated model name from server: Tongyi-MAI/Z-Image
+[06-18 01:17:02] Using task from --task: text-to-image
+[06-18 01:17:02] Loading requests...
+[06-18 01:17:02] Prepared 4 requests from vbench dataset.
+[06-18 01:17:02] Running 1 warmup request(s) with num_inference_steps=1...
+[06-18 01:17:06] Warmup 1/1: latency=4.34s, success=True
+
+================= Serving Benchmark Result =================
+Task:                                         text-to-image                 
+Model:                                        Tongyi-MAI/Z-Image            
+Dataset:                                      vbench                        
+--------------------------------------------------
+Benchmark duration (s):                       10.72                         
+Request rate:                                 inf                           
+Max request concurrency:                      4                             
+Successful requests:                          4/4                           
+Completed outputs:                            4                             
+Outputs per prompt:                           1                             
+--------------------------------------------------
+Request throughput (req/s):                   0.37                          
+Output throughput (outputs/s):                0.37                          
+Latency Mean (s):                             6.70                          
+Latency Median (s):                           6.70                          
+Latency P90 (s):                              9.92                          
+Latency P95 (s):                              10.32                         
+Latency P99 (s):                              10.64                         
+--------------------------------------------------
+Peak Memory Max (MB):                         20972.00                      
+Peak Memory Mean (MB):                        20972.00                      
+Peak Memory Median (MB):                      20972.00                      
+------------------------------------------------------------
+Metrics saved to /workspace/continuous-bench/results/more_models/zimage/no_batch_512x512_inf_run1.json

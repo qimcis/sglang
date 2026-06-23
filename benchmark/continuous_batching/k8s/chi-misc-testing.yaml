@@ -1,0 +1,111 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chi-misc-testing
+  namespace: production
+  labels:
+    app: chi-misc-testing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chi-misc-testing
+  template:
+    metadata:
+      labels:
+        app: chi-misc-testing
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: computeinstance-e00amf6e730ww11vnh
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: sglang-diffusion
+          image: chi11781/sglang:chi-continuous-232e03e1b-cu13
+          imagePullPolicy: Always
+          command:
+            - /bin/bash
+            - -lc
+          args:
+            - |
+              set -euo pipefail
+              echo "Starting chi-misc-testing with batching mode=${BATCHING_MODE}, max_size=${BATCHING_MAX_SIZE}, delay_ms=${BATCHING_DELAY_MS}"
+              python3 -m sglang.multimodal_gen.runtime.entrypoints.cli.main serve \
+                --model-path black-forest-labs/FLUX.1-schnell \
+                --backend sglang \
+                --num-gpus 1 \
+                --host 0.0.0.0 \
+                --port 30000 \
+                --log-level info \
+                --output-path "" \
+                --batching-mode "${BATCHING_MODE}" \
+                --batching-max-size "${BATCHING_MAX_SIZE}" \
+                --batching-delay-ms "${BATCHING_DELAY_MS}" \
+                --enable-batching-metrics
+          env:
+            - name: BATCHING_MODE
+              value: dynamic
+            - name: BATCHING_MAX_SIZE
+              value: "1"
+            - name: BATCHING_DELAY_MS
+              value: "0"
+            - name: HF_HOME
+              value: /cache/chi-misc-testing/huggingface
+            - name: HUGGINGFACE_HUB_CACHE
+              value: /cache/chi-misc-testing/huggingface/hub
+            - name: SGLANG_CACHE_DIR
+              value: /cache/chi-misc-testing/sglang
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          ports:
+            - name: http
+              containerPort: 30000
+          resources:
+            requests:
+              cpu: "16"
+              memory: 120Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "32"
+              memory: 180Gi
+              nvidia.com/gpu: "1"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 120
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 300
+            periodSeconds: 30
+            failureThreshold: 20
+          volumeMounts:
+            - name: cache
+              mountPath: /cache
+      volumes:
+        - name: cache
+          persistentVolumeClaim:
+            claimName: disk-reaper-cache-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chi-misc-testing
+  namespace: production
+  labels:
+    app: chi-misc-testing
+spec:
+  type: ClusterIP
+  selector:
+    app: chi-misc-testing
+  ports:
+    - name: http
+      port: 30000
+      targetPort: http

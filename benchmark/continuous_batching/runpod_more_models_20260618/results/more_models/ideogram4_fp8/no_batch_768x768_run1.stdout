@@ -1,0 +1,30 @@
+[06-18 01:41:49] Waiting for service at http://127.0.0.1:30240...
+[06-18 01:41:49] Service is ready.
+[06-18 01:41:49] Updated model name from server: ideogram-ai/ideogram-4-fp8
+[06-18 01:41:49] Using task from --task: text-to-image
+[06-18 01:41:49] Loading requests...
+[06-18 01:41:49] Prepared 16 requests from vbench dataset.
+[06-18 01:41:49] Running 1 warmup request(s) with num_inference_steps=1...
+[06-18 01:41:49] Warmup 1/1: latency=0.02s, success=False
+
+================= Serving Benchmark Result =================
+Task:                                         text-to-image                 
+Model:                                        ideogram-ai/ideogram-4-fp8    
+Dataset:                                      vbench                        
+--------------------------------------------------
+Benchmark duration (s):                       0.70                          
+Request rate:                                 inf                           
+Max request concurrency:                      4                             
+Successful requests:                          0/16                          
+Completed outputs:                            0                             
+Outputs per prompt:                           1                             
+--------------------------------------------------
+Request throughput (req/s):                   0.00                          
+Output throughput (outputs/s):                0.00                          
+Latency Mean (s):                             0                             
+Latency Median (s):                           0                             
+Latency P90 (s):                              0                             
+Latency P95 (s):                              0                             
+Latency P99 (s):                              0                             
+------------------------------------------------------------
+Metrics saved to /workspace/continuous-bench/results/more_models/ideogram4_fp8/no_batch_768x768_inf_run1.json
