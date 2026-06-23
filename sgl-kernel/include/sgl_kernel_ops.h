@@ -636,6 +636,15 @@ void transfer_kv_all_layer_direct_lf_pf(
     const at::Tensor& dst_indices,
     int64_t page_size);
 
+// Fused KV transfer checksum (logical order, physical-page-id independent).
+// Returns a 1-element int64 tensor holding XOR_t(per-row splitmix64 fold).
+void kv_checksum(
+    const at::Tensor& rows,
+    const at::Tensor& row_indices,
+    const std::optional<at::Tensor>& positions,
+    int64_t num_lanes,
+    at::Tensor& out);
+
 /*
  * From csrc/memory
  */
