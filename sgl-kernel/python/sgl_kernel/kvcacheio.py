@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -8,6 +8,43 @@ def is_hip() -> bool:
 
 
 _is_hip = is_hip()
+
+
+def kv_checksum(
+    rows: torch.Tensor,
+    row_indices: torch.Tensor,
+    positions: Optional[torch.Tensor] = None,
+    num_lanes: int = -1,
+) -> int:
+    """Fused KV transfer checksum over logically-ordered rows (CUDA).
+
+    Reproduces the per-row splitmix64 fold of
+    ``sglang.srt.mem_cache.kv_page_tags.hash_rows_with_positions`` and returns
+    the XOR-reduced ``combined`` int64 (signed bit pattern). The caller applies
+    the two scalar finishing mixes so the hash constants live in exactly one
+    place (``kv_page_tags``), guaranteeing bit-for-bit parity.
+
+    Args:
+        rows: ``[num_total_rows, ...]`` contiguous tensor of KV bytes; any
+            integer/byte dtype, reinterpreted as little-endian int64 lanes.
+        row_indices: int64 selected logical token indices into ``rows`` dim 0.
+            The kernel gathers these itself (no host-side ``index_select``).
+        positions: optional int64 logical positions folded in for order
+            sensitivity; must match ``row_indices`` length when given.
+        num_lanes: cap on leading int64 lanes/row to hash; ``-1`` hashes all.
+
+    Returns:
+        The ``combined`` XOR-fold as a signed python int (one host sync).
+    """
+    rows = rows.contiguous()
+    row_indices = row_indices.contiguous()
+    if positions is not None:
+        positions = positions.contiguous()
+    out = torch.empty((1,), dtype=torch.int64, device=rows.device)
+    torch.ops.sgl_kernel.kv_checksum.default(
+        rows, row_indices, positions, int(num_lanes), out
+    )
+    return int(out.item())
 
 
 def transfer_kv_per_layer(
