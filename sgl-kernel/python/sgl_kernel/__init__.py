@@ -73,6 +73,7 @@ else:
     )
     from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
     from sgl_kernel.kvcacheio import (
+        kv_checksum_direct,
         transfer_kv_all_layer,
         transfer_kv_all_layer_mla,
         transfer_kv_per_layer,
@@ -201,6 +202,7 @@ else:
         "top_p_renorm_prob",
         "topk_sigmoid",
         "topk_softmax",
+        "kv_checksum_direct",
         "transfer_kv_all_layer",
         "transfer_kv_all_layer_mla",
         "transfer_kv_per_layer",

@@ -322,6 +322,13 @@ class Envs:
     SGLANG_KV_CHECKSUM_SAMPLE_RATE = EnvFloat(0.05)
     # Fraction of each token's KV bytes hashed when mode is sampled_partial.
     SGLANG_KV_CHECKSUM_PARTIAL_BYTE_RATE = EnvFloat(0.25)
+    # Direct-KV checksum CUDA kernel gate: auto | off | strict.
+    #   auto   - use the kernel when available + layout supported, else fall back
+    #            to the row-materialized Torch reference (default).
+    #   off    - never use the kernel (pure Torch reference).
+    #   strict - require the kernel; raise if it is unavailable or the KV layout
+    #            is unsupported (no silent fallback).
+    SGLANG_KV_CHECKSUM_DIRECT_KERNEL = EnvStr("auto")
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.

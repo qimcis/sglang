@@ -636,6 +636,20 @@ void transfer_kv_all_layer_direct_lf_pf(
     const at::Tensor& dst_indices,
     int64_t page_size);
 
+// Direct-KV transfer checksum: hash K/V bytes in logical token order straight
+// from the per-layer KV-cache buffers (no [tokens, row_bytes] materialization).
+// Writes a per-row splitmix64 accumulator to `out` ([N] int64); the XOR-reduce
+// and finishing mixes are applied in Python (kv_page_tags) for bit-for-bit
+// parity with the row-materialized reference. See csrc/kvcacheio/checksum.cu.
+void kv_checksum_direct(
+    const at::Tensor& buffer_ptrs,
+    const at::Tensor& row_strides,
+    const at::Tensor& row_nbytes,
+    const at::Tensor& sel_loc,
+    const std::optional<at::Tensor>& positions,
+    int64_t num_lanes,
+    at::Tensor& out);
+
 /*
  * From csrc/memory
  */

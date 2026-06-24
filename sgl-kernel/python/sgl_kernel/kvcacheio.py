@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -8,6 +8,52 @@ def is_hip() -> bool:
 
 
 _is_hip = is_hip()
+
+
+def kv_checksum_direct(
+    buffer_ptrs: torch.Tensor,
+    row_strides: torch.Tensor,
+    row_nbytes: torch.Tensor,
+    sel_loc: torch.Tensor,
+    positions: Optional[torch.Tensor],
+    num_lanes: int,
+    out: torch.Tensor,
+) -> None:
+    """Direct-KV transfer checksum over logically-ordered KV bytes (CUDA).
+
+    Hashes K/V bytes straight from the per-layer KV-cache buffers in logical
+    token order, WITHOUT first materializing a ``[selected_tokens, row_bytes]``
+    tensor.  Reproduces the per-row splitmix64 fold of
+    ``sglang.srt.mem_cache.kv_page_tags.hash_rows_with_positions`` and writes the
+    per-row accumulator into ``out``; the caller applies the XOR-reduce and the
+    two scalar finishing mixes so the hash constants live in exactly one place
+    (``kv_page_tags``), guaranteeing bit-for-bit parity.
+
+    Args:
+        buffer_ptrs: int64 CUDA tensor ``[B]`` of ``data_ptr()`` values for each
+            K/V layer buffer, in the same order as ``gather_logical_kv_rows``
+            (``K(l0), V(l0), K(l1), V(l1), ...``).
+        row_strides: int64 CUDA tensor ``[B]`` of bytes between consecutive
+            dim-0 rows for each buffer (``buf.stride(0) * itemsize``).
+        row_nbytes: int64 CUDA tensor ``[B]`` of flattened bytes per token row
+            for each buffer; every entry must be a multiple of 8.
+        sel_loc: int64 CUDA tensor ``[N]`` of physical slots for the selected
+            logical tokens (``kv_loc[indices]``).
+        positions: optional int64 CUDA tensor ``[N]`` of logical positions folded
+            into each row hash for order sensitivity, or ``None``.
+        num_lanes: cap on leading concatenated int64 lanes per row; ``-1`` hashes
+            all lanes.
+        out: preallocated int64 CUDA tensor ``[N]`` receiving per-row accumulators.
+    """
+    torch.ops.sgl_kernel.kv_checksum_direct.default(
+        buffer_ptrs,
+        row_strides,
+        row_nbytes,
+        sel_loc,
+        positions,
+        int(num_lanes),
+        out,
+    )
 
 
 def transfer_kv_per_layer(

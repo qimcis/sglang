@@ -245,6 +245,12 @@ class KVProtectionConfig:
     checksum_sample_rate: float = 0.05
     # Fraction of each token's bytes hashed when partial-byte sampling.
     checksum_partial_byte_rate: float = 0.25
+    # Direct-KV checksum CUDA kernel gate: "auto" | "off" | "strict".
+    #   auto   - use the direct kernel when available + layout supported, else
+    #            fall back to the row-materialized Torch reference.
+    #   off    - never use the kernel (pure Torch reference).
+    #   strict - require the kernel; raise on unavailable/unsupported layout.
+    checksum_direct_kernel: str = "auto"
 
     @property
     def enabled(self) -> bool:
@@ -290,11 +296,20 @@ class KVProtectionConfig:
         byte_rate = float(envs.SGLANG_KV_CHECKSUM_PARTIAL_BYTE_RATE.get())
         byte_rate = min(max(byte_rate, 0.0), 1.0)
 
+        direct_kernel = str(envs.SGLANG_KV_CHECKSUM_DIRECT_KERNEL.get()).lower()
+        if direct_kernel not in ("auto", "off", "strict"):
+            logger.warning(
+                "Invalid SGLANG_KV_CHECKSUM_DIRECT_KERNEL=%r; using 'auto'.",
+                direct_kernel,
+            )
+            direct_kernel = "auto"
+
         return cls(
             enable_page_tags=enable_page_tags,
             checksum_mode=checksum_mode,
             checksum_sample_rate=sample_rate,
             checksum_partial_byte_rate=byte_rate,
+            checksum_direct_kernel=direct_kernel,
         )
 
 
@@ -1054,6 +1069,146 @@ def gather_logical_kv_rows(
     return torch.cat(parts, dim=1)
 
 
+def direct_kv_checksum_from_loc(
+    kv_pool: object,
+    kv_loc: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    mode: ChecksumMode,
+    config: KVProtectionConfig,
+) -> Optional[int]:
+    """Hash KV bytes directly from the cache buffers (no row materialization).
+
+    Reproduces ``hash_rows_with_positions(gather_logical_kv_rows(...))``
+    bit-for-bit using the fused ``kv_checksum_direct`` CUDA op, but WITHOUT
+    building the ``[selected_tokens, row_bytes]`` tensor: the kernel reads each
+    selected logical token's K/V bytes straight from the per-layer buffers, in
+    logical order, and folds them with the same splitmix64 chain.
+
+    Returns the full checksum on success, or ``None`` to signal the caller to use
+    the row-materialized Torch reference path.  Gated by
+    ``config.checksum_direct_kernel`` (``auto``/``off``/``strict``); in ``strict``
+    mode an unsupported layout / unavailable kernel raises instead of returning
+    ``None``.
+
+    Supported-layout requirements (else fall back / raise in strict): all K/V
+    buffers are contiguous CUDA tensors on ``kv_loc``'s device, each buffer's
+    per-token row byte count and dim-0 stride are multiples of 8 (so int64 lanes
+    never straddle a buffer boundary), and the base pointers are 8-byte aligned.
+    """
+    setting = str(getattr(config, "checksum_direct_kernel", "auto")).lower()
+    if setting == "off":
+        return None
+    strict = setting == "strict"
+
+    def _unsupported(reason: str) -> None:
+        if strict:
+            raise RuntimeError(
+                "SGLANG_KV_CHECKSUM_DIRECT_KERNEL=strict but the direct KV "
+                f"checksum kernel cannot run: {reason}. Set the gate to 'auto' "
+                "to fall back, 'off' to disable, or run a supported "
+                "(contiguous MHA/MLA, 8-byte-aligned) KV layout."
+            )
+        logger.debug("Direct KV checksum fallback: %s", reason)
+        return None
+
+    if not isinstance(kv_loc, torch.Tensor) or not kv_loc.is_cuda:
+        return _unsupported("kv_loc is not a CUDA tensor")
+    if not (hasattr(kv_pool, "get_key_buffer") and hasattr(kv_pool, "layer_num")):
+        return _unsupported(
+            f"pool {type(kv_pool).__name__!r} lacks per-layer KV accessors"
+        )
+
+    try:
+        from sgl_kernel.kvcacheio import kv_checksum_direct as _op
+    except Exception as e:  # pragma: no cover - depends on CUDA build
+        return _unsupported(f"sgl_kernel kv_checksum_direct unavailable ({e})")
+
+    # Build the buffer list in the SAME order as gather_logical_kv_rows:
+    # K(l0), V(l0)?, K(l1), V(l1)?, ...  (V skipped when the pool folds V into K).
+    buffers: List[torch.Tensor] = []
+    for layer_id in range(int(kv_pool.layer_num)):
+        buffers.append(kv_pool.get_key_buffer(layer_id))
+        try:
+            buffers.append(kv_pool.get_value_buffer(layer_id))
+        except (NotImplementedError, AttributeError):
+            pass
+    if not buffers:
+        return _unsupported("no KV buffers exposed")
+
+    device = kv_loc.device
+    ptrs: List[int] = []
+    strides: List[int] = []
+    nbytes: List[int] = []
+    total_bytes = 0
+    for buf in buffers:
+        if not isinstance(buf, torch.Tensor) or not buf.is_cuda:
+            return _unsupported("a KV buffer is not a CUDA tensor")
+        if buf.device != device:
+            return _unsupported("KV buffer / kv_loc device mismatch")
+        if not buf.is_contiguous():
+            return _unsupported("a KV buffer is not contiguous")
+        if buf.dim() < 1 or buf.shape[0] == 0:
+            return _unsupported("degenerate KV buffer shape")
+        itemsize = buf.element_size()
+        per_row_elems = 1
+        for s in buf.shape[1:]:
+            per_row_elems *= int(s)
+        row_b = per_row_elems * itemsize
+        if row_b == 0 or row_b % 8 != 0:
+            return _unsupported("per-buffer row bytes not a positive multiple of 8")
+        stride0_b = int(buf.stride(0)) * itemsize
+        if stride0_b % 8 != 0:
+            return _unsupported("per-buffer dim-0 stride not a multiple of 8")
+        base = int(buf.data_ptr())
+        if base % 8 != 0:
+            return _unsupported("KV buffer base pointer not 8-byte aligned")
+        ptrs.append(base)
+        strides.append(stride0_b)
+        nbytes.append(row_b)
+        total_bytes += row_b
+
+    num_lanes = select_checksum_byte_count(
+        total_bytes, mode, config.checksum_partial_byte_rate
+    )
+
+    indices_dev = indices.to(device=device, dtype=torch.long)
+    if indices_dev.numel() == 0:
+        return _splitmix64_scalar(_CKSUM_SEED)
+    sel_loc = kv_loc.to(torch.long).index_select(0, indices_dev)
+    positions = indices_dev  # logical positions, matching the reference path
+
+    buffer_ptrs = torch.tensor(ptrs, dtype=TAG_DTYPE, device=device)
+    row_strides = torch.tensor(strides, dtype=TAG_DTYPE, device=device)
+    row_nbytes = torch.tensor(nbytes, dtype=TAG_DTYPE, device=device)
+    out = torch.empty((sel_loc.numel(),), dtype=TAG_DTYPE, device=device)
+
+    try:
+        _op(
+            buffer_ptrs,
+            row_strides,
+            row_nbytes,
+            sel_loc,
+            positions,
+            int(num_lanes),
+            out,
+        )
+    except Exception as e:  # pragma: no cover - depends on CUDA runtime
+        if strict:
+            raise RuntimeError(f"direct KV checksum kernel failed: {e}") from e
+        logger.warning(
+            "Direct KV checksum kernel failed (%s); falling back to Torch path.", e
+        )
+        return None
+
+    # XOR-reduce + finishing mixes here so the finishing constants live in exactly
+    # one place (mirrors hash_rows_with_positions).
+    combined = _xor_reduce(out)
+    total = _mix_scalar(_CKSUM_SEED, combined)
+    total = _mix_scalar(total, int(sel_loc.numel()))
+    return total
+
+
 def compare_checksums(expected: ChecksumPlan, actual_checksum: int) -> bool:
     """Return True if the decode-side checksum matches the prefill-side plan."""
     return _to_i64(int(expected.checksum)) == _to_i64(int(actual_checksum))
@@ -1309,6 +1464,14 @@ class KVPageProtectionManager:
         )
         if indices.numel() == 0:
             return _splitmix64_scalar(_CKSUM_SEED)
+        # Fast path: hash KV bytes directly from the cache buffers (no
+        # [tokens, row_bytes] materialization).  Returns None to fall back to the
+        # row-materialized reference (or raises in strict mode).
+        direct = direct_kv_checksum_from_loc(
+            kv_pool, kv_loc, indices, mode=mode, config=self.config
+        )
+        if direct is not None:
+            return direct
         rows = gather_logical_kv_rows(kv_pool, kv_loc, indices)
         row_nbytes = (
             rows.contiguous().view(torch.uint8).reshape(rows.shape[0], -1).shape[1]
