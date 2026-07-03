@@ -9,7 +9,6 @@ import unittest
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv_page_tags import (
-    ChecksumMode,
     KVProtectionConfig,
     assert_protection_supported,
 )
@@ -36,48 +35,35 @@ class TestGating(CustomTestCase):
     def test_non_pd_is_always_disabled(self):
         with envs.SGLANG_KV_PAGE_PROTECTION.override(
             True
-        ), envs.SGLANG_KV_TRANSFER_CHECKSUM_MODE.override("always_full"):
+        ), envs.SGLANG_KV_TRANSFER_CHECKSUM.override(True):
             cfg = KVProtectionConfig.from_env(is_pd_decode=False)
         self.assertFalse(cfg.enabled)
         self.assertFalse(cfg.enable_page_tags)
-        self.assertEqual(cfg.checksum_mode, ChecksumMode.NONE)
+        self.assertFalse(cfg.checksum_enabled)
 
     def test_pd_disabled_by_default(self):
         # Neither env var set -> disabled even in PD.
         with envs.SGLANG_KV_PAGE_PROTECTION.override(
             False
-        ), envs.SGLANG_KV_TRANSFER_CHECKSUM_MODE.override("none"):
+        ), envs.SGLANG_KV_TRANSFER_CHECKSUM.override(False):
             cfg = KVProtectionConfig.from_env(is_pd_decode=True)
         self.assertFalse(cfg.enabled)
 
     def test_pd_page_tags_enabled(self):
         with envs.SGLANG_KV_PAGE_PROTECTION.override(
             True
-        ), envs.SGLANG_KV_TRANSFER_CHECKSUM_MODE.override("none"):
+        ), envs.SGLANG_KV_TRANSFER_CHECKSUM.override(False):
             cfg = KVProtectionConfig.from_env(is_pd_decode=True)
         self.assertTrue(cfg.enabled)
         self.assertTrue(cfg.enable_page_tags)
         self.assertFalse(cfg.checksum_enabled)
 
-    def test_pd_checksum_mode_parsed(self):
+    def test_pd_checksum_enabled(self):
         with envs.SGLANG_KV_PAGE_PROTECTION.override(
             False
-        ), envs.SGLANG_KV_TRANSFER_CHECKSUM_MODE.override(
-            "sampled_partial"
-        ), envs.SGLANG_KV_CHECKSUM_SAMPLE_RATE.override(
-            0.2
-        ):
+        ), envs.SGLANG_KV_TRANSFER_CHECKSUM.override(True):
             cfg = KVProtectionConfig.from_env(is_pd_decode=True)
         self.assertTrue(cfg.checksum_enabled)
-        self.assertEqual(cfg.checksum_mode, ChecksumMode.SAMPLED_PARTIAL)
-        self.assertAlmostEqual(cfg.checksum_sample_rate, 0.2)
-
-    def test_invalid_checksum_mode_falls_back_to_none(self):
-        with envs.SGLANG_KV_PAGE_PROTECTION.override(
-            False
-        ), envs.SGLANG_KV_TRANSFER_CHECKSUM_MODE.override("garbage"):
-            cfg = KVProtectionConfig.from_env(is_pd_decode=True)
-        self.assertFalse(cfg.checksum_enabled)
 
 
 class TestFailFast(CustomTestCase):
@@ -107,7 +93,7 @@ class TestFailFast(CustomTestCase):
     def test_unsupported_backend_fails_fast_for_checksum(self):
         with self.assertRaises(RuntimeError):
             assert_protection_supported(
-                KVProtectionConfig(checksum_mode=ChecksumMode.ALWAYS_FULL),
+                KVProtectionConfig(enable_transfer_checksum=True),
                 transfer_backend="nixl",
             )
 

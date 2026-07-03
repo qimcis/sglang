@@ -47,7 +47,6 @@ from __future__ import annotations
 import logging
 from bisect import bisect_right
 from dataclasses import dataclass
-from enum import Enum
 from typing import List, Optional, Sequence, Tuple
 
 import torch
@@ -147,85 +146,6 @@ def _u64(value: Optional[int]) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
-# Checksum modes
-# ---------------------------------------------------------------------------
-
-
-class ChecksumMode(Enum):
-    """Transfer checksum verification strength.
-
-    NONE          : no transfer checksums.
-    SAMPLED_PARTIAL: hash a deterministic sample of tokens, partial bytes/token.
-    SAMPLED_FULL  : hash a deterministic sample of tokens, all bytes/token.
-    ALWAYS_FULL   : hash every token, all bytes/token.
-    """
-
-    NONE = "none"
-    SAMPLED_PARTIAL = "sampled_partial"
-    SAMPLED_FULL = "sampled_full"
-    ALWAYS_FULL = "always_full"
-
-    @property
-    def enabled(self) -> bool:
-        return self is not ChecksumMode.NONE
-
-    @property
-    def is_sampled(self) -> bool:
-        return self in (ChecksumMode.SAMPLED_PARTIAL, ChecksumMode.SAMPLED_FULL)
-
-    @property
-    def is_partial_bytes(self) -> bool:
-        return self is ChecksumMode.SAMPLED_PARTIAL
-
-
-# Accept a few friendly aliases without silently misparsing typos.
-_CHECKSUM_ALIASES = {
-    "none": ChecksumMode.NONE,
-    "off": ChecksumMode.NONE,
-    "": ChecksumMode.NONE,
-    "sample_partial": ChecksumMode.SAMPLED_PARTIAL,
-    "sampled_partial": ChecksumMode.SAMPLED_PARTIAL,
-    "partial": ChecksumMode.SAMPLED_PARTIAL,
-    "sampled_full": ChecksumMode.SAMPLED_FULL,
-    "sample_full": ChecksumMode.SAMPLED_FULL,
-    "always_full": ChecksumMode.ALWAYS_FULL,
-    "full": ChecksumMode.ALWAYS_FULL,
-}
-
-
-# Stable integer codes for transmitting the mode through a numeric side channel
-# (e.g. the spare metadata-buffer slots).  Append-only; never renumber.
-_CHECKSUM_MODE_CODES = {
-    ChecksumMode.NONE: 0,
-    ChecksumMode.SAMPLED_PARTIAL: 1,
-    ChecksumMode.SAMPLED_FULL: 2,
-    ChecksumMode.ALWAYS_FULL: 3,
-}
-_CHECKSUM_CODE_TO_MODE = {code: mode for mode, code in _CHECKSUM_MODE_CODES.items()}
-
-
-def checksum_mode_to_code(mode: ChecksumMode) -> int:
-    return _CHECKSUM_MODE_CODES[mode]
-
-
-def checksum_code_to_mode(code: int) -> ChecksumMode:
-    return _CHECKSUM_CODE_TO_MODE.get(int(code), ChecksumMode.NONE)
-
-
-def parse_checksum_mode(value: Optional[str]) -> ChecksumMode:
-    """Parse a checksum-mode string; raises ValueError on an unknown value."""
-    if value is None:
-        return ChecksumMode.NONE
-    key = str(value).strip().lower()
-    if key not in _CHECKSUM_ALIASES:
-        valid = ", ".join(sorted({m.value for m in ChecksumMode}))
-        raise ValueError(
-            f"Invalid KV transfer checksum mode {value!r}; expected one of: {valid}"
-        )
-    return _CHECKSUM_ALIASES[key]
-
-
-# ---------------------------------------------------------------------------
 # Gating / configuration
 # ---------------------------------------------------------------------------
 
@@ -240,25 +160,15 @@ class KVProtectionConfig:
     """
 
     enable_page_tags: bool = False
-    checksum_mode: ChecksumMode = ChecksumMode.NONE
-    # Fraction of tokens sampled when ``checksum_mode.is_sampled``.
-    checksum_sample_rate: float = 0.05
-    # Fraction of each token's bytes hashed when partial-byte sampling.
-    checksum_partial_byte_rate: float = 0.25
-    # Direct-KV checksum CUDA kernel gate: "auto" | "off" | "strict".
-    #   auto   - use the direct kernel when available + layout supported, else
-    #            fall back to the row-materialized Torch reference.
-    #   off    - never use the kernel (pure Torch reference).
-    #   strict - require the kernel; raise on unavailable/unsupported layout.
-    checksum_direct_kernel: str = "auto"
+    enable_transfer_checksum: bool = False
 
     @property
     def enabled(self) -> bool:
-        return self.enable_page_tags or self.checksum_mode.enabled
+        return self.enable_page_tags or self.enable_transfer_checksum
 
     @property
     def checksum_enabled(self) -> bool:
-        return self.checksum_mode.enabled
+        return self.enable_transfer_checksum
 
     @staticmethod
     def disabled() -> KVProtectionConfig:
@@ -280,36 +190,14 @@ class KVProtectionConfig:
             return cls.disabled()
 
         enable_page_tags = envs.SGLANG_KV_PAGE_PROTECTION.get()
-        try:
-            checksum_mode = parse_checksum_mode(
-                envs.SGLANG_KV_TRANSFER_CHECKSUM_MODE.get()
-            )
-        except ValueError as e:
-            logger.warning("%s; disabling KV transfer checksums.", e)
-            checksum_mode = ChecksumMode.NONE
+        enable_transfer_checksum = envs.SGLANG_KV_TRANSFER_CHECKSUM.get()
 
-        if not enable_page_tags and not checksum_mode.enabled:
+        if not enable_page_tags and not enable_transfer_checksum:
             return cls.disabled()
-
-        sample_rate = float(envs.SGLANG_KV_CHECKSUM_SAMPLE_RATE.get())
-        sample_rate = min(max(sample_rate, 0.0), 1.0)
-        byte_rate = float(envs.SGLANG_KV_CHECKSUM_PARTIAL_BYTE_RATE.get())
-        byte_rate = min(max(byte_rate, 0.0), 1.0)
-
-        direct_kernel = str(envs.SGLANG_KV_CHECKSUM_DIRECT_KERNEL.get()).lower()
-        if direct_kernel not in ("auto", "off", "strict"):
-            logger.warning(
-                "Invalid SGLANG_KV_CHECKSUM_DIRECT_KERNEL=%r; using 'auto'.",
-                direct_kernel,
-            )
-            direct_kernel = "auto"
 
         return cls(
             enable_page_tags=enable_page_tags,
-            checksum_mode=checksum_mode,
-            checksum_sample_rate=sample_rate,
-            checksum_partial_byte_rate=byte_rate,
-            checksum_direct_kernel=direct_kernel,
+            enable_transfer_checksum=enable_transfer_checksum,
         )
 
 
@@ -352,8 +240,8 @@ def assert_protection_supported(
                 "KV page protection / transfer checksums are enabled but the "
                 f"active allocator {name!r} is not supported. Supported "
                 f"allocators: {SUPPORTED_ALLOCATOR_CLASSES}. Disable the feature "
-                "(SGLANG_KV_PAGE_PROTECTION=0, SGLANG_KV_TRANSFER_CHECKSUM_MODE="
-                "none) or run a supported layout (plain paged, non-SWA/non-DSA)."
+                "(SGLANG_KV_PAGE_PROTECTION=0, SGLANG_KV_TRANSFER_CHECKSUM=0) "
+                "or run a supported layout (plain paged, non-SWA/non-DSA)."
             )
 
     if is_spec_decode and config.enable_page_tags:
@@ -370,8 +258,7 @@ def assert_protection_supported(
                 "KV transfer checksums are enabled but transfer backend "
                 f"{transfer_backend!r} does not support the checksum manifest "
                 f"exchange. Supported backends: {SUPPORTED_CHECKSUM_BACKENDS}. "
-                "Set SGLANG_KV_TRANSFER_CHECKSUM_MODE=none or use a supported "
-                "backend."
+                "Set SGLANG_KV_TRANSFER_CHECKSUM=0 or use a supported backend."
             )
 
 
@@ -803,43 +690,26 @@ def verify_page_tags(
 def select_checksum_token_indices(
     num_tokens: int,
     bootstrap_room: int,
-    mode: ChecksumMode,
     sample_rate: float,
 ) -> torch.Tensor:
-    """Deterministically choose which logical token indices to checksum.
+    """Choose logical token indices to checksum.
 
-    The selection depends only on ``(num_tokens, bootstrap_room, mode,
-    sample_rate)`` -- never on physical layout -- so prefill and decode pick the
-    *same* logical tokens independently.
+    Checksums are always full-strength when enabled: every logical token is
+    included.  ``bootstrap_room`` and ``sample_rate`` are retained in the helper
+    signature only for call-site stability while mode-based sampling is removed.
     """
-    if num_tokens <= 0 or not mode.enabled:
+    del bootstrap_room, sample_rate
+    if num_tokens <= 0:
         return torch.empty(0, dtype=torch.long)
-    if not mode.is_sampled:
-        return torch.arange(num_tokens, dtype=torch.long)
-
-    k = max(1, int(round(num_tokens * sample_rate)))
-    k = min(k, num_tokens)
-    if k >= num_tokens:
-        return torch.arange(num_tokens, dtype=torch.long)
-
-    # Deterministic, layout-independent stride sampling seeded by bootstrap_room.
-    start = _splitmix64_scalar(bootstrap_room) % num_tokens
-    # Use a stride coprime-ish with num_tokens to spread samples out.
-    stride = max(1, num_tokens // k)
-    idx = (start + torch.arange(k, dtype=torch.long) * stride) % num_tokens
-    return torch.unique(idx)
+    return torch.arange(num_tokens, dtype=torch.long)
 
 
-def select_checksum_byte_count(
-    row_nbytes: int,
-    mode: ChecksumMode,
-    partial_byte_rate: float,
-) -> int:
-    """Number of leading int64 lanes per token row to hash for a given mode."""
-    lanes = max(1, row_nbytes // 8)
-    if mode.is_partial_bytes:
-        lanes = max(1, int(round(lanes * partial_byte_rate)))
-    return lanes
+def select_checksum_byte_count(row_nbytes: int) -> int:
+    """Number of leading int64 lanes per token row to hash.
+
+    Checksums are always full-byte when enabled, so this is the whole row.
+    """
+    return max(1, row_nbytes // 8)
 
 
 def hash_kv_rows(
@@ -959,16 +829,12 @@ class ChecksumPlan:
 
     bootstrap_room: int
     num_tokens: int
-    mode: ChecksumMode
-    num_lanes: Optional[int]
     checksum: int  # the prefill-side (source) checksum
 
     def to_payload(self) -> dict:
         return {
             "bootstrap_room": int(self.bootstrap_room),
             "num_tokens": int(self.num_tokens),
-            "mode": self.mode.value,
-            "num_lanes": (None if self.num_lanes is None else int(self.num_lanes)),
             "checksum": _u64(self.checksum),
         }
 
@@ -977,10 +843,6 @@ class ChecksumPlan:
         return cls(
             bootstrap_room=int(payload["bootstrap_room"]),
             num_tokens=int(payload["num_tokens"]),
-            mode=parse_checksum_mode(payload["mode"]),
-            num_lanes=(
-                None if payload["num_lanes"] is None else int(payload["num_lanes"])
-            ),
             checksum=_to_i64(int(payload["checksum"])),
         )
 
@@ -990,7 +852,6 @@ def compute_transfer_checksum(
     *,
     bootstrap_room: int,
     num_tokens: int,
-    mode: ChecksumMode,
     config: KVProtectionConfig,
     row_nbytes: Optional[int] = None,
 ) -> ChecksumPlan:
@@ -1000,9 +861,7 @@ def compute_transfer_checksum(
     logically-ordered ``rows``; identical KV bytes yield identical checksums
     regardless of physical page placement.
     """
-    indices = select_checksum_token_indices(
-        num_tokens, bootstrap_room, mode, config.checksum_sample_rate
-    )
+    indices = select_checksum_token_indices(num_tokens, bootstrap_room, 1.0)
     if row_nbytes is None:
         # Infer from the tensor.
         row_nbytes = (
@@ -1010,17 +869,11 @@ def compute_transfer_checksum(
             if rows.numel()
             else 0
         )
-    num_lanes = (
-        select_checksum_byte_count(row_nbytes, mode, config.checksum_partial_byte_rate)
-        if mode.enabled
-        else None
-    )
+    num_lanes = select_checksum_byte_count(row_nbytes)
     checksum = hash_kv_rows(rows, indices, num_lanes=num_lanes)
     return ChecksumPlan(
         bootstrap_room=bootstrap_room,
         num_tokens=num_tokens,
-        mode=mode,
-        num_lanes=num_lanes,
         checksum=checksum,
     )
 
@@ -1074,9 +927,8 @@ def direct_kv_checksum_from_loc(
     kv_loc: torch.Tensor,
     indices: torch.Tensor,
     *,
-    mode: ChecksumMode,
     config: KVProtectionConfig,
-) -> Optional[int]:
+) -> int:
     """Hash KV bytes directly from the cache buffers (no row materialization).
 
     Reproduces ``hash_rows_with_positions(gather_logical_kv_rows(...))``
@@ -1085,32 +937,22 @@ def direct_kv_checksum_from_loc(
     selected logical token's K/V bytes straight from the per-layer buffers, in
     logical order, and folds them with the same splitmix64 chain.
 
-    Returns the full checksum on success, or ``None`` to signal the caller to use
-    the row-materialized Torch reference path.  Gated by
-    ``config.checksum_direct_kernel`` (``auto``/``off``/``strict``); in ``strict``
-    mode an unsupported layout / unavailable kernel raises instead of returning
-    ``None``.
+    Returns the full checksum on success.  Unsupported layouts or a missing
+    direct CUDA op raise immediately; the serving path never silently falls back
+    to the row-materialized Torch reference.
 
-    Supported-layout requirements (else fall back / raise in strict): all K/V
-    buffers are contiguous CUDA tensors on ``kv_loc``'s device, each buffer's
-    per-token row byte count and dim-0 stride are multiples of 8 (so int64 lanes
-    never straddle a buffer boundary), and the base pointers are 8-byte aligned.
+    Supported-layout requirements: all K/V buffers are contiguous CUDA tensors
+    on ``kv_loc``'s device, each buffer's per-token row byte count and dim-0
+    stride are multiples of 8 (so int64 lanes never straddle a buffer boundary),
+    and the base pointers are 8-byte aligned.
     """
-    setting = str(getattr(config, "checksum_direct_kernel", "auto")).lower()
-    if setting == "off":
-        return None
-    strict = setting == "strict"
 
     def _unsupported(reason: str) -> None:
-        if strict:
-            raise RuntimeError(
-                "SGLANG_KV_CHECKSUM_DIRECT_KERNEL=strict but the direct KV "
-                f"checksum kernel cannot run: {reason}. Set the gate to 'auto' "
-                "to fall back, 'off' to disable, or run a supported "
-                "(contiguous MHA/MLA, 8-byte-aligned) KV layout."
-            )
-        logger.debug("Direct KV checksum fallback: %s", reason)
-        return None
+        raise RuntimeError(
+            "Direct KV checksum kernel is required but cannot run: "
+            f"{reason}. Run a supported contiguous CUDA KV layout with "
+            "8-byte-aligned rows and a built sgl_kernel.kvcacheio.kv_checksum_direct op."
+        )
 
     if not isinstance(kv_loc, torch.Tensor) or not kv_loc.is_cuda:
         return _unsupported("kv_loc is not a CUDA tensor")
@@ -1168,9 +1010,7 @@ def direct_kv_checksum_from_loc(
         nbytes.append(row_b)
         total_bytes += row_b
 
-    num_lanes = select_checksum_byte_count(
-        total_bytes, mode, config.checksum_partial_byte_rate
-    )
+    num_lanes = select_checksum_byte_count(total_bytes)
 
     indices_dev = indices.to(device=device, dtype=torch.long)
     if indices_dev.numel() == 0:
@@ -1194,12 +1034,7 @@ def direct_kv_checksum_from_loc(
             out,
         )
     except Exception as e:  # pragma: no cover - depends on CUDA runtime
-        if strict:
-            raise RuntimeError(f"direct KV checksum kernel failed: {e}") from e
-        logger.warning(
-            "Direct KV checksum kernel failed (%s); falling back to Torch path.", e
-        )
-        return None
+        raise RuntimeError(f"direct KV checksum kernel failed: {e}") from e
 
     # XOR-reduce + finishing mixes here so the finishing constants live in exactly
     # one place (mirrors hash_rows_with_positions).
@@ -1445,7 +1280,6 @@ class KVPageProtectionManager:
             rows,
             bootstrap_room=bootstrap_room,
             num_tokens=num_tokens,
-            mode=self.config.checksum_mode,
             config=self.config,
         )
 
@@ -1456,32 +1290,15 @@ class KVPageProtectionManager:
         *,
         bootstrap_room: int,
         num_tokens: int,
-        mode: ChecksumMode,
     ) -> int:
         """Gather only the sampled logical-token rows and hash them."""
-        indices = select_checksum_token_indices(
-            num_tokens, bootstrap_room, mode, self.config.checksum_sample_rate
-        )
+        indices = select_checksum_token_indices(num_tokens, bootstrap_room, 1.0)
         if indices.numel() == 0:
             return _splitmix64_scalar(_CKSUM_SEED)
-        # Fast path: hash KV bytes directly from the cache buffers (no
-        # [tokens, row_bytes] materialization).  Returns None to fall back to the
-        # row-materialized reference (or raises in strict mode).
-        direct = direct_kv_checksum_from_loc(
-            kv_pool, kv_loc, indices, mode=mode, config=self.config
-        )
-        if direct is not None:
-            return direct
-        rows = gather_logical_kv_rows(kv_pool, kv_loc, indices)
-        row_nbytes = (
-            rows.contiguous().view(torch.uint8).reshape(rows.shape[0], -1).shape[1]
-            if rows.numel()
-            else 0
-        )
-        num_lanes = select_checksum_byte_count(
-            row_nbytes, mode, self.config.checksum_partial_byte_rate
-        )
-        return hash_rows_with_positions(rows, positions=indices, num_lanes=num_lanes)
+        # Hash KV bytes directly from the cache buffers (no [tokens, row_bytes]
+        # materialization).  The direct CUDA kernel is required; unsupported
+        # layouts or missing ops raise instead of silently falling back.
+        return direct_kv_checksum_from_loc(kv_pool, kv_loc, indices, config=self.config)
 
     def compute_source_checksum_from_loc(
         self,
@@ -1494,22 +1311,16 @@ class KVPageProtectionManager:
         """Prefill side: gather + hash source KV bytes (logical order)."""
         if not self.config.checksum_enabled:
             return None
-        mode = self.config.checksum_mode
         checksum = self._checksum_from_loc(
             kv_pool,
             kv_loc,
             bootstrap_room=bootstrap_room,
             num_tokens=num_tokens,
-            mode=mode,
         )
-        indices = select_checksum_token_indices(
-            num_tokens, bootstrap_room, mode, self.config.checksum_sample_rate
-        )
+        indices = select_checksum_token_indices(num_tokens, bootstrap_room, 1.0)
         return ChecksumPlan(
             bootstrap_room=bootstrap_room,
             num_tokens=num_tokens,
-            mode=mode,
-            num_lanes=None,
             checksum=checksum,
         )
 
@@ -1531,7 +1342,6 @@ class KVPageProtectionManager:
             kv_loc,
             bootstrap_room=bootstrap_room,
             num_tokens=num_tokens,
-            mode=expected.mode,
         )
         if self.metrics is not None:
             self.metrics.increment_kv_transfer_checksum_checked_pages(int(num_tokens))
@@ -1563,7 +1373,6 @@ class KVPageProtectionManager:
             rows,
             bootstrap_room=bootstrap_room,
             num_tokens=num_tokens,
-            mode=expected.mode,
             config=self.config,
             row_nbytes=None,
         )

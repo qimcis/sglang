@@ -316,19 +316,9 @@ class Envs:
     # Enable a sidecar uint64 page-tag buffer that detects stale/wrong/mid-decode
     # KV page reuse before decode attention reads pages.
     SGLANG_KV_PAGE_PROTECTION = EnvBool(False)
-    # Transfer checksum strength: none | sampled_partial | sampled_full | always_full
-    SGLANG_KV_TRANSFER_CHECKSUM_MODE = EnvStr("none")
-    # Fraction of tokens sampled when the checksum mode is sampled_*.
-    SGLANG_KV_CHECKSUM_SAMPLE_RATE = EnvFloat(0.05)
-    # Fraction of each token's KV bytes hashed when mode is sampled_partial.
-    SGLANG_KV_CHECKSUM_PARTIAL_BYTE_RATE = EnvFloat(0.25)
-    # Direct-KV checksum CUDA kernel gate: auto | off | strict.
-    #   auto   - use the kernel when available + layout supported, else fall back
-    #            to the row-materialized Torch reference (default).
-    #   off    - never use the kernel (pure Torch reference).
-    #   strict - require the kernel; raise if it is unavailable or the KV layout
-    #            is unsupported (no silent fallback).
-    SGLANG_KV_CHECKSUM_DIRECT_KERNEL = EnvStr("auto")
+    # Enable full direct-KV transfer checksums. When enabled, every transferred
+    # token row is checksummed and the direct CUDA kernel is required.
+    SGLANG_KV_TRANSFER_CHECKSUM = EnvBool(False)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.

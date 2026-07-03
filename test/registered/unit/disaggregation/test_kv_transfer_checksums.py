@@ -10,17 +10,14 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.kv_page_tags import (
-    ChecksumMode,
     ChecksumPlan,
     KVChecksumError,
     KVPageProtectionManager,
     KVProtectionConfig,
-    checksum_code_to_mode,
-    checksum_mode_to_code,
+    compare_checksums,
     compute_transfer_checksum,
     direct_kv_checksum_from_loc,
     gather_logical_kv_rows,
-    parse_checksum_mode,
     select_checksum_token_indices,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -60,11 +57,11 @@ class TestChecksumRowLevel(CustomTestCase):
         torch.manual_seed(0)
         self.N = 16
         self.rows = torch.randint(0, 1000, (self.N, 8), dtype=torch.int32)
-        self.cfg = KVProtectionConfig(checksum_mode=ChecksumMode.ALWAYS_FULL)
+        self.cfg = KVProtectionConfig(enable_transfer_checksum=True)
 
-    def _cksum(self, rows, mode=ChecksumMode.ALWAYS_FULL):
+    def _cksum(self, rows):
         return compute_transfer_checksum(
-            rows, bootstrap_room=42, num_tokens=self.N, mode=mode, config=self.cfg
+            rows, bootstrap_room=42, num_tokens=self.N, config=self.cfg
         ).checksum
 
     def test_identical_bytes_match(self):
@@ -85,7 +82,7 @@ class TestChecksumExcludesPhysicalPageIds(CustomTestCase):
     """The core acceptance criterion from the prior rejected patch."""
 
     def _manager(self, metrics=None):
-        cfg = KVProtectionConfig(checksum_mode=ChecksumMode.ALWAYS_FULL)
+        cfg = KVProtectionConfig(enable_transfer_checksum=True)
         return KVPageProtectionManager(
             cfg,
             allocator=None,
@@ -104,18 +101,17 @@ class TestChecksumExcludesPhysicalPageIds(CustomTestCase):
         }
         loc_src = torch.tensor([5, 6, 7, 20, 21, 22, 40, 41, 42, 50])
         mgr = self._manager()
-        plan = mgr.compute_source_checksum_from_loc(
-            _FakePool(src), loc_src, bootstrap_room=99, num_tokens=N
-        )
+        rows_src = gather_logical_kv_rows(_FakePool(src), loc_src, torch.arange(N))
+        plan = mgr.compute_source_checksum(rows_src, bootstrap_room=99, num_tokens=N)
 
         # Decode places the SAME logical content at DIFFERENT physical slots.
         loc_dst = torch.tensor([1, 2, 3, 4, 8, 9, 10, 11, 12, 13])
         dst = {l: torch.zeros(size, h, d, dtype=torch.int32) for l in range(L)}
         for l in range(L):
             dst[l][loc_dst] = src[l][loc_src]
-        err = mgr.verify_destination_checksum_from_loc(
-            _FakePool(dst),
-            loc_dst,
+        rows_dst = gather_logical_kv_rows(_FakePool(dst), loc_dst, torch.arange(N))
+        err = mgr.verify_destination_checksum(
+            rows_dst,
             bootstrap_room=99,
             num_tokens=N,
             expected=plan,
@@ -131,14 +127,13 @@ class TestChecksumExcludesPhysicalPageIds(CustomTestCase):
         }
         loc_src = torch.arange(N)
         mgr = self._manager(_FakeMetrics())
-        plan = mgr.compute_source_checksum_from_loc(
-            _FakePool(src), loc_src, bootstrap_room=7, num_tokens=N
-        )
+        rows_src = gather_logical_kv_rows(_FakePool(src), loc_src, torch.arange(N))
+        plan = mgr.compute_source_checksum(rows_src, bootstrap_room=7, num_tokens=N)
         dst = {l: src[l].clone() for l in range(L)}
         dst[0][3, 0, 0] += 1  # flip a destination byte
-        err = mgr.verify_destination_checksum_from_loc(
-            _FakePool(dst),
-            loc_src,
+        rows_dst = gather_logical_kv_rows(_FakePool(dst), loc_src, torch.arange(N))
+        err = mgr.verify_destination_checksum(
+            rows_dst,
             bootstrap_room=7,
             num_tokens=N,
             expected=plan,
@@ -154,53 +149,21 @@ class TestChecksumExcludesPhysicalPageIds(CustomTestCase):
             gather_logical_kv_rows(BadPool(), torch.arange(4), torch.arange(4))
 
 
-class TestChecksumModesAndSampling(CustomTestCase):
-    def test_parse_modes(self):
-        self.assertEqual(parse_checksum_mode("none"), ChecksumMode.NONE)
-        self.assertEqual(
-            parse_checksum_mode("sampled_partial"), ChecksumMode.SAMPLED_PARTIAL
-        )
-        self.assertEqual(
-            parse_checksum_mode("sample_partial"), ChecksumMode.SAMPLED_PARTIAL
-        )
-        self.assertEqual(parse_checksum_mode("sampled_full"), ChecksumMode.SAMPLED_FULL)
-        self.assertEqual(parse_checksum_mode("always_full"), ChecksumMode.ALWAYS_FULL)
-
-    def test_parse_invalid_raises(self):
-        with self.assertRaises(ValueError):
-            parse_checksum_mode("bogus")
-
-    def test_sampling_is_deterministic(self):
-        a = select_checksum_token_indices(100, 42, ChecksumMode.SAMPLED_PARTIAL, 0.1)
-        b = select_checksum_token_indices(100, 42, ChecksumMode.SAMPLED_PARTIAL, 0.1)
-        self.assertTrue(torch.equal(a, b))
-        self.assertGreater(a.numel(), 0)
-        self.assertLessEqual(a.numel(), 100)
-
-    def test_always_full_selects_all(self):
-        idx = select_checksum_token_indices(50, 1, ChecksumMode.ALWAYS_FULL, 0.05)
+class TestChecksumSelectionAndPayload(CustomTestCase):
+    def test_selects_all_tokens(self):
+        idx = select_checksum_token_indices(50, 1, 1.0)
         self.assertEqual(idx.numel(), 50)
-
-    def test_mode_code_roundtrip(self):
-        for mode in ChecksumMode:
-            self.assertEqual(checksum_code_to_mode(checksum_mode_to_code(mode)), mode)
 
     def test_plan_payload_roundtrip(self):
         plan = ChecksumPlan(
             bootstrap_room=5,
             num_tokens=12,
-            mode=ChecksumMode.SAMPLED_FULL,
-            num_lanes=3,
             checksum=(1 << 63) + 123,  # exercises uint64 bit pattern
         )
         restored = ChecksumPlan.from_payload(plan.to_payload())
         self.assertEqual(restored.bootstrap_room, plan.bootstrap_room)
         self.assertEqual(restored.num_tokens, plan.num_tokens)
-        self.assertEqual(restored.mode, plan.mode)
-        self.assertEqual(restored.num_lanes, plan.num_lanes)
         # checksum compares equal as int64 bit patterns
-        from sglang.srt.mem_cache.kv_page_tags import compare_checksums
-
         self.assertTrue(compare_checksums(plan, restored.checksum))
 
 
@@ -219,15 +182,11 @@ class _FakePoolKV:
         return self._v[layer_id]
 
 
-class TestDirectKernelGating(CustomTestCase):
-    """The direct-KV checksum kernel is CUDA-only; on CPU it must fall back
-    cleanly (auto) or fail explicitly (strict), preserving all semantics."""
+class TestDirectKernelRequired(CustomTestCase):
+    """The direct-KV checksum kernel is required for loc-based checksums."""
 
-    def _manager(self, direct_kernel):
-        cfg = KVProtectionConfig(
-            checksum_mode=ChecksumMode.ALWAYS_FULL,
-            checksum_direct_kernel=direct_kernel,
-        )
+    def _manager(self):
+        cfg = KVProtectionConfig(enable_transfer_checksum=True)
         return KVPageProtectionManager(
             cfg,
             allocator=None,
@@ -237,51 +196,19 @@ class TestDirectKernelGating(CustomTestCase):
             transfer_backend="mooncake",
         )
 
-    def test_auto_falls_back_on_cpu(self):
-        # On a CPU pool the kernel is unavailable -> direct path returns None.
+    def test_direct_kernel_raises_on_cpu(self):
         k = [torch.randn(32, 2, 8) for _ in range(2)]
         v = [torch.randn(32, 2, 8) for _ in range(2)]
-        cfg = KVProtectionConfig(
-            checksum_mode=ChecksumMode.ALWAYS_FULL, checksum_direct_kernel="auto"
-        )
-        idx = torch.arange(8)
-        got = direct_kv_checksum_from_loc(
-            _FakePoolKV(k, v), torch.arange(32), idx, mode=cfg.checksum_mode, config=cfg
-        )
-        self.assertIsNone(got)
-
-    def test_strict_raises_on_cpu(self):
-        k = [torch.randn(32, 2, 8) for _ in range(2)]
-        v = [torch.randn(32, 2, 8) for _ in range(2)]
-        cfg = KVProtectionConfig(
-            checksum_mode=ChecksumMode.ALWAYS_FULL, checksum_direct_kernel="strict"
-        )
+        cfg = KVProtectionConfig(enable_transfer_checksum=True)
         with self.assertRaises(RuntimeError):
             direct_kv_checksum_from_loc(
                 _FakePoolKV(k, v),
                 torch.arange(32),
                 torch.arange(8),
-                mode=cfg.checksum_mode,
                 config=cfg,
             )
 
-    def test_off_returns_none(self):
-        k = [torch.randn(32, 2, 8)]
-        v = [torch.randn(32, 2, 8)]
-        cfg = KVProtectionConfig(
-            checksum_mode=ChecksumMode.ALWAYS_FULL, checksum_direct_kernel="off"
-        )
-        got = direct_kv_checksum_from_loc(
-            _FakePoolKV(k, v),
-            torch.arange(32),
-            torch.arange(8),
-            mode=cfg.checksum_mode,
-            config=cfg,
-        )
-        self.assertIsNone(got)
-
-    def test_manager_checksum_matches_across_gates_on_cpu(self):
-        # auto (falls back) and off must produce the identical CPU checksum.
+    def test_manager_loc_checksum_raises_on_cpu(self):
         torch.manual_seed(7)
         size, h, d, L, N = 64, 2, 4, 2, 10
         k = {
@@ -291,15 +218,11 @@ class TestDirectKernelGating(CustomTestCase):
             l: torch.randint(0, 100, (size, h, d), dtype=torch.int32) for l in range(L)
         }
         loc = torch.arange(N)
-        auto = self._manager("auto")
-        off = self._manager("off")
-        ca = auto.compute_source_checksum_from_loc(
-            _FakePoolKV(k, v), loc, bootstrap_room=3, num_tokens=N
-        )
-        co = off.compute_source_checksum_from_loc(
-            _FakePoolKV(k, v), loc, bootstrap_room=3, num_tokens=N
-        )
-        self.assertEqual(ca.checksum, co.checksum)
+        manager = self._manager()
+        with self.assertRaises(RuntimeError):
+            manager.compute_source_checksum_from_loc(
+                _FakePoolKV(k, v), loc, bootstrap_room=3, num_tokens=N
+            )
 
 
 if __name__ == "__main__":

@@ -375,9 +375,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         self.scheduler.kv_protection_manager = manager
         logger.info(
-            "KV page protection enabled (page_tags=%s, checksum_mode=%s)",
+            "KV page protection enabled (page_tags=%s, transfer_checksum=%s)",
             config.enable_page_tags,
-            config.checksum_mode.value,
+            config.checksum_enabled,
         )
 
         if (
@@ -1651,23 +1651,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if manager is None or not manager.config.checksum_enabled:
             return False
         try:
-            from sglang.srt.mem_cache.kv_page_tags import (
-                ChecksumPlan,
-                checksum_code_to_mode,
-            )
+            from sglang.srt.mem_cache.kv_page_tags import ChecksumPlan
 
-            # Slot map: 0=room 1=checksum 2=num_tokens 3=checksum_mode_code.
-            mode_code = int(meta_bootstrap_room[3].item())
-            mode = checksum_code_to_mode(mode_code)
-            if not mode.enabled:
+            # Slot map: 0=room 1=checksum 2=num_tokens 3=checksum_present.
+            if int(meta_bootstrap_room[3].item()) == 0:
                 return False
             num_tokens = int(meta_bootstrap_room[2].item())
             checksum_u64 = int(meta_bootstrap_room[1].item())
             expected = ChecksumPlan(
                 bootstrap_room=req.bootstrap_room or 0,
                 num_tokens=num_tokens,
-                mode=mode,
-                num_lanes=None,
                 checksum=checksum_u64,
             )
             if num_tokens <= 0 or req.req_pool_idx is None:

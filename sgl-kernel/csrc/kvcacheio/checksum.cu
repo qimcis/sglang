@@ -1,21 +1,8 @@
-// Direct-KV transfer checksum kernel for PD disaggregation.
+// Direct-KV transfer checksum for PD disaggregation.
 //
-// Hashes K/V cache bytes in *logical token order* directly from the per-layer
-// KV-cache buffers, WITHOUT first materializing a `[selected_tokens, row_bytes]`
-// tensor (which `gather_logical_kv_rows` does in the Torch reference path).
-//
-// Bit-for-bit parity with
-// `sglang.srt.mem_cache.kv_page_tags.hash_rows_with_positions`:
-//
-//   acc = CKSUM_SEED
-//   if positions: acc = splitmix64(acc ^ position)
-//   for lane in concatenated_int64_lanes(K(l0),V(l0),K(l1),V(l1),...)[:num_lanes]:
-//       acc = splitmix64(acc ^ lane)
-//   out[row] = acc        # XOR-reduce + finishing mixes happen in Python
-//
-// The per-lane fold is a strict serial chain (splitmix64 is NOT associative),
-// so parallelism is *across rows*: one warp per selected token, with coalesced
-// vector loads fed to lane 0 (which carries the serial chain) in lane order.
+// One warp hashes one logical token row directly from K/V cache buffers. The
+// digest mixes logical token position plus each 8-byte KV lane with splitmix64;
+// Python XOR-reduces the per-row outputs into the final checksum.
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>

@@ -13,7 +13,6 @@ import pytest
 import torch
 
 from sglang.srt.mem_cache.kv_page_tags import (
-    ChecksumMode,
     KVProtectionConfig,
     direct_kv_checksum_from_loc,
     gather_logical_kv_rows,
@@ -53,38 +52,30 @@ class _Pool:
         return self._v[layer_id]
 
 
-def _reference(pool, kv_loc, indices, mode, cfg):
+def _reference(pool, kv_loc, indices):
     rows = gather_logical_kv_rows(pool, kv_loc, indices)
     row_nbytes = (
         rows.contiguous().view(torch.uint8).reshape(rows.shape[0], -1).shape[1]
         if rows.numel()
         else 0
     )
-    num_lanes = select_checksum_byte_count(
-        row_nbytes, mode, cfg.checksum_partial_byte_rate
-    )
+    num_lanes = select_checksum_byte_count(row_nbytes)
     return hash_rows_with_positions(rows, positions=indices, num_lanes=num_lanes)
 
 
-def _run(pool, kv_loc, num_tokens, mode, cfg, room=99):
-    indices = select_checksum_token_indices(
-        num_tokens, room, mode, cfg.checksum_sample_rate
-    )
-    ref = _reference(pool, kv_loc, indices, mode, cfg)
-    got = direct_kv_checksum_from_loc(pool, kv_loc, indices, mode=mode, config=cfg)
+def _run(pool, kv_loc, num_tokens, cfg, room=99):
+    indices = select_checksum_token_indices(num_tokens, room, 1.0)
+    ref = _reference(pool, kv_loc, indices)
+    got = direct_kv_checksum_from_loc(pool, kv_loc, indices, config=cfg)
     return ref, got
 
 
 @pytest.mark.skipif(not _have_op(), reason="sgl_kernel.kv_checksum_direct not built")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.int8])
-@pytest.mark.parametrize(
-    "mode",
-    [ChecksumMode.ALWAYS_FULL, ChecksumMode.SAMPLED_FULL, ChecksumMode.SAMPLED_PARTIAL],
-)
-def test_mha_parity(dtype, mode):
+def test_mha_parity(dtype):
     torch.manual_seed(0)
     size, h, d, L, N = 256, 4, 16, 6, 48
-    cfg = KVProtectionConfig(checksum_mode=mode, checksum_direct_kernel="auto")
+    cfg = KVProtectionConfig(enable_transfer_checksum=True)
     if dtype == torch.int8:
         k = [
             torch.randint(-120, 120, (size, h, d), dtype=dtype, device="cuda")
@@ -99,27 +90,24 @@ def test_mha_parity(dtype, mode):
         v = [torch.randn(size, h, d, dtype=dtype, device="cuda") for _ in range(L)]
     pool = _Pool(k, v)
     kv_loc = torch.randperm(size, device="cuda")[:N].contiguous()
-    ref, got = _run(pool, kv_loc, N, mode, cfg)
+    ref, got = _run(pool, kv_loc, N, cfg)
     assert got is not None, "direct path unexpectedly fell back"
     assert ref == got, f"mismatch: ref={ref} got={got}"
 
 
 @pytest.mark.skipif(not _have_op(), reason="sgl_kernel.kv_checksum_direct not built")
-@pytest.mark.parametrize(
-    "mode", [ChecksumMode.ALWAYS_FULL, ChecksumMode.SAMPLED_PARTIAL]
-)
-def test_mla_k_only_parity(mode):
+def test_mla_k_only_parity():
     """MLA-style pool: get_value_buffer raises -> only K is hashed."""
     torch.manual_seed(1)
     size, lora, L, N = 256, 64, 4, 40
-    cfg = KVProtectionConfig(checksum_mode=mode, checksum_direct_kernel="auto")
+    cfg = KVProtectionConfig(enable_transfer_checksum=True)
     k = [
         torch.randn(size, 1, lora, dtype=torch.bfloat16, device="cuda")
         for _ in range(L)
     ]
     pool = _Pool(k, v_buffers=None)
     kv_loc = torch.randperm(size, device="cuda")[:N].contiguous()
-    ref, got = _run(pool, kv_loc, N, mode, cfg)
+    ref, got = _run(pool, kv_loc, N, cfg)
     assert got is not None
     assert ref == got
 
@@ -128,9 +116,7 @@ def test_mla_k_only_parity(mode):
 def test_same_logical_bytes_different_slots_match():
     torch.manual_seed(2)
     size, h, d, L, N = 128, 2, 16, 3, 12
-    cfg = KVProtectionConfig(
-        checksum_mode=ChecksumMode.ALWAYS_FULL, checksum_direct_kernel="auto"
-    )
+    cfg = KVProtectionConfig(enable_transfer_checksum=True)
     src_k = [
         torch.randn(size, h, d, dtype=torch.float16, device="cuda") for _ in range(L)
     ]
@@ -145,12 +131,8 @@ def test_same_logical_bytes_different_slots_match():
         dst_k[l][loc_dst] = src_k[l][loc_src]
         dst_v[l][loc_dst] = src_v[l][loc_src]
     idx = torch.arange(N)
-    a = direct_kv_checksum_from_loc(
-        _Pool(src_k, src_v), loc_src, idx, mode=cfg.checksum_mode, config=cfg
-    )
-    b = direct_kv_checksum_from_loc(
-        _Pool(dst_k, dst_v), loc_dst, idx, mode=cfg.checksum_mode, config=cfg
-    )
+    a = direct_kv_checksum_from_loc(_Pool(src_k, src_v), loc_src, idx, config=cfg)
+    b = direct_kv_checksum_from_loc(_Pool(dst_k, dst_v), loc_dst, idx, config=cfg)
     assert a is not None and a == b
 
 
@@ -158,62 +140,39 @@ def test_same_logical_bytes_different_slots_match():
 def test_corruption_detected():
     torch.manual_seed(3)
     size, h, d, L, N = 128, 2, 16, 2, 16
-    cfg = KVProtectionConfig(
-        checksum_mode=ChecksumMode.ALWAYS_FULL, checksum_direct_kernel="auto"
-    )
+    cfg = KVProtectionConfig(enable_transfer_checksum=True)
     k = [torch.randn(size, h, d, dtype=torch.float16, device="cuda") for _ in range(L)]
     v = [torch.randn(size, h, d, dtype=torch.float16, device="cuda") for _ in range(L)]
     kv_loc = torch.arange(N, device="cuda")
     idx = torch.arange(N)
-    base = direct_kv_checksum_from_loc(
-        _Pool(k, v), kv_loc, idx, mode=cfg.checksum_mode, config=cfg
-    )
+    base = direct_kv_checksum_from_loc(_Pool(k, v), kv_loc, idx, config=cfg)
     k[0][5, 1, 3] += 1.0
-    bad = direct_kv_checksum_from_loc(
-        _Pool(k, v), kv_loc, idx, mode=cfg.checksum_mode, config=cfg
-    )
+    bad = direct_kv_checksum_from_loc(_Pool(k, v), kv_loc, idx, config=cfg)
     assert base != bad
 
 
 @pytest.mark.skipif(not _have_op(), reason="sgl_kernel.kv_checksum_direct not built")
 def test_empty_selection():
-    cfg = KVProtectionConfig(
-        checksum_mode=ChecksumMode.ALWAYS_FULL, checksum_direct_kernel="auto"
-    )
+    cfg = KVProtectionConfig(enable_transfer_checksum=True)
     k = [torch.randn(16, 2, 16, dtype=torch.float16, device="cuda")]
     pool = _Pool(k, None)
     kv_loc = torch.arange(16, device="cuda")
     idx = torch.arange(0)  # empty
-    got = direct_kv_checksum_from_loc(
-        pool, kv_loc, idx, mode=cfg.checksum_mode, config=cfg
-    )
+    got = direct_kv_checksum_from_loc(pool, kv_loc, idx, config=cfg)
     from sglang.srt.mem_cache.kv_page_tags import _CKSUM_SEED, _splitmix64_scalar
 
     assert got == _splitmix64_scalar(_CKSUM_SEED)
 
 
-def test_cpu_falls_back_and_strict_raises():
-    """No CUDA op needed: auto -> None on CPU pool, strict -> RuntimeError."""
+def test_cpu_requires_direct_kernel():
+    """No CUDA op needed: CPU pool cannot run the required direct kernel."""
     k = [torch.randn(16, 2, 8, dtype=torch.float32)]
     pool = _Pool(k, None)
     kv_loc = torch.arange(16)
     idx = torch.arange(4)
-    auto = KVProtectionConfig(
-        checksum_mode=ChecksumMode.ALWAYS_FULL, checksum_direct_kernel="auto"
-    )
-    assert (
-        direct_kv_checksum_from_loc(
-            pool, kv_loc, idx, mode=auto.checksum_mode, config=auto
-        )
-        is None
-    )
-    strict = KVProtectionConfig(
-        checksum_mode=ChecksumMode.ALWAYS_FULL, checksum_direct_kernel="strict"
-    )
+    cfg = KVProtectionConfig(enable_transfer_checksum=True)
     with pytest.raises(RuntimeError):
-        direct_kv_checksum_from_loc(
-            pool, kv_loc, idx, mode=strict.checksum_mode, config=strict
-        )
+        direct_kv_checksum_from_loc(pool, kv_loc, idx, config=cfg)
 
 
 if __name__ == "__main__":
