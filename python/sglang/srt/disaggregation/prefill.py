@@ -146,7 +146,7 @@ class PrefillBootstrapQueue:
             )
         self.kv_manager = self._init_kv_manager()
 
-        # KV transfer checksum (prefill side, gated). Page tags are a
+        # KV transfer checksum (prefill side, gated). Attention tags are a
         # decode-side concept, so the prefill manager is checksum-only.
         self._init_kv_protection()
 
@@ -159,9 +159,9 @@ class PrefillBootstrapQueue:
         )
 
         config = KVProtectionConfig.from_env(is_pd_decode=True)
-        # Prefill only needs the transfer-checksum half; disable page tags so we
+        # Prefill only needs the transfer-checksum half; disable attention tags so we
         # do not attach a sidecar table / bump generations on the prefill side.
-        config = dataclasses.replace(config, enable_page_tags=False)
+        config = dataclasses.replace(config, enable_attention_tags=False)
         if not config.checksum_enabled:
             self.scheduler.kv_protection_manager = getattr(
                 self.scheduler, "kv_protection_manager", None
@@ -649,6 +649,45 @@ class SchedulerDisaggregationPrefillMixin:
                 idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
             }
 
+        checksum_batch = None
+        checksum_reqs: List[Req] = []
+        manager = getattr(self, "kv_protection_manager", None)
+        if manager is not None and manager.config.checksum_enabled:
+            req_pool_indices = []
+            bootstrap_rooms = []
+            num_tokens = []
+            for i, req in enumerate(batch.reqs):
+                if req.inflight_middle_chunks > 0:
+                    continue
+                if (
+                    i in optimistic_polls
+                    and optimistic_polls[i] != KVPoll.WaitingForInput
+                ):
+                    continue
+                seq_len = min(req.fill_len, len(req.origin_input_ids))
+                if seq_len <= 0 or req.req_pool_idx is None:
+                    continue
+                checksum_reqs.append(req)
+                req_pool_indices.append(int(req.req_pool_idx))
+                bootstrap_rooms.append(int(req.bootstrap_room or 0))
+                num_tokens.append(int(seq_len))
+            if checksum_reqs:
+                try:
+                    kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+                    checksum_batch = manager.begin_transfer_checksums_from_table(
+                        kv_pool,
+                        self.req_to_token_pool.req_to_token,
+                        req_pool_indices=req_pool_indices,
+                        bootstrap_rooms=bootstrap_rooms,
+                        num_tokens=num_tokens,
+                    )
+                except Exception as e:
+                    logger.error("KV transfer checksum batch launch failed: %s", e)
+                    checksum_batch = None
+                    checksum_reqs = []
+
+        final_send_reqs: List[Req] = []
+
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
@@ -689,8 +728,7 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                self.send_kv_chunk(req, last_chunk=True)
-                req.time_stats.set_prefill_transfer_queue_entry_time()
+                final_send_reqs.append(req)
 
                 if req.grammar is not None:
                     try:
@@ -743,6 +781,21 @@ class SchedulerDisaggregationPrefillMixin:
                     ), f"Req {req.rid} does not have metadata buffer allocated"
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
+
+        if checksum_batch is not None:
+            try:
+                for req, plan in zip(
+                    checksum_reqs, checksum_batch.finalize(), strict=True
+                ):
+                    req.kv_transfer_checksum = plan
+            except Exception as e:
+                logger.error("KV transfer checksum batch finalize failed: %s", e)
+                for req in checksum_reqs:
+                    req.kv_transfer_checksum = None
+
+        for req in final_send_reqs:
+            self.send_kv_chunk(req, last_chunk=True)
+            req.time_stats.set_prefill_transfer_queue_entry_time()
 
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
@@ -1052,7 +1105,8 @@ class SchedulerDisaggregationPrefillMixin:
             # Compute the source KV transfer checksum (gated) over the full
             # prompt in logical token order before publishing metadata, so the
             # decode side can prove the bytes copied correctly.
-            self._maybe_compute_transfer_checksum(req)
+            if getattr(req, "kv_transfer_checksum", None) is None:
+                self._maybe_compute_transfer_checksum(req)
             self.disagg_metadata_buffers.set_buf(req)
 
             # fill_ids includes the token sampled during prefill, but decode

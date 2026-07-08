@@ -137,7 +137,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # Newly allocated physical pages: bump their generation (gated; no-op
         # unless a page-tag table is attached).
-        if self.page_tag_table is not None:
+        if self.attention_tag_table is not None:
             self._bump_page_generations(out_pages)
 
         out_indices = (
@@ -194,7 +194,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
-        if self.page_tag_table is not None and num_new_pages > 0:
+        if self.attention_tag_table is not None and num_new_pages > 0:
             self._bump_page_generations(self.free_pages[:num_new_pages])
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
@@ -235,7 +235,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
-        if self.page_tag_table is not None and num_new_pages > 0:
+        if self.attention_tag_table is not None and num_new_pages > 0:
             self._bump_page_generations(self.free_pages[:num_new_pages])
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
@@ -246,6 +246,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.is_not_in_free_group:
             free_page_indices = torch.unique(free_index // self.page_size)
+            free_page_indices = self._filter_transfer_pinned_pages(free_page_indices)
+            if free_page_indices.numel() == 0:
+                return
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:
@@ -264,6 +267,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._clear_transfer_page_pins()
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)

@@ -23,11 +23,9 @@ def kv_checksum_direct(
 
     Hashes K/V bytes straight from the per-layer KV-cache buffers in logical
     token order, WITHOUT first materializing a ``[selected_tokens, row_bytes]``
-    tensor.  Reproduces the per-row splitmix64 fold of
-    ``sglang.srt.mem_cache.kv_page_tags.hash_rows_with_positions`` and writes the
-    per-row accumulator into ``out``; the caller applies the XOR-reduce and the
-    two scalar finishing mixes so the hash constants live in exactly one place
-    (``kv_page_tags``), guaranteeing bit-for-bit parity.
+    tensor.  Each 8-byte lane is an independent 32-bit chunk hash salted by
+    logical position and chunk offset; the caller applies the XOR-reduce and
+    finishing mix.
 
     Args:
         buffer_ptrs: int64 CUDA tensor ``[B]`` of ``data_ptr()`` values for each
@@ -43,7 +41,8 @@ def kv_checksum_direct(
             into each row hash for order sensitivity, or ``None``.
         num_lanes: cap on leading concatenated int64 lanes per row; ``-1`` hashes
             all lanes.
-        out: preallocated int64 CUDA tensor ``[N]`` receiving per-row accumulators.
+        out: preallocated int64 CUDA tensor ``[N]`` receiving per-row uint32
+            checksums stored as int64 values.
     """
     torch.ops.sgl_kernel.kv_checksum_direct.default(
         buffer_ptrs,
@@ -52,6 +51,64 @@ def kv_checksum_direct(
         sel_loc,
         positions,
         int(num_lanes),
+        out,
+    )
+
+
+def kv_checksum_direct_range(
+    buffer_ptrs: torch.Tensor,
+    row_strides: torch.Tensor,
+    row_nbytes: torch.Tensor,
+    kv_loc: torch.Tensor,
+    start: int,
+    num_tokens: int,
+    num_lanes: int,
+    out: torch.Tensor,
+) -> None:
+    """Direct-KV checksum over a contiguous logical slice of ``kv_loc``.
+
+    Equivalent to calling :func:`kv_checksum_direct` with
+    ``sel_loc=kv_loc[start:start+num_tokens]`` and positions
+    ``arange(start, start+num_tokens)``, but avoids allocating those temporary
+    tensors.
+    """
+    torch.ops.sgl_kernel.kv_checksum_direct_range.default(
+        buffer_ptrs,
+        row_strides,
+        row_nbytes,
+        kv_loc,
+        int(start),
+        int(num_tokens),
+        int(num_lanes),
+        out,
+    )
+
+
+def kv_checksum_direct_table_batched(
+    buffer_ptrs: torch.Tensor,
+    row_strides: torch.Tensor,
+    row_nbytes: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    starts: torch.Tensor,
+    lengths: torch.Tensor,
+    max_num_tokens: int,
+    num_lanes: int,
+    accum: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Batched direct-KV checksum over request rows in ``req_to_token``."""
+    torch.ops.sgl_kernel.kv_checksum_direct_table_batched.default(
+        buffer_ptrs,
+        row_strides,
+        row_nbytes,
+        req_to_token,
+        req_pool_indices,
+        starts,
+        lengths,
+        int(max_num_tokens),
+        int(num_lanes),
+        accum,
         out,
     )
 

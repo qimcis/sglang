@@ -63,6 +63,7 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import KVTransferPagePinManager
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
@@ -253,6 +254,8 @@ class DecodeRequest:
     kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    transfer_pinned_page_ids: Tuple[int, ...] = ()
+    transfer_pinned_page_generations: Tuple[int, ...] = ()
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -375,8 +378,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         self.scheduler.kv_protection_manager = manager
         logger.info(
-            "KV page protection enabled (page_tags=%s, transfer_checksum=%s)",
-            config.enable_page_tags,
+            "KV page protection enabled (attention_tags=%s, transfer_checksum=%s)",
+            config.enable_attention_tags,
             config.checksum_enabled,
         )
 
@@ -1105,6 +1108,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size)
+            self.transfer_queue.pin_transfer_pages(decode_req, page_indices)
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
@@ -1506,6 +1510,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
+        self.transfer_page_pin_manager = KVTransferPagePinManager(
+            scheduler.token_to_kv_pool_allocator
+        )
+        scheduler.token_to_kv_pool_allocator.attach_transfer_page_pin_manager(
+            self.transfer_page_pin_manager
+        )
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -1519,6 +1529,37 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     and dr.kv_receiver.require_staging
                 ):
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
+
+    def pin_transfer_pages(self, decode_req: DecodeRequest, page_indices) -> None:
+        decode_req.transfer_pinned_page_ids = self.transfer_page_pin_manager.pin_pages(
+            page_indices
+        )
+        decode_req.transfer_pinned_page_generations = ()
+        if not decode_req.transfer_pinned_page_ids:
+            return
+        manager = getattr(self.scheduler, "kv_protection_manager", None)
+        table = getattr(manager, "table", None)
+        if table is None:
+            return
+        page_ids = torch.tensor(decode_req.transfer_pinned_page_ids, dtype=torch.long)
+        decode_req.transfer_pinned_page_generations = tuple(
+            int(x) for x in table.generation_of(page_ids).detach().cpu().tolist()
+        )
+
+    def _release_transfer_pins(self, decode_req: DecodeRequest) -> None:
+        if not decode_req.transfer_pinned_page_ids:
+            return
+        self.transfer_page_pin_manager.release_pages(
+            decode_req.transfer_pinned_page_ids
+        )
+        decode_req.transfer_pinned_page_ids = ()
+        decode_req.transfer_pinned_page_generations = ()
+
+    def _clear_receiver(self, decode_req: DecodeRequest) -> None:
+        self._release_transfer_pins(decode_req)
+        if decode_req.kv_receiver is not None:
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
@@ -1560,8 +1601,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 "(bootstrap_room=0)",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
-            decode_req.kv_receiver.clear()
-            decode_req.kv_receiver = None
+            self._clear_receiver(decode_req)
             return
         elif actual_room != expected_room:
             # Real corruption detected (mismatch)
@@ -1579,8 +1619,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 "Metadata corruption detected - bootstrap_room mismatch",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
-            decode_req.kv_receiver.clear()
-            decode_req.kv_receiver = None
+            self._clear_receiver(decode_req)
             return
 
         self._commit_hicache_local_restore_to_req(decode_req)
@@ -1631,17 +1670,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # transmitted in the spare metadata slots. Aborts only this request on
         # mismatch.
         if self._verify_transfer_checksum(decode_req.req, output_bootstrap_room):
-            decode_req.kv_receiver.clear()
-            decode_req.kv_receiver = None
+            self._clear_receiver(decode_req)
             return
 
-        # Register baseline KV page tags for the transferred prompt pages so a
-        # later cross-request page reuse / mid-decode overwrite is detectable
-        # before decode attention reads them (gated; no-op when disabled).
-        self._register_kv_page_tags(decode_req.req)
+        # Register baseline KV attention tags for the transferred prompt pages
+        # so a later cross-request page reuse is detectable before decode
+        # attention reads them (gated; no-op when disabled).
+        self._register_kv_attention_tags(decode_req.req)
 
-        decode_req.kv_receiver.clear()
-        decode_req.kv_receiver = None
+        self._clear_receiver(decode_req)
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return
 
@@ -1665,18 +1702,34 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
             if num_tokens <= 0 or req.req_pool_idx is None:
                 return False
-            kv_loc = self.scheduler.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :num_tokens
-            ]
-            kv_pool = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
-            err = manager.verify_destination_checksum_from_loc(
-                kv_pool,
-                kv_loc,
-                bootstrap_room=req.bootstrap_room or 0,
-                num_tokens=num_tokens,
-                expected=expected,
-                rid=req.rid,
-            )
+            actual = getattr(req, "_kv_transfer_actual_checksum", None)
+            if actual is not None:
+                err = None
+                if not manager.compare_destination_checksum(
+                    expected, actual, rid=req.rid
+                ):
+                    from sglang.srt.mem_cache.kv_page_tags import KVChecksumError
+
+                    err = KVChecksumError(
+                        rid=req.rid,
+                        bootstrap_room=req.bootstrap_room or 0,
+                        expected_checksum=expected.checksum,
+                        actual_checksum=actual,
+                        num_checked_tokens=num_tokens,
+                    )
+            else:
+                kv_loc = self.scheduler.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, :num_tokens
+                ]
+                kv_pool = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
+                err = manager.verify_destination_checksum_from_loc(
+                    kv_pool,
+                    kv_loc,
+                    bootstrap_room=req.bootstrap_room or 0,
+                    num_tokens=num_tokens,
+                    expected=expected,
+                    rid=req.rid,
+                )
         except Exception as e:
             logger.error(
                 "KV transfer checksum verification error for rid=%s: %s", req.rid, e
@@ -1692,14 +1745,54 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         return True
 
-    def _register_kv_page_tags(self, req: Req) -> None:
+    def _begin_destination_checksum_batch(
+        self, decode_reqs: List[DecodeRequest]
+    ) -> Tuple[Optional[object], List[Req]]:
         manager = getattr(self.scheduler, "kv_protection_manager", None)
-        if manager is None or not manager.config.enable_page_tags:
+        if manager is None or not manager.config.checksum_enabled:
+            return None, []
+        req_pool_indices = []
+        bootstrap_rooms = []
+        num_tokens = []
+        reqs = []
+        for decode_req in decode_reqs:
+            req = decode_req.req
+            if req.req_pool_idx is None:
+                continue
+            meta = self.metadata_buffers.bootstrap_room[
+                decode_req.metadata_buffer_index
+            ]
+            try:
+                if int(meta[3].item()) == 0:
+                    continue
+                n = int(meta[2].item())
+            except Exception:
+                continue
+            if n <= 0:
+                continue
+            reqs.append(req)
+            req_pool_indices.append(int(req.req_pool_idx))
+            bootstrap_rooms.append(int(req.bootstrap_room or 0))
+            num_tokens.append(n)
+        if not reqs:
+            return None, []
+        kv_pool = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
+        batch = manager.begin_transfer_checksums_from_table(
+            kv_pool,
+            self.scheduler.req_to_token_pool.req_to_token,
+            req_pool_indices=req_pool_indices,
+            bootstrap_rooms=bootstrap_rooms,
+            num_tokens=num_tokens,
+        )
+        return batch, reqs
+
+    def _register_kv_attention_tags(self, req: Req) -> None:
+        manager = getattr(self.scheduler, "kv_protection_manager", None)
+        if manager is None or not manager.config.enable_attention_tags:
             return
         try:
             page_size = manager.page_size
-            token_ids = req.origin_input_ids
-            seq_len = len(token_ids)
+            seq_len = len(req.origin_input_ids)
             if seq_len == 0 or req.req_pool_idx is None:
                 return
             kv_loc = self.scheduler.req_to_token_pool.req_to_token[
@@ -1708,14 +1801,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             # First token's loc within each logical page -> physical page id.
             first_locs = kv_loc[::page_size]
             page_physical_ids = (first_locs // page_size).tolist()
-            req.kv_page_manifest = manager.register_pages(
-                token_ids=list(token_ids),
+            req.kv_attention_tag_manifest = manager.register_attention_tags(
                 page_physical_ids=page_physical_ids,
                 bootstrap_room=req.bootstrap_room or 0,
             )
         except Exception as e:  # never break serving on a protection bookkeeping error
-            logger.error("KV page tag registration failed for rid=%s: %s", req.rid, e)
-            req.kv_page_manifest = None
+            logger.error(
+                "KV attention tag registration failed for rid=%s: %s", req.rid, e
+            )
+            req.kv_attention_tag_manifest = None
 
     def _poll_with_metadata_gate(self) -> List[int]:
         pollers = (
@@ -1769,6 +1863,47 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         else:
             polls = self._poll_with_metadata_gate()
 
+        checksum_batch = None
+        checksum_reqs: List[Req] = []
+        checksum_finalized = False
+        checksum_success_reqs = [
+            decode_req
+            for decode_req, poll in zip(self.queue, polls)
+            if poll == KVPoll.Success
+            and (
+                not self.scheduler.enable_decode_hicache
+                or decode_req.hicache_restore_status != HiCacheRestoreResult.PENDING
+            )
+        ]
+        if checksum_success_reqs:
+            try:
+                checksum_batch, checksum_reqs = self._begin_destination_checksum_batch(
+                    checksum_success_reqs
+                )
+            except Exception as e:
+                logger.error(
+                    "KV transfer checksum destination batch launch failed: %s", e
+                )
+                checksum_batch = None
+                checksum_reqs = []
+
+        def finalize_checksum_batch_once() -> None:
+            nonlocal checksum_finalized
+            if checksum_finalized:
+                return
+            checksum_finalized = True
+            if checksum_batch is None:
+                return
+            try:
+                for req, plan in zip(
+                    checksum_reqs, checksum_batch.finalize(), strict=True
+                ):
+                    req._kv_transfer_actual_checksum = plan.checksum
+            except Exception as e:
+                logger.error(
+                    "KV transfer checksum destination batch finalize failed: %s", e
+                )
+
         transferred_reqs = []
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
@@ -1810,8 +1945,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
-                decode_req.kv_receiver.clear()
-                decode_req.kv_receiver = None
+                self._clear_receiver(decode_req)
                 indices_to_remove.add(i)
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
@@ -1822,7 +1956,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
                 ):
                     continue
+                finalize_checksum_batch_once()
                 self._commit_transfer_to_req(decode_req)
+                if hasattr(decode_req.req, "_kv_transfer_actual_checksum"):
+                    delattr(decode_req.req, "_kv_transfer_actual_checksum")
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
@@ -1871,6 +2008,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
+        for decode_req in self.queue:
+            self._release_transfer_pins(decode_req)
         self.queue.clear()
 
     def resume_memory_occupation(self):

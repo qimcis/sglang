@@ -3081,24 +3081,24 @@ class Scheduler(
         # Update batch tensors
         batch.prepare_for_decode()
 
-        # Verify KV page tags before decode attention reads the pages (gated;
+        # Verify KV attention tags before decode attention reads the pages (gated;
         # no-op unless PD page protection is enabled). Aborts only the affected
         # requests and rebuilds the batch for the survivors.
         if getattr(self, "kv_protection_manager", None) is not None:
-            self._verify_decode_kv_page_tags(batch)
+            self._verify_decode_kv_attention_tags(batch)
             if batch.is_empty():
                 return batch
         return batch
 
-    def _verify_decode_kv_page_tags(self, batch: ScheduleBatch) -> None:
-        """Vectorized page-tag verification + per-request abort for PD decode.
+    def _verify_decode_kv_attention_tags(self, batch: ScheduleBatch) -> None:
+        """Vectorized attention-tag verification + per-request abort for PD decode.
 
         Runs one batched gather+compare over cached page/tag/generation tensors,
         aborts solely the requests whose pages no longer match, then refreshes
         only survivor tail pages (O(1)/req) for the just-appended token.
         """
         manager = self.kv_protection_manager
-        if manager is None or not manager.config.enable_page_tags:
+        if manager is None or not manager.config.enable_attention_tags:
             return
         try:
             page_size = manager.page_size
@@ -3106,30 +3106,24 @@ class Scheduler(
             items = []
             pending_refreshes = []
             for i, req in enumerate(batch.reqs):
-                manifest = getattr(req, "kv_page_manifest", None)
+                manifest = getattr(req, "kv_attention_tag_manifest", None)
                 if manifest is None:
                     continue
                 logical_pos = int(batch.seq_lens_cpu[i].item()) - 1
                 if logical_pos < 0:
                     continue
-                token_id = (
-                    req.output_ids[-1]
-                    if len(req.output_ids)
-                    else req.origin_input_ids[-1]
-                )
                 items.append((req.rid, manifest))
                 pending_refreshes.append(
                     (
                         req.rid,
                         manifest,
                         logical_pos,
-                        token_id,
                         tail_page_ids[i : i + 1],
                     )
                 )
             mismatches = manager.verify_batch(items)
         except Exception as e:  # protection must never crash the decode loop
-            logger.error("KV page tag verification error: %s", e)
+            logger.error("KV attention tag verification error: %s", e)
             return
 
         if not mismatches:
@@ -3138,17 +3132,15 @@ class Scheduler(
                     _,
                     manifest,
                     logical_pos,
-                    token_id,
                     physical_page_id,
                 ) in pending_refreshes:
-                    manager.refresh_tail_token(
+                    manager.refresh_tail_page(
                         manifest,
                         logical_pos=logical_pos,
-                        token_id=token_id,
                         physical_page_id=physical_page_id,
                     )
             except Exception as e:
-                logger.error("KV page tag tail refresh error: %s", e)
+                logger.error("KV attention tag tail refresh error: %s", e)
             return
 
         bad_rids = {m.rid for m in mismatches}
@@ -3159,9 +3151,9 @@ class Scheduler(
                 continue
             logger.error("Aborting request due to %s", m)
             req.finished_reason = FINISH_ABORT(
-                f"KV page tag mismatch: {m}",
+                f"KV attention tag mismatch: {m}",
                 HTTPStatus.INTERNAL_SERVER_ERROR,
-                "KVPageTagMismatch",
+                "KVAttentionTagMismatch",
             )
             req.to_finish = None
             if (
@@ -3191,19 +3183,17 @@ class Scheduler(
                     rid,
                     manifest,
                     logical_pos,
-                    token_id,
                     physical_page_id,
                 ) in pending_refreshes:
                     if rid in bad_rids:
                         continue
-                    manager.refresh_tail_token(
+                    manager.refresh_tail_page(
                         manifest,
                         logical_pos=logical_pos,
-                        token_id=token_id,
                         physical_page_id=physical_page_id,
                     )
             except Exception as e:
-                logger.error("KV page tag tail refresh error: %s", e)
+                logger.error("KV attention tag tail refresh error: %s", e)
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC

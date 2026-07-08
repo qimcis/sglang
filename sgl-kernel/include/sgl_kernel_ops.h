@@ -638,9 +638,8 @@ void transfer_kv_all_layer_direct_lf_pf(
 
 // Direct-KV transfer checksum: hash K/V bytes in logical token order straight
 // from the per-layer KV-cache buffers (no [tokens, row_bytes] materialization).
-// Writes a per-row splitmix64 accumulator to `out` ([N] int64); the XOR-reduce
-// and finishing mixes are applied in Python (kv_page_tags) for bit-for-bit
-// parity with the row-materialized reference. See csrc/kvcacheio/checksum.cu.
+// Writes per-row uint32 checksums into `out` ([N] int64); Python applies the
+// XOR-reduce and finishing mix. See csrc/kvcacheio/checksum.cu.
 void kv_checksum_direct(
     const at::Tensor& buffer_ptrs,
     const at::Tensor& row_strides,
@@ -648,6 +647,33 @@ void kv_checksum_direct(
     const at::Tensor& sel_loc,
     const std::optional<at::Tensor>& positions,
     int64_t num_lanes,
+    at::Tensor& out);
+
+// Range variant for the common case where logical positions are a contiguous
+// slice of kv_loc. Avoids materializing sel_loc and positions tensors.
+void kv_checksum_direct_range(
+    const at::Tensor& buffer_ptrs,
+    const at::Tensor& row_strides,
+    const at::Tensor& row_nbytes,
+    const at::Tensor& kv_loc,
+    int64_t start,
+    int64_t num_tokens,
+    int64_t num_lanes,
+    at::Tensor& out);
+
+// Batched serving variant. Reads physical slots directly from req_to_token
+// table rows and writes one finalized uint32-compatible checksum per request.
+void kv_checksum_direct_table_batched(
+    const at::Tensor& buffer_ptrs,
+    const at::Tensor& row_strides,
+    const at::Tensor& row_nbytes,
+    const at::Tensor& req_to_token,
+    const at::Tensor& req_pool_indices,
+    const at::Tensor& starts,
+    const at::Tensor& lengths,
+    int64_t max_num_tokens,
+    int64_t num_lanes,
+    at::Tensor& accum,
     at::Tensor& out);
 
 /*
