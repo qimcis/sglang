@@ -1718,17 +1718,20 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         num_checked_tokens=num_tokens,
                     )
             else:
-                kv_loc = self.scheduler.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, :num_tokens
-                ]
-                kv_pool = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
-                err = manager.verify_destination_checksum_from_loc(
-                    kv_pool,
-                    kv_loc,
-                    bootstrap_room=req.bootstrap_room or 0,
-                    num_tokens=num_tokens,
-                    expected=expected,
+                from sglang.srt.mem_cache.kv_page_tags import KVChecksumError
+
+                logger.error(
+                    "KV transfer checksum missing batched destination result for rid=%s",
+                    req.rid,
+                )
+                if manager.metrics is not None:
+                    manager.metrics.increment_kv_transfer_checksum_mismatches()
+                err = KVChecksumError(
                     rid=req.rid,
+                    bootstrap_room=req.bootstrap_room or 0,
+                    expected_checksum=expected.checksum,
+                    actual_checksum=0,
+                    num_checked_tokens=num_tokens,
                 )
         except Exception as e:
             logger.error(

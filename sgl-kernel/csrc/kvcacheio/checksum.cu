@@ -1,8 +1,9 @@
-// Direct-KV transfer checksum for PD disaggregation.
+// Batched direct-KV transfer checksum for PD disaggregation.
 //
 // One warp hashes one logical token row directly from K/V cache buffers. Each
 // thread hashes independent 8-byte chunks salted by logical token position and
-// chunk offset; Python XOR-reduces the per-row outputs into the final checksum.
+// chunk offset; the batched serving op XOR-reduces rows into one checksum per
+// request.
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -10,7 +11,6 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
-#include <optional>
 
 namespace {
 
@@ -37,99 +37,6 @@ __device__ __forceinline__ uint32_t cksum_chunk32(uint64_t value, int64_t positi
   h ^= static_cast<uint32_t>(value);
   h ^= static_cast<uint32_t>(value >> 32) * kHiMul;
   return cksum_fmix32(h);
-}
-
-// One warp per selected token; lanes stride over 8-byte chunks in the row.
-template <int BLOCK>
-__global__ void kv_checksum_direct_kernel(
-    const uint64_t* __restrict__ buffer_ptrs,  // [B] device pointers (as int64)
-    const int64_t* __restrict__ row_strides,   // [B] bytes between dim-0 rows
-    const int64_t* __restrict__ row_nbytes,    // [B] flattened bytes per row (%8==0)
-    const int64_t* __restrict__ sel_loc,       // [N] physical slot per logical token
-    const int64_t* __restrict__ positions,     // [N] or nullptr
-    int B,
-    int N,
-    int64_t cap,  // max leading concatenated lanes, <0 => all
-    int64_t* __restrict__ out) {
-  const int lane = threadIdx.x & 31;
-  const int warps_per_block = BLOCK >> 5;
-  const int row = blockIdx.x * warps_per_block + (threadIdx.x >> 5);
-  if (row >= N) return;  // warp-uniform: whole warp returns or none does
-
-  const int64_t loc = sel_loc[row];
-  const int64_t position = (positions != nullptr) ? positions[row] : 0;
-
-  const uint64_t lane_cap = (cap < 0) ? ~0ULL : static_cast<uint64_t>(cap);
-  uint64_t consumed = 0;  // warp-uniform (every lane steps it identically)
-  uint32_t local = 0;
-
-  for (int b = 0; b < B && consumed < lane_cap; ++b) {
-    const int64_t nlanes = row_nbytes[b] >> 3;  // /8
-    const char* base = reinterpret_cast<const char*>(buffer_ptrs[b]) + loc * row_strides[b];
-    const uint64_t* p = reinterpret_cast<const uint64_t*>(base);
-
-    for (int64_t j = lane; j < nlanes; j += 32) {
-      const uint64_t global_lane = consumed + static_cast<uint64_t>(j);
-      if (global_lane < lane_cap) {
-        local ^= cksum_chunk32(p[j], position, global_lane);
-      }
-    }
-    consumed += static_cast<uint64_t>(nlanes);
-  }
-
-#pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    local ^= __shfl_xor_sync(0xffffffffu, local, offset);
-  }
-
-  if (lane == 0) out[row] = static_cast<int64_t>(local);
-}
-
-// Same checksum math as kv_checksum_direct_kernel, but reads physical slots from
-// kv_loc[start:start+N] and salts each row with logical position start+row.
-template <int BLOCK>
-__global__ void kv_checksum_direct_range_kernel(
-    const uint64_t* __restrict__ buffer_ptrs,
-    const int64_t* __restrict__ row_strides,
-    const int64_t* __restrict__ row_nbytes,
-    const int64_t* __restrict__ kv_loc,
-    int B,
-    int64_t start,
-    int N,
-    int64_t cap,
-    int64_t* __restrict__ out) {
-  const int lane = threadIdx.x & 31;
-  const int warps_per_block = BLOCK >> 5;
-  const int row = blockIdx.x * warps_per_block + (threadIdx.x >> 5);
-  if (row >= N) return;
-
-  const int64_t position = start + row;
-  const int64_t loc = kv_loc[position];
-
-  const uint64_t lane_cap = (cap < 0) ? ~0ULL : static_cast<uint64_t>(cap);
-  uint64_t consumed = 0;
-  uint32_t local = 0;
-
-  for (int b = 0; b < B && consumed < lane_cap; ++b) {
-    const int64_t nlanes = row_nbytes[b] >> 3;
-    const char* base = reinterpret_cast<const char*>(buffer_ptrs[b]) + loc * row_strides[b];
-    const uint64_t* p = reinterpret_cast<const uint64_t*>(base);
-
-    for (int64_t j = lane; j < nlanes; j += 32) {
-      const uint64_t global_lane = consumed + static_cast<uint64_t>(j);
-      if (global_lane < lane_cap) {
-        local ^= cksum_chunk32(p[j], position, global_lane);
-      }
-    }
-    consumed += static_cast<uint64_t>(nlanes);
-  }
-
-#pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    local ^= __shfl_xor_sync(0xffffffffu, local, offset);
-  }
-
-  if (lane == 0) out[row] = static_cast<int64_t>(local);
 }
 
 template <int BLOCK, typename LocT>
@@ -193,128 +100,6 @@ __global__ void kv_checksum_finalize_batched_kernel(
 }
 
 }  // namespace
-
-// See sgl_kernel_ops.h for the contract. `buffer_ptrs`/`row_strides`/`row_nbytes`
-// are small [B] int64 CUDA tensors; `sel_loc`/`positions` are [N] int64 CUDA
-// tensors; `out` is a preallocated [N] int64 CUDA tensor (per-row accumulators).
-void kv_checksum_direct(
-    const at::Tensor& buffer_ptrs,
-    const at::Tensor& row_strides,
-    const at::Tensor& row_nbytes,
-    const at::Tensor& sel_loc,
-    const std::optional<at::Tensor>& positions,
-    int64_t num_lanes,
-    at::Tensor& out) {
-#if defined(USE_ROCM) || defined(USE_MUSA)
-  TORCH_CHECK(false, "kv_checksum_direct is CUDA-only and is not supported on ROCm/MUSA");
-#else
-  TORCH_CHECK(buffer_ptrs.scalar_type() == at::kLong, "buffer_ptrs must be int64");
-  TORCH_CHECK(row_strides.scalar_type() == at::kLong, "row_strides must be int64");
-  TORCH_CHECK(row_nbytes.scalar_type() == at::kLong, "row_nbytes must be int64");
-  TORCH_CHECK(sel_loc.scalar_type() == at::kLong, "sel_loc must be int64");
-  TORCH_CHECK(out.scalar_type() == at::kLong, "out must be int64");
-  TORCH_CHECK(sel_loc.is_cuda() && out.is_cuda(), "sel_loc/out must be CUDA tensors");
-  TORCH_CHECK(
-      buffer_ptrs.is_cuda() && row_strides.is_cuda() && row_nbytes.is_cuda(),
-      "buffer metadata tensors must be CUDA tensors");
-  TORCH_CHECK(buffer_ptrs.is_contiguous(), "buffer_ptrs must be contiguous");
-  TORCH_CHECK(row_strides.is_contiguous(), "row_strides must be contiguous");
-  TORCH_CHECK(row_nbytes.is_contiguous(), "row_nbytes must be contiguous");
-  TORCH_CHECK(sel_loc.is_contiguous(), "sel_loc must be contiguous");
-  TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
-
-  const int B = static_cast<int>(buffer_ptrs.numel());
-  const int N = static_cast<int>(sel_loc.numel());
-  TORCH_CHECK(row_strides.numel() == B && row_nbytes.numel() == B, "metadata length mismatch");
-  TORCH_CHECK(out.numel() == N, "out must have N elements");
-  if (N == 0 || B == 0) return;
-
-  const int64_t* pos_ptr = nullptr;
-  if (positions.has_value() && positions->numel() > 0) {
-    TORCH_CHECK(positions->scalar_type() == at::kLong, "positions must be int64");
-    TORCH_CHECK(positions->is_cuda(), "positions must be a CUDA tensor");
-    TORCH_CHECK(positions->is_contiguous(), "positions must be contiguous");
-    TORCH_CHECK(positions->numel() == N, "positions must have N elements");
-    pos_ptr = positions->data_ptr<int64_t>();
-  }
-
-  auto stream = at::cuda::getCurrentCUDAStream();
-  constexpr int kBlock = 256;
-  const int warps_per_block = kBlock / 32;
-  const int grid = (N + warps_per_block - 1) / warps_per_block;
-  auto kernel = kv_checksum_direct_kernel<kBlock>;
-  // clang-format off
-  kernel<<<grid, kBlock, 0, stream>>>(
-      reinterpret_cast<const uint64_t*>(buffer_ptrs.data_ptr<int64_t>()),
-      row_strides.data_ptr<int64_t>(),
-      row_nbytes.data_ptr<int64_t>(),
-      sel_loc.data_ptr<int64_t>(),
-      pos_ptr,
-      B,
-      N,
-      num_lanes,
-      out.data_ptr<int64_t>());
-  // clang-format on
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-#endif
-}
-
-void kv_checksum_direct_range(
-    const at::Tensor& buffer_ptrs,
-    const at::Tensor& row_strides,
-    const at::Tensor& row_nbytes,
-    const at::Tensor& kv_loc,
-    int64_t start,
-    int64_t num_tokens,
-    int64_t num_lanes,
-    at::Tensor& out) {
-#if defined(USE_ROCM) || defined(USE_MUSA)
-  TORCH_CHECK(false, "kv_checksum_direct_range is CUDA-only and is not supported on ROCm/MUSA");
-#else
-  TORCH_CHECK(buffer_ptrs.scalar_type() == at::kLong, "buffer_ptrs must be int64");
-  TORCH_CHECK(row_strides.scalar_type() == at::kLong, "row_strides must be int64");
-  TORCH_CHECK(row_nbytes.scalar_type() == at::kLong, "row_nbytes must be int64");
-  TORCH_CHECK(kv_loc.scalar_type() == at::kLong, "kv_loc must be int64");
-  TORCH_CHECK(out.scalar_type() == at::kLong, "out must be int64");
-  TORCH_CHECK(kv_loc.is_cuda() && out.is_cuda(), "kv_loc/out must be CUDA tensors");
-  TORCH_CHECK(
-      buffer_ptrs.is_cuda() && row_strides.is_cuda() && row_nbytes.is_cuda(),
-      "buffer metadata tensors must be CUDA tensors");
-  TORCH_CHECK(buffer_ptrs.is_contiguous(), "buffer_ptrs must be contiguous");
-  TORCH_CHECK(row_strides.is_contiguous(), "row_strides must be contiguous");
-  TORCH_CHECK(row_nbytes.is_contiguous(), "row_nbytes must be contiguous");
-  TORCH_CHECK(kv_loc.is_contiguous(), "kv_loc must be contiguous");
-  TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
-
-  const int B = static_cast<int>(buffer_ptrs.numel());
-  const int N = static_cast<int>(num_tokens);
-  TORCH_CHECK(start >= 0, "start must be non-negative");
-  TORCH_CHECK(num_tokens >= 0, "num_tokens must be non-negative");
-  TORCH_CHECK(start + num_tokens <= kv_loc.numel(), "range exceeds kv_loc length");
-  TORCH_CHECK(row_strides.numel() == B && row_nbytes.numel() == B, "metadata length mismatch");
-  TORCH_CHECK(out.numel() >= N, "out must have at least num_tokens elements");
-  if (N == 0 || B == 0) return;
-
-  auto stream = at::cuda::getCurrentCUDAStream();
-  constexpr int kBlock = 256;
-  const int warps_per_block = kBlock / 32;
-  const int grid = (N + warps_per_block - 1) / warps_per_block;
-  auto kernel = kv_checksum_direct_range_kernel<kBlock>;
-  // clang-format off
-  kernel<<<grid, kBlock, 0, stream>>>(
-      reinterpret_cast<const uint64_t*>(buffer_ptrs.data_ptr<int64_t>()),
-      row_strides.data_ptr<int64_t>(),
-      row_nbytes.data_ptr<int64_t>(),
-      kv_loc.data_ptr<int64_t>(),
-      B,
-      start,
-      N,
-      num_lanes,
-      out.data_ptr<int64_t>());
-  // clang-format on
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-#endif
-}
 
 void kv_checksum_direct_table_batched(
     const at::Tensor& buffer_ptrs,

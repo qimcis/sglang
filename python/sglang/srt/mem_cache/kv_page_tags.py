@@ -44,7 +44,6 @@ Design constraints (hard requirements):
 from __future__ import annotations
 
 import logging
-import os
 from bisect import bisect_right
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
@@ -345,78 +344,6 @@ _CKSUM32_SEED = 0x4E474353  # Low 32 bits of "SGLANGCS".
 _CKSUM32_POS_MUL = 0x9E3779B1
 _CKSUM32_LANE_MUL = 0x85EBCA77
 _CKSUM32_HI_MUL = 0xC2B2AE3D
-
-_DIRECT_CHECKSUM_EXT_LOAD_ATTEMPTED = False
-_DIRECT_CHECKSUM_EXT_OP: Optional[object] = None
-_DIRECT_CHECKSUM_RANGE_EXT_OP: Optional[object] = None
-_DIRECT_CHECKSUM_TABLE_BATCHED_EXT_OP: Optional[object] = None
-
-
-def _try_load_direct_checksum_ext(
-    op_name: str = "kv_checksum_direct",
-) -> Optional[object]:
-    """Best-effort loader for staging overlays that build only this CUDA op.
-
-    Production/default builds register ``sgl_kernel.kvcacheio.kv_checksum_direct``
-    through the normal sgl-kernel extension.  Staging benchmark overlays may build
-    a tiny shared object that registers only ``torch.ops.sgl_kernel``'s checksum
-    op; load that object here only if the normal Python wrapper is unavailable.
-    """
-    global _DIRECT_CHECKSUM_EXT_LOAD_ATTEMPTED, _DIRECT_CHECKSUM_EXT_OP, _DIRECT_CHECKSUM_RANGE_EXT_OP, _DIRECT_CHECKSUM_TABLE_BATCHED_EXT_OP
-    if op_name == "kv_checksum_direct" and _DIRECT_CHECKSUM_EXT_OP is not None:
-        return _DIRECT_CHECKSUM_EXT_OP
-    if (
-        op_name == "kv_checksum_direct_range"
-        and _DIRECT_CHECKSUM_RANGE_EXT_OP is not None
-    ):
-        return _DIRECT_CHECKSUM_RANGE_EXT_OP
-    if (
-        op_name == "kv_checksum_direct_table_batched"
-        and _DIRECT_CHECKSUM_TABLE_BATCHED_EXT_OP is not None
-    ):
-        return _DIRECT_CHECKSUM_TABLE_BATCHED_EXT_OP
-    if _DIRECT_CHECKSUM_EXT_LOAD_ATTEMPTED:
-        try:
-            op = getattr(torch.ops.sgl_kernel, op_name).default
-        except Exception:
-            return None
-        if op_name == "kv_checksum_direct":
-            _DIRECT_CHECKSUM_EXT_OP = op
-        elif op_name == "kv_checksum_direct_range":
-            _DIRECT_CHECKSUM_RANGE_EXT_OP = op
-        elif op_name == "kv_checksum_direct_table_batched":
-            _DIRECT_CHECKSUM_TABLE_BATCHED_EXT_OP = op
-        return op
-
-    lib_path = os.environ.get(
-        "SGLANG_KV_CHECKSUM_DIRECT_EXT_SO",
-        "/sgl-workspace/sglang/python/sgl_kernel_kv_checksum_direct_ext.so",
-    )
-    if not lib_path or not os.path.exists(lib_path):
-        return None
-    torch.ops.load_library(lib_path)
-    _DIRECT_CHECKSUM_EXT_LOAD_ATTEMPTED = True
-    try:
-        _DIRECT_CHECKSUM_EXT_OP = torch.ops.sgl_kernel.kv_checksum_direct.default
-    except Exception:
-        _DIRECT_CHECKSUM_EXT_OP = None
-    try:
-        _DIRECT_CHECKSUM_RANGE_EXT_OP = (
-            torch.ops.sgl_kernel.kv_checksum_direct_range.default
-        )
-    except Exception:
-        _DIRECT_CHECKSUM_RANGE_EXT_OP = None
-    try:
-        _DIRECT_CHECKSUM_TABLE_BATCHED_EXT_OP = (
-            torch.ops.sgl_kernel.kv_checksum_direct_table_batched.default
-        )
-    except Exception:
-        _DIRECT_CHECKSUM_TABLE_BATCHED_EXT_OP = None
-    if op_name == "kv_checksum_direct_range":
-        return _DIRECT_CHECKSUM_RANGE_EXT_OP
-    if op_name == "kv_checksum_direct_table_batched":
-        return _DIRECT_CHECKSUM_TABLE_BATCHED_EXT_OP
-    return _DIRECT_CHECKSUM_EXT_OP
 
 
 def compute_attention_tag_scalar(
@@ -964,81 +891,6 @@ class AsyncChecksumBatch:
         return self.finalized
 
 
-def compute_transfer_checksum(
-    rows: torch.Tensor,
-    *,
-    bootstrap_room: int,
-    num_tokens: int,
-    config: KVProtectionConfig,
-    row_nbytes: Optional[int] = None,
-) -> ChecksumPlan:
-    """Compute a (source or destination) transfer checksum over logical rows.
-
-    Both prefill and decode call this with their own physically-gathered-but-
-    logically-ordered ``rows``; identical KV bytes yield identical checksums
-    regardless of physical page placement.
-    """
-    indices = select_checksum_token_indices(num_tokens, bootstrap_room, 1.0)
-    if row_nbytes is None:
-        # Infer from the tensor.
-        row_nbytes = (
-            rows.contiguous().view(torch.uint8).reshape(rows.shape[0], -1).shape[1]
-            if rows.numel()
-            else 0
-        )
-    num_lanes = select_checksum_byte_count(row_nbytes)
-    checksum = hash_kv_rows(rows, indices, num_lanes=num_lanes)
-    return ChecksumPlan(
-        bootstrap_room=bootstrap_room,
-        num_tokens=num_tokens,
-        checksum=checksum,
-    )
-
-
-def gather_logical_kv_rows(
-    kv_pool: object,
-    kv_loc: torch.Tensor,
-    token_indices: torch.Tensor,
-) -> torch.Tensor:
-    """Gather KV bytes for the selected logical tokens, in logical order.
-
-    For each selected logical token we concatenate its K and V across all layers
-    into one row.  Rows are ordered by logical token (the order of
-    ``token_indices``), so the resulting tensor is independent of how the tokens
-    are scattered across physical pages: we read the *bytes* living at each
-    token's physical slot, but never fold the slot/page id into the data.
-
-    Fails fast (raises) for KV pools that do not expose the standard
-    per-layer ``get_key_buffer``/``get_value_buffer`` accessors, rather than
-    silently skipping the checksum.
-    """
-    if not (
-        hasattr(kv_pool, "get_key_buffer")
-        and hasattr(kv_pool, "get_value_buffer")
-        and hasattr(kv_pool, "layer_num")
-    ):
-        raise RuntimeError(
-            "KV transfer checksum is enabled but the active KV cache "
-            f"{type(kv_pool).__name__!r} does not expose a per-layer "
-            "get_key_buffer/get_value_buffer gather. Disable checksums or run a "
-            "supported (MHA/MLA contiguous) KV cache."
-        )
-    sel_loc = kv_loc.to(torch.long).index_select(
-        0, token_indices.to(kv_loc.device, dtype=torch.long)
-    )
-    parts: List[torch.Tensor] = []
-    for layer_id in range(int(kv_pool.layer_num)):
-        k = kv_pool.get_key_buffer(layer_id).index_select(0, sel_loc)
-        parts.append(k.reshape(k.shape[0], -1))
-        try:
-            v = kv_pool.get_value_buffer(layer_id).index_select(0, sel_loc)
-            parts.append(v.reshape(v.shape[0], -1))
-        except (NotImplementedError, AttributeError):
-            # MLA-style caches may fold V into K; K alone still proves transfer.
-            pass
-    return torch.cat(parts, dim=1)
-
-
 def _direct_metadata_from_pool(
     kv_pool: object,
     device: torch.device,
@@ -1055,8 +907,9 @@ def _direct_metadata_from_pool(
             return unsupported("cached direct checksum metadata is incomplete")
         return buffer_ptrs, row_strides, row_nbytes, total_bytes
 
-    # Build the buffer list in the SAME order as gather_logical_kv_rows:
-    # K(l0), V(l0)?, K(l1), V(l1)?, ...  (V skipped when the pool folds V into K).
+    # Build the buffer list in the same logical byte order used by the Python
+    # checksum reference: K(l0), V(l0)?, K(l1), V(l1)?, ...
+    # V is skipped when the pool folds V into K.
     buffers: List[torch.Tensor] = []
     for layer_id in range(int(kv_pool.layer_num)):
         buffers.append(kv_pool.get_key_buffer(layer_id))
@@ -1111,121 +964,6 @@ def _direct_metadata_from_pool(
         cache.row_nbytes = row_nbytes
         cache.total_bytes = total_bytes
     return buffer_ptrs, row_strides, row_nbytes, total_bytes
-
-
-def direct_kv_checksum_from_loc(
-    kv_pool: object,
-    kv_loc: torch.Tensor,
-    indices: torch.Tensor,
-    *,
-    config: KVProtectionConfig,
-    cache: Optional[_DirectKVChecksumCache] = None,
-    contiguous_start: Optional[int] = None,
-) -> int:
-    """Hash KV bytes directly from the cache buffers (no row materialization).
-
-    Reproduces ``hash_rows_with_positions(gather_logical_kv_rows(...))`` using
-    the fused ``kv_checksum_direct`` CUDA op, but WITHOUT building the
-    ``[selected_tokens, row_bytes]`` tensor: the kernel reads each selected
-    logical token's K/V bytes straight from the per-layer buffers and hashes
-    independent 8-byte chunks in logical order.
-
-    Returns the full checksum on success.  Unsupported layouts or a missing
-    direct CUDA op raise immediately; the serving path never silently falls back
-    to the row-materialized Torch reference.
-
-    Supported-layout requirements: all K/V buffers are contiguous CUDA tensors
-    on ``kv_loc``'s device, each buffer's per-token row byte count and dim-0
-    stride are multiples of 8 (so int64 lanes never straddle a buffer boundary),
-    and the base pointers are 8-byte aligned.
-    """
-
-    def _unsupported(reason: str) -> None:
-        raise RuntimeError(
-            "Direct KV checksum kernel is required but cannot run: "
-            f"{reason}. Run a supported contiguous CUDA KV layout with "
-            "8-byte-aligned rows and a built sgl_kernel.kvcacheio.kv_checksum_direct op."
-        )
-
-    if not isinstance(kv_loc, torch.Tensor) or not kv_loc.is_cuda:
-        return _unsupported("kv_loc is not a CUDA tensor")
-    if not (hasattr(kv_pool, "get_key_buffer") and hasattr(kv_pool, "layer_num")):
-        return _unsupported(
-            f"pool {type(kv_pool).__name__!r} lacks per-layer KV accessors"
-        )
-
-    try:
-        from sgl_kernel.kvcacheio import kv_checksum_direct as _op
-    except Exception as e:  # pragma: no cover - depends on CUDA build
-        try:
-            _op = _try_load_direct_checksum_ext()
-        except Exception as load_e:  # pragma: no cover - depends on CUDA runtime
-            return _unsupported(
-                "sgl_kernel kv_checksum_direct unavailable "
-                f"({e}); fallback extension load failed ({load_e})"
-            )
-        if _op is None:
-            return _unsupported(f"sgl_kernel kv_checksum_direct unavailable ({e})")
-
-    _range_op = None
-    if contiguous_start is not None:
-        try:
-            from sgl_kernel.kvcacheio import kv_checksum_direct_range as _range_op
-        except Exception:
-            try:
-                _range_op = _try_load_direct_checksum_ext("kv_checksum_direct_range")
-            except Exception:
-                _range_op = None
-
-    device = kv_loc.device
-    buffer_ptrs, row_strides, row_nbytes, total_bytes = _direct_metadata_from_pool(
-        kv_pool, device, cache, _unsupported
-    )
-
-    num_lanes = select_checksum_byte_count(total_bytes)
-
-    num_selected = int(indices.numel())
-    if num_selected == 0:
-        return _fmix32_scalar(_CKSUM32_SEED)
-    out = (
-        cache.out_slice(num_selected, device)
-        if cache is not None
-        else torch.empty((num_selected,), dtype=TAG_DTYPE, device=device)
-    )
-
-    try:
-        if _range_op is not None and contiguous_start is not None:
-            kv_loc_dev = kv_loc.to(dtype=torch.long).contiguous()
-            _range_op(
-                buffer_ptrs,
-                row_strides,
-                row_nbytes,
-                kv_loc_dev,
-                int(contiguous_start),
-                int(num_selected),
-                int(num_lanes),
-                out,
-            )
-        else:
-            indices_dev = indices.to(device=device, dtype=torch.long)
-            sel_loc = kv_loc.to(torch.long).index_select(0, indices_dev)
-            positions = indices_dev  # logical positions, matching the reference path
-            _op(
-                buffer_ptrs,
-                row_strides,
-                row_nbytes,
-                sel_loc,
-                positions,
-                int(num_lanes),
-                out,
-            )
-    except Exception as e:  # pragma: no cover - depends on CUDA runtime
-        raise RuntimeError(f"direct KV checksum kernel failed: {e}") from e
-
-    # XOR-reduce + finishing mix here so the finishing constants live in exactly
-    # one place (mirrors hash_rows_with_positions).
-    combined = _xor_reduce(out)
-    return _fmix32_scalar(_CKSUM32_SEED ^ combined ^ num_selected)
 
 
 def compare_checksums(expected: ChecksumPlan, actual_checksum: int) -> bool:
@@ -1459,70 +1197,6 @@ class KVPageProtectionManager:
 
     # -- transfer checksums ------------------------------------------------
 
-    def compute_source_checksum(
-        self,
-        rows: torch.Tensor,
-        *,
-        bootstrap_room: int,
-        num_tokens: int,
-    ) -> Optional[ChecksumPlan]:
-        """Prefill side: hash source KV bytes in logical order."""
-        if not self.config.checksum_enabled:
-            return None
-        return compute_transfer_checksum(
-            rows,
-            bootstrap_room=bootstrap_room,
-            num_tokens=num_tokens,
-            config=self.config,
-        )
-
-    def _checksum_from_loc(
-        self,
-        kv_pool: object,
-        kv_loc: torch.Tensor,
-        *,
-        bootstrap_room: int,
-        num_tokens: int,
-    ) -> int:
-        """Hash the logical-token rows directly from KV cache storage."""
-        indices = select_checksum_token_indices(num_tokens, bootstrap_room, 1.0)
-        if indices.numel() == 0:
-            return _fmix32_scalar(_CKSUM32_SEED)
-        # Hash KV bytes directly from the cache buffers (no [tokens, row_bytes]
-        # materialization).  The direct CUDA kernel is required; unsupported
-        # layouts or missing ops raise instead of silently falling back.
-        return direct_kv_checksum_from_loc(
-            kv_pool,
-            kv_loc,
-            indices,
-            config=self.config,
-            cache=self._checksum_cache,
-            contiguous_start=0,
-        )
-
-    def compute_source_checksum_from_loc(
-        self,
-        kv_pool: object,
-        kv_loc: torch.Tensor,
-        *,
-        bootstrap_room: int,
-        num_tokens: int,
-    ) -> Optional[ChecksumPlan]:
-        """Prefill side: gather + hash source KV bytes (logical order)."""
-        if not self.config.checksum_enabled:
-            return None
-        checksum = self._checksum_from_loc(
-            kv_pool,
-            kv_loc,
-            bootstrap_room=bootstrap_room,
-            num_tokens=num_tokens,
-        )
-        return ChecksumPlan(
-            bootstrap_room=bootstrap_room,
-            num_tokens=num_tokens,
-            checksum=checksum,
-        )
-
     def begin_transfer_checksums_from_table(
         self,
         kv_pool: object,
@@ -1556,17 +1230,9 @@ class KVPageProtectionManager:
         try:
             from sgl_kernel.kvcacheio import kv_checksum_direct_table_batched as _op
         except Exception as e:  # pragma: no cover - depends on CUDA build
-            try:
-                _op = _try_load_direct_checksum_ext("kv_checksum_direct_table_batched")
-            except Exception as load_e:  # pragma: no cover
-                raise RuntimeError(
-                    "sgl_kernel kv_checksum_direct_table_batched unavailable "
-                    f"({e}); fallback extension load failed ({load_e})"
-                ) from load_e
-            if _op is None:
-                raise RuntimeError(
-                    f"sgl_kernel kv_checksum_direct_table_batched unavailable ({e})"
-                )
+            raise RuntimeError(
+                f"sgl_kernel kv_checksum_direct_table_batched unavailable ({e})"
+            ) from e
 
         device = req_to_token.device
 
@@ -1630,39 +1296,6 @@ class KVPageProtectionManager:
             stream=stream,
         )
 
-    def verify_destination_checksum_from_loc(
-        self,
-        kv_pool: object,
-        kv_loc: torch.Tensor,
-        *,
-        bootstrap_room: int,
-        num_tokens: int,
-        expected: Optional[ChecksumPlan],
-        rid: Optional[str] = None,
-    ) -> Optional[KVChecksumError]:
-        """Decode side: gather + hash destination KV bytes and compare."""
-        if not self.config.checksum_enabled or expected is None:
-            return None
-        actual = self._checksum_from_loc(
-            kv_pool,
-            kv_loc,
-            bootstrap_room=bootstrap_room,
-            num_tokens=num_tokens,
-        )
-        if self.metrics is not None:
-            self.metrics.increment_kv_transfer_checksum_checked_pages(int(num_tokens))
-        if compare_checksums(expected, actual):
-            return None
-        if self.metrics is not None:
-            self.metrics.increment_kv_transfer_checksum_mismatches()
-        return KVChecksumError(
-            rid=rid,
-            bootstrap_room=bootstrap_room,
-            expected_checksum=expected.checksum,
-            actual_checksum=actual,
-            num_checked_tokens=num_tokens,
-        )
-
     def compare_destination_checksum(
         self, expected: ChecksumPlan, actual_checksum: int, *, rid: Optional[str] = None
     ) -> bool:
@@ -1676,38 +1309,3 @@ class KVPageProtectionManager:
             self.metrics.increment_kv_transfer_checksum_mismatches()
         del rid
         return ok
-
-    def verify_destination_checksum(
-        self,
-        rows: torch.Tensor,
-        *,
-        bootstrap_room: int,
-        num_tokens: int,
-        expected: Optional[ChecksumPlan],
-        rid: Optional[str] = None,
-    ) -> Optional[KVChecksumError]:
-        """Decode side: hash destination KV bytes (logical order) and compare."""
-        if not self.config.checksum_enabled or expected is None:
-            return None
-        actual = compute_transfer_checksum(
-            rows,
-            bootstrap_room=bootstrap_room,
-            num_tokens=num_tokens,
-            config=self.config,
-            row_nbytes=None,
-        )
-        if self.metrics is not None:
-            self.metrics.increment_kv_transfer_checksum_checked_pages(
-                int(actual.num_tokens)
-            )
-        if compare_checksums(expected, actual.checksum):
-            return None
-        if self.metrics is not None:
-            self.metrics.increment_kv_transfer_checksum_mismatches()
-        return KVChecksumError(
-            rid=rid,
-            bootstrap_room=bootstrap_room,
-            expected_checksum=expected.checksum,
-            actual_checksum=actual.checksum,
-            num_checked_tokens=actual.num_tokens,
-        )
