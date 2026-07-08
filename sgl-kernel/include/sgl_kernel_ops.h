@@ -642,12 +642,16 @@ void kv_checksum_direct_table_batched(
     const at::Tensor& buffer_ptrs,
     const at::Tensor& row_strides,
     const at::Tensor& row_nbytes,
+    const at::Tensor& swa_buffer_flags,
+    const at::Tensor& full_to_swa_index_mapping,
     const at::Tensor& req_to_token,
     const at::Tensor& req_pool_indices,
     const at::Tensor& starts,
     const at::Tensor& lengths,
     int64_t max_num_tokens,
     int64_t num_lanes,
+    bool has_swa,
+    bool is_capped,
     at::Tensor& accum,
     at::Tensor& out);
 
