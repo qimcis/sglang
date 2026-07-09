@@ -676,6 +676,9 @@ class QwenImageCrossAttention(nn.Module):
         # Varlen metadata precomputed in QwenImageTransformer2DModel.forward,
         # paired with the same ``attn_mask`` for the USPAttention FA fast path.
         attn_mask_meta = cross_attention_kwargs.get("attn_mask_meta")
+        # Per-token RoPE positions for cross-resolution packed batches.
+        img_rope_positions = cross_attention_kwargs.get("img_rope_positions")
+        txt_rope_positions = cross_attention_kwargs.get("txt_rope_positions")
 
         (
             img_query,
@@ -714,6 +717,7 @@ class QwenImageCrossAttention(nn.Module):
                 head_dim=img_query.shape[-1],
                 cos_sin_cache=img_cache,
                 is_neox=False,
+                positions=img_rope_positions,
                 allow_inplace=True,
             )
             txt_query, txt_key = apply_qk_norm_with_optional_rope(
@@ -724,14 +728,23 @@ class QwenImageCrossAttention(nn.Module):
                 head_dim=txt_query.shape[-1],
                 cos_sin_cache=txt_cache,
                 is_neox=False,
+                positions=txt_rope_positions,
                 allow_inplace=True,
             )
         elif img_cache is not None and txt_cache is not None:
             img_query, img_key = apply_flashinfer_rope_qk_inplace(
-                img_query, img_key, img_cache, is_neox=False
+                img_query,
+                img_key,
+                img_cache,
+                is_neox=False,
+                positions=img_rope_positions,
             )
             txt_query, txt_key = apply_flashinfer_rope_qk_inplace(
-                txt_query, txt_key, txt_cache, is_neox=False
+                txt_query,
+                txt_key,
+                txt_cache,
+                is_neox=False,
+                positions=txt_rope_positions,
             )
 
         # Concatenate for joint attention
@@ -1159,6 +1172,9 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _no_split_modules = ["QwenImageTransformerBlock"]
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
     _repeated_blocks = ["QwenImageTransformerBlock"]
+    # Supports cross-resolution packed batches (per-row image masks and
+    # per-token RoPE positions via image_seq_lens / attention_kwargs).
+    supports_varlen_step_packing = True
 
     param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
     _fsdp_shard_conditions = QwenImageDitConfig().arch_config._fsdp_shard_conditions
@@ -1311,6 +1327,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         guidance: torch.Tensor = None,  # TODO: this should probably be removed
         attention_kwargs: Optional[Dict[str, Any]] = None,
         controlnet_block_samples=None,
+        image_seq_lens: Optional[List[int]] = None,
         return_dict: bool = True,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         """
@@ -1367,16 +1384,33 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         encoder_hidden_states, _ = self.txt_in(encoder_hidden_states)
 
         block_attention_kwargs = attention_kwargs.copy() if attention_kwargs else {}
-        if encoder_hidden_states_mask is not None:
+        if encoder_hidden_states_mask is not None or image_seq_lens is not None:
+            batch_size, image_seq_len = hidden_states.shape[:2]
+            if encoder_hidden_states_mask is None:
+                encoder_hidden_states_mask = torch.ones(
+                    (batch_size, encoder_hidden_states.shape[1]),
+                    dtype=torch.bool,
+                    device=hidden_states.device,
+                )
             encoder_hidden_states_mask = encoder_hidden_states_mask.to(
                 device=hidden_states.device, dtype=torch.bool
             )
-            batch_size, image_seq_len = hidden_states.shape[:2]
-            image_mask = torch.ones(
-                (batch_size, image_seq_len),
-                dtype=torch.bool,
-                device=hidden_states.device,
-            )
+            if image_seq_lens is not None:
+                # Cross-resolution packing: image rows are right-padded to a
+                # shared length; mask off each row's padded tail.
+                lens = torch.as_tensor(
+                    image_seq_lens, dtype=torch.int64, device=hidden_states.device
+                )
+                image_mask = (
+                    torch.arange(image_seq_len, device=hidden_states.device)[None, :]
+                    < lens[:, None]
+                )
+            else:
+                image_mask = torch.ones(
+                    (batch_size, image_seq_len),
+                    dtype=torch.bool,
+                    device=hidden_states.device,
+                )
             joint_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
             block_attention_kwargs["attn_mask"] = joint_mask
             # Precompute varlen metadata once per request so every block reuses
