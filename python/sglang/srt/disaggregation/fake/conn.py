@@ -125,6 +125,8 @@ class FakeKVReceiver(BaseKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        transfer_page_tag_ids: Optional[npt.NDArray[np.int32]] = None,
+        transfer_page_tags: Optional[npt.NDArray[np.int32]] = None,
     ):
         self.has_sent_metadata = True
         logger.debug(

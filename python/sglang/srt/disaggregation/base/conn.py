@@ -182,6 +182,8 @@ class BaseKVReceiver(ABC):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        transfer_page_tag_ids: Optional[npt.NDArray[np.int32]] = None,
+        transfer_page_tags: Optional[npt.NDArray[np.int32]] = None,
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.

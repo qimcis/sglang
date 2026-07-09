@@ -17,6 +17,35 @@ if _is_npu:
     )
 
 
+class _OffsetAttentionTagTable:
+    """Namespace a shared attention-tag table for an independent page pool."""
+
+    def __init__(self, table, offset: int):
+        self.table = table
+        self.offset = int(offset)
+
+    @property
+    def device(self):
+        return self.table.device
+
+    def _global_page_ids(self, page_ids: torch.Tensor) -> torch.Tensor:
+        if self.offset == 0:
+            return page_ids
+        return page_ids + self.offset
+
+    def bump_generations(self, page_ids: torch.Tensor) -> None:
+        self.table.bump_generations(self._global_page_ids(page_ids))
+
+    def generation_of(self, page_ids: torch.Tensor) -> torch.Tensor:
+        return self.table.generation_of(self._global_page_ids(page_ids))
+
+    def write_tags(self, page_ids: torch.Tensor, tags: torch.Tensor) -> None:
+        self.table.write_tags(self._global_page_ids(page_ids), tags)
+
+    def read_tags(self, page_ids: torch.Tensor) -> torch.Tensor:
+        return self.table.read_tags(self._global_page_ids(page_ids))
+
+
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for SWA hybrid KV cache."""
 
@@ -95,6 +124,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self.attention_tag_table = None
+        self.transfer_page_pin_manager = None
 
         self._kvcache = kvcache
         self.clear()
@@ -134,6 +165,40 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def get_kvcache(self):
         return self._kvcache
+
+    def _num_full_pages(self) -> int:
+        return self._size_full // self.page_size
+
+    def _num_swa_pages(self) -> int:
+        return self._size_swa // self.page_size
+
+    def attention_tag_num_pages(self) -> int:
+        return self._num_full_pages() + self._num_swa_pages()
+
+    def attention_tag_swa_page_offset(self) -> int:
+        return self._num_full_pages()
+
+    def attention_tag_full_page_ids(self, page_ids):
+        return page_ids
+
+    def attention_tag_swa_page_ids(self, page_ids):
+        offset = self.attention_tag_swa_page_offset()
+        if isinstance(page_ids, torch.Tensor):
+            return page_ids + offset
+        return [int(page_id) + offset for page_id in page_ids]
+
+    def attach_attention_tag_table(self, table) -> None:
+        # Full and SWA sub-pools have independent page-id namespaces, both
+        # starting at 1.  Share one table by offsetting all SWA page ids after the
+        # full-pool range.
+        self.attention_tag_table = table
+        self.full_attn_allocator.attach_attention_tag_table(table)
+        self.swa_attn_allocator.attach_attention_tag_table(
+            _OffsetAttentionTagTable(table, self.attention_tag_swa_page_offset())
+        )
+
+    def attach_transfer_page_pin_manager(self, manager) -> None:
+        self.transfer_page_pin_manager = manager
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self._kvcache.full_to_swa_index_mapping is not None
@@ -312,6 +377,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # NOTE: the API is not idempotent.
         if self.is_not_in_free_group:
+            free_index = self._filter_transfer_pinned_full_indices(free_index)
+            if free_index.numel() == 0:
+                return
             self.full_attn_allocator.free(free_index)
             self.free_swa(free_index)
         else:
@@ -351,6 +419,44 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         swa_indices = swa_indices[swa_indices > 0]
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[mapping_indices] = 0
+
+    def _filter_transfer_pinned_full_indices(
+        self, free_index: torch.Tensor
+    ) -> torch.Tensor:
+        manager = self.transfer_page_pin_manager
+        if manager is None or free_index.numel() == 0:
+            return free_index
+        if self.page_size == 1:
+            return manager.defer_free_pages(free_index)
+
+        free_pages = torch.unique(free_index // self.page_size)
+        unpinned_pages = manager.defer_free_pages(free_pages)
+        if unpinned_pages.numel() == free_pages.numel():
+            return free_index
+        if unpinned_pages.numel() == 0:
+            return free_index.new_empty((0,))
+        page_offsets = torch.arange(
+            self.page_size, dtype=free_index.dtype, device=free_index.device
+        )
+        return (
+            unpinned_pages[:, None] * self.page_size + page_offsets[None, :]
+        ).reshape(-1)
+
+    def _release_transfer_pinned_pages(self, page_ids) -> None:
+        if not page_ids:
+            return
+        pages = torch.tensor(page_ids, dtype=torch.int64, device=self.device)
+        self.full_attn_allocator._release_transfer_pinned_pages(page_ids)
+        if self.page_size == 1:
+            full_indices = pages
+        else:
+            page_offsets = torch.arange(
+                self.page_size, dtype=torch.int64, device=self.device
+            )
+            full_indices = (
+                pages[:, None] * self.page_size + page_offsets[None, :]
+            ).reshape(-1)
+        self.free_swa(full_indices)
 
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
         pages = torch.unique(indices // self.page_size)

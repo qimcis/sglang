@@ -25,7 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -333,14 +333,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
-        self.kv_manager = self._init_kv_manager()
-        if self.enable_staging:
-            self.transfer_queue._init_staging_handler(self.kv_manager)
-
         # KV page protection / transfer checksums (PD disaggregation, gated).
         # Constructed PD-decode-side only; inert for non-PD serving.  Fails fast
         # on unsupported allocators/backends rather than silently disabling.
         self._init_kv_protection()
+        self.kv_manager = self._init_kv_manager()
+        if self.enable_staging:
+            self.transfer_queue._init_staging_handler(self.kv_manager)
 
     def _init_kv_protection(self) -> None:
         from sglang.srt.mem_cache.kv_page_tags import (
@@ -355,7 +354,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         allocator = self.token_to_kv_pool_allocator
         page_size = allocator.page_size
-        num_pages = max(1, allocator.size // max(page_size, 1))
+        if hasattr(allocator, "attention_tag_num_pages"):
+            num_pages = max(1, int(allocator.attention_tag_num_pages()))
+        else:
+            num_pages = max(1, allocator.size // max(page_size, 1))
         metrics_collector = (
             self.scheduler.metrics_collector
             if getattr(self.scheduler, "metrics_reporter", None) is not None
@@ -413,6 +415,126 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         window_start = max(0, seq_len - window_size)
         window_start = (window_start // page_size) * page_size
         return seq_len - window_start
+
+    def _prepare_transfer_page_tags(
+        self,
+        *,
+        req: Req,
+        page_indices,
+        page_position_start: int,
+        state_indices: Optional[List],
+        state_types: Sequence[StateType],
+        seq_len: int,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Create expected transfer page tags and payload for prefill.
+
+        The returned arrays are sent to prefill. Prefill writes the same tags
+        back through the transfer lifecycle after the corresponding KV/state
+        pages have landed on decode.
+        """
+        manager = getattr(self.scheduler, "kv_protection_manager", None)
+        if (
+            manager is None
+            or not manager.config.enable_attention_tags
+            or self.scheduler.enable_hisparse
+        ):
+            req.kv_transfer_page_tag_manifest = None
+            return None, None
+
+        try:
+            from sglang.srt.mem_cache.kv_page_tags import TransferPageTagManifestGroup
+
+            manifests = []
+            all_page_ids: List[int] = []
+            all_tags: List[int] = []
+
+            def append_manifest(manifest) -> None:
+                if manifest is None or manifest.num_pages == 0:
+                    return
+                manifests.append(manifest)
+                all_page_ids.extend(int(x) for x in manifest.physical_page_ids)
+                all_tags.extend(
+                    int(x)
+                    for x in manifest.expected_tags_t.detach()
+                    .cpu()
+                    .reshape(-1)
+                    .tolist()
+                )
+
+            full_pages = np.asarray(page_indices, dtype=np.int64).reshape(-1)
+            if full_pages.size > 0:
+                positions = np.arange(
+                    page_position_start,
+                    page_position_start + full_pages.size,
+                    dtype=np.int64,
+                )
+                append_manifest(
+                    manager.register_transfer_page_tags(
+                        page_physical_ids=full_pages.tolist(),
+                        page_positions=positions.tolist(),
+                        bootstrap_room=req.bootstrap_room or 0,
+                    )
+                )
+
+            if state_indices:
+                page_size = self.token_to_kv_pool_allocator.page_size
+                allocator = self.token_to_kv_pool_allocator
+                for st, component_indices in zip(
+                    state_types, state_indices, strict=False
+                ):
+                    if component_indices is None:
+                        continue
+                    pages = np.asarray(component_indices, dtype=np.int64).reshape(-1)
+                    if pages.size == 0:
+                        continue
+                    if st == StateType.SWA and hasattr(
+                        allocator, "attention_tag_swa_page_ids"
+                    ):
+                        window_size = self.scheduler.sliding_window_size or seq_len
+                        window_start = max(0, seq_len - window_size)
+                        window_start = page_align_floor(window_start, page_size)
+                        positions = np.arange(
+                            window_start // page_size,
+                            window_start // page_size + pages.size,
+                            dtype=np.int64,
+                        )
+                        page_ids = allocator.attention_tag_swa_page_ids(
+                            [int(x) for x in pages.tolist()]
+                        )
+                    elif st == StateType.DSA:
+                        positions = np.arange(pages.size, dtype=np.int64)
+                        page_ids = [int(x) for x in pages.tolist()]
+                    else:
+                        continue
+                    append_manifest(
+                        manager.register_transfer_page_tags(
+                            page_physical_ids=page_ids,
+                            page_positions=positions.tolist(),
+                            bootstrap_room=req.bootstrap_room or 0,
+                        )
+                    )
+
+            if len(manifests) > 1:
+                req.kv_transfer_page_tag_manifest = TransferPageTagManifestGroup(
+                    tuple(manifests)
+                )
+            elif manifests:
+                req.kv_transfer_page_tag_manifest = manifests[0]
+            else:
+                req.kv_transfer_page_tag_manifest = None
+
+            if not all_page_ids:
+                return None, None
+            return (
+                np.asarray(all_page_ids, dtype=np.int32),
+                np.asarray(all_tags, dtype=np.int32),
+            )
+        except Exception as e:
+            logger.error(
+                "KV transfer page tag preparation failed for rid=%s: %s", req.rid, e
+            )
+            req.kv_transfer_page_tag_manifest = None
+            return None, None
 
     def _swa_retractable_len(self, req: Req) -> int:
         if not self._uses_swa_tail_prealloc():
@@ -476,6 +598,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
         kv_args.page_size = self.token_to_kv_pool.page_size
+        kv_args.transfer_page_tag_manager = getattr(
+            self.scheduler, "kv_protection_manager", None
+        )
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
@@ -1108,12 +1233,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size)
+            transfer_page_tag_ids, transfer_page_tags = (
+                self._prepare_transfer_page_tags(
+                    req=decode_req.req,
+                    page_indices=page_indices,
+                    page_position_start=total_prefix_len // page_size,
+                    state_indices=state_indices,
+                    state_types=state_types,
+                    seq_len=seq_len,
+                )
+            )
             self.transfer_queue.pin_transfer_pages(decode_req, page_indices)
+            metadata_kwargs = {"decode_prefix_len": total_prefix_len}
+            if transfer_page_tag_ids is not None and transfer_page_tags is not None:
+                metadata_kwargs["transfer_page_tag_ids"] = transfer_page_tag_ids
+                metadata_kwargs["transfer_page_tags"] = transfer_page_tags
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
                 state_indices,
-                decode_prefix_len=total_prefix_len,
+                **metadata_kwargs,
             )
             if (
                 self.transfer_queue.enable_staging
@@ -1673,6 +1812,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self._clear_receiver(decode_req)
             return
 
+        if self.enable_staging and getattr(
+            decode_req.kv_receiver, "require_staging", False
+        ):
+            if self._write_staged_transfer_page_tags(decode_req.req):
+                self._clear_receiver(decode_req)
+                return
+
         # Register baseline KV attention tags for the transferred prompt pages
         # so a later cross-request page reuse is detectable before decode
         # attention reads them (gated; no-op when disabled).
@@ -1754,9 +1900,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         manager = getattr(self.scheduler, "kv_protection_manager", None)
         if manager is None or not manager.config.checksum_enabled:
             return None, []
+        from sglang.srt.mem_cache.kv_page_tags import swa_checksum_evicted_len
+
+        sliding_window = getattr(self.scheduler, "sliding_window_size", None)
+        page_size = getattr(self.scheduler.token_to_kv_pool_allocator, "page_size", 1)
         req_pool_indices = []
         bootstrap_rooms = []
         num_tokens = []
+        swa_evicted = []
         reqs = []
         for decode_req in decode_reqs:
             req = decode_req.req
@@ -1777,6 +1928,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             req_pool_indices.append(int(req.req_pool_idx))
             bootstrap_rooms.append(int(req.bootstrap_room or 0))
             num_tokens.append(n)
+            swa_evicted.append(swa_checksum_evicted_len(n, sliding_window, page_size))
         if not reqs:
             return None, []
         kv_pool = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
@@ -1786,6 +1938,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             req_pool_indices=req_pool_indices,
             bootstrap_rooms=bootstrap_rooms,
             num_tokens=num_tokens,
+            swa_evicted_lens=swa_evicted,
         )
         return batch, reqs
 
@@ -1794,6 +1947,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if manager is None or not manager.config.enable_attention_tags:
             return
         try:
+            from sglang.srt.mem_cache.kv_page_tags import AttentionTagManifestGroup
+
             page_size = manager.page_size
             seq_len = len(req.origin_input_ids)
             if seq_len == 0 or req.req_pool_idx is None:
@@ -1803,16 +1958,81 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             ]
             # First token's loc within each logical page -> physical page id.
             first_locs = kv_loc[::page_size]
-            page_physical_ids = (first_locs // page_size).tolist()
-            req.kv_attention_tag_manifest = manager.register_attention_tags(
+            page_positions = torch.arange(
+                first_locs.numel(), dtype=torch.long, device=first_locs.device
+            )
+            page_physical_ids = first_locs // page_size
+            full_manifest = manager.register_attention_tags(
                 page_physical_ids=page_physical_ids,
+                page_positions=page_positions,
                 bootstrap_room=req.bootstrap_room or 0,
             )
+            manifests = [full_manifest] if full_manifest is not None else []
+
+            allocator = self.scheduler.token_to_kv_pool_allocator
+            if hasattr(allocator, "translate_loc_from_full_to_swa") and hasattr(
+                allocator, "attention_tag_swa_page_ids"
+            ):
+                swa_locs = allocator.translate_loc_from_full_to_swa(kv_loc)
+                swa_first_locs = swa_locs[::page_size]
+                valid_swa_pages = swa_first_locs > 0
+                if bool(valid_swa_pages.any().item()):
+                    swa_page_ids = swa_first_locs[valid_swa_pages] // page_size
+                    swa_page_ids = allocator.attention_tag_swa_page_ids(swa_page_ids)
+                    swa_page_positions = page_positions[valid_swa_pages]
+                    swa_manifest = manager.register_attention_tags(
+                        page_physical_ids=swa_page_ids,
+                        page_positions=swa_page_positions,
+                        bootstrap_room=req.bootstrap_room or 0,
+                    )
+                    if swa_manifest is not None:
+                        manifests.append(swa_manifest)
+
+            if len(manifests) > 1:
+                req.kv_attention_tag_manifest = AttentionTagManifestGroup(
+                    tuple(manifests)
+                )
+            elif manifests:
+                req.kv_attention_tag_manifest = manifests[0]
+            else:
+                req.kv_attention_tag_manifest = None
         except Exception as e:  # never break serving on a protection bookkeeping error
             logger.error(
                 "KV attention tag registration failed for rid=%s: %s", req.rid, e
             )
             req.kv_attention_tag_manifest = None
+
+    def _write_staged_transfer_page_tags(self, req: Req) -> bool:
+        """Return True if the request was aborted due to tag write failure."""
+        manager = getattr(self.scheduler, "kv_protection_manager", None)
+        manifest = getattr(req, "kv_transfer_page_tag_manifest", None)
+        if (
+            manager is None
+            or not manager.config.enable_attention_tags
+            or manifest is None
+        ):
+            return False
+        try:
+            from sglang.srt.mem_cache.kv_page_tags import (
+                _iter_transfer_page_tag_manifests,
+            )
+
+            for sub_manifest in _iter_transfer_page_tag_manifests(manifest):
+                manager.write_transfer_page_tags(
+                    page_physical_ids=sub_manifest.physical_page_ids,
+                    transfer_page_tags=sub_manifest.expected_tags,
+                )
+            return False
+        except Exception as e:
+            logger.error(
+                "KV transfer page tag write failed for staged rid=%s: %s", req.rid, e
+            )
+            prepare_abort(
+                req,
+                f"KV transfer page tag write failed: {e}",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return True
 
     def _poll_with_metadata_gate(self) -> List[int]:
         pollers = (

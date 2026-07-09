@@ -1160,6 +1160,31 @@ def _as_int64_lanes(rows: torch.Tensor) -> torch.Tensor:
     return lanes
 
 
+def swa_checksum_evicted_len(
+    seq_len: int, sliding_window: Optional[int], page_size: int
+) -> int:
+    """Number of leading tokens whose SWA state is NOT transferred under
+    sliding-window PD disaggregation.
+
+    Only the last ``sliding_window`` tokens of the sliding-window layers are
+    transferred prefill -> decode; the earlier (out-of-window) tokens map to a
+    server-local placeholder SWA slot on each side (slot 0 on the decode
+    tail-allocation path, a recycled ring slot on prefill) whose bytes
+    legitimately differ.  Those tokens must be excluded from the SWA-buffer
+    checksum.  The boundary is page-aligned to match the SWA-tail allocator
+    (``_swa_tail_len``), so both sides compute an identical value.
+    """
+    if (
+        not sliding_window
+        or int(sliding_window) <= 0
+        or int(seq_len) <= 0
+        or int(page_size) <= 1
+    ):
+        return 0
+    window_start = max(0, int(seq_len) - int(sliding_window))
+    return (window_start // int(page_size)) * int(page_size)
+
+
 @dataclass
 class ChecksumPlan:
     """A request's transfer-checksum plan, exchanged prefill -> decode.
@@ -1832,6 +1857,52 @@ class KVPageProtectionManager:
 
     # -- transfer checksums ------------------------------------------------
 
+    @staticmethod
+    def _run_checksum_pass(
+        _op,
+        buffer_ptrs: torch.Tensor,
+        row_strides: torch.Tensor,
+        row_nbytes: torch.Tensor,
+        swa_buffer_flags: torch.Tensor,
+        full_to_swa_index_mapping: torch.Tensor,
+        req_to_token: torch.Tensor,
+        req_pool_t: torch.Tensor,
+        starts_list: Sequence[int],
+        lengths_list: Sequence[int],
+        total_bytes: int,
+        device: torch.device,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """Run one batched checksum op over a buffer subset and return the
+        finalized per-request checksum tensor.  Allocates its own ``accum``/
+        ``out`` so multiple passes do not alias."""
+        num_lanes = select_checksum_byte_count(int(total_bytes))
+        has_swa = full_to_swa_index_mapping.numel() > 0
+        is_capped = (int(num_lanes) * 8) < int(total_bytes)
+        accum = torch.zeros((batch_size,), dtype=torch.int32, device=device)
+        out = torch.empty((batch_size,), dtype=TAG_DTYPE, device=device)
+        starts_t = torch.as_tensor(starts_list, dtype=TAG_DTYPE, device=device)
+        lengths_t = torch.as_tensor(lengths_list, dtype=TAG_DTYPE, device=device)
+        max_num_tokens = max((int(x) for x in lengths_list), default=0)
+        _op(
+            buffer_ptrs,
+            row_strides,
+            row_nbytes,
+            swa_buffer_flags,
+            full_to_swa_index_mapping,
+            req_to_token,
+            req_pool_t,
+            starts_t,
+            lengths_t,
+            int(max_num_tokens),
+            int(num_lanes),
+            has_swa,
+            is_capped,
+            accum,
+            out,
+        )
+        return out
+
     def begin_transfer_checksums_from_table(
         self,
         kv_pool: object,
@@ -1841,12 +1912,24 @@ class KVPageProtectionManager:
         bootstrap_rooms: Sequence[int],
         num_tokens: Sequence[int],
         starts: Optional[Sequence[int]] = None,
+        swa_evicted_lens: Optional[Sequence[int]] = None,
     ) -> Optional[AsyncChecksumBatch]:
         """Launch batched direct checksums from the request-token table.
 
         The returned object keeps the finalized checksum tensor on GPU until the
         caller reaches the metadata publication/verification boundary, avoiding
         per-request `.item()` synchronization.
+
+        ``swa_evicted_lens`` gives, per request, the number of leading tokens
+        whose sliding-window (SWA) state is NOT transferred (see
+        :func:`swa_checksum_evicted_len`).  When any request has a nonzero value
+        and the pool has SWA buffers, the checksum is computed in two passes:
+        full-attention buffers over all ``num_tokens`` tokens, and SWA buffers
+        over only the in-window tail ``[evicted, num_tokens)``.  This matches
+        exactly the bytes that are transferred and avoids false-positive
+        mismatches on the untransferred out-of-window SWA placeholders.  The two
+        per-request results are combined with XOR; both prefill and decode use
+        identical gating, so the source and destination checksums agree.
         """
         if not self.config.checksum_enabled:
             return None
@@ -1856,11 +1939,23 @@ class KVPageProtectionManager:
             return AsyncChecksumBatch([], [], torch.empty(0, dtype=TAG_DTYPE), None)
         if not (len(req_pool_indices) == len(bootstrap_rooms) == len(num_tokens)):
             raise RuntimeError("batched checksum metadata length mismatch")
+        batch_size = len(req_pool_indices)
         starts_list = (
-            list(starts) if starts is not None else [0] * len(req_pool_indices)
+            [int(x) for x in starts] if starts is not None else [0] * batch_size
         )
-        if len(starts_list) != len(req_pool_indices):
+        if len(starts_list) != batch_size:
             raise RuntimeError("batched checksum starts length mismatch")
+        num_tokens_list = [int(n) for n in num_tokens]
+        evicted_list = (
+            [int(x) for x in swa_evicted_lens]
+            if swa_evicted_lens is not None
+            else [0] * batch_size
+        )
+        if len(evicted_list) != batch_size:
+            raise RuntimeError("batched checksum swa_evicted length mismatch")
+        evicted_list = [
+            min(max(0, e), num_tokens_list[i]) for i, e in enumerate(evicted_list)
+        ]
 
         try:
             from sgl_kernel.kvcacheio import kv_checksum_direct_table_batched as _op
@@ -1888,26 +1983,12 @@ class KVPageProtectionManager:
         ) = _direct_metadata_from_pool(
             kv_pool, device, self._checksum_cache, _unsupported
         )
-        num_lanes = select_checksum_byte_count(total_bytes)
-        has_swa = full_to_swa_index_mapping.numel() > 0
-        is_capped = (int(num_lanes) * 8) < int(total_bytes)
-        batch_size = len(req_pool_indices)
-        accum, final_out, req_pool_t, starts_t, lengths_t = (
-            self._checksum_cache.batch_slices(batch_size, device)
-        )
 
-        req_pool_t.copy_(
-            torch.as_tensor(req_pool_indices, dtype=TAG_DTYPE, device=device),
-            non_blocking=True,
-        )
-        starts_t.copy_(
-            torch.as_tensor(starts_list, dtype=TAG_DTYPE, device=device),
-            non_blocking=True,
-        )
-        lengths_t.copy_(
-            torch.as_tensor(num_tokens, dtype=TAG_DTYPE, device=device),
-            non_blocking=True,
-        )
+        req_pool_t = torch.as_tensor(req_pool_indices, dtype=TAG_DTYPE, device=device)
+        swa_flags_cpu = swa_buffer_flags.tolist()
+        nbytes_cpu = row_nbytes.tolist()
+        has_swa_buffers = any(swa_flags_cpu)
+        need_two_pass = has_swa_buffers and any(e > 0 for e in evicted_list)
 
         if (
             self._checksum_cache.stream is None
@@ -1916,30 +1997,77 @@ class KVPageProtectionManager:
             self._checksum_cache.stream = torch.cuda.Stream(device=device)
         stream = self._checksum_cache.stream
         stream.wait_stream(torch.cuda.current_stream(device))
-        max_num_tokens = max(int(n) for n in num_tokens)
+
         with torch.cuda.stream(stream):
-            accum.zero_()
-            _op(
-                buffer_ptrs,
-                row_strides,
-                row_nbytes,
-                swa_buffer_flags,
-                full_to_swa_index_mapping,
-                req_to_token,
-                req_pool_t,
-                starts_t,
-                lengths_t,
-                int(max_num_tokens),
-                int(num_lanes),
-                has_swa,
-                is_capped,
-                accum,
-                final_out,
-            )
-            checksums_t = final_out.clone()
+            if not need_two_pass:
+                checksums_t = self._run_checksum_pass(
+                    _op,
+                    buffer_ptrs,
+                    row_strides,
+                    row_nbytes,
+                    swa_buffer_flags,
+                    full_to_swa_index_mapping,
+                    req_to_token,
+                    req_pool_t,
+                    starts_list,
+                    num_tokens_list,
+                    total_bytes,
+                    device,
+                    batch_size,
+                ).clone()
+            else:
+                full_mask = swa_buffer_flags == 0
+                swa_mask = swa_buffer_flags != 0
+                full_total = sum(
+                    nb for nb, f in zip(nbytes_cpu, swa_flags_cpu) if not f
+                )
+                swa_total = sum(nb for nb, f in zip(nbytes_cpu, swa_flags_cpu) if f)
+                empty_map = torch.empty(0, dtype=TAG_DTYPE, device=device)
+                if any(not f for f in swa_flags_cpu):
+                    full_ck = self._run_checksum_pass(
+                        _op,
+                        buffer_ptrs[full_mask].contiguous(),
+                        row_strides[full_mask].contiguous(),
+                        row_nbytes[full_mask].contiguous(),
+                        swa_buffer_flags[full_mask].contiguous(),
+                        empty_map,
+                        req_to_token,
+                        req_pool_t,
+                        starts_list,
+                        num_tokens_list,
+                        full_total,
+                        device,
+                        batch_size,
+                    )
+                else:
+                    full_ck = torch.zeros((batch_size,), dtype=TAG_DTYPE, device=device)
+                swa_starts = [
+                    starts_list[i] + evicted_list[i] for i in range(batch_size)
+                ]
+                swa_lengths = [
+                    num_tokens_list[i] - evicted_list[i] for i in range(batch_size)
+                ]
+                swa_ck = self._run_checksum_pass(
+                    _op,
+                    buffer_ptrs[swa_mask].contiguous(),
+                    row_strides[swa_mask].contiguous(),
+                    row_nbytes[swa_mask].contiguous(),
+                    swa_buffer_flags[swa_mask].contiguous(),
+                    full_to_swa_index_mapping,
+                    req_to_token,
+                    req_pool_t,
+                    swa_starts,
+                    swa_lengths,
+                    swa_total,
+                    device,
+                    batch_size,
+                )
+                checksums_t = torch.bitwise_and(
+                    torch.bitwise_xor(full_ck, swa_ck), _U32_MASK
+                ).clone()
         return AsyncChecksumBatch(
             bootstrap_rooms=[int(x) for x in bootstrap_rooms],
-            num_tokens=[int(x) for x in num_tokens],
+            num_tokens=num_tokens_list,
             checksums_t=checksums_t,
             stream=stream,
         )

@@ -3103,25 +3103,69 @@ class Scheduler(
         try:
             page_size = manager.page_size
             tail_page_ids = batch.out_cache_loc // page_size
-            items = []
+            swa_tail_page_ids = None
+            # Refresh (and thus the SWA loc translation it needs) is only
+            # required on steps that open a new logical page; skip the two SWA
+            # translation kernels entirely on the common in-page step.
+            any_page_boundary = bool(
+                (((batch.seq_lens_cpu - 1) % page_size) == 0).any().item()
+            )
+            allocator = getattr(self, "token_to_kv_pool_allocator", None)
+            if (
+                any_page_boundary
+                and allocator is not None
+                and hasattr(allocator, "translate_loc_from_full_to_swa")
+                and hasattr(allocator, "attention_tag_swa_page_ids")
+            ):
+                swa_tail_locs = allocator.translate_loc_from_full_to_swa(
+                    batch.out_cache_loc
+                )
+                swa_tail_page_ids = allocator.attention_tag_swa_page_ids(
+                    swa_tail_locs // page_size
+                )
+            attention_items = []
+            transfer_items = []
             pending_refreshes = []
             for i, req in enumerate(batch.reqs):
-                manifest = getattr(req, "kv_attention_tag_manifest", None)
-                if manifest is None:
+                attention_manifest = getattr(req, "kv_attention_tag_manifest", None)
+                transfer_manifest = getattr(req, "kv_transfer_page_tag_manifest", None)
+                if attention_manifest is None and transfer_manifest is None:
                     continue
                 logical_pos = int(batch.seq_lens_cpu[i].item()) - 1
                 if logical_pos < 0:
                     continue
-                items.append((req.rid, manifest))
-                pending_refreshes.append(
-                    (
-                        req.rid,
-                        manifest,
-                        logical_pos,
-                        tail_page_ids[i : i + 1],
+                if attention_manifest is not None:
+                    attention_items.append((req.rid, attention_manifest))
+                if transfer_manifest is not None:
+                    transfer_items.append((req.rid, transfer_manifest))
+                # A page's ownership/transfer tag is a pure function of
+                # (physical_page_id, page_position, bootstrap_room, generation),
+                # all of which are invariant while tokens are appended within the
+                # same logical page.  Re-writing the tail tag on every decode
+                # step therefore recomputes an identical value; only the step
+                # that opens a new logical page needs a refresh (and manifest
+                # append).  Gating to page boundaries removes O(batch) per-step
+                # gathers/compute-kernels/scatters from the decode hot path
+                # without changing any tag value, manifest state, or the
+                # theft-detection guarantee (verify still runs every step over
+                # the full page set).
+                if logical_pos % page_size == 0:
+                    pending_refreshes.append(
+                        (
+                            req.rid,
+                            attention_manifest,
+                            transfer_manifest,
+                            logical_pos,
+                            tail_page_ids[i : i + 1],
+                            (
+                                None
+                                if swa_tail_page_ids is None
+                                else swa_tail_page_ids[i : i + 1]
+                            ),
+                        )
                     )
-                )
-            mismatches = manager.verify_batch(items)
+            mismatches = manager.verify_batch(attention_items)
+            mismatches.extend(manager.verify_transfer_page_tag_batch(transfer_items))
         except Exception as e:  # protection must never crash the decode loop
             logger.error("KV attention tag verification error: %s", e)
             return
@@ -3130,15 +3174,26 @@ class Scheduler(
             try:
                 for (
                     _,
-                    manifest,
+                    attention_manifest,
+                    transfer_manifest,
                     logical_pos,
                     physical_page_id,
+                    swa_physical_page_id,
                 ) in pending_refreshes:
-                    manager.refresh_tail_page(
-                        manifest,
-                        logical_pos=logical_pos,
-                        physical_page_id=physical_page_id,
-                    )
+                    if attention_manifest is not None:
+                        manager.refresh_tail_page(
+                            attention_manifest,
+                            logical_pos=logical_pos,
+                            physical_page_id=physical_page_id,
+                            swa_physical_page_id=swa_physical_page_id,
+                        )
+                    if transfer_manifest is not None:
+                        manager.refresh_transfer_page_tag_tail_page(
+                            transfer_manifest,
+                            logical_pos=logical_pos,
+                            physical_page_id=physical_page_id,
+                            swa_physical_page_id=swa_physical_page_id,
+                        )
             except Exception as e:
                 logger.error("KV attention tag tail refresh error: %s", e)
             return
@@ -3150,10 +3205,11 @@ class Scheduler(
             if req is None:
                 continue
             logger.error("Aborting request due to %s", m)
+            mismatch_type = type(m).__name__
             req.finished_reason = FINISH_ABORT(
-                f"KV attention tag mismatch: {m}",
+                f"{mismatch_type}: {m}",
                 HTTPStatus.INTERNAL_SERVER_ERROR,
-                "KVAttentionTagMismatch",
+                mismatch_type,
             )
             req.to_finish = None
             if (
@@ -3181,17 +3237,28 @@ class Scheduler(
             try:
                 for (
                     rid,
-                    manifest,
+                    attention_manifest,
+                    transfer_manifest,
                     logical_pos,
                     physical_page_id,
+                    swa_physical_page_id,
                 ) in pending_refreshes:
                     if rid in bad_rids:
                         continue
-                    manager.refresh_tail_page(
-                        manifest,
-                        logical_pos=logical_pos,
-                        physical_page_id=physical_page_id,
-                    )
+                    if attention_manifest is not None:
+                        manager.refresh_tail_page(
+                            attention_manifest,
+                            logical_pos=logical_pos,
+                            physical_page_id=physical_page_id,
+                            swa_physical_page_id=swa_physical_page_id,
+                        )
+                    if transfer_manifest is not None:
+                        manager.refresh_transfer_page_tag_tail_page(
+                            transfer_manifest,
+                            logical_pos=logical_pos,
+                            physical_page_id=physical_page_id,
+                            swa_physical_page_id=swa_physical_page_id,
+                        )
             except Exception as e:
                 logger.error("KV attention tag tail refresh error: %s", e)
 
