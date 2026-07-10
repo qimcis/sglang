@@ -3095,37 +3095,19 @@ class Scheduler(
 
         Runs one batched gather+compare over cached page/tag/generation tensors,
         aborts solely the requests whose pages no longer match, then refreshes
-        only survivor tail pages (O(1)/req) for the just-appended token.
+        survivor tail-page manifests only when a decode step opens a new logical
+        page. Within a page the tag inputs are invariant, so rewriting the tag is
+        a pure no-op that only adds GPU work to the decode hot path.
         """
         manager = self.kv_protection_manager
         if manager is None or not manager.config.enable_attention_tags:
             return
         try:
             page_size = manager.page_size
-            tail_page_ids = batch.out_cache_loc // page_size
-            swa_tail_page_ids = None
-            # Refresh (and thus the SWA loc translation it needs) is only
-            # required on steps that open a new logical page; skip the two SWA
-            # translation kernels entirely on the common in-page step.
-            any_page_boundary = bool(
-                (((batch.seq_lens_cpu - 1) % page_size) == 0).any().item()
-            )
-            allocator = getattr(self, "token_to_kv_pool_allocator", None)
-            if (
-                any_page_boundary
-                and allocator is not None
-                and hasattr(allocator, "translate_loc_from_full_to_swa")
-                and hasattr(allocator, "attention_tag_swa_page_ids")
-            ):
-                swa_tail_locs = allocator.translate_loc_from_full_to_swa(
-                    batch.out_cache_loc
-                )
-                swa_tail_page_ids = allocator.attention_tag_swa_page_ids(
-                    swa_tail_locs // page_size
-                )
             attention_items = []
             transfer_items = []
             pending_refreshes = []
+            refresh_candidates = []
             for i, req in enumerate(batch.reqs):
                 attention_manifest = getattr(req, "kv_attention_tag_manifest", None)
                 transfer_manifest = getattr(req, "kv_transfer_page_tag_manifest", None)
@@ -3150,9 +3132,35 @@ class Scheduler(
                 # theft-detection guarantee (verify still runs every step over
                 # the full page set).
                 if logical_pos % page_size == 0:
+                    refresh_candidates.append(
+                        (i, req.rid, attention_manifest, transfer_manifest, logical_pos)
+                    )
+
+            if refresh_candidates:
+                tail_page_ids = batch.out_cache_loc // page_size
+                swa_tail_page_ids = None
+                allocator = getattr(self, "token_to_kv_pool_allocator", None)
+                if (
+                    allocator is not None
+                    and hasattr(allocator, "translate_loc_from_full_to_swa")
+                    and hasattr(allocator, "attention_tag_swa_page_ids")
+                ):
+                    swa_tail_locs = allocator.translate_loc_from_full_to_swa(
+                        batch.out_cache_loc
+                    )
+                    swa_tail_page_ids = allocator.attention_tag_swa_page_ids(
+                        swa_tail_locs // page_size
+                    )
+                for (
+                    i,
+                    rid,
+                    attention_manifest,
+                    transfer_manifest,
+                    logical_pos,
+                ) in refresh_candidates:
                     pending_refreshes.append(
                         (
-                            req.rid,
+                            rid,
                             attention_manifest,
                             transfer_manifest,
                             logical_pos,
