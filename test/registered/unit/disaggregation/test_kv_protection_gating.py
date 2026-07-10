@@ -26,6 +26,10 @@ class _FakeSWAAllocator:
     pass
 
 
+class _FakeUnsupportedAllocator:
+    pass
+
+
 # Name the fakes to match the supported allowlist for the positive case.
 _FakePagedAllocator.__name__ = "PagedTokenToKVPoolAllocator"
 _FakeSWAAllocator.__name__ = "SWATokenToKVPoolAllocator"
@@ -38,7 +42,7 @@ class TestGating(CustomTestCase):
         ), envs.SGLANG_KV_TRANSFER_CHECKSUM.override(True):
             cfg = KVProtectionConfig.from_env(is_pd_decode=False)
         self.assertFalse(cfg.enabled)
-        self.assertFalse(cfg.enable_page_tags)
+        self.assertFalse(cfg.enable_attention_tags)
         self.assertFalse(cfg.checksum_enabled)
 
     def test_pd_disabled_by_default(self):
@@ -49,13 +53,13 @@ class TestGating(CustomTestCase):
             cfg = KVProtectionConfig.from_env(is_pd_decode=True)
         self.assertFalse(cfg.enabled)
 
-    def test_pd_page_tags_enabled(self):
+    def test_pd_attention_tags_enabled(self):
         with envs.SGLANG_KV_PAGE_PROTECTION.override(
             True
         ), envs.SGLANG_KV_TRANSFER_CHECKSUM.override(False):
             cfg = KVProtectionConfig.from_env(is_pd_decode=True)
         self.assertTrue(cfg.enabled)
-        self.assertTrue(cfg.enable_page_tags)
+        self.assertTrue(cfg.enable_attention_tags)
         self.assertFalse(cfg.checksum_enabled)
 
     def test_pd_checksum_enabled(self):
@@ -78,16 +82,23 @@ class TestFailFast(CustomTestCase):
 
     def test_supported_allocator_ok(self):
         assert_protection_supported(
-            KVProtectionConfig(enable_page_tags=True),
+            KVProtectionConfig(enable_attention_tags=True),
             allocator=_FakePagedAllocator(),
+            transfer_backend="mooncake",
+        )
+        assert_protection_supported(
+            KVProtectionConfig(
+                enable_attention_tags=True, enable_transfer_checksum=True
+            ),
+            allocator=_FakeSWAAllocator(),
             transfer_backend="mooncake",
         )
 
     def test_unsupported_allocator_fails_fast(self):
         with self.assertRaises(RuntimeError):
             assert_protection_supported(
-                KVProtectionConfig(enable_page_tags=True),
-                allocator=_FakeSWAAllocator(),
+                KVProtectionConfig(enable_attention_tags=True),
+                allocator=_FakeUnsupportedAllocator(),
             )
 
     def test_unsupported_backend_fails_fast_for_checksum(self):
@@ -97,10 +108,10 @@ class TestFailFast(CustomTestCase):
                 transfer_backend="nixl",
             )
 
-    def test_spec_decode_fails_fast_for_page_tags(self):
+    def test_spec_decode_fails_fast_for_attention_tags(self):
         with self.assertRaises(RuntimeError):
             assert_protection_supported(
-                KVProtectionConfig(enable_page_tags=True),
+                KVProtectionConfig(enable_attention_tags=True),
                 allocator=_FakePagedAllocator(),
                 is_spec_decode=True,
             )

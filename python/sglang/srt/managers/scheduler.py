@@ -3095,33 +3095,79 @@ class Scheduler(
 
         Runs one batched gather+compare over cached page/tag/generation tensors,
         aborts solely the requests whose pages no longer match, then refreshes
-        only survivor tail pages (O(1)/req) for the just-appended token.
+        survivor tail-page manifests only when a decode step opens a new logical
+        page. Within a page the tag inputs are invariant, so rewriting the tag is
+        a pure no-op that only adds GPU work to the decode hot path.
         """
         manager = self.kv_protection_manager
         if manager is None or not manager.config.enable_attention_tags:
             return
         try:
             page_size = manager.page_size
-            tail_page_ids = batch.out_cache_loc // page_size
-            items = []
+            attention_items = []
+            transfer_items = []
             pending_refreshes = []
+            refresh_candidates = []
             for i, req in enumerate(batch.reqs):
-                manifest = getattr(req, "kv_attention_tag_manifest", None)
-                if manifest is None:
+                attention_manifest = getattr(req, "kv_attention_tag_manifest", None)
+                transfer_manifest = getattr(req, "kv_transfer_page_tag_manifest", None)
+                if attention_manifest is None and transfer_manifest is None:
                     continue
                 logical_pos = int(batch.seq_lens_cpu[i].item()) - 1
                 if logical_pos < 0:
                     continue
-                items.append((req.rid, manifest))
-                pending_refreshes.append(
-                    (
-                        req.rid,
-                        manifest,
-                        logical_pos,
-                        tail_page_ids[i : i + 1],
+                if attention_manifest is not None:
+                    attention_items.append((req.rid, attention_manifest))
+                if transfer_manifest is not None:
+                    transfer_items.append((req.rid, transfer_manifest))
+
+                # A page tag is a pure function of page id, page position,
+                # bootstrap room, and generation. Those inputs do not change
+                # while appending within the same logical page, so refresh only
+                # when the just-appended token opens a new page.
+                if logical_pos % page_size == 0:
+                    refresh_candidates.append(
+                        (i, req.rid, attention_manifest, transfer_manifest, logical_pos)
                     )
-                )
-            mismatches = manager.verify_batch(items)
+
+            if refresh_candidates:
+                tail_page_ids = batch.out_cache_loc // page_size
+                swa_tail_page_ids = None
+                allocator = getattr(self, "token_to_kv_pool_allocator", None)
+                if (
+                    allocator is not None
+                    and hasattr(allocator, "translate_loc_from_full_to_swa")
+                    and hasattr(allocator, "attention_tag_swa_page_ids")
+                ):
+                    swa_tail_locs = allocator.translate_loc_from_full_to_swa(
+                        batch.out_cache_loc
+                    )
+                    swa_tail_page_ids = allocator.attention_tag_swa_page_ids(
+                        swa_tail_locs // page_size
+                    )
+                for (
+                    i,
+                    rid,
+                    attention_manifest,
+                    transfer_manifest,
+                    logical_pos,
+                ) in refresh_candidates:
+                    pending_refreshes.append(
+                        (
+                            rid,
+                            attention_manifest,
+                            transfer_manifest,
+                            logical_pos,
+                            tail_page_ids[i : i + 1],
+                            (
+                                None
+                                if swa_tail_page_ids is None
+                                else swa_tail_page_ids[i : i + 1]
+                            ),
+                        )
+                    )
+            mismatches = manager.verify_batch(attention_items)
+            mismatches.extend(manager.verify_transfer_page_tag_batch(transfer_items))
         except Exception as e:  # protection must never crash the decode loop
             logger.error("KV attention tag verification error: %s", e)
             return
@@ -3130,15 +3176,26 @@ class Scheduler(
             try:
                 for (
                     _,
-                    manifest,
+                    attention_manifest,
+                    transfer_manifest,
                     logical_pos,
                     physical_page_id,
+                    swa_physical_page_id,
                 ) in pending_refreshes:
-                    manager.refresh_tail_page(
-                        manifest,
-                        logical_pos=logical_pos,
-                        physical_page_id=physical_page_id,
-                    )
+                    if attention_manifest is not None:
+                        manager.refresh_tail_page(
+                            attention_manifest,
+                            logical_pos=logical_pos,
+                            physical_page_id=physical_page_id,
+                            swa_physical_page_id=swa_physical_page_id,
+                        )
+                    if transfer_manifest is not None:
+                        manager.refresh_transfer_page_tag_tail_page(
+                            transfer_manifest,
+                            logical_pos=logical_pos,
+                            physical_page_id=physical_page_id,
+                            swa_physical_page_id=swa_physical_page_id,
+                        )
             except Exception as e:
                 logger.error("KV attention tag tail refresh error: %s", e)
             return
@@ -3150,10 +3207,11 @@ class Scheduler(
             if req is None:
                 continue
             logger.error("Aborting request due to %s", m)
+            mismatch_type = type(m).__name__
             req.finished_reason = FINISH_ABORT(
-                f"KV attention tag mismatch: {m}",
+                f"{mismatch_type}: {m}",
                 HTTPStatus.INTERNAL_SERVER_ERROR,
-                "KVAttentionTagMismatch",
+                mismatch_type,
             )
             req.to_finish = None
             if (
@@ -3181,17 +3239,28 @@ class Scheduler(
             try:
                 for (
                     rid,
-                    manifest,
+                    attention_manifest,
+                    transfer_manifest,
                     logical_pos,
                     physical_page_id,
+                    swa_physical_page_id,
                 ) in pending_refreshes:
                     if rid in bad_rids:
                         continue
-                    manager.refresh_tail_page(
-                        manifest,
-                        logical_pos=logical_pos,
-                        physical_page_id=physical_page_id,
-                    )
+                    if attention_manifest is not None:
+                        manager.refresh_tail_page(
+                            attention_manifest,
+                            logical_pos=logical_pos,
+                            physical_page_id=physical_page_id,
+                            swa_physical_page_id=swa_physical_page_id,
+                        )
+                    if transfer_manifest is not None:
+                        manager.refresh_transfer_page_tag_tail_page(
+                            transfer_manifest,
+                            logical_pos=logical_pos,
+                            physical_page_id=physical_page_id,
+                            swa_physical_page_id=swa_physical_page_id,
+                        )
             except Exception as e:
                 logger.error("KV attention tag tail refresh error: %s", e)
 

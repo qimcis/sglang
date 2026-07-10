@@ -76,6 +76,8 @@ class TransferInfo:
     required_dst_info_num: int
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
+    dst_transfer_page_tag_ids: Optional[npt.NDArray[np.int32]] = None
+    dst_transfer_page_tags: Optional[npt.NDArray[np.int32]] = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -86,10 +88,22 @@ class TransferInfo:
             dst_kv_indices = np.array([], dtype=np.int32)
             dst_aux_index = None
             dst_state_indices = []
+            dst_transfer_page_tag_ids = np.array([], dtype=np.int32)
+            dst_transfer_page_tags = np.array([], dtype=np.int32)
         else:
             dst_kv_indices = np.frombuffer(msg[4], dtype=np.int32)
             dst_aux_index = int(msg[5].decode("ascii"))
             dst_state_indices = unpack_int_lists(msg[6], "i")
+            dst_transfer_page_tag_ids = (
+                np.frombuffer(msg[9], dtype=np.int32)
+                if len(msg) > 9 and msg[9]
+                else np.array([], dtype=np.int32)
+            )
+            dst_transfer_page_tags = (
+                np.frombuffer(msg[10], dtype=np.int32)
+                if len(msg) > 10 and msg[10]
+                else np.array([], dtype=np.int32)
+            )
             is_dummy = False
         return cls(
             room=int(msg[0].decode("ascii")),
@@ -104,6 +118,8 @@ class TransferInfo:
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
             ),
+            dst_transfer_page_tag_ids=dst_transfer_page_tag_ids,
+            dst_transfer_page_tags=dst_transfer_page_tags,
         )
 
 
@@ -152,6 +168,7 @@ class KVArgsRegisterInfo:
 
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+    TRANSFER_PAGE_TAG_HEADER = b"TRANSFER_PAGE_TAG"
 
     def __init__(
         self,
@@ -397,7 +414,10 @@ class MooncakeKVManager(CommonKVManager):
         """Execute staging transfer for one chunk. Returns (ret, deferred).
 
         Handles readiness check, transfer, fallback, and CHUNK_READY notification.
-        deferred=True means caller should re-enqueue and break.
+        deferred=True means caller should re-enqueue and break. The third return
+        value is true only when this call has written the chunk into decode KV
+        pages; pure staging writes land in an intermediate buffer and are scattered
+        later on decode.
         """
         _tp = self.attn_tp_rank
         ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
@@ -415,8 +435,9 @@ class MooncakeKVManager(CommonKVManager):
                     f"Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB."
                 )
             queue.put(kv_chunk)
-            return (-1, True)
+            return (-1, True, False)
 
+        landed_on_decode = False
         ret = staging_strategy.transfer(
             req.mooncake_session_id,
             kv_chunk.prefill_kv_indices,
@@ -439,9 +460,10 @@ class MooncakeKVManager(CommonKVManager):
                 target_info.dst_kv_item_len,
                 executor,
             )
+            landed_on_decode = ret == 0
         elif ret == 0 and not kv_chunk.is_last_chunk:
             self._send_chunk_ready(req, chunk_idx, kv_chunk, prefill_unique_rank)
-        return (ret, False)
+        return (ret, False, landed_on_decode)
 
     def _prefetch_staging_reqs(self, room: int):
         if not self.enable_staging or self.kv_buffer_tensors is None:
@@ -1155,6 +1177,73 @@ class MooncakeKVManager(CommonKVManager):
             ]
         )
 
+    def sync_transfer_page_tags_to_decode_endpoint(
+        self,
+        remote: str,
+        dst_port: int,
+        room: int,
+        page_ids: npt.NDArray[np.int32],
+        transfer_page_tags: npt.NDArray[np.int32],
+    ) -> None:
+        if page_ids is None or transfer_page_tags is None or len(page_ids) == 0:
+            return
+        if len(page_ids) != len(transfer_page_tags):
+            raise RuntimeError(
+                "transfer page tag sync length mismatch: "
+                f"page_ids={len(page_ids)}, tags={len(transfer_page_tags)}"
+            )
+        na = NetworkAddress(remote, dst_port)
+        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+            [
+                MooncakeKVManager.TRANSFER_PAGE_TAG_HEADER,
+                str(room).encode("ascii"),
+                np.asarray(page_ids, dtype=np.int32).tobytes(),
+                np.asarray(transfer_page_tags, dtype=np.int32).tobytes(),
+            ]
+        )
+
+    def _sync_transfer_page_tags_for_slice(
+        self,
+        req: TransferInfo,
+        index_slice: slice,
+    ) -> None:
+        ids = req.dst_transfer_page_tag_ids
+        tags = req.dst_transfer_page_tags
+        if ids is None or tags is None or len(ids) == 0:
+            return
+        # Full KV page tags are first and align one-for-one with dst_kv_indices.
+        end = min(len(req.dst_kv_indices), len(ids))
+        chunk_ids = ids[:end][index_slice]
+        chunk_tags = tags[:end][index_slice]
+        self.sync_transfer_page_tags_to_decode_endpoint(
+            req.endpoint, req.dst_port, req.room, chunk_ids, chunk_tags
+        )
+
+    def _sync_extra_transfer_page_tags(self, req: TransferInfo) -> None:
+        ids = req.dst_transfer_page_tag_ids
+        tags = req.dst_transfer_page_tags
+        if ids is None or tags is None or len(ids) == 0:
+            return
+        start = min(len(req.dst_kv_indices), len(ids))
+        self.sync_transfer_page_tags_to_decode_endpoint(
+            req.endpoint, req.dst_port, req.room, ids[start:], tags[start:]
+        )
+
+    def _handle_transfer_page_tags(self, msg: List[bytes]) -> None:
+        manager = getattr(self.kv_args, "transfer_page_tag_manager", None)
+        if manager is None:
+            return
+        room = int(msg[1].decode("ascii"))
+        page_ids = np.frombuffer(msg[2], dtype=np.int32)
+        tags = np.frombuffer(msg[3], dtype=np.int32)
+        try:
+            manager.write_transfer_page_tags(
+                page_physical_ids=page_ids,
+                transfer_page_tags=tags,
+            )
+        except Exception as e:
+            logger.error("Failed to write transfer page tags for room=%s: %s", room, e)
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -1254,6 +1343,7 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+                        kv_landed_on_decode = True
                         if len(kv_chunk.prefill_kv_indices) == 0:
                             ret = 0
                         elif self.is_mla_backend or (
@@ -1272,15 +1362,17 @@ class MooncakeKVManager(CommonKVManager):
                             and staging_strategy is not None
                             and target_rank_registration_info.staging is not None
                         ):
-                            ret, deferred = self._do_staging_transfer(
-                                staging_strategy,
-                                kv_chunk,
-                                req,
-                                target_rank_registration_info,
-                                chunked_dst_kv_indice,
-                                executor,
-                                queue,
-                                prefill_unique_rank,
+                            ret, deferred, kv_landed_on_decode = (
+                                self._do_staging_transfer(
+                                    staging_strategy,
+                                    kv_chunk,
+                                    req,
+                                    target_rank_registration_info,
+                                    chunked_dst_kv_indice,
+                                    executor,
+                                    queue,
+                                    prefill_unique_rank,
+                                )
                             )
                             if deferred:
                                 staging_deferred = True
@@ -1321,14 +1413,42 @@ class MooncakeKVManager(CommonKVManager):
                             )
                             break
 
+                        if kv_landed_on_decode:
+                            self._sync_transfer_page_tags_for_slice(
+                                req, kv_chunk.index_slice
+                            )
+
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices:
-                                self.maybe_send_extra(
+                                ret = self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
                                     executor,
                                     target_rank_registration_info,
                                 )
+                                if ret != 0:
+                                    with self.session_lock:
+                                        self.session_failures[
+                                            req.mooncake_session_id
+                                        ] += 1
+                                        self.failed_sessions.add(
+                                            req.mooncake_session_id
+                                        )
+                                    self.record_failure(
+                                        kv_chunk.room,
+                                        f"Failed to send state chunk of {kv_chunk.room} to "
+                                        f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
+                                    )
+                                    self.update_status(kv_chunk.room, KVPoll.Failed)
+                                    self.sync_status_to_decode_endpoint(
+                                        req.endpoint,
+                                        req.dst_port,
+                                        req.room,
+                                        KVPoll.Failed,
+                                        prefill_unique_rank,
+                                    )
+                                    break
+                                self._sync_extra_transfer_page_tags(req)
 
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(
@@ -1494,6 +1614,10 @@ class MooncakeKVManager(CommonKVManager):
                 msg = self.server_socket.recv_multipart()
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
+                    continue
+
+                if msg[0] == MooncakeKVManager.TRANSFER_PAGE_TAG_HEADER:
+                    self._handle_transfer_page_tags(msg)
                     continue
 
                 # Staging: prefill notifies a chunk written to staging buffer
@@ -1829,6 +1953,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        transfer_page_tag_ids: Optional[npt.NDArray[np.int32]] = None,
+        transfer_page_tags: Optional[npt.NDArray[np.int32]] = None,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
@@ -1867,6 +1993,16 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
                         str(decode_prefix_len or 0).encode("ascii"),
+                        (
+                            np.asarray(transfer_page_tag_ids, dtype=np.int32).tobytes()
+                            if not is_dummy and transfer_page_tag_ids is not None
+                            else b""
+                        ),
+                        (
+                            np.asarray(transfer_page_tags, dtype=np.int32).tobytes()
+                            if not is_dummy and transfer_page_tags is not None
+                            else b""
+                        ),
                     ]
                 )
         self.init_time = time.time()
