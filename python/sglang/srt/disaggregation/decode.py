@@ -426,12 +426,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         state_types: Sequence[StateType],
         seq_len: int,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """Create expected transfer page tags and payload for prefill.
-
-        The returned arrays are sent to prefill. Prefill writes the same tags
-        back through the transfer lifecycle after the corresponding KV/state
-        pages have landed on decode.
-        """
+        """Create expected transfer tags retained locally and sent to prefill."""
         manager = getattr(self.scheduler, "kv_protection_manager", None)
         if (
             manager is None
@@ -445,21 +440,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             from sglang.srt.mem_cache.kv_page_tags import TransferPageTagManifestGroup
 
             manifests = []
-            all_page_ids: List[int] = []
-            all_tags: List[int] = []
 
             def append_manifest(manifest) -> None:
                 if manifest is None or manifest.num_pages == 0:
                     return
                 manifests.append(manifest)
-                all_page_ids.extend(int(x) for x in manifest.physical_page_ids)
-                all_tags.extend(
-                    int(x)
-                    for x in manifest.expected_tags_t.detach()
-                    .cpu()
-                    .reshape(-1)
-                    .tolist()
-                )
 
             full_pages = np.asarray(page_indices, dtype=np.int64).reshape(-1)
             if full_pages.size > 0:
@@ -523,12 +508,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             else:
                 req.kv_transfer_page_tag_manifest = None
 
-            if not all_page_ids:
+            page_tensors = [
+                manifest.physical_page_ids_t.to(dtype=torch.int32)
+                for manifest in manifests
+            ]
+            tag_tensors = [manifest.expected_tags_t for manifest in manifests]
+            if not page_tensors:
                 return None, None
-            return (
-                np.asarray(all_page_ids, dtype=np.int32),
-                np.asarray(all_tags, dtype=np.int32),
+            pages_t = (
+                page_tensors[0] if len(page_tensors) == 1 else torch.cat(page_tensors)
             )
+            tags_t = tag_tensors[0] if len(tag_tensors) == 1 else torch.cat(tag_tensors)
+            packed = torch.stack((pages_t, tags_t)).detach().cpu().numpy()
+            return packed[0], packed[1]
         except Exception as e:
             logger.error(
                 "KV transfer page tag preparation failed for rid=%s: %s", req.rid, e
@@ -1676,6 +1668,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.transfer_pinned_page_generations = ()
         if not decode_req.transfer_pinned_page_ids:
             return
+        if not self.enable_staging or not getattr(
+            decode_req.kv_receiver, "require_staging", False
+        ):
+            return
         manager = getattr(self.scheduler, "kv_protection_manager", None)
         table = getattr(manager, "table", None)
         if table is None:
@@ -1836,16 +1832,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         try:
             from sglang.srt.mem_cache.kv_page_tags import ChecksumPlan
 
-            # Slot map: 0=room 1=checksum 2=num_tokens 3=checksum_present.
-            if int(meta_bootstrap_room[3].item()) == 0:
-                return False
-            num_tokens = int(meta_bootstrap_room[2].item())
-            checksum_u64 = int(meta_bootstrap_room[1].item())
-            expected = ChecksumPlan(
-                bootstrap_room=req.bootstrap_room or 0,
-                num_tokens=num_tokens,
-                checksum=checksum_u64,
-            )
+            expected = getattr(req, "_kv_transfer_expected_checksum", None)
+            if expected is None:
+                # Slot map: 0=room 1=checksum 2=num_tokens 3=checksum_present.
+                if int(meta_bootstrap_room[3].item()) == 0:
+                    return False
+                expected = ChecksumPlan(
+                    bootstrap_room=req.bootstrap_room or 0,
+                    num_tokens=int(meta_bootstrap_room[2].item()),
+                    checksum=int(meta_bootstrap_room[1].item()),
+                )
+            num_tokens = expected.num_tokens
             if num_tokens <= 0 or req.req_pool_idx is None:
                 return False
             actual = getattr(req, "_kv_transfer_actual_checksum", None)
@@ -1900,29 +1897,48 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         manager = getattr(self.scheduler, "kv_protection_manager", None)
         if manager is None or not manager.config.checksum_enabled:
             return None, []
+        from sglang.srt.mem_cache.kv_page_tags import (
+            ChecksumPlan,
+            swa_checksum_evicted_len,
+        )
+
+        sliding_window = getattr(self.scheduler, "sliding_window_size", None)
+        page_size = getattr(self.scheduler.token_to_kv_pool_allocator, "page_size", 1)
+        eligible_reqs = [
+            decode_req
+            for decode_req in decode_reqs
+            if decode_req.req.req_pool_idx is not None
+        ]
+        if not eligible_reqs:
+            return None, []
+        metadata_indices = [
+            decode_req.metadata_buffer_index for decode_req in eligible_reqs
+        ]
+        metadata_rows = (
+            self.metadata_buffers.bootstrap_room[metadata_indices, :4].detach().cpu()
+        )
+
         req_pool_indices = []
         bootstrap_rooms = []
         num_tokens = []
+        swa_evicted = []
         reqs = []
-        for decode_req in decode_reqs:
+        for decode_req, meta in zip(eligible_reqs, metadata_rows, strict=True):
             req = decode_req.req
-            if req.req_pool_idx is None:
+            _, checksum, n, present = (int(x) for x in meta.tolist())
+            if present == 0 or n <= 0:
                 continue
-            meta = self.metadata_buffers.bootstrap_room[
-                decode_req.metadata_buffer_index
-            ]
-            try:
-                if int(meta[3].item()) == 0:
-                    continue
-                n = int(meta[2].item())
-            except Exception:
-                continue
-            if n <= 0:
-                continue
+            expected = ChecksumPlan(
+                bootstrap_room=req.bootstrap_room or 0,
+                num_tokens=n,
+                checksum=checksum,
+            )
+            req._kv_transfer_expected_checksum = expected
             reqs.append(req)
             req_pool_indices.append(int(req.req_pool_idx))
             bootstrap_rooms.append(int(req.bootstrap_room or 0))
             num_tokens.append(n)
+            swa_evicted.append(swa_checksum_evicted_len(n, sliding_window, page_size))
         if not reqs:
             return None, []
         kv_pool = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
@@ -1932,6 +1948,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             req_pool_indices=req_pool_indices,
             bootstrap_rooms=bootstrap_rooms,
             num_tokens=num_tokens,
+            swa_evicted_lens=swa_evicted,
         )
         return batch, reqs
 
@@ -1957,7 +1974,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             page_physical_ids = first_locs // page_size
             full_manifest = manager.register_attention_tags(
                 page_physical_ids=page_physical_ids,
-                page_positions=page_positions,
                 bootstrap_room=req.bootstrap_room or 0,
             )
             manifests = [full_manifest] if full_manifest is not None else []
@@ -1969,17 +1985,24 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 swa_locs = allocator.translate_loc_from_full_to_swa(kv_loc)
                 swa_first_locs = swa_locs[::page_size]
                 valid_swa_pages = swa_first_locs > 0
-                if bool(valid_swa_pages.any().item()):
-                    swa_page_ids = swa_first_locs[valid_swa_pages] // page_size
-                    swa_page_ids = allocator.attention_tag_swa_page_ids(swa_page_ids)
-                    swa_page_positions = page_positions[valid_swa_pages]
-                    swa_manifest = manager.register_attention_tags(
-                        page_physical_ids=swa_page_ids,
-                        page_positions=swa_page_positions,
-                        bootstrap_room=req.bootstrap_room or 0,
-                    )
-                    if swa_manifest is not None:
-                        manifests.append(swa_manifest)
+                swa_page_ids = swa_first_locs[valid_swa_pages] // page_size
+                swa_page_ids = allocator.attention_tag_swa_page_ids(swa_page_ids)
+                window_size = self.scheduler.sliding_window_size or seq_len
+                window_start = page_align_floor(
+                    max(0, seq_len - window_size), page_size
+                )
+                swa_page_position_start = window_start // page_size
+                swa_page_positions = range(
+                    swa_page_position_start,
+                    swa_page_position_start + int(swa_page_ids.numel()),
+                )
+                swa_manifest = manager.register_attention_tags(
+                    page_physical_ids=swa_page_ids,
+                    page_positions=swa_page_positions,
+                    bootstrap_room=req.bootstrap_room or 0,
+                )
+                if swa_manifest is not None and swa_manifest.num_pages > 0:
+                    manifests.append(swa_manifest)
 
             if len(manifests) > 1:
                 req.kv_attention_tag_manifest = AttentionTagManifestGroup(
@@ -2006,15 +2029,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         ):
             return False
         try:
-            from sglang.srt.mem_cache.kv_page_tags import (
-                _iter_transfer_page_tag_manifests,
-            )
-
-            for sub_manifest in _iter_transfer_page_tag_manifests(manifest):
-                manager.write_transfer_page_tags(
-                    page_physical_ids=sub_manifest.physical_page_ids,
-                    transfer_page_tags=sub_manifest.expected_tags,
-                )
+            manager.commit_transfer_page_tags(manifest)
             return False
         except Exception as e:
             logger.error(
@@ -2176,6 +2191,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._commit_transfer_to_req(decode_req)
                 if hasattr(decode_req.req, "_kv_transfer_actual_checksum"):
                     delattr(decode_req.req, "_kv_transfer_actual_checksum")
+                if hasattr(decode_req.req, "_kv_transfer_expected_checksum"):
+                    delattr(decode_req.req, "_kv_transfer_expected_checksum")
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):

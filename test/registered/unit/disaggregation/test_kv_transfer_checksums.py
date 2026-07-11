@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.kv_page_tags import (
     compare_checksums,
     hash_rows_with_positions,
     select_checksum_token_indices,
+    swa_checksum_evicted_len,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -120,6 +121,12 @@ class TestChecksumSelectionAndPayload(CustomTestCase):
         plan = ChecksumPlan(bootstrap_room=1, num_tokens=2, checksum=0xFFFF_FFFE)
         self.assertTrue(compare_checksums(plan, -2))
         self.assertFalse(compare_checksums(plan, 0xFFFF_FFFD))
+
+    def test_swa_evicted_len_is_page_aligned(self):
+        self.assertEqual(swa_checksum_evicted_len(100, 32, 16), 64)
+        self.assertEqual(swa_checksum_evicted_len(100, 32, 1), 68)
+        self.assertEqual(swa_checksum_evicted_len(31, 32, 16), 0)
+        self.assertEqual(swa_checksum_evicted_len(100, None, 16), 0)
 
 
 class TestManagerCompare(CustomTestCase):

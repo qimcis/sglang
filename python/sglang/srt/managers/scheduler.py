@@ -3076,6 +3076,9 @@ class Scheduler(
             batch.batch_is_full = False
 
         if batch.is_empty():
+            manager = getattr(self, "kv_protection_manager", None)
+            if manager is not None:
+                manager.clear_verification_cache()
             return batch
 
         # Update batch tensors
@@ -3166,8 +3169,9 @@ class Scheduler(
                             ),
                         )
                     )
-            mismatches = manager.verify_batch(attention_items)
-            mismatches.extend(manager.verify_transfer_page_tag_batch(transfer_items))
+            mismatches = manager.verify_protection_batch(
+                attention_items, transfer_items
+            )
         except Exception as e:  # protection must never crash the decode loop
             logger.error("KV attention tag verification error: %s", e)
             return

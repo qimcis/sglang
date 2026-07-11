@@ -515,20 +515,15 @@ class AttentionTagManifest:
 
     bootstrap_room: int
     page_size: int
-    # logical page position -> physical page id backing it
-    physical_page_ids: List[int]
     # manifest entry -> logical page position.  This is usually 0..N-1, but SWA
     # tail manifests can cover only the live sliding-window pages.
     page_positions: List[int]
-    # logical page position -> allocation generation captured at write time
-    generations: List[int]
-    # cached expected attention tag per logical page (uint64)
-    expected_tags: List[int]
     # Cached device tensors consumed by the decode verification hot path.
     physical_page_ids_t: torch.Tensor
     page_positions_t: torch.Tensor
     generations_t: torch.Tensor
     expected_tags_t: torch.Tensor
+    revision: int = 0
 
     @classmethod
     def from_pages(
@@ -559,19 +554,65 @@ class AttentionTagManifest:
         return cls(
             bootstrap_room=bootstrap_room,
             page_size=page_size,
-            physical_page_ids=phys,
             page_positions=positions,
-            generations=gens,
-            expected_tags=expected,
             physical_page_ids_t=physical_page_ids_t,
             page_positions_t=page_positions_t,
             generations_t=generations_t,
             expected_tags_t=expected_tags_t,
         )
 
+    @classmethod
+    def from_tensors(
+        cls,
+        page_size: int,
+        bootstrap_room: int,
+        physical_page_ids: torch.Tensor,
+        generations: torch.Tensor,
+        page_positions: Optional[Sequence[int] | torch.Tensor] = None,
+    ) -> AttentionTagManifest:
+        pages_t = physical_page_ids.reshape(-1).to(dtype=torch.long)
+        generations_t = generations.reshape(-1).to(
+            device=pages_t.device, dtype=TAG_DTYPE
+        )
+        num_pages = int(pages_t.numel())
+        if page_positions is None:
+            positions = list(range(num_pages))
+            positions_t = torch.arange(
+                num_pages, dtype=TAG_DTYPE, device=pages_t.device
+            )
+        elif isinstance(page_positions, torch.Tensor):
+            positions_t = page_positions.to(
+                device=pages_t.device, dtype=TAG_DTYPE
+            ).reshape(-1)
+            positions = []
+        else:
+            positions = [int(x) for x in page_positions]
+            positions_t = torch.tensor(
+                positions, dtype=TAG_DTYPE, device=pages_t.device
+            )
+        if generations_t.numel() != num_pages or positions_t.numel() != num_pages:
+            raise RuntimeError("attention tag tensor metadata length mismatch")
+        expected_tags_t = compute_attention_tags_tensor(
+            pages_t,
+            positions_t,
+            torch.full_like(positions_t, bootstrap_room),
+            generations_t,
+        )
+        if not positions and num_pages:
+            positions = [int(x) for x in positions_t.detach().cpu().tolist()]
+        return cls(
+            bootstrap_room=bootstrap_room,
+            page_size=page_size,
+            page_positions=positions,
+            physical_page_ids_t=pages_t,
+            page_positions_t=positions_t,
+            generations_t=generations_t,
+            expected_tags_t=expected_tags_t,
+        )
+
     @property
     def num_pages(self) -> int:
-        return len(self.physical_page_ids)
+        return int(self.physical_page_ids_t.numel())
 
     def expected_tags_tensor(self, device: str = "cpu") -> torch.Tensor:
         """int64 tensor of expected tags (uint64 bit patterns) for verification."""
@@ -644,11 +685,8 @@ class AttentionTagManifest:
         entry_index = self._entry_index_for_page_position(page_position)
         is_new_page = entry_index is None
         if is_new_page:
-            entry_index = len(self.physical_page_ids)
-            self.physical_page_ids.append(0)
+            entry_index = len(self.page_positions)
             self.page_positions.append(page_position)
-            self.generations.append(0)
-            self.expected_tags.append(0)
 
         physical_page_id = physical_page_id.reshape(1).to(dtype=torch.long)
         generation = generation.reshape(1).to(
@@ -674,10 +712,7 @@ class AttentionTagManifest:
         )
         self.expected_tags_t[entry_index : entry_index + 1] = expected_t
 
-        if device.type == "cpu":
-            self.physical_page_ids[entry_index] = int(tag_page_id[0].item())
-            self.generations[entry_index] = int(tag_generation[0].item())
-            self.expected_tags[entry_index] = int(expected_t[0].item())
+        self.revision += 1
         return tag_page_id, expected_t
 
 
@@ -714,14 +749,12 @@ class TransferPageTagManifest:
 
     bootstrap_room: int
     page_size: int
-    physical_page_ids: List[int]
     page_positions: List[int]
-    generations: List[int]
-    expected_tags: List[int]
     physical_page_ids_t: torch.Tensor
     page_positions_t: torch.Tensor
     generations_t: torch.Tensor
     expected_tags_t: torch.Tensor
+    revision: int = 0
 
     @classmethod
     def from_pages(
@@ -750,19 +783,65 @@ class TransferPageTagManifest:
         return cls(
             bootstrap_room=bootstrap_room,
             page_size=page_size,
-            physical_page_ids=phys,
             page_positions=positions,
-            generations=gens,
-            expected_tags=expected,
             physical_page_ids_t=torch.tensor(phys, dtype=torch.long),
             page_positions_t=torch.tensor(positions, dtype=TAG_DTYPE),
             generations_t=torch.tensor(gens, dtype=TAG_DTYPE),
             expected_tags_t=transfer_page_tags_to_tensor(expected),
         )
 
+    @classmethod
+    def from_tensors(
+        cls,
+        page_size: int,
+        bootstrap_room: int,
+        physical_page_ids: torch.Tensor,
+        generations: torch.Tensor,
+        page_positions: Optional[Sequence[int] | torch.Tensor] = None,
+    ) -> TransferPageTagManifest:
+        pages_t = physical_page_ids.reshape(-1).to(dtype=torch.long)
+        generations_t = generations.reshape(-1).to(
+            device=pages_t.device, dtype=TAG_DTYPE
+        )
+        num_pages = int(pages_t.numel())
+        if page_positions is None:
+            positions = list(range(num_pages))
+            positions_t = torch.arange(
+                num_pages, dtype=TAG_DTYPE, device=pages_t.device
+            )
+        elif isinstance(page_positions, torch.Tensor):
+            positions_t = page_positions.to(
+                device=pages_t.device, dtype=TAG_DTYPE
+            ).reshape(-1)
+            positions = []
+        else:
+            positions = [int(x) for x in page_positions]
+            positions_t = torch.tensor(
+                positions, dtype=TAG_DTYPE, device=pages_t.device
+            )
+        if generations_t.numel() != num_pages or positions_t.numel() != num_pages:
+            raise RuntimeError("transfer page tag tensor metadata length mismatch")
+        expected_tags_t = compute_transfer_page_tags_tensor(
+            pages_t,
+            positions_t,
+            torch.full_like(positions_t, bootstrap_room),
+            generations_t,
+        )
+        if not positions and num_pages:
+            positions = [int(x) for x in positions_t.detach().cpu().tolist()]
+        return cls(
+            bootstrap_room=bootstrap_room,
+            page_size=page_size,
+            page_positions=positions,
+            physical_page_ids_t=pages_t,
+            page_positions_t=positions_t,
+            generations_t=generations_t,
+            expected_tags_t=expected_tags_t,
+        )
+
     @property
     def num_pages(self) -> int:
-        return len(self.physical_page_ids)
+        return int(self.physical_page_ids_t.numel())
 
     def physical_pages_tensor(self, device: str = "cpu") -> torch.Tensor:
         return self.physical_page_ids_t.to(device=device, dtype=torch.long)
@@ -831,11 +910,8 @@ class TransferPageTagManifest:
         entry_index = self._entry_index_for_page_position(page_position)
         is_new_page = entry_index is None
         if is_new_page:
-            entry_index = len(self.physical_page_ids)
-            self.physical_page_ids.append(0)
+            entry_index = len(self.page_positions)
             self.page_positions.append(page_position)
-            self.generations.append(0)
-            self.expected_tags.append(0)
 
         physical_page_id = physical_page_id.reshape(1).to(dtype=torch.long)
         generation = generation.reshape(1).to(
@@ -861,10 +937,7 @@ class TransferPageTagManifest:
         )
         self.expected_tags_t[entry_index : entry_index + 1] = expected_t
 
-        if device.type == "cpu":
-            self.physical_page_ids[entry_index] = int(tag_page_id[0].item())
-            self.generations[entry_index] = int(tag_generation[0].item())
-            self.expected_tags[entry_index] = int(expected_t[0].item())
+        self.revision += 1
         return tag_page_id, expected_t
 
 
@@ -968,23 +1041,14 @@ class KVAttentionTagTable:
         return self.transfer_page_tags.index_select(0, page_ids)
 
 
-def verify_attention_tags(
+def _attention_tag_mismatch_mask(
     table: KVAttentionTagTable,
     page_ids: torch.Tensor,
     expected_tags: torch.Tensor,
     expected_generations: Optional[torch.Tensor] = None,
-) -> Tuple[bool, torch.Tensor]:
-    """Vectorized batch verification of attention ownership tags.
-
-    A vectorized gather + compare over the whole batch -- no per-page Python
-    loop or ``.item()`` over full-sequence pages.  When provided, allocation
-    generations are compared in the same vectorized path so a page reuse cannot
-    be hidden by refreshing a tail tag.  Returns ``(all_ok, mismatch_mask)``.
-    Only one ``.item()`` (the ``.any()`` short-circuit) is performed;
-    per-element diagnostics are extracted only on the rare mismatch path.
-    """
+) -> torch.Tensor:
     if page_ids.numel() == 0:
-        return True, torch.zeros(0, dtype=torch.bool, device=table.device)
+        return torch.zeros(0, dtype=torch.bool, device=table.device)
     actual = table.read_tags(page_ids)
     expected = expected_tags.to(table.device, dtype=TAG_DTYPE).reshape(-1)
     mismatch = actual != expected
@@ -994,19 +1058,31 @@ def verify_attention_tags(
             table.device, dtype=TAG_DTYPE
         ).reshape(-1)
         mismatch |= actual_generations != expected_generations
-    all_ok = not bool(mismatch.any().item())
-    return all_ok, mismatch
+    return mismatch
 
 
-def verify_transfer_page_tags(
+def verify_attention_tags(
     table: KVAttentionTagTable,
     page_ids: torch.Tensor,
     expected_tags: torch.Tensor,
     expected_generations: Optional[torch.Tensor] = None,
 ) -> Tuple[bool, torch.Tensor]:
-    """Vectorized verification of transfer-written page tags."""
+    """Vectorized batch verification of attention ownership tags."""
+    mismatch = _attention_tag_mismatch_mask(
+        table, page_ids, expected_tags, expected_generations
+    )
+    all_ok = not bool(mismatch.any().item())
+    return all_ok, mismatch
+
+
+def _transfer_page_tag_mismatch_mask(
+    table: KVAttentionTagTable,
+    page_ids: torch.Tensor,
+    expected_tags: torch.Tensor,
+    expected_generations: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     if page_ids.numel() == 0:
-        return True, torch.zeros(0, dtype=torch.bool, device=table.device)
+        return torch.zeros(0, dtype=torch.bool, device=table.device)
     actual = table.read_transfer_page_tags(page_ids)
     expected = expected_tags.to(table.device, dtype=TRANSFER_PAGE_TAG_DTYPE).reshape(-1)
     mismatch = actual != expected
@@ -1016,6 +1092,19 @@ def verify_transfer_page_tags(
             table.device, dtype=TAG_DTYPE
         ).reshape(-1)
         mismatch |= actual_generations != expected_generations
+    return mismatch
+
+
+def verify_transfer_page_tags(
+    table: KVAttentionTagTable,
+    page_ids: torch.Tensor,
+    expected_tags: torch.Tensor,
+    expected_generations: Optional[torch.Tensor] = None,
+) -> Tuple[bool, torch.Tensor]:
+    """Vectorized verification of transfer-written page tags."""
+    mismatch = _transfer_page_tag_mismatch_mask(
+        table, page_ids, expected_tags, expected_generations
+    )
     all_ok = not bool(mismatch.any().item())
     return all_ok, mismatch
 
@@ -1160,6 +1249,21 @@ def _as_int64_lanes(rows: torch.Tensor) -> torch.Tensor:
     return lanes
 
 
+def swa_checksum_evicted_len(
+    seq_len: int, sliding_window: Optional[int], page_size: int
+) -> int:
+    """Page-aligned leading tokens omitted from transferred SWA state."""
+    if (
+        not sliding_window
+        or int(sliding_window) <= 0
+        or int(seq_len) <= 0
+        or int(page_size) <= 0
+    ):
+        return 0
+    window_start = max(0, int(seq_len) - int(sliding_window))
+    return (window_start // int(page_size)) * int(page_size)
+
+
 @dataclass
 class ChecksumPlan:
     """A request's transfer-checksum plan, exchanged prefill -> decode.
@@ -1199,60 +1303,63 @@ class _DirectKVChecksumCache:
     swa_buffer_flags: Optional[torch.Tensor] = None
     full_to_swa_index_mapping: Optional[torch.Tensor] = None
     total_bytes: int = 0
-    out: Optional[torch.Tensor] = None
+    full_buffer_ptrs: Optional[torch.Tensor] = None
+    full_row_strides: Optional[torch.Tensor] = None
+    full_row_nbytes: Optional[torch.Tensor] = None
+    full_swa_buffer_flags: Optional[torch.Tensor] = None
+    full_total_bytes: int = 0
+    swa_buffer_ptrs_only: Optional[torch.Tensor] = None
+    swa_row_strides: Optional[torch.Tensor] = None
+    swa_row_nbytes: Optional[torch.Tensor] = None
+    swa_buffer_flags_only: Optional[torch.Tensor] = None
+    swa_total_bytes: int = 0
     accum: Optional[torch.Tensor] = None
     final_out: Optional[torch.Tensor] = None
-    req_pool_indices: Optional[torch.Tensor] = None
-    starts: Optional[torch.Tensor] = None
-    lengths: Optional[torch.Tensor] = None
+    secondary_accum: Optional[torch.Tensor] = None
+    secondary_out: Optional[torch.Tensor] = None
+    metadata_host: Optional[torch.Tensor] = None
+    metadata_device: Optional[torch.Tensor] = None
+    batch_capacity: int = 0
     stream: Optional[torch.cuda.Stream] = None
+    metadata_copy_event: Optional[torch.cuda.Event] = None
+    workspace_event: Optional[torch.cuda.Event] = None
 
-    def out_slice(self, numel: int, device: torch.device) -> torch.Tensor:
-        if self.out is None or self.out.device != device or self.out.numel() < numel:
-            self.out = torch.empty((numel,), dtype=TAG_DTYPE, device=device)
-        return self.out[:numel]
-
-    def batch_slices(
-        self, batch_size: int, device: torch.device
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def batch_slices(self, batch_size: int, device: torch.device) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         if (
             self.accum is None
             or self.accum.device != device
-            or self.accum.numel() < batch_size
+            or self.batch_capacity < batch_size
         ):
-            self.accum = torch.empty((batch_size,), dtype=torch.int32, device=device)
-        if (
-            self.final_out is None
-            or self.final_out.device != device
-            or self.final_out.numel() < batch_size
-        ):
-            self.final_out = torch.empty((batch_size,), dtype=TAG_DTYPE, device=device)
-        if (
-            self.req_pool_indices is None
-            or self.req_pool_indices.device != device
-            or self.req_pool_indices.numel() < batch_size
-        ):
-            self.req_pool_indices = torch.empty(
-                (batch_size,), dtype=TAG_DTYPE, device=device
+            capacity = max(8, 1 << (batch_size - 1).bit_length())
+            self.accum = torch.empty((capacity,), dtype=torch.int32, device=device)
+            self.final_out = torch.empty((capacity,), dtype=TAG_DTYPE, device=device)
+            self.secondary_accum = torch.empty(
+                (capacity,), dtype=torch.int32, device=device
             )
-        if (
-            self.starts is None
-            or self.starts.device != device
-            or self.starts.numel() < batch_size
-        ):
-            self.starts = torch.empty((batch_size,), dtype=TAG_DTYPE, device=device)
-        if (
-            self.lengths is None
-            or self.lengths.device != device
-            or self.lengths.numel() < batch_size
-        ):
-            self.lengths = torch.empty((batch_size,), dtype=TAG_DTYPE, device=device)
+            self.secondary_out = torch.empty(
+                (capacity,), dtype=TAG_DTYPE, device=device
+            )
+            self.metadata_host = torch.empty(
+                (5 * capacity,), dtype=TAG_DTYPE, device="cpu", pin_memory=True
+            )
+            self.metadata_device = torch.empty(
+                (5 * capacity,), dtype=TAG_DTYPE, device=device
+            )
+            self.batch_capacity = capacity
         return (
             self.accum[:batch_size],
             self.final_out[:batch_size],
-            self.req_pool_indices[:batch_size],
-            self.starts[:batch_size],
-            self.lengths[:batch_size],
+            self.secondary_accum[:batch_size],
+            self.secondary_out[:batch_size],
+            self.metadata_host,
+            self.metadata_device,
         )
 
 
@@ -1322,7 +1429,8 @@ def _direct_metadata_from_pool(
     buffers: List[torch.Tensor] = []
     is_swa_buffer: List[int] = []
     layers_mapping = getattr(kv_pool, "layers_mapping", None)
-    for layer_id in range(int(kv_pool.layer_num)):
+    start_layer = int(getattr(kv_pool, "start_layer", 0))
+    for layer_id in range(start_layer, start_layer + int(kv_pool.layer_num)):
         is_swa = 0
         if layers_mapping is not None:
             try:
@@ -1377,6 +1485,26 @@ def _direct_metadata_from_pool(
     row_strides = torch.tensor(strides, dtype=TAG_DTYPE, device=device)
     row_nbytes = torch.tensor(nbytes, dtype=TAG_DTYPE, device=device)
     swa_buffer_flags = torch.tensor(is_swa_buffer, dtype=TAG_DTYPE, device=device)
+    full_indices = [i for i, flag in enumerate(is_swa_buffer) if not flag]
+    swa_indices = [i for i, flag in enumerate(is_swa_buffer) if flag]
+
+    def subset_tensor(values: List[int], indices: List[int]) -> torch.Tensor:
+        return torch.tensor(
+            [values[i] for i in indices], dtype=TAG_DTYPE, device=device
+        )
+
+    full_buffer_ptrs = subset_tensor(ptrs, full_indices)
+    full_row_strides = subset_tensor(strides, full_indices)
+    full_row_nbytes = subset_tensor(nbytes, full_indices)
+    full_swa_buffer_flags = torch.zeros(
+        len(full_indices), dtype=TAG_DTYPE, device=device
+    )
+    full_total_bytes = sum(nbytes[i] for i in full_indices)
+    swa_buffer_ptrs_only = subset_tensor(ptrs, swa_indices)
+    swa_row_strides = subset_tensor(strides, swa_indices)
+    swa_row_nbytes = subset_tensor(nbytes, swa_indices)
+    swa_buffer_flags_only = torch.ones(len(swa_indices), dtype=TAG_DTYPE, device=device)
+    swa_total_bytes = sum(nbytes[i] for i in swa_indices)
     if any(is_swa_buffer):
         full_to_swa_index_mapping = getattr(kv_pool, "full_to_swa_index_mapping", None)
         if not isinstance(full_to_swa_index_mapping, torch.Tensor):
@@ -1397,6 +1525,16 @@ def _direct_metadata_from_pool(
         cache.swa_buffer_flags = swa_buffer_flags
         cache.full_to_swa_index_mapping = full_to_swa_index_mapping
         cache.total_bytes = total_bytes
+        cache.full_buffer_ptrs = full_buffer_ptrs
+        cache.full_row_strides = full_row_strides
+        cache.full_row_nbytes = full_row_nbytes
+        cache.full_swa_buffer_flags = full_swa_buffer_flags
+        cache.full_total_bytes = full_total_bytes
+        cache.swa_buffer_ptrs_only = swa_buffer_ptrs_only
+        cache.swa_row_strides = swa_row_strides
+        cache.swa_row_nbytes = swa_row_nbytes
+        cache.swa_buffer_flags_only = swa_buffer_flags_only
+        cache.swa_total_bytes = swa_total_bytes
     return (
         buffer_ptrs,
         row_strides,
@@ -1416,6 +1554,16 @@ def _to_int_list(values: Sequence[int] | torch.Tensor) -> List[int]:
     if isinstance(values, torch.Tensor):
         return [int(x) for x in values.detach().cpu().reshape(-1).tolist()]
     return [int(x) for x in values]
+
+
+@dataclass
+class _FlattenedTagBatch:
+    key: tuple
+    pages: torch.Tensor
+    expected_tags: torch.Tensor
+    generations: torch.Tensor
+    owners: List[Tuple[Optional[str], object]]
+    offsets: List[int]
 
 
 # ---------------------------------------------------------------------------
@@ -1456,6 +1604,8 @@ class KVPageProtectionManager:
         self.metrics = metrics_collector
         self.table: Optional[KVAttentionTagTable] = None
         self._checksum_cache = _DirectKVChecksumCache()
+        self._attention_verification_cache: Optional[_FlattenedTagBatch] = None
+        self._transfer_verification_cache: Optional[_FlattenedTagBatch] = None
         if config.enable_attention_tags:
             self.table = KVAttentionTagTable(num_pages, device=device)
             if allocator is not None and hasattr(
@@ -1480,21 +1630,17 @@ class KVPageProtectionManager:
         """
         if not self.config.enable_attention_tags or self.table is None:
             return None
-        page_ids = _to_int_list(page_physical_ids)
-        positions = None if page_positions is None else _to_int_list(page_positions)
-        pages_t = torch.tensor(page_ids, dtype=torch.long, device=self.device)
-        generations = self.table.generation_of(pages_t).tolist()
-        manifest = AttentionTagManifest.from_pages(
+        pages_t = torch.as_tensor(
+            page_physical_ids, dtype=torch.long, device=self.device
+        ).reshape(-1)
+        generations_t = self.table.generation_of(pages_t)
+        manifest = AttentionTagManifest.from_tensors(
             self.page_size,
             bootstrap_room,
-            page_ids,
-            generations,
-            page_positions=positions,
+            pages_t,
+            generations_t,
+            page_positions=page_positions,
         )
-        manifest.physical_page_ids_t = pages_t[: manifest.num_pages]
-        manifest.page_positions_t = manifest.page_positions_t.to(device=self.device)
-        manifest.generations_t = manifest.generations_t.to(device=self.device)
-        manifest.expected_tags_t = manifest.expected_tags_tensor(self.device)
         self.table.write_tags(
             manifest.physical_page_ids_t,
             manifest.expected_tags_t,
@@ -1608,33 +1754,39 @@ class KVPageProtectionManager:
     ) -> Optional[TransferPageTagManifest]:
         """Create expected transfer page tags for decode-owned pages.
 
-        ``write_actual`` is False for PD-transferred prompt pages: prefill writes
+        ``write_actual`` is False for PD-transferred prompt pages: decode commits
         those actual tags after the KV transfer completes. It is True only for
         locally produced decode pages that never pass through prefill transfer.
         """
         if not self.config.enable_attention_tags or self.table is None:
             return None
-        page_ids = _to_int_list(page_physical_ids)
-        positions = None if page_positions is None else _to_int_list(page_positions)
-        pages_t = torch.tensor(page_ids, dtype=torch.long, device=self.device)
-        generations = self.table.generation_of(pages_t).tolist()
-        manifest = TransferPageTagManifest.from_pages(
+        pages_t = torch.as_tensor(
+            page_physical_ids, dtype=torch.long, device=self.device
+        ).reshape(-1)
+        generations_t = self.table.generation_of(pages_t)
+        manifest = TransferPageTagManifest.from_tensors(
             self.page_size,
             bootstrap_room,
-            page_ids,
-            generations,
-            page_positions=positions,
+            pages_t,
+            generations_t,
+            page_positions=page_positions,
         )
-        manifest.physical_page_ids_t = pages_t[: manifest.num_pages]
-        manifest.page_positions_t = manifest.page_positions_t.to(device=self.device)
-        manifest.generations_t = manifest.generations_t.to(device=self.device)
-        manifest.expected_tags_t = manifest.expected_tags_tensor(self.device)
         if write_actual:
             self.table.write_transfer_page_tags(
                 manifest.physical_page_ids_t,
                 manifest.expected_tags_t,
             )
         return manifest
+
+    def commit_transfer_page_tags(self, manifest) -> None:
+        """Commit retained transfer tags after all KV/state writes have landed."""
+        if not self.config.enable_attention_tags or self.table is None:
+            return
+        for sub_manifest in _iter_transfer_page_tag_manifests(manifest):
+            self.table.write_transfer_page_tags(
+                sub_manifest.physical_page_ids_t,
+                sub_manifest.expected_tags_t,
+            )
 
     def write_transfer_page_tags(
         self,
@@ -1697,6 +1849,125 @@ class KVPageProtectionManager:
         )
         self.table.write_transfer_page_tags(page_id_t, expected_t)
 
+    def _flatten_tag_batch(
+        self,
+        items: Sequence[Tuple[Optional[str], object]],
+        *,
+        transfer: bool,
+    ) -> Optional[_FlattenedTagBatch]:
+        iterator = (
+            _iter_transfer_page_tag_manifests if transfer else _iter_attention_manifests
+        )
+        entries = [
+            (rid, sub_manifest)
+            for rid, manifest in items
+            for sub_manifest in iterator(manifest)
+            if sub_manifest is not None and sub_manifest.num_pages > 0
+        ]
+        cache_attr = (
+            "_transfer_verification_cache"
+            if transfer
+            else "_attention_verification_cache"
+        )
+        if not entries:
+            setattr(self, cache_attr, None)
+            return None
+
+        key = tuple(
+            (rid, id(manifest), manifest.revision, manifest.num_pages)
+            for rid, manifest in entries
+        )
+        cached = getattr(self, cache_attr)
+        if cached is not None and cached.key == key:
+            return cached
+
+        page_tensors = [
+            manifest.physical_pages_tensor(self.device) for _, manifest in entries
+        ]
+        expected_tensors = [
+            manifest.expected_tags_tensor(self.device) for _, manifest in entries
+        ]
+        generation_tensors = [
+            manifest.generations_tensor(self.device) for _, manifest in entries
+        ]
+
+        def cat_or_single(tensors: List[torch.Tensor]) -> torch.Tensor:
+            return tensors[0] if len(tensors) == 1 else torch.cat(tensors)
+
+        offsets = [0]
+        for pages in page_tensors:
+            offsets.append(offsets[-1] + int(pages.numel()))
+        flattened = _FlattenedTagBatch(
+            key=key,
+            pages=cat_or_single(page_tensors),
+            expected_tags=cat_or_single(expected_tensors),
+            generations=cat_or_single(generation_tensors),
+            owners=entries,
+            offsets=offsets,
+        )
+        setattr(self, cache_attr, flattened)
+        return flattened
+
+    def clear_verification_cache(self) -> None:
+        self._attention_verification_cache = None
+        self._transfer_verification_cache = None
+
+    def _transfer_mismatch_details(
+        self, flattened: _FlattenedTagBatch, mismatch: torch.Tensor
+    ) -> List[KVTransferPageTagMismatch]:
+        actual_all = self.table.read_transfer_page_tags(flattened.pages)
+        bad_idx = torch.nonzero(mismatch).reshape(-1).cpu().tolist()
+        seen_rids = set()
+        result = []
+        for i in bad_idx:
+            owner_idx = bisect_right(flattened.offsets, int(i)) - 1
+            rid, manifest = flattened.owners[owner_idx]
+            if rid in seen_rids:
+                continue
+            seen_rids.add(rid)
+            p = int(i) - flattened.offsets[owner_idx]
+            result.append(
+                KVTransferPageTagMismatch(
+                    rid=rid,
+                    bootstrap_room=manifest.bootstrap_room,
+                    page_id=int(flattened.pages[i].item()),
+                    page_position=manifest.page_positions[p],
+                    expected_transfer_tag=int(flattened.expected_tags[i].item()),
+                    actual_transfer_tag=int(actual_all[i].item()),
+                )
+            )
+        if self.metrics is not None and result:
+            self.metrics.increment_kv_attention_tag_mismatches(len(result))
+        return result
+
+    def _attention_mismatch_details(
+        self, flattened: _FlattenedTagBatch, mismatch: torch.Tensor
+    ) -> List[KVAttentionTagMismatch]:
+        actual_all = self.table.read_tags(flattened.pages)
+        bad_idx = torch.nonzero(mismatch).reshape(-1).cpu().tolist()
+        seen_rids = set()
+        result = []
+        for i in bad_idx:
+            owner_idx = bisect_right(flattened.offsets, int(i)) - 1
+            rid, manifest = flattened.owners[owner_idx]
+            if rid in seen_rids:
+                continue
+            seen_rids.add(rid)
+            p = int(i) - flattened.offsets[owner_idx]
+            result.append(
+                KVAttentionTagMismatch(
+                    rid=rid,
+                    bootstrap_room=manifest.bootstrap_room,
+                    page_id=int(flattened.pages[i].item()),
+                    page_position=manifest.page_positions[p],
+                    expected_tag=int(flattened.expected_tags[i].item()),
+                    actual_tag=int(actual_all[i].item()),
+                )
+            )
+        if self.metrics is not None:
+            self.metrics.increment_kv_attention_tag_mismatches(len(result))
+        return result
+
     def verify_transfer_page_tag_batch(
         self,
         items: Sequence[Tuple[str, TransferPageTagManifest]],
@@ -1704,59 +1975,18 @@ class KVPageProtectionManager:
         """Vectorized verification of actual transfer page tags for a batch."""
         if not self.config.enable_attention_tags or self.table is None:
             return []
-        page_tensors: List[torch.Tensor] = []
-        expected_tensors: List[torch.Tensor] = []
-        generation_tensors: List[torch.Tensor] = []
-        owners: List[Tuple[str, TransferPageTagManifest]] = []
-        offsets: List[int] = [0]
-        for rid, manifest in items:
-            for sub_manifest in _iter_transfer_page_tag_manifests(manifest):
-                if sub_manifest is None:
-                    continue
-                pages = sub_manifest.physical_pages_tensor(self.device)
-                if pages.numel() == 0:
-                    continue
-                expected = sub_manifest.expected_tags_tensor(self.device)
-                generations = sub_manifest.generations_tensor(self.device)
-                page_tensors.append(pages)
-                expected_tensors.append(expected)
-                generation_tensors.append(generations)
-                owners.append((rid, sub_manifest))
-                offsets.append(offsets[-1] + int(pages.numel()))
-        if not page_tensors:
+        flattened = self._flatten_tag_batch(items, transfer=True)
+        if flattened is None:
             return []
-        pages_t = torch.cat(page_tensors)
-        expected_t = torch.cat(expected_tensors)
-        generations_t = torch.cat(generation_tensors)
-        ok, mismatch = verify_transfer_page_tags(
-            self.table, pages_t, expected_t, generations_t
+        mismatch = _transfer_page_tag_mismatch_mask(
+            self.table,
+            flattened.pages,
+            flattened.expected_tags,
+            flattened.generations,
         )
-        if ok:
+        if not bool(mismatch.any().item()):
             return []
-        actual_all = self.table.read_transfer_page_tags(pages_t)
-        bad_idx = torch.nonzero(mismatch).reshape(-1).cpu().tolist()
-        seen_rids = set()
-        result: List[KVTransferPageTagMismatch] = []
-        for i in bad_idx:
-            owner_idx = bisect_right(offsets, int(i)) - 1
-            rid, manifest = owners[owner_idx]
-            if rid in seen_rids:
-                continue
-            seen_rids.add(rid)
-            p = int(i) - offsets[owner_idx]
-            result.append(
-                KVTransferPageTagMismatch(
-                    rid=rid,
-                    bootstrap_room=manifest.bootstrap_room,
-                    page_id=int(pages_t[i].item()),
-                    page_position=manifest.page_positions[p],
-                    expected_transfer_tag=int(expected_t[i].item()),
-                    actual_transfer_tag=int(actual_all[i].item()),
-                )
-            )
-        if self.metrics is not None and result:
-            self.metrics.increment_kv_attention_tag_mismatches(len(result))
-        return result
+        return self._transfer_mismatch_details(flattened, mismatch)
 
     def verify_batch(
         self,
@@ -1773,61 +2003,78 @@ class KVPageProtectionManager:
         """
         if not self.config.enable_attention_tags or self.table is None:
             return []
-        page_tensors: List[torch.Tensor] = []
-        expected_tensors: List[torch.Tensor] = []
-        generation_tensors: List[torch.Tensor] = []
-        owners: List[Tuple[str, AttentionTagManifest]] = []
-        offsets: List[int] = [0]
-        for rid, manifest in items:
-            for sub_manifest in _iter_attention_manifests(manifest):
-                if sub_manifest is None:
-                    continue
-                pages = sub_manifest.physical_pages_tensor(self.device)
-                if pages.numel() == 0:
-                    continue
-                expected = sub_manifest.expected_tags_tensor(self.device)
-                generations = sub_manifest.generations_tensor(self.device)
-                page_tensors.append(pages)
-                expected_tensors.append(expected)
-                generation_tensors.append(generations)
-                owners.append((rid, sub_manifest))
-                offsets.append(offsets[-1] + int(pages.numel()))
-        if not page_tensors:
+        flattened = self._flatten_tag_batch(items, transfer=False)
+        if flattened is None:
             return []
-        pages_t = torch.cat(page_tensors)
-        expected_t = torch.cat(expected_tensors)
-        generations_t = torch.cat(generation_tensors)
-        ok, mismatch = verify_attention_tags(
-            self.table, pages_t, expected_t, generations_t
+        mismatch = _attention_tag_mismatch_mask(
+            self.table,
+            flattened.pages,
+            flattened.expected_tags,
+            flattened.generations,
         )
         if self.metrics is not None:
-            self.metrics.increment_kv_attention_tag_checked_pages(int(pages_t.numel()))
-        if ok:
-            return []
-        actual_all = self.table.read_tags(pages_t)
-        bad_idx = torch.nonzero(mismatch).reshape(-1).cpu().tolist()
-        # Report at most one mismatch per request (the first offending page).
-        seen_rids = set()
-        result: List[KVAttentionTagMismatch] = []
-        for i in bad_idx:
-            owner_idx = bisect_right(offsets, int(i)) - 1
-            rid, manifest = owners[owner_idx]
-            if rid in seen_rids:
-                continue
-            seen_rids.add(rid)
-            p = int(i) - offsets[owner_idx]
-            result.append(
-                KVAttentionTagMismatch(
-                    rid=rid,
-                    bootstrap_room=manifest.bootstrap_room,
-                    page_id=int(pages_t[i].item()),
-                    page_position=manifest.page_positions[p],
-                    expected_tag=int(expected_t[i].item()),
-                    actual_tag=int(actual_all[i].item()),
-                )
+            self.metrics.increment_kv_attention_tag_checked_pages(
+                int(flattened.pages.numel())
             )
-        if self.metrics is not None:
-            self.metrics.increment_kv_attention_tag_mismatches(len(result))
+        if not bool(mismatch.any().item()):
+            return []
+        return self._attention_mismatch_details(flattened, mismatch)
+
+    def verify_protection_batch(
+        self,
+        attention_items: Sequence[Tuple[str, AttentionTagManifest]],
+        transfer_items: Sequence[Tuple[str, TransferPageTagManifest]],
+    ) -> List[KVPageProtectionError]:
+        """Verify both tag families with one host-visible mismatch decision."""
+        if not self.config.enable_attention_tags or self.table is None:
+            return []
+        attention = self._flatten_tag_batch(attention_items, transfer=False)
+        transfer = self._flatten_tag_batch(transfer_items, transfer=True)
+        attention_mismatch = (
+            None
+            if attention is None
+            else _attention_tag_mismatch_mask(
+                self.table,
+                attention.pages,
+                attention.expected_tags,
+                attention.generations,
+            )
+        )
+        transfer_mismatch = (
+            None
+            if transfer is None
+            else _transfer_page_tag_mismatch_mask(
+                self.table,
+                transfer.pages,
+                transfer.expected_tags,
+                transfer.generations,
+            )
+        )
+        if attention is not None and self.metrics is not None:
+            self.metrics.increment_kv_attention_tag_checked_pages(
+                int(attention.pages.numel())
+            )
+
+        reductions = [
+            mismatch.any()
+            for mismatch in (attention_mismatch, transfer_mismatch)
+            if mismatch is not None
+        ]
+        if not reductions:
+            return []
+        any_mismatch = reductions[0]
+        for reduction in reductions[1:]:
+            any_mismatch = torch.logical_or(any_mismatch, reduction)
+        if not bool(any_mismatch.item()):
+            return []
+
+        result: List[KVPageProtectionError] = []
+        if attention is not None and bool(attention_mismatch.any().item()):
+            result.extend(
+                self._attention_mismatch_details(attention, attention_mismatch)
+            )
+        if transfer is not None and bool(transfer_mismatch.any().item()):
+            result.extend(self._transfer_mismatch_details(transfer, transfer_mismatch))
         return result
 
     # -- transfer checksums ------------------------------------------------
@@ -1841,6 +2088,7 @@ class KVPageProtectionManager:
         bootstrap_rooms: Sequence[int],
         num_tokens: Sequence[int],
         starts: Optional[Sequence[int]] = None,
+        swa_evicted_lens: Optional[Sequence[int]] = None,
     ) -> Optional[AsyncChecksumBatch]:
         """Launch batched direct checksums from the request-token table.
 
@@ -1856,11 +2104,24 @@ class KVPageProtectionManager:
             return AsyncChecksumBatch([], [], torch.empty(0, dtype=TAG_DTYPE), None)
         if not (len(req_pool_indices) == len(bootstrap_rooms) == len(num_tokens)):
             raise RuntimeError("batched checksum metadata length mismatch")
+        batch_size = len(req_pool_indices)
         starts_list = (
-            list(starts) if starts is not None else [0] * len(req_pool_indices)
+            [int(x) for x in starts] if starts is not None else [0] * batch_size
         )
-        if len(starts_list) != len(req_pool_indices):
+        if len(starts_list) != batch_size:
             raise RuntimeError("batched checksum starts length mismatch")
+        num_tokens_list = [int(x) for x in num_tokens]
+        evicted_list = (
+            [int(x) for x in swa_evicted_lens]
+            if swa_evicted_lens is not None
+            else [0] * batch_size
+        )
+        if len(evicted_list) != batch_size:
+            raise RuntimeError("batched checksum swa_evicted length mismatch")
+        evicted_list = [
+            min(max(0, evicted), num_tokens_list[i])
+            for i, evicted in enumerate(evicted_list)
+        ]
 
         try:
             from sgl_kernel.kvcacheio import kv_checksum_direct_table_batched as _op
@@ -1891,23 +2152,63 @@ class KVPageProtectionManager:
         num_lanes = select_checksum_byte_count(total_bytes)
         has_swa = full_to_swa_index_mapping.numel() > 0
         is_capped = (int(num_lanes) * 8) < int(total_bytes)
-        batch_size = len(req_pool_indices)
-        accum, final_out, req_pool_t, starts_t, lengths_t = (
-            self._checksum_cache.batch_slices(batch_size, device)
+        # The representation must depend only on the pool layout, not on which
+        # other requests happen to share the prefill/decode checksum batch.
+        need_two_pass = self._checksum_cache.swa_total_bytes > 0
+        swa_starts_list = [starts_list[i] + evicted_list[i] for i in range(batch_size)]
+        swa_lengths_list = [
+            num_tokens_list[i] - evicted_list[i] for i in range(batch_size)
+        ]
+        device_changed = (
+            self._checksum_cache.accum is not None
+            and self._checksum_cache.accum.device != device
         )
-
-        req_pool_t.copy_(
-            torch.as_tensor(req_pool_indices, dtype=TAG_DTYPE, device=device),
-            non_blocking=True,
+        workspace_event = self._checksum_cache.workspace_event
+        workspace_resize = (
+            self._checksum_cache.accum is None
+            or device_changed
+            or self._checksum_cache.batch_capacity < batch_size
         )
-        starts_t.copy_(
-            torch.as_tensor(starts_list, dtype=TAG_DTYPE, device=device),
-            non_blocking=True,
+        if (
+            workspace_resize
+            and workspace_event is not None
+            and not workspace_event.query()
+        ):
+            workspace_event.synchronize()
+        metadata_copy_event = self._checksum_cache.metadata_copy_event
+        if metadata_copy_event is not None and not metadata_copy_event.query():
+            metadata_copy_event.synchronize()
+        if device_changed:
+            workspace_event = None
+            self._checksum_cache.workspace_event = None
+            metadata_copy_event = None
+            self._checksum_cache.metadata_copy_event = None
+        (
+            accum,
+            final_out,
+            secondary_accum,
+            secondary_out,
+            metadata_host,
+            metadata_device,
+        ) = self._checksum_cache.batch_slices(batch_size, device)
+        active_metadata_size = 5 * batch_size
+        metadata_host[:active_metadata_size].copy_(
+            torch.tensor(
+                [
+                    req_pool_indices,
+                    starts_list,
+                    num_tokens_list,
+                    swa_starts_list,
+                    swa_lengths_list,
+                ],
+                dtype=TAG_DTYPE,
+            ).reshape(-1)
         )
-        lengths_t.copy_(
-            torch.as_tensor(num_tokens, dtype=TAG_DTYPE, device=device),
-            non_blocking=True,
-        )
+        req_pool_t = metadata_device[:batch_size]
+        starts_t = metadata_device[batch_size : 2 * batch_size]
+        lengths_t = metadata_device[2 * batch_size : 3 * batch_size]
+        swa_starts_t = metadata_device[3 * batch_size : 4 * batch_size]
+        swa_lengths_t = metadata_device[4 * batch_size : active_metadata_size]
 
         if (
             self._checksum_cache.stream is None
@@ -1916,30 +2217,96 @@ class KVPageProtectionManager:
             self._checksum_cache.stream = torch.cuda.Stream(device=device)
         stream = self._checksum_cache.stream
         stream.wait_stream(torch.cuda.current_stream(device))
-        max_num_tokens = max(int(n) for n in num_tokens)
+        max_num_tokens = max(num_tokens_list)
+        max_swa_tokens = max(swa_lengths_list)
         with torch.cuda.stream(stream):
-            accum.zero_()
-            _op(
-                buffer_ptrs,
-                row_strides,
-                row_nbytes,
-                swa_buffer_flags,
-                full_to_swa_index_mapping,
-                req_to_token,
-                req_pool_t,
-                starts_t,
-                lengths_t,
-                int(max_num_tokens),
-                int(num_lanes),
-                has_swa,
-                is_capped,
-                accum,
-                final_out,
+            metadata_device[:active_metadata_size].copy_(
+                metadata_host[:active_metadata_size], non_blocking=True
             )
-            checksums_t = final_out.clone()
+            if metadata_copy_event is None:
+                metadata_copy_event = torch.cuda.Event()
+                self._checksum_cache.metadata_copy_event = metadata_copy_event
+            metadata_copy_event.record(stream)
+            if not need_two_pass:
+                accum.zero_()
+                _op(
+                    buffer_ptrs,
+                    row_strides,
+                    row_nbytes,
+                    swa_buffer_flags,
+                    full_to_swa_index_mapping,
+                    req_to_token,
+                    req_pool_t,
+                    starts_t,
+                    lengths_t,
+                    int(max_num_tokens),
+                    int(num_lanes),
+                    has_swa,
+                    is_capped,
+                    accum,
+                    final_out,
+                )
+                checksums_t = final_out.clone()
+            else:
+                empty_mapping = full_to_swa_index_mapping[:0]
+                full_out = None
+                if self._checksum_cache.full_total_bytes > 0:
+                    accum.zero_()
+                    full_num_lanes = select_checksum_byte_count(
+                        self._checksum_cache.full_total_bytes
+                    )
+                    _op(
+                        self._checksum_cache.full_buffer_ptrs,
+                        self._checksum_cache.full_row_strides,
+                        self._checksum_cache.full_row_nbytes,
+                        self._checksum_cache.full_swa_buffer_flags,
+                        empty_mapping,
+                        req_to_token,
+                        req_pool_t,
+                        starts_t,
+                        lengths_t,
+                        int(max_num_tokens),
+                        int(full_num_lanes),
+                        False,
+                        False,
+                        accum,
+                        final_out,
+                    )
+                    full_out = final_out
+
+                secondary_accum.zero_()
+                swa_num_lanes = select_checksum_byte_count(
+                    self._checksum_cache.swa_total_bytes
+                )
+                _op(
+                    self._checksum_cache.swa_buffer_ptrs_only,
+                    self._checksum_cache.swa_row_strides,
+                    self._checksum_cache.swa_row_nbytes,
+                    self._checksum_cache.swa_buffer_flags_only,
+                    full_to_swa_index_mapping,
+                    req_to_token,
+                    req_pool_t,
+                    swa_starts_t,
+                    swa_lengths_t,
+                    int(max_swa_tokens),
+                    int(swa_num_lanes),
+                    True,
+                    False,
+                    secondary_accum,
+                    secondary_out,
+                )
+                checksums_t = (
+                    secondary_out.clone()
+                    if full_out is None
+                    else torch.bitwise_xor(full_out, secondary_out)
+                )
+            if workspace_event is None:
+                workspace_event = torch.cuda.Event()
+                self._checksum_cache.workspace_event = workspace_event
+            workspace_event.record(stream)
         return AsyncChecksumBatch(
             bootstrap_rooms=[int(x) for x in bootstrap_rooms],
-            num_tokens=[int(x) for x in num_tokens],
+            num_tokens=num_tokens_list,
             checksums_t=checksums_t,
             stream=stream,
         )

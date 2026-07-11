@@ -1211,7 +1211,6 @@ class MooncakeKVManager(CommonKVManager):
         tags = req.dst_transfer_page_tags
         if ids is None or tags is None or len(ids) == 0:
             return
-        # Full KV page tags are first and align one-for-one with dst_kv_indices.
         end = min(len(req.dst_kv_indices), len(ids))
         chunk_ids = ids[:end][index_slice]
         chunk_tags = tags[:end][index_slice]
@@ -1893,39 +1892,39 @@ class MooncakeKVReceiver(CommonKVReceiver):
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
     def _register_kv_args(self):
-        for bootstrap_info in self.bootstrap_infos:
-            packed_kv_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
-            )
-            packed_aux_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
-            )
-            packed_state_data_ptrs = pack_int_lists(
-                self.kv_mgr.kv_args.state_data_ptrs, "Q"
-            )
-            packed_state_item_lens = pack_int_lists(
-                self.kv_mgr.kv_args.state_item_lens, "I"
-            )
-            packed_state_dim_per_tensor = pack_int_lists(
-                getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
-            )
-            # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
-            tp_rank = self.kv_mgr.kv_args.engine_rank
-            kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
-            dst_tp_rank = str(tp_rank).encode("ascii")
-            dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
-            dst_kv_item_len = str(kv_item_len).encode("ascii")
-            if (
-                self.kv_mgr.enable_staging
-                and self.kv_mgr._staging_ctx.allocator is not None
-            ):
-                _alloc = self.kv_mgr._staging_ctx.allocator
-                packed_staging_base_ptr = struct.pack("Q", _alloc.get_base_ptr())
-                staging_total_size_str = str(_alloc.get_total_size()).encode("ascii")
-            else:
-                packed_staging_base_ptr = b""
-                staging_total_size_str = b""
+        packed_kv_data_ptrs = b"".join(
+            struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+        )
+        packed_aux_data_ptrs = b"".join(
+            struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+        )
+        packed_state_data_ptrs = pack_int_lists(
+            self.kv_mgr.kv_args.state_data_ptrs, "Q"
+        )
+        packed_state_item_lens = pack_int_lists(
+            self.kv_mgr.kv_args.state_item_lens, "I"
+        )
+        packed_state_dim_per_tensor = pack_int_lists(
+            getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
+        )
+        # No PP rank is needed because decode PP equals prefill PP or is one.
+        tp_rank = self.kv_mgr.kv_args.engine_rank
+        kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
+        dst_tp_rank = str(tp_rank).encode("ascii")
+        dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
+        dst_kv_item_len = str(kv_item_len).encode("ascii")
+        if (
+            self.kv_mgr.enable_staging
+            and self.kv_mgr._staging_ctx.allocator is not None
+        ):
+            _alloc = self.kv_mgr._staging_ctx.allocator
+            packed_staging_base_ptr = struct.pack("Q", _alloc.get_base_ptr())
+            staging_total_size_str = str(_alloc.get_total_size()).encode("ascii")
+        else:
+            packed_staging_base_ptr = b""
+            staging_total_size_str = b""
 
+        for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             with lock:
                 sock.send_multipart(
@@ -1973,6 +1972,20 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 self.bootstrap_room, self.bootstrap_infos, self
             )
 
+        kv_indices_bytes = kv_indices.tobytes()
+        state_indices_bytes = (
+            pack_int_lists(state_indices, "i") if state_indices else b""
+        )
+        transfer_page_tag_ids_bytes = (
+            np.asarray(transfer_page_tag_ids, dtype=np.int32).tobytes()
+            if transfer_page_tag_ids is not None
+            else b""
+        )
+        transfer_page_tags_bytes = (
+            np.asarray(transfer_page_tags, dtype=np.int32).tobytes()
+            if transfer_page_tags is not None
+            else b""
+        )
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
@@ -1984,25 +1997,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         self.kv_mgr.local_ip.encode("ascii"),
                         str(self.kv_mgr.rank_port).encode("ascii"),
                         self.session_id.encode("ascii"),
-                        kv_indices.tobytes() if not is_dummy else b"",
+                        kv_indices_bytes if not is_dummy else b"",
                         str(aux_index).encode("ascii") if not is_dummy else b"",
-                        (
-                            pack_int_lists(state_indices, "i")
-                            if not is_dummy and state_indices
-                            else b""
-                        ),
+                        state_indices_bytes if not is_dummy else b"",
                         str(self.required_dst_info_num).encode("ascii"),
                         str(decode_prefix_len or 0).encode("ascii"),
-                        (
-                            np.asarray(transfer_page_tag_ids, dtype=np.int32).tobytes()
-                            if not is_dummy and transfer_page_tag_ids is not None
-                            else b""
-                        ),
-                        (
-                            np.asarray(transfer_page_tags, dtype=np.int32).tobytes()
-                            if not is_dummy and transfer_page_tags is not None
-                            else b""
-                        ),
+                        transfer_page_tag_ids_bytes if not is_dummy else b"",
+                        transfer_page_tags_bytes if not is_dummy else b"",
                     ]
                 )
         self.init_time = time.time()

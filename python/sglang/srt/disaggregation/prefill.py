@@ -653,9 +653,14 @@ class SchedulerDisaggregationPrefillMixin:
         checksum_reqs: List[Req] = []
         manager = getattr(self, "kv_protection_manager", None)
         if manager is not None and manager.config.checksum_enabled:
+            from sglang.srt.mem_cache.kv_page_tags import swa_checksum_evicted_len
+
+            sliding_window = getattr(self, "sliding_window_size", None)
+            page_size = getattr(self.token_to_kv_pool_allocator, "page_size", 1)
             req_pool_indices = []
             bootstrap_rooms = []
             num_tokens = []
+            swa_evicted = []
             for i, req in enumerate(batch.reqs):
                 if req.inflight_middle_chunks > 0:
                     continue
@@ -671,6 +676,9 @@ class SchedulerDisaggregationPrefillMixin:
                 req_pool_indices.append(int(req.req_pool_idx))
                 bootstrap_rooms.append(int(req.bootstrap_room or 0))
                 num_tokens.append(int(seq_len))
+                swa_evicted.append(
+                    swa_checksum_evicted_len(seq_len, sliding_window, page_size)
+                )
             if checksum_reqs:
                 try:
                     kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
@@ -680,6 +688,7 @@ class SchedulerDisaggregationPrefillMixin:
                         req_pool_indices=req_pool_indices,
                         bootstrap_rooms=bootstrap_rooms,
                         num_tokens=num_tokens,
+                        swa_evicted_lens=swa_evicted,
                     )
                 except Exception as e:
                     logger.error("KV transfer checksum batch launch failed: %s", e)

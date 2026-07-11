@@ -78,36 +78,79 @@ class _SWAPool:
         return self.swa_v[local_id] if is_swa else self.full_v[local_id]
 
 
+class _PPPool:
+    """KV pool whose accessors require global layer ids."""
+
+    def __init__(self, start_layer, k_buffers, v_buffers):
+        self.start_layer = start_layer
+        self.layer_num = len(k_buffers)
+        self._k = dict(enumerate(k_buffers, start=start_layer))
+        self._v = dict(enumerate(v_buffers, start=start_layer))
+
+    def get_key_buffer(self, layer_id):
+        return self._k[layer_id]
+
+    def get_value_buffer(self, layer_id):
+        return self._v[layer_id]
+
+
 def _rows_for_buffer(buf, locs):
     return buf.index_select(0, locs).reshape(locs.numel(), -1)
 
 
-def _reference(pool, req_to_token, req_idx, start, length):
+def _reference(pool, req_to_token, req_idx, start, length, swa_evicted=0):
     if length == 0:
         return _fmix32_scalar(_CKSUM32_SEED)
 
     positions = torch.arange(start, start + length, dtype=torch.long, device="cuda")
     full_locs = req_to_token[req_idx, start : start + length].to(torch.long)
-    rows = []
+    full_rows = []
+    swa_rows = []
     layers_mapping = getattr(pool, "layers_mapping", None)
-    for layer_id in range(pool.layer_num):
+    start_layer = getattr(pool, "start_layer", 0)
+    for layer_id in range(start_layer, start_layer + pool.layer_num):
         locs = full_locs
-        if layers_mapping is not None and bool(layers_mapping[layer_id][1]):
+        is_swa = layers_mapping is not None and bool(layers_mapping[layer_id][1])
+        if is_swa:
             mapping = pool.full_to_swa_index_mapping
-            locs = mapping.index_select(0, full_locs).clamp_min(0)
+            locs = mapping.index_select(0, full_locs[swa_evicted:]).clamp_min(0)
+        rows = swa_rows if is_swa else full_rows
         rows.append(_rows_for_buffer(pool.get_key_buffer(layer_id), locs))
         try:
             rows.append(_rows_for_buffer(pool.get_value_buffer(layer_id), locs))
         except (NotImplementedError, AttributeError):
             pass
 
-    selected = torch.cat(rows, dim=1)
-    row_nbytes = selected.contiguous().view(torch.uint8).reshape(length, -1).shape[1]
-    num_lanes = select_checksum_byte_count(row_nbytes)
-    return hash_rows_with_positions(selected, positions=positions, num_lanes=num_lanes)
+    full_checksum = None
+    if full_rows:
+        selected = torch.cat(full_rows, dim=1)
+        row_nbytes = (
+            selected.contiguous().view(torch.uint8).reshape(length, -1).shape[1]
+        )
+        full_checksum = hash_rows_with_positions(
+            selected,
+            positions=positions,
+            num_lanes=select_checksum_byte_count(row_nbytes),
+        )
+    if not swa_rows:
+        return full_checksum
+    selected = torch.cat(swa_rows, dim=1)
+    swa_length = length - swa_evicted
+    num_lanes = None
+    if swa_length:
+        row_nbytes = (
+            selected.contiguous().view(torch.uint8).reshape(swa_length, -1).shape[1]
+        )
+        num_lanes = select_checksum_byte_count(row_nbytes)
+    swa_checksum = hash_rows_with_positions(
+        selected,
+        positions=positions[swa_evicted:],
+        num_lanes=num_lanes,
+    )
+    return swa_checksum if full_checksum is None else full_checksum ^ swa_checksum
 
 
-def _batched(pool, req_to_token, req_indices, starts, lengths):
+def _batched(pool, req_to_token, req_indices, starts, lengths, swa_evicted_lens=None):
     cfg = KVProtectionConfig(enable_transfer_checksum=True)
     manager = KVPageProtectionManager(
         config=cfg,
@@ -124,6 +167,7 @@ def _batched(pool, req_to_token, req_indices, starts, lengths):
         bootstrap_rooms=[100 + i for i in range(len(req_indices))],
         num_tokens=lengths,
         starts=starts,
+        swa_evicted_lens=swa_evicted_lens,
     )
     assert batch is not None
     return [plan.checksum for plan in batch.finalize()]
@@ -184,6 +228,78 @@ def test_mha_batched_parity(dtype):
     not _have_batched_op(),
     reason="sgl_kernel.kv_checksum_direct_table_batched not built",
 )
+def test_manager_reuses_geometric_batch_metadata():
+    torch.manual_seed(11)
+    size, h, d, requests, tokens = 256, 2, 16, 9, 16
+    k = [torch.randn(size, h, d, dtype=torch.float16, device="cuda")]
+    v = [torch.randn_like(k[0])]
+    pool = _Pool(k, v)
+    req_to_token = torch.stack(
+        [torch.randperm(size, device="cuda")[:tokens] for _ in range(requests)]
+    ).to(torch.int32)
+
+    def make_manager():
+        return KVPageProtectionManager(
+            config=KVProtectionConfig(enable_transfer_checksum=True),
+            allocator=None,
+            num_pages=1,
+            page_size=1,
+            device="cuda",
+            transfer_backend="mooncake",
+        )
+
+    manager = make_manager()
+
+    def launch(target_manager, count):
+        return target_manager.begin_transfer_checksums_from_table(
+            pool,
+            req_to_token,
+            req_pool_indices=list(range(count)),
+            bootstrap_rooms=list(range(100, 100 + count)),
+            num_tokens=[tokens] * count,
+        )
+
+    def run(count):
+        return [plan.checksum for plan in launch(manager, count).finalize()]
+
+    assert run(1) == [_reference(pool, req_to_token, 0, 0, tokens)]
+    assert manager._checksum_cache.batch_capacity == 8
+    assert run(requests) == [
+        _reference(pool, req_to_token, i, 0, tokens) for i in range(requests)
+    ]
+    assert manager._checksum_cache.batch_capacity == 16
+    metadata_ptr = manager._checksum_cache.metadata_device.data_ptr()
+    run(4)
+    assert manager._checksum_cache.batch_capacity == 16
+    assert manager._checksum_cache.metadata_device.data_ptr() == metadata_ptr
+
+    growing_manager = make_manager()
+    first = launch(growing_manager, 1)
+    second = launch(growing_manager, requests)
+    assert growing_manager._checksum_cache.batch_capacity == 16
+    assert [plan.checksum for plan in first.finalize()] == [
+        _reference(pool, req_to_token, 0, 0, tokens)
+    ]
+    assert [plan.checksum for plan in second.finalize()] == [
+        _reference(pool, req_to_token, i, 0, tokens) for i in range(requests)
+    ]
+
+    same_capacity_manager = make_manager()
+    first = launch(same_capacity_manager, 1)
+    second = launch(same_capacity_manager, 4)
+    assert same_capacity_manager._checksum_cache.batch_capacity == 8
+    assert [plan.checksum for plan in first.finalize()] == [
+        _reference(pool, req_to_token, 0, 0, tokens)
+    ]
+    assert [plan.checksum for plan in second.finalize()] == [
+        _reference(pool, req_to_token, i, 0, tokens) for i in range(4)
+    ]
+
+
+@pytest.mark.skipif(
+    not _have_batched_op(),
+    reason="sgl_kernel.kv_checksum_direct_table_batched not built",
+)
 def test_mla_k_only_batched_parity():
     torch.manual_seed(1)
     size, lora, layers, tokens = 256, 64, 4, 48
@@ -199,6 +315,25 @@ def test_mla_k_only_batched_parity():
     got = _one(pool, req_to_token, 0, 0, tokens)
     expected = _reference(pool, req_to_token, 0, 0, tokens)
     assert got == expected
+
+
+@pytest.mark.skipif(
+    not _have_batched_op(),
+    reason="sgl_kernel.kv_checksum_direct_table_batched not built",
+)
+def test_pp_pool_uses_global_layer_ids():
+    torch.manual_seed(12)
+    size, h, d, tokens = 128, 2, 16, 24
+    k = [torch.randn(size, h, d, dtype=torch.float16, device="cuda") for _ in range(2)]
+    v = [torch.randn_like(buf) for buf in k]
+    pool = _PPPool(start_layer=5, k_buffers=k, v_buffers=v)
+    req_to_token = (
+        torch.randperm(size, device="cuda")[:tokens].reshape(1, -1).to(torch.int32)
+    )
+
+    assert _one(pool, req_to_token, 0, 0, tokens) == _reference(
+        pool, req_to_token, 0, 0, tokens
+    )
 
 
 @pytest.mark.skipif(
@@ -306,6 +441,112 @@ def test_swa_batched_parity_uses_full_to_swa_mapping():
     swa_k[0][swa_locs[7], 0, 0] += 1.0
     corrupted = _one(pool, req_to_token, 0, 0, tokens)
     assert corrupted != got
+
+
+@pytest.mark.skipif(
+    not _have_batched_op(),
+    reason="sgl_kernel.kv_checksum_direct_table_batched not built",
+)
+def test_swa_checksum_excludes_untransferred_prefix():
+    torch.manual_seed(13)
+    full_size, swa_size, h, d, tokens, evicted = 128, 64, 2, 16, 32, 16
+    full_k = [torch.randn(full_size, h, d, device="cuda", dtype=torch.float16)]
+    full_v = [torch.randn_like(full_k[0])]
+    swa_k = [torch.randn(swa_size, h, d, device="cuda", dtype=torch.float16)]
+    swa_v = [torch.randn_like(swa_k[0])]
+    full_locs = torch.randperm(full_size, device="cuda")[:tokens]
+    swa_locs = torch.randperm(swa_size - 1, device="cuda")[: tokens - evicted] + 1
+    mapping = torch.zeros(full_size + 1, dtype=torch.long, device="cuda")
+    mapping[full_locs[evicted:]] = swa_locs
+    pool = _SWAPool(full_k, full_v, swa_k, swa_v, mapping)
+    req_to_token = full_locs.reshape(1, -1).to(torch.int32)
+
+    got = _batched(
+        pool,
+        req_to_token,
+        [0],
+        [0],
+        [tokens],
+        swa_evicted_lens=[evicted],
+    )[0]
+    full_rows = torch.cat(
+        [_rows_for_buffer(buf, full_locs) for buf in (full_k + full_v)], dim=1
+    )
+    swa_rows = torch.cat(
+        [_rows_for_buffer(buf, swa_locs) for buf in (swa_k + swa_v)], dim=1
+    )
+    expected = hash_rows_with_positions(
+        full_rows, positions=torch.arange(tokens, device="cuda")
+    ) ^ hash_rows_with_positions(
+        swa_rows, positions=torch.arange(evicted, tokens, device="cuda")
+    )
+    assert got == expected
+
+    swa_k[0][0].add_(1)
+    unchanged = _batched(
+        pool,
+        req_to_token,
+        [0],
+        [0],
+        [tokens],
+        swa_evicted_lens=[evicted],
+    )[0]
+    assert unchanged == got
+
+    swa_k[0][swa_locs[0], 0, 0].add_(1)
+    changed = _batched(
+        pool,
+        req_to_token,
+        [0],
+        [0],
+        [tokens],
+        swa_evicted_lens=[evicted],
+    )[0]
+    assert changed != got
+
+
+@pytest.mark.skipif(
+    not _have_batched_op(),
+    reason="sgl_kernel.kv_checksum_direct_table_batched not built",
+)
+def test_swa_two_pass_is_independent_per_request():
+    torch.manual_seed(14)
+    full_size, swa_size, h, d = 256, 96, 2, 16
+    full_k = [torch.randn(full_size, h, d, device="cuda", dtype=torch.float16)]
+    full_v = [torch.randn_like(full_k[0])]
+    swa_k = [torch.randn(swa_size, h, d, device="cuda", dtype=torch.float16)]
+    swa_v = [torch.randn_like(swa_k[0])]
+    req_to_token = torch.randperm(full_size, device="cuda")[:80].reshape(2, 40)
+    starts = [3, 2]
+    lengths = [20, 30]
+    evicted = [0, 16]
+    mapping = torch.zeros(full_size + 1, dtype=torch.long, device="cuda")
+    swa_locs = torch.randperm(swa_size - 1, device="cuda")[:34] + 1
+    mapping[req_to_token[0, 3:23]] = swa_locs[:20]
+    mapping[req_to_token[1, 18:32]] = swa_locs[20:]
+    pool = _SWAPool(full_k, full_v, swa_k, swa_v, mapping)
+    req_to_token = req_to_token.to(torch.int32)
+
+    got = _batched(
+        pool,
+        req_to_token,
+        [0, 1],
+        starts,
+        lengths,
+        swa_evicted_lens=evicted,
+    )
+    expected = [
+        _reference(
+            pool,
+            req_to_token,
+            req_idx,
+            starts[req_idx],
+            lengths[req_idx],
+            evicted[req_idx],
+        )
+        for req_idx in range(2)
+    ]
+    assert got == expected
 
 
 @pytest.mark.skipif(

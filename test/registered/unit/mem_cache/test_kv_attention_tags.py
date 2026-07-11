@@ -6,6 +6,7 @@ byte-level correctness.
 """
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -248,6 +249,66 @@ class TestProtectionManager(CustomTestCase):
         self.assertEqual(mismatches[0].bootstrap_room, 2)
         self.assertEqual(metrics.mismatches, 1)
 
+    def test_combined_verification_reports_both_tag_families(self):
+        mgr = self._make_manager()
+        mgr.table.bump_generations(torch.tensor([2, 3]))
+        attention = mgr.register_attention_tags(page_physical_ids=[2], bootstrap_room=1)
+        transfer = mgr.register_transfer_page_tags(
+            page_physical_ids=[3], bootstrap_room=2, write_actual=True
+        )
+        self.assertEqual(
+            mgr.verify_protection_batch(
+                [("attention", attention)], [("transfer", transfer)]
+            ),
+            [],
+        )
+
+        mgr.table.bump_generations(torch.tensor([2, 3]))
+        mismatches = mgr.verify_protection_batch(
+            [("attention", attention)], [("transfer", transfer)]
+        )
+        self.assertEqual(
+            {type(mismatch) for mismatch in mismatches},
+            {KVAttentionTagMismatch, KVTransferPageTagMismatch},
+        )
+
+    def test_flattened_verification_cache_reuses_and_invalidates(self):
+        mgr = self._make_manager()
+        mgr.table.bump_generations(torch.tensor([3]))
+        attention = mgr.register_attention_tags(page_physical_ids=[3], bootstrap_room=7)
+        transfer = mgr.register_transfer_page_tags(
+            page_physical_ids=[3], bootstrap_room=7, write_actual=True
+        )
+        items = [("r", attention)]
+        transfer_items = [("r", transfer)]
+
+        self.assertEqual(mgr.verify_protection_batch(items, transfer_items), [])
+        attention_cache = mgr._attention_verification_cache
+        transfer_cache = mgr._transfer_verification_cache
+        with patch("torch.cat", side_effect=AssertionError("unexpected rebuild")):
+            self.assertEqual(mgr.verify_protection_batch(items, transfer_items), [])
+        self.assertIs(mgr._attention_verification_cache, attention_cache)
+        self.assertIs(mgr._transfer_verification_cache, transfer_cache)
+
+        mgr.table.bump_generations(torch.tensor([8]))
+        mgr.refresh_tail_page(
+            attention, logical_pos=4, physical_page_id=torch.tensor([8])
+        )
+        mgr.refresh_transfer_page_tag_tail_page(
+            transfer, logical_pos=4, physical_page_id=torch.tensor([8])
+        )
+        self.assertEqual(mgr.verify_protection_batch(items, transfer_items), [])
+        self.assertIsNot(mgr._attention_verification_cache, attention_cache)
+        self.assertIsNot(mgr._transfer_verification_cache, transfer_cache)
+
+        mgr.table.bump_generations(torch.tensor([8]))
+        mismatches = mgr.verify_protection_batch(items, transfer_items)
+        self.assertEqual({m.page_position for m in mismatches}, {1})
+
+        mgr.clear_verification_cache()
+        self.assertIsNone(mgr._attention_verification_cache)
+        self.assertIsNone(mgr._transfer_verification_cache)
+
     def test_refresh_tail_page_appends_new_page(self):
         mgr = self._make_manager()
         mgr.table.bump_generations(torch.tensor([3]))
@@ -303,8 +364,8 @@ class TestProtectionManager(CustomTestCase):
         )
 
         mgr.write_transfer_page_tags(
-            page_physical_ids=old_owner.physical_page_ids,
-            transfer_page_tags=old_owner.expected_tags,
+            page_physical_ids=old_owner.physical_page_ids_t,
+            transfer_page_tags=old_owner.expected_tags_t,
         )
         mismatches = mgr.verify_transfer_page_tag_batch([("new", new_owner)])
         self.assertEqual(len(mismatches), 1)
@@ -336,6 +397,21 @@ class TestProtectionManager(CustomTestCase):
         self.assertEqual(len(mismatches), 1)
         self.assertEqual(mismatches[0].rid, "r")
         self.assertEqual(mismatches[0].page_position, 11)
+
+    def test_commit_transfer_page_tags_writes_retained_group(self):
+        mgr = self._make_manager()
+        mgr.table.bump_generations(torch.tensor([3, 53]))
+        full = mgr.register_transfer_page_tags(
+            page_physical_ids=[3], page_positions=[0], bootstrap_room=7
+        )
+        swa = mgr.register_transfer_page_tags(
+            page_physical_ids=[53], page_positions=[10], bootstrap_room=7
+        )
+        group = TransferPageTagManifestGroup((full, swa))
+
+        self.assertEqual(len(mgr.verify_transfer_page_tag_batch([("r", group)])), 1)
+        mgr.commit_transfer_page_tags(group)
+        self.assertEqual(mgr.verify_transfer_page_tag_batch([("r", group)]), [])
 
     def test_refresh_transfer_page_tag_tail_page_writes_actual(self):
         mgr = self._make_manager()
