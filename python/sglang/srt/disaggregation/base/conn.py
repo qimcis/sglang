@@ -132,6 +132,10 @@ class BaseKVSender(ABC):
     def pop_decode_prefix_len(self) -> int:
         return 0
 
+    def set_checksum_plan(self, plan) -> None:
+        """Attach optional protection metadata to the final transfer chunk."""
+        pass
+
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0
 

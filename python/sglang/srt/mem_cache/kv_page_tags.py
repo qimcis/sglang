@@ -43,10 +43,15 @@ Design constraints (hard requirements):
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import struct
+import time
+import uuid
 from bisect import bisect_right
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -84,6 +89,28 @@ class KVPageProtectionError(Exception):
     """Base class for KV page protection failures."""
 
 
+class KVProtectionBookkeepingError(KVPageProtectionError):
+    """Raised when protection metadata cannot be committed safely."""
+
+    def __init__(
+        self,
+        *,
+        rid: Optional[str] = None,
+        bootstrap_room: Optional[int] = None,
+        cause: str = "bookkeeping_error",
+        detail: Optional[str] = None,
+    ):
+        self.rid = rid
+        self.bootstrap_room = bootstrap_room
+        self.cause = cause
+        self.detail = detail
+        self.incident = None
+        super().__init__(
+            f"KV protection bookkeeping failed (rid={rid}, "
+            f"bootstrap_room={bootstrap_room}, cause={cause}, detail={detail})"
+        )
+
+
 class KVAttentionTagMismatch(KVPageProtectionError):
     """Raised/recorded when a decode attention tag does not match.
 
@@ -99,6 +126,9 @@ class KVAttentionTagMismatch(KVPageProtectionError):
         page_position: Optional[int] = None,
         expected_tag: Optional[int] = None,
         actual_tag: Optional[int] = None,
+        expected_generation: Optional[int] = None,
+        actual_generation: Optional[int] = None,
+        cause: str = "tag_value",
     ):
         self.rid = rid
         self.bootstrap_room = bootstrap_room
@@ -106,10 +136,16 @@ class KVAttentionTagMismatch(KVPageProtectionError):
         self.page_position = page_position
         self.expected_tag = expected_tag
         self.actual_tag = actual_tag
+        self.expected_generation = expected_generation
+        self.actual_generation = actual_generation
+        self.cause = cause
+        self.incident = None
         super().__init__(
             f"KV attention tag mismatch (rid={rid}, bootstrap_room={bootstrap_room}, "
             f"page_id={page_id}, page_position={page_position}, "
-            f"expected_tag={_u64(expected_tag)}, actual_tag={_u64(actual_tag)})"
+            f"expected_tag={_u64(expected_tag)}, actual_tag={_u64(actual_tag)}, "
+            f"expected_generation={expected_generation}, actual_generation={actual_generation}, "
+            f"cause={cause})"
         )
 
 
@@ -124,17 +160,30 @@ class KVChecksumError(KVPageProtectionError):
         expected_checksum: Optional[int] = None,
         actual_checksum: Optional[int] = None,
         num_checked_tokens: Optional[int] = None,
+        page_position: Optional[int] = None,
+        expected_page_digest: Optional[int] = None,
+        actual_page_digest: Optional[int] = None,
+        cause: str = "digest_mismatch",
+        detail: Optional[str] = None,
     ):
         self.rid = rid
         self.bootstrap_room = bootstrap_room
         self.expected_checksum = expected_checksum
         self.actual_checksum = actual_checksum
         self.num_checked_tokens = num_checked_tokens
+        self.page_position = page_position
+        self.expected_page_digest = expected_page_digest
+        self.actual_page_digest = actual_page_digest
+        self.cause = cause
+        self.detail = detail
+        self.incident = None
         super().__init__(
             f"KV transfer checksum mismatch (rid={rid}, "
             f"bootstrap_room={bootstrap_room}, "
             f"expected={_u32(expected_checksum)}, actual={_u32(actual_checksum)}, "
-            f"num_checked_tokens={num_checked_tokens})"
+            f"num_checked_tokens={num_checked_tokens}, page_position={page_position}, "
+            f"expected_page_digest={_u64(expected_page_digest)}, "
+            f"actual_page_digest={_u64(actual_page_digest)}, cause={cause}, detail={detail})"
         )
 
 
@@ -150,6 +199,9 @@ class KVTransferPageTagMismatch(KVPageProtectionError):
         page_position: Optional[int] = None,
         expected_transfer_tag: Optional[int] = None,
         actual_transfer_tag: Optional[int] = None,
+        expected_generation: Optional[int] = None,
+        actual_generation: Optional[int] = None,
+        cause: str = "tag_value",
     ):
         self.rid = rid
         self.bootstrap_room = bootstrap_room
@@ -157,11 +209,17 @@ class KVTransferPageTagMismatch(KVPageProtectionError):
         self.page_position = page_position
         self.expected_transfer_tag = expected_transfer_tag
         self.actual_transfer_tag = actual_transfer_tag
+        self.expected_generation = expected_generation
+        self.actual_generation = actual_generation
+        self.cause = cause
+        self.incident = None
         super().__init__(
             f"KV transfer page tag mismatch (rid={rid}, bootstrap_room={bootstrap_room}, "
             f"page_id={page_id}, page_position={page_position}, "
             f"expected_transfer_tag={_u32(expected_transfer_tag)}, "
-            f"actual_transfer_tag={_u32(actual_transfer_tag)})"
+            f"actual_transfer_tag={_u32(actual_transfer_tag)}, "
+            f"expected_generation={expected_generation}, actual_generation={actual_generation}, "
+            f"cause={cause})"
         )
 
 
@@ -177,6 +235,110 @@ def _u32(value: Optional[int]) -> Optional[int]:
     if value is None:
         return None
     return int(value) & _U32_MASK
+
+
+@dataclass
+class KVProtectionIncident:
+    schema_version: int
+    incident_id: str
+    observed_at_ns: int
+    kind: str
+    cause: str
+    phase: str
+    rid: Optional[str]
+    bootstrap_room: Optional[int]
+    pod: Optional[str]
+    rank: Optional[str]
+    page_id: Optional[int] = None
+    page_position: Optional[int] = None
+    expected_tag: Optional[int] = None
+    actual_tag: Optional[int] = None
+    expected_generation: Optional[int] = None
+    actual_generation: Optional[int] = None
+    expected_checksum: Optional[int] = None
+    actual_checksum: Optional[int] = None
+    expected_page_digest: Optional[int] = None
+    actual_page_digest: Optional[int] = None
+    num_checked_tokens: Optional[int] = None
+    detail: Optional[str] = None
+    history: Tuple[Dict[str, Any], ...] = ()
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = {
+            key: value
+            for key, value in self.__dict__.items()
+            if value is not None and key != "history"
+        }
+        payload["history"] = list(self.history)
+        for key in (
+            "expected_tag",
+            "actual_tag",
+            "expected_page_digest",
+            "actual_page_digest",
+        ):
+            if payload.get(key) is not None:
+                payload[key] = f"0x{int(payload[key]) & _U64_MASK:016x}"
+        for key in ("expected_checksum", "actual_checksum"):
+            if payload.get(key) is not None:
+                payload[key] = f"0x{int(payload[key]) & _U32_MASK:08x}"
+        return payload
+
+
+def attach_kv_protection_incident(
+    error: KVPageProtectionError,
+    *,
+    kind: str,
+    phase: str,
+    history: Sequence[Dict[str, Any]] = (),
+) -> KVProtectionIncident:
+    incident = KVProtectionIncident(
+        schema_version=1,
+        incident_id=uuid.uuid4().hex,
+        observed_at_ns=time.time_ns(),
+        kind=kind,
+        cause=getattr(error, "cause", "unknown"),
+        phase=phase,
+        rid=getattr(error, "rid", None),
+        bootstrap_room=getattr(error, "bootstrap_room", None),
+        pod=os.getenv("HOSTNAME"),
+        rank=os.getenv("RANK", os.getenv("LOCAL_RANK")),
+        page_id=getattr(error, "page_id", None),
+        page_position=getattr(error, "page_position", None),
+        expected_tag=getattr(
+            error, "expected_tag", getattr(error, "expected_transfer_tag", None)
+        ),
+        actual_tag=getattr(
+            error, "actual_tag", getattr(error, "actual_transfer_tag", None)
+        ),
+        expected_generation=getattr(error, "expected_generation", None),
+        actual_generation=getattr(error, "actual_generation", None),
+        expected_checksum=getattr(error, "expected_checksum", None),
+        actual_checksum=getattr(error, "actual_checksum", None),
+        expected_page_digest=getattr(error, "expected_page_digest", None),
+        actual_page_digest=getattr(error, "actual_page_digest", None),
+        num_checked_tokens=getattr(error, "num_checked_tokens", None),
+        detail=getattr(error, "detail", None),
+        history=tuple(history),
+    )
+    error.incident = incident
+    return incident
+
+
+def emit_kv_protection_incident(
+    error: KVPageProtectionError, log: logging.Logger = logger
+) -> None:
+    incident = getattr(error, "incident", None)
+    if incident is None:
+        kind = {
+            KVAttentionTagMismatch: "attention_tag",
+            KVTransferPageTagMismatch: "transfer_page_tag",
+            KVChecksumError: "transfer_checksum",
+        }.get(type(error), "unknown")
+        incident = attach_kv_protection_incident(error, kind=kind, phase="unknown")
+    log.error(
+        "KVProtectionIncident %s",
+        json.dumps(incident.to_dict(), sort_keys=True, separators=(",", ":")),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +357,8 @@ class KVProtectionConfig:
 
     enable_attention_tags: bool = False
     enable_transfer_checksum: bool = False
+    enable_page_history: bool = False
+    allow_legacy_completion: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -232,6 +396,13 @@ class KVProtectionConfig:
         return cls(
             enable_attention_tags=enable_attention_tags,
             enable_transfer_checksum=enable_transfer_checksum,
+            enable_page_history=(
+                enable_attention_tags and envs.SGLANG_KV_PAGE_HISTORY.get()
+            ),
+            allow_legacy_completion=(
+                (enable_attention_tags or enable_transfer_checksum)
+                and envs.SGLANG_ENABLE_LEGACY_KV_PROTECTION_COMPLETION.get()
+            ),
         )
 
 
@@ -383,6 +554,14 @@ _CKSUM32_POS_MUL = 0x9E3779B1
 _CKSUM32_LANE_MUL = 0x85EBCA77
 _CKSUM32_HI_MUL = 0xC2B2AE3D
 _TRANSFER_PAGE_TAG_SEED = 0x5047_5447  # "PGTG".
+
+TRANSFER_CHECKSUM_DIGEST_PAGE_SIZE = 64
+_CHECKSUM_MANIFEST_MAGIC = b"SGLKVDG1"
+_CHECKSUM_MANIFEST_VERSION = 1
+_CHECKSUM_MANIFEST_ALGORITHM = 1
+_CHECKSUM_MANIFEST_DIGEST_BYTES = 8
+_CHECKSUM_MANIFEST_MAX_BYTES = 8 * 1024 * 1024
+_CHECKSUM_MANIFEST_HEADER = struct.Struct("<8sBBHQQIIqII")
 
 
 def compute_attention_tag_scalar(
@@ -975,6 +1154,157 @@ def _iter_transfer_page_tag_manifests(
 # ---------------------------------------------------------------------------
 
 
+class KVPageHistory:
+    """Small device-resident operation ring, materialized only after a mismatch."""
+
+    DEPTH = 8
+    BYTES_PER_PAGE = 8 + DEPTH * 5 * 8
+    ALLOC = 1
+    FREE = 2
+    FREE_DEFERRED = 3
+    FREE_RELEASED = 4
+    TRANSFER_EXPECTED = 5
+    TRANSFER_WRITE = 6
+    TAG_REFRESH = 7
+    _OP_NAMES = {
+        ALLOC: "alloc",
+        FREE: "free",
+        FREE_DEFERRED: "free_deferred",
+        FREE_RELEASED: "free_released",
+        TRANSFER_EXPECTED: "transfer_expected",
+        TRANSFER_WRITE: "transfer_write",
+        TAG_REFRESH: "tag_refresh",
+    }
+
+    def __init__(self, size: int, device: str):
+        shape = (size, self.DEPTH)
+        self.device = device
+        self.cursor = torch.zeros(size, dtype=TAG_DTYPE, device=device)
+        self.records = torch.zeros((*shape, 5), dtype=TAG_DTYPE, device=device)
+        self.records[:, :, 3].fill_(-1)
+        self.operations = self.records[:, :, 0]
+        self.generations = self.records[:, :, 1]
+        self.bootstrap_rooms = self.records[:, :, 2]
+        self.page_positions = self.records[:, :, 3]
+        self.values = self.records[:, :, 4]
+
+    @staticmethod
+    def _field_tensor(value, page_ids: torch.Tensor, default: int) -> torch.Tensor:
+        if value is None:
+            return torch.full_like(page_ids, default, dtype=TAG_DTYPE)
+        value_t = torch.as_tensor(
+            value, dtype=TAG_DTYPE, device=page_ids.device
+        ).reshape(-1)
+        if value_t.numel() == 1 and page_ids.numel() != 1:
+            value_t = value_t.expand(page_ids.numel())
+        if value_t.numel() != page_ids.numel():
+            raise RuntimeError("KV page history metadata length mismatch")
+        return value_t
+
+    def record(
+        self,
+        page_ids,
+        operation: int,
+        *,
+        generations=None,
+        bootstrap_rooms=None,
+        page_positions=None,
+        values=None,
+        generations_by_page: bool = False,
+    ) -> None:
+        page_ids_t = torch.as_tensor(
+            page_ids, dtype=torch.long, device=self.device
+        ).reshape(-1)
+        if page_ids_t.numel() == 0:
+            return
+        if page_ids_t.is_cuda:
+            if generations is None:
+                raise RuntimeError("CUDA KV page history requires generations")
+            if not isinstance(bootstrap_rooms, (int, type(None))):
+                raise RuntimeError("CUDA KV page history requires a scalar room")
+
+            def field_arg(value, default):
+                if value is None:
+                    return page_ids_t[:0], default
+                if isinstance(value, int):
+                    return page_ids_t[:0], int(value)
+                value_t = torch.as_tensor(value, device=self.device).reshape(-1)
+                if value_t.numel() not in (1, page_ids_t.numel()):
+                    raise RuntimeError("KV page history metadata length mismatch")
+                return value_t.contiguous(), default
+
+            generations_t = torch.as_tensor(
+                generations, dtype=TAG_DTYPE, device=self.device
+            ).reshape(-1)
+            expected_generations = (
+                self.cursor.numel() if generations_by_page else page_ids_t.numel()
+            )
+            if generations_t.numel() != expected_generations:
+                raise RuntimeError("KV page history generation length mismatch")
+            page_positions_t, page_position = field_arg(page_positions, -1)
+            values_t, value = field_arg(values, 0)
+            from sgl_kernel.kvcacheio import kv_page_history_record
+
+            kv_page_history_record(
+                page_ids_t,
+                operation,
+                generations_t.contiguous(),
+                generations_by_page,
+                int(bootstrap_rooms or 0),
+                page_positions_t,
+                page_position,
+                values_t,
+                value,
+                self.cursor,
+                self.records,
+            )
+            return
+        cursors = self.cursor.index_select(0, page_ids_t)
+        slots = torch.remainder(cursors, self.DEPTH).to(torch.long)
+        flat_indices = page_ids_t * self.DEPTH + slots
+        if generations_by_page:
+            generations_t = torch.as_tensor(
+                generations, dtype=TAG_DTYPE, device=page_ids_t.device
+            ).reshape(-1)
+            generations_t = generations_t.index_select(0, page_ids_t)
+        else:
+            generations_t = generations
+        fields = torch.stack(
+            (
+                torch.full_like(page_ids_t, int(operation), dtype=TAG_DTYPE),
+                self._field_tensor(generations_t, page_ids_t, 0),
+                self._field_tensor(bootstrap_rooms, page_ids_t, 0),
+                self._field_tensor(page_positions, page_ids_t, -1),
+                self._field_tensor(values, page_ids_t, 0),
+            ),
+            dim=1,
+        )
+        self.records.view(-1, 5).index_copy_(0, flat_indices, fields)
+        self.cursor.index_add_(
+            0, page_ids_t, torch.ones_like(page_ids_t, dtype=TAG_DTYPE)
+        )
+
+    def materialize(self, page_id: int) -> List[Dict[str, Any]]:
+        cursor = int(self.cursor[page_id].item())
+        count = min(cursor, self.DEPTH)
+        start = cursor - count
+        result = []
+        for sequence in range(start, cursor):
+            slot = sequence % self.DEPTH
+            operation = int(self.operations[page_id, slot].item())
+            result.append(
+                {
+                    "sequence": sequence,
+                    "operation": self._OP_NAMES.get(operation, f"unknown_{operation}"),
+                    "generation": int(self.generations[page_id, slot].item()),
+                    "bootstrap_room": int(self.bootstrap_rooms[page_id, slot].item()),
+                    "page_position": int(self.page_positions[page_id, slot].item()),
+                    "value": f"0x{int(self.values[page_id, slot].item()) & _U64_MASK:016x}",
+                }
+            )
+        return result
+
+
 class KVAttentionTagTable:
     """Sidecar GPU buffer of per-physical-page attention tags + generations.
 
@@ -982,7 +1312,9 @@ class KVAttentionTagTable:
     protection is enabled, so the default serving path pays nothing.
     """
 
-    def __init__(self, num_pages: int, device: str = "cpu"):
+    def __init__(
+        self, num_pages: int, device: str = "cpu", *, enable_history: bool = False
+    ):
         # +1 so physical page ids (which are 1-based in the paged allocator) fit.
         self._size = num_pages + 1
         self.device = device
@@ -991,10 +1323,38 @@ class KVAttentionTagTable:
         self.transfer_page_tags = torch.zeros(
             self._size, dtype=TRANSFER_PAGE_TAG_DTYPE, device=device
         )
+        self.history = KVPageHistory(self._size, device) if enable_history else None
+        self._history_warning_emitted = False
 
     @property
     def size(self) -> int:
         return self._size
+
+    def _record_history(self, *args, **kwargs) -> None:
+        if self.history is None:
+            return
+        try:
+            self.history.record(*args, **kwargs)
+        except Exception:
+            if not self._history_warning_emitted:
+                logger.warning(
+                    "KV page history recording failed; protection remains active",
+                    exc_info=True,
+                )
+                self._history_warning_emitted = True
+
+    def materialize_history(self, page_id: int) -> List[Dict[str, Any]]:
+        if self.history is None:
+            return []
+        try:
+            return self.history.materialize(page_id)
+        except Exception:
+            logger.warning(
+                "KV page history materialization failed for page_id=%s",
+                page_id,
+                exc_info=True,
+            )
+            return []
 
     def bump_generations(self, page_ids: torch.Tensor) -> None:
         """Increment the allocation generation of the given physical pages.
@@ -1008,6 +1368,13 @@ class KVAttentionTagTable:
         page_ids = page_ids.to(self.device, dtype=torch.long).reshape(-1)
         self.generations.index_add_(
             0, page_ids, torch.ones_like(page_ids, dtype=TAG_DTYPE)
+        )
+        history_pages = torch.unique(page_ids)
+        self._record_history(
+            history_pages,
+            KVPageHistory.ALLOC,
+            generations=self.generations,
+            generations_by_page=True,
         )
 
     def generation_of(self, page_ids: torch.Tensor) -> torch.Tensor:
@@ -1028,7 +1395,7 @@ class KVAttentionTagTable:
 
     def write_transfer_page_tags(
         self, page_ids: torch.Tensor, tags: torch.Tensor
-    ) -> None:
+    ) -> Optional[torch.cuda.Event]:
         """Scatter transfer-written page tags into the sidecar buffer."""
         if page_ids.numel() == 0:
             return
@@ -1039,6 +1406,24 @@ class KVAttentionTagTable:
     def read_transfer_page_tags(self, page_ids: torch.Tensor) -> torch.Tensor:
         page_ids = page_ids.to(self.device, dtype=torch.long).reshape(-1)
         return self.transfer_page_tags.index_select(0, page_ids)
+
+    def record_free(self, page_ids, *, deferred: bool = False) -> None:
+        page_ids_t = torch.as_tensor(page_ids, dtype=torch.long, device=self.device)
+        self._record_history(
+            page_ids_t,
+            KVPageHistory.FREE_DEFERRED if deferred else KVPageHistory.FREE,
+            generations=self.generations,
+            generations_by_page=True,
+        )
+
+    def record_free_released(self, page_ids) -> None:
+        page_ids_t = torch.as_tensor(page_ids, dtype=torch.long, device=self.device)
+        self._record_history(
+            page_ids_t,
+            KVPageHistory.FREE_RELEASED,
+            generations=self.generations,
+            generations_by_page=True,
+        )
 
 
 def _attention_tag_mismatch_mask(
@@ -1275,13 +1660,28 @@ class ChecksumPlan:
     bootstrap_room: int
     num_tokens: int
     checksum: int  # the prefill-side uint32 source checksum
+    page_size: int = 0
+    logical_start: int = 0
+    page_digests: Tuple[int, ...] = ()
 
     def to_payload(self) -> dict:
-        return {
+        payload = {
             "bootstrap_room": int(self.bootstrap_room),
             "num_tokens": int(self.num_tokens),
             "checksum": int(self.checksum) & _U32_MASK,
         }
+        if self.page_size > 0 or self.page_digests:
+            payload.update(
+                {
+                    "manifest_version": _CHECKSUM_MANIFEST_VERSION,
+                    "page_size": int(self.page_size),
+                    "logical_start": int(self.logical_start),
+                    "page_digests": [
+                        int(value) & _U64_MASK for value in self.page_digests
+                    ],
+                }
+            )
+        return payload
 
     @classmethod
     def from_payload(cls, payload: dict) -> ChecksumPlan:
@@ -1289,6 +1689,135 @@ class ChecksumPlan:
             bootstrap_room=int(payload["bootstrap_room"]),
             num_tokens=int(payload["num_tokens"]),
             checksum=int(payload["checksum"]) & _U32_MASK,
+            page_size=int(payload.get("page_size", 0)),
+            logical_start=int(payload.get("logical_start", 0)),
+            page_digests=tuple(
+                int(value) & _U64_MASK for value in payload.get("page_digests", ())
+            ),
+        )
+
+    def to_wire_bytes(self, *, transfer_nonce: int) -> bytes:
+        """Serialize a bounded, versioned manifest for Mooncake completion."""
+        num_pages = len(self.page_digests)
+        if self.num_tokens <= 0:
+            raise ValueError("checksum page manifest requires a positive token count")
+        if self.page_size != TRANSFER_CHECKSUM_DIGEST_PAGE_SIZE:
+            raise ValueError(
+                "checksum page manifest requires page_size="
+                f"{TRANSFER_CHECKSUM_DIGEST_PAGE_SIZE}"
+            )
+        if self.logical_start < 0:
+            raise ValueError("checksum page manifest requires a non-negative start")
+        if not transfer_nonce:
+            raise ValueError("checksum page manifest requires a transfer nonce")
+        expected_pages = (
+            (self.logical_start % self.page_size + self.num_tokens + self.page_size - 1)
+            // self.page_size
+            if self.num_tokens > 0
+            else 0
+        )
+        if num_pages != expected_pages:
+            raise ValueError(
+                f"checksum page digest count mismatch: expected={expected_pages}, actual={num_pages}"
+            )
+        payload_size = _CHECKSUM_MANIFEST_HEADER.size + num_pages * 8
+        if payload_size > _CHECKSUM_MANIFEST_MAX_BYTES:
+            raise ValueError("checksum page manifest exceeds the wire size limit")
+        header = _CHECKSUM_MANIFEST_HEADER.pack(
+            _CHECKSUM_MANIFEST_MAGIC,
+            _CHECKSUM_MANIFEST_VERSION,
+            _CHECKSUM_MANIFEST_ALGORITHM,
+            _CHECKSUM_MANIFEST_DIGEST_BYTES,
+            int(transfer_nonce) & _U64_MASK,
+            int(self.bootstrap_room) & _U64_MASK,
+            int(self.num_tokens),
+            int(self.page_size),
+            int(self.logical_start),
+            int(self.checksum) & _U32_MASK,
+            num_pages,
+        )
+        if not num_pages:
+            return header
+        return header + struct.pack(
+            f"<{num_pages}Q", *(int(value) & _U64_MASK for value in self.page_digests)
+        )
+
+    @classmethod
+    def from_wire_bytes(
+        cls,
+        payload: bytes,
+        *,
+        expected_transfer_nonce: Optional[int] = None,
+        expected_bootstrap_room: Optional[int] = None,
+    ) -> ChecksumPlan:
+        if (
+            not isinstance(payload, bytes)
+            or len(payload) < _CHECKSUM_MANIFEST_HEADER.size
+        ):
+            raise ValueError("checksum page manifest is truncated")
+        if len(payload) > _CHECKSUM_MANIFEST_MAX_BYTES:
+            raise ValueError("checksum page manifest exceeds the wire size limit")
+        (
+            magic,
+            version,
+            algorithm,
+            digest_bytes,
+            transfer_nonce,
+            bootstrap_room,
+            num_tokens,
+            page_size,
+            logical_start,
+            checksum,
+            num_pages,
+        ) = _CHECKSUM_MANIFEST_HEADER.unpack_from(payload)
+        if magic != _CHECKSUM_MANIFEST_MAGIC:
+            raise ValueError("checksum page manifest has invalid magic")
+        if version != _CHECKSUM_MANIFEST_VERSION:
+            raise ValueError(f"unsupported checksum page manifest version {version}")
+        if algorithm != _CHECKSUM_MANIFEST_ALGORITHM or digest_bytes != 8:
+            raise ValueError("unsupported checksum page digest algorithm")
+        if num_tokens <= 0:
+            raise ValueError("checksum page manifest has invalid token count")
+        if page_size != TRANSFER_CHECKSUM_DIGEST_PAGE_SIZE:
+            raise ValueError(
+                "checksum page manifest has unsupported page_size " f"{page_size}"
+            )
+        if logical_start < 0:
+            raise ValueError("checksum page manifest has invalid logical_start")
+        if transfer_nonce == 0:
+            raise ValueError("checksum page manifest has invalid transfer nonce")
+        expected_size = _CHECKSUM_MANIFEST_HEADER.size + num_pages * digest_bytes
+        if len(payload) != expected_size:
+            raise ValueError("checksum page manifest payload length mismatch")
+        expected_pages = (
+            (logical_start % page_size + num_tokens + page_size - 1) // page_size
+            if num_tokens > 0
+            else 0
+        )
+        if num_pages != expected_pages:
+            raise ValueError("checksum page manifest digest count is inconsistent")
+        if expected_transfer_nonce is not None and transfer_nonce != (
+            int(expected_transfer_nonce) & _U64_MASK
+        ):
+            raise ValueError("checksum page manifest transfer nonce mismatch")
+        if expected_bootstrap_room is not None and bootstrap_room != (
+            int(expected_bootstrap_room) & _U64_MASK
+        ):
+            raise ValueError("checksum page manifest bootstrap room mismatch")
+        page_digests = (
+            struct.unpack_from(
+                f"<{num_pages}Q", payload, _CHECKSUM_MANIFEST_HEADER.size
+            )
+            if num_pages
+            else ()
+        )
+        return cls(
+            bootstrap_room=int(bootstrap_room),
+            num_tokens=int(num_tokens),
+            checksum=int(checksum),
+            page_size=int(page_size),
+            logical_start=int(logical_start),
+            page_digests=tuple(int(value) for value in page_digests),
         )
 
 
@@ -1317,14 +1846,30 @@ class _DirectKVChecksumCache:
     final_out: Optional[torch.Tensor] = None
     secondary_accum: Optional[torch.Tensor] = None
     secondary_out: Optional[torch.Tensor] = None
+    page_accum: Optional[torch.Tensor] = None
+    page_out: Optional[torch.Tensor] = None
+    secondary_page_accum: Optional[torch.Tensor] = None
+    secondary_page_out: Optional[torch.Tensor] = None
     metadata_host: Optional[torch.Tensor] = None
     metadata_device: Optional[torch.Tensor] = None
     batch_capacity: int = 0
+    page_capacity: int = 0
     stream: Optional[torch.cuda.Stream] = None
     metadata_copy_event: Optional[torch.cuda.Event] = None
     workspace_event: Optional[torch.cuda.Event] = None
 
-    def batch_slices(self, batch_size: int, device: torch.device) -> Tuple[
+    def batch_slices(
+        self,
+        batch_size: int,
+        max_num_pages: int,
+        device: torch.device,
+        *,
+        need_secondary: bool,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -1336,16 +1881,18 @@ class _DirectKVChecksumCache:
             self.accum is None
             or self.accum.device != device
             or self.batch_capacity < batch_size
+            or self.page_capacity < max_num_pages
         ):
+            # Resize both dimensions from the active shape. Keeping each prior
+            # high-water mark independently can retain their unused cross-product.
             capacity = max(8, 1 << (batch_size - 1).bit_length())
+            page_capacity = 1 << (max_num_pages - 1).bit_length()
             self.accum = torch.empty((capacity,), dtype=torch.int32, device=device)
             self.final_out = torch.empty((capacity,), dtype=TAG_DTYPE, device=device)
-            self.secondary_accum = torch.empty(
-                (capacity,), dtype=torch.int32, device=device
+            self.page_accum = torch.empty(
+                (capacity, page_capacity), dtype=TAG_DTYPE, device=device
             )
-            self.secondary_out = torch.empty(
-                (capacity,), dtype=TAG_DTYPE, device=device
-            )
+            self.page_out = torch.empty_like(self.page_accum)
             self.metadata_host = torch.empty(
                 (5 * capacity,), dtype=TAG_DTYPE, device="cpu", pin_memory=True
             )
@@ -1353,11 +1900,53 @@ class _DirectKVChecksumCache:
                 (5 * capacity,), dtype=TAG_DTYPE, device=device
             )
             self.batch_capacity = capacity
+            self.page_capacity = page_capacity
+        if need_secondary and (
+            self.secondary_accum is None
+            or self.secondary_accum.device != device
+            or self.secondary_accum.numel() < self.batch_capacity
+            or self.secondary_page_accum is None
+            or self.secondary_page_accum.shape[0] < self.batch_capacity
+            or self.secondary_page_accum.shape[1] < self.page_capacity
+        ):
+            self.secondary_accum = torch.empty(
+                (self.batch_capacity,), dtype=torch.int32, device=device
+            )
+            self.secondary_out = torch.empty(
+                (self.batch_capacity,), dtype=TAG_DTYPE, device=device
+            )
+            self.secondary_page_accum = torch.empty(
+                (self.batch_capacity, self.page_capacity),
+                dtype=TAG_DTYPE,
+                device=device,
+            )
+            self.secondary_page_out = torch.empty_like(self.secondary_page_accum)
+        secondary_accum = self.secondary_accum if need_secondary else self.accum
+        secondary_out = self.secondary_out if need_secondary else self.final_out
+        secondary_page_accum = (
+            self.secondary_page_accum if need_secondary else self.page_accum
+        )
+        secondary_page_out = (
+            self.secondary_page_out if need_secondary else self.page_out
+        )
+        active_page_slots = batch_size * max_num_pages
+
+        def active_page_view(workspace: torch.Tensor) -> torch.Tensor:
+            # Slicing both dimensions of rounded storage leaves a widened row
+            # stride. Pack the active flat prefix without allocating instead.
+            return workspace.view(-1)[:active_page_slots].view(
+                batch_size, max_num_pages
+            )
+
         return (
             self.accum[:batch_size],
             self.final_out[:batch_size],
-            self.secondary_accum[:batch_size],
-            self.secondary_out[:batch_size],
+            secondary_accum[:batch_size],
+            secondary_out[:batch_size],
+            active_page_view(self.page_accum),
+            active_page_view(self.page_out),
+            active_page_view(secondary_page_accum),
+            active_page_view(secondary_page_out),
             self.metadata_host,
             self.metadata_device,
         )
@@ -1370,6 +1959,10 @@ class AsyncChecksumBatch:
     bootstrap_rooms: List[int]
     num_tokens: List[int]
     checksums_t: torch.Tensor
+    page_digests_t: torch.Tensor
+    page_counts: List[int]
+    page_size: int
+    logical_starts: List[int]
     stream: Optional[torch.cuda.Stream]
     finalized: Optional[List[ChecksumPlan]] = None
 
@@ -1379,14 +1972,40 @@ class AsyncChecksumBatch:
         if self.stream is not None:
             torch.cuda.current_stream(self.checksums_t.device).wait_stream(self.stream)
         checksums = self.checksums_t.detach().cpu().tolist()
+        valid_page_rows = [
+            self.page_digests_t[index, :page_count]
+            for index, page_count in enumerate(self.page_counts)
+            if page_count
+        ]
+        packed_page_digests = (
+            torch.cat(valid_page_rows).detach().cpu().tolist()
+            if valid_page_rows
+            else []
+        )
+        page_digests = []
+        offset = 0
+        for page_count in self.page_counts:
+            page_digests.append(packed_page_digests[offset : offset + page_count])
+            offset += page_count
         self.finalized = [
             ChecksumPlan(
                 bootstrap_room=room,
                 num_tokens=n,
                 checksum=int(checksum) & _U32_MASK,
+                page_size=self.page_size,
+                logical_start=logical_start,
+                page_digests=tuple(
+                    int(value) & _U64_MASK for value in digest_row[:page_count]
+                ),
             )
-            for room, n, checksum in zip(
-                self.bootstrap_rooms, self.num_tokens, checksums, strict=True
+            for room, n, checksum, logical_start, page_count, digest_row in zip(
+                self.bootstrap_rooms,
+                self.num_tokens,
+                checksums,
+                self.logical_starts,
+                self.page_counts,
+                page_digests,
+                strict=True,
             )
         ]
         return self.finalized
@@ -1550,6 +2169,32 @@ def compare_checksums(expected: ChecksumPlan, actual_checksum: int) -> bool:
     return (int(expected.checksum) & _U32_MASK) == (int(actual_checksum) & _U32_MASK)
 
 
+def first_checksum_page_mismatch(
+    expected: ChecksumPlan, actual: ChecksumPlan
+) -> Optional[int]:
+    """Return the first mismatching logical page position, if any."""
+    if (
+        expected.page_size != actual.page_size
+        or expected.logical_start != actual.logical_start
+    ):
+        return expected.logical_start // max(expected.page_size, 1)
+    count = max(len(expected.page_digests), len(actual.page_digests))
+    for index in range(count):
+        expected_digest = (
+            int(expected.page_digests[index]) & _U64_MASK
+            if index < len(expected.page_digests)
+            else None
+        )
+        actual_digest = (
+            int(actual.page_digests[index]) & _U64_MASK
+            if index < len(actual.page_digests)
+            else None
+        )
+        if expected_digest != actual_digest:
+            return expected.logical_start // max(expected.page_size, 1) + index
+    return None
+
+
 def _to_int_list(values: Sequence[int] | torch.Tensor) -> List[int]:
     if isinstance(values, torch.Tensor):
         return [int(x) for x in values.detach().cpu().reshape(-1).tolist()]
@@ -1607,7 +2252,18 @@ class KVPageProtectionManager:
         self._attention_verification_cache: Optional[_FlattenedTagBatch] = None
         self._transfer_verification_cache: Optional[_FlattenedTagBatch] = None
         if config.enable_attention_tags:
-            self.table = KVAttentionTagTable(num_pages, device=device)
+            if config.enable_page_history:
+                history_bytes = (num_pages + 1) * KVPageHistory.BYTES_PER_PAGE
+                logger.warning(
+                    "KV page history enabled; allocating %.2f MiB for %s pages",
+                    history_bytes / (1024 * 1024),
+                    num_pages + 1,
+                )
+            self.table = KVAttentionTagTable(
+                num_pages,
+                device=device,
+                enable_history=config.enable_page_history,
+            )
             if allocator is not None and hasattr(
                 allocator, "attach_attention_tag_table"
             ):
@@ -1644,6 +2300,15 @@ class KVPageProtectionManager:
         self.table.write_tags(
             manifest.physical_page_ids_t,
             manifest.expected_tags_t,
+        )
+        self.table._record_history(
+            manifest.physical_page_ids_t,
+            KVPageHistory.TAG_REFRESH,
+            generations=self.table.generations,
+            bootstrap_rooms=bootstrap_room,
+            page_positions=manifest.page_positions_t,
+            values=manifest.expected_tags_t,
+            generations_by_page=True,
         )
         return manifest
 
@@ -1683,6 +2348,17 @@ class KVPageProtectionManager:
         bad = int(torch.nonzero(mismatch).reshape(-1)[0].item())
         expected_tag = int(expected[bad].item())
         actual_tag = int(self.table.read_tags(pages[bad : bad + 1])[0].item())
+        expected_generation = int(generations[bad].item())
+        actual_generation = int(
+            self.table.generation_of(pages[bad : bad + 1])[0].item()
+        )
+        tag_differs = expected_tag != actual_tag
+        generation_differs = expected_generation != actual_generation
+        cause = (
+            "both"
+            if tag_differs and generation_differs
+            else "tag_value" if tag_differs else "generation"
+        )
         exc = KVAttentionTagMismatch(
             rid=rid,
             bootstrap_room=manifest.bootstrap_room,
@@ -1690,6 +2366,15 @@ class KVPageProtectionManager:
             page_position=manifest.page_positions[bad],
             expected_tag=expected_tag,
             actual_tag=actual_tag,
+            expected_generation=expected_generation,
+            actual_generation=actual_generation,
+            cause=cause,
+        )
+        attach_kv_protection_incident(
+            exc,
+            kind="attention_tag",
+            phase="pre_attention",
+            history=self.table.materialize_history(exc.page_id),
         )
         if self.metrics is not None:
             self.metrics.increment_kv_attention_tag_mismatches()
@@ -1702,7 +2387,7 @@ class KVPageProtectionManager:
         logical_pos: int,
         physical_page_id: torch.Tensor,
         swa_physical_page_id: Optional[torch.Tensor] = None,
-    ) -> None:
+    ) -> Optional[torch.cuda.Event]:
         """Refresh the logical page touched by a decode append.
 
         ``physical_page_id`` is a one-element device tensor derived from
@@ -1741,6 +2426,16 @@ class KVPageProtectionManager:
             generation=generation,
         )
         self.table.write_tags(page_id_t, expected_t)
+        page_position = int(logical_pos) // manifest.page_size
+        self.table._record_history(
+            page_id_t,
+            KVPageHistory.TAG_REFRESH,
+            generations=self.table.generations,
+            bootstrap_rooms=manifest.bootstrap_room,
+            page_positions=page_position,
+            values=expected_t,
+            generations_by_page=True,
+        )
 
     # -- transfer-written page tags ----------------------------------------
 
@@ -1776,16 +2471,34 @@ class KVPageProtectionManager:
                 manifest.physical_page_ids_t,
                 manifest.expected_tags_t,
             )
+        self.table._record_history(
+            manifest.physical_page_ids_t,
+            KVPageHistory.TRANSFER_EXPECTED,
+            generations=self.table.generations,
+            bootstrap_rooms=bootstrap_room,
+            page_positions=manifest.page_positions_t,
+            values=manifest.expected_tags_t,
+            generations_by_page=True,
+        )
         return manifest
 
     def commit_transfer_page_tags(self, manifest) -> None:
         """Commit retained transfer tags after all KV/state writes have landed."""
         if not self.config.enable_attention_tags or self.table is None:
-            return
+            return None
         for sub_manifest in _iter_transfer_page_tag_manifests(manifest):
             self.table.write_transfer_page_tags(
                 sub_manifest.physical_page_ids_t,
                 sub_manifest.expected_tags_t,
+            )
+            self.table._record_history(
+                sub_manifest.physical_page_ids_t,
+                KVPageHistory.TRANSFER_WRITE,
+                generations=self.table.generations,
+                bootstrap_rooms=sub_manifest.bootstrap_room,
+                page_positions=sub_manifest.page_positions_t,
+                values=sub_manifest.expected_tags_t,
+                generations_by_page=True,
             )
 
     def write_transfer_page_tags(
@@ -1793,6 +2506,7 @@ class KVPageProtectionManager:
         *,
         page_physical_ids: Sequence[int],
         transfer_page_tags: Sequence[int],
+        bootstrap_room: int = 0,
     ) -> None:
         """Write actual transfer page tags produced by the transfer path."""
         if not self.config.enable_attention_tags or self.table is None:
@@ -1802,10 +2516,23 @@ class KVPageProtectionManager:
         if len(page_ids) != len(tags):
             raise RuntimeError("transfer page tag metadata length mismatch")
         if not page_ids:
-            return
+            return None
         pages_t = torch.tensor(page_ids, dtype=torch.long, device=self.device)
         tags_t = transfer_page_tags_to_tensor(tags, device=self.device)
         self.table.write_transfer_page_tags(pages_t, tags_t)
+        self.table._record_history(
+            pages_t,
+            KVPageHistory.TRANSFER_WRITE,
+            generations=self.table.generations,
+            bootstrap_rooms=bootstrap_room,
+            values=tags_t,
+            generations_by_page=True,
+        )
+        if pages_t.is_cuda:
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(pages_t.device))
+            return event
+        return None
 
     def refresh_transfer_page_tag_tail_page(
         self,
@@ -1848,6 +2575,16 @@ class KVPageProtectionManager:
             generation=generation,
         )
         self.table.write_transfer_page_tags(page_id_t, expected_t)
+        page_position = int(logical_pos) // manifest.page_size
+        self.table._record_history(
+            page_id_t,
+            KVPageHistory.TRANSFER_WRITE,
+            generations=self.table.generations,
+            bootstrap_rooms=manifest.bootstrap_room,
+            page_positions=page_position,
+            values=expected_t,
+            generations_by_page=True,
+        )
 
     def _flatten_tag_batch(
         self,
@@ -1916,6 +2653,7 @@ class KVPageProtectionManager:
         self, flattened: _FlattenedTagBatch, mismatch: torch.Tensor
     ) -> List[KVTransferPageTagMismatch]:
         actual_all = self.table.read_transfer_page_tags(flattened.pages)
+        actual_generations = self.table.generation_of(flattened.pages)
         bad_idx = torch.nonzero(mismatch).reshape(-1).cpu().tolist()
         seen_rids = set()
         result = []
@@ -1926,24 +2664,44 @@ class KVPageProtectionManager:
                 continue
             seen_rids.add(rid)
             p = int(i) - flattened.offsets[owner_idx]
-            result.append(
-                KVTransferPageTagMismatch(
-                    rid=rid,
-                    bootstrap_room=manifest.bootstrap_room,
-                    page_id=int(flattened.pages[i].item()),
-                    page_position=manifest.page_positions[p],
-                    expected_transfer_tag=int(flattened.expected_tags[i].item()),
-                    actual_transfer_tag=int(actual_all[i].item()),
-                )
+            expected_tag = int(flattened.expected_tags[i].item())
+            actual_tag = int(actual_all[i].item())
+            expected_generation = int(flattened.generations[i].item())
+            actual_generation = int(actual_generations[i].item())
+            tag_differs = expected_tag != actual_tag
+            generation_differs = expected_generation != actual_generation
+            cause = (
+                "both"
+                if tag_differs and generation_differs
+                else "tag_value" if tag_differs else "generation"
             )
+            error = KVTransferPageTagMismatch(
+                rid=rid,
+                bootstrap_room=manifest.bootstrap_room,
+                page_id=int(flattened.pages[i].item()),
+                page_position=manifest.page_positions[p],
+                expected_transfer_tag=expected_tag,
+                actual_transfer_tag=actual_tag,
+                expected_generation=expected_generation,
+                actual_generation=actual_generation,
+                cause=cause,
+            )
+            attach_kv_protection_incident(
+                error,
+                kind="transfer_page_tag",
+                phase="pre_attention",
+                history=self.table.materialize_history(error.page_id),
+            )
+            result.append(error)
         if self.metrics is not None and result:
-            self.metrics.increment_kv_attention_tag_mismatches(len(result))
+            self.metrics.increment_kv_transfer_page_tag_mismatches(len(result))
         return result
 
     def _attention_mismatch_details(
         self, flattened: _FlattenedTagBatch, mismatch: torch.Tensor
     ) -> List[KVAttentionTagMismatch]:
         actual_all = self.table.read_tags(flattened.pages)
+        actual_generations = self.table.generation_of(flattened.pages)
         bad_idx = torch.nonzero(mismatch).reshape(-1).cpu().tolist()
         seen_rids = set()
         result = []
@@ -1954,16 +2712,35 @@ class KVPageProtectionManager:
                 continue
             seen_rids.add(rid)
             p = int(i) - flattened.offsets[owner_idx]
-            result.append(
-                KVAttentionTagMismatch(
-                    rid=rid,
-                    bootstrap_room=manifest.bootstrap_room,
-                    page_id=int(flattened.pages[i].item()),
-                    page_position=manifest.page_positions[p],
-                    expected_tag=int(flattened.expected_tags[i].item()),
-                    actual_tag=int(actual_all[i].item()),
-                )
+            expected_tag = int(flattened.expected_tags[i].item())
+            actual_tag = int(actual_all[i].item())
+            expected_generation = int(flattened.generations[i].item())
+            actual_generation = int(actual_generations[i].item())
+            tag_differs = expected_tag != actual_tag
+            generation_differs = expected_generation != actual_generation
+            cause = (
+                "both"
+                if tag_differs and generation_differs
+                else "tag_value" if tag_differs else "generation"
             )
+            error = KVAttentionTagMismatch(
+                rid=rid,
+                bootstrap_room=manifest.bootstrap_room,
+                page_id=int(flattened.pages[i].item()),
+                page_position=manifest.page_positions[p],
+                expected_tag=expected_tag,
+                actual_tag=actual_tag,
+                expected_generation=expected_generation,
+                actual_generation=actual_generation,
+                cause=cause,
+            )
+            attach_kv_protection_incident(
+                error,
+                kind="attention_tag",
+                phase="pre_attention",
+                history=self.table.materialize_history(error.page_id),
+            )
+            result.append(error)
         if self.metrics is not None:
             self.metrics.increment_kv_attention_tag_mismatches(len(result))
         return result
@@ -1984,6 +2761,10 @@ class KVPageProtectionManager:
             flattened.expected_tags,
             flattened.generations,
         )
+        if self.metrics is not None:
+            self.metrics.increment_kv_transfer_page_tag_checked_pages(
+                int(flattened.pages.numel())
+            )
         if not bool(mismatch.any().item()):
             return []
         return self._transfer_mismatch_details(flattened, mismatch)
@@ -2054,6 +2835,10 @@ class KVPageProtectionManager:
             self.metrics.increment_kv_attention_tag_checked_pages(
                 int(attention.pages.numel())
             )
+        if transfer is not None and self.metrics is not None:
+            self.metrics.increment_kv_transfer_page_tag_checked_pages(
+                int(transfer.pages.numel())
+            )
 
         reductions = [
             mismatch.any()
@@ -2089,6 +2874,7 @@ class KVPageProtectionManager:
         num_tokens: Sequence[int],
         starts: Optional[Sequence[int]] = None,
         swa_evicted_lens: Optional[Sequence[int]] = None,
+        checksum_page_size: int = TRANSFER_CHECKSUM_DIGEST_PAGE_SIZE,
     ) -> Optional[AsyncChecksumBatch]:
         """Launch batched direct checksums from the request-token table.
 
@@ -2101,7 +2887,16 @@ class KVPageProtectionManager:
         if not isinstance(req_to_token, torch.Tensor) or not req_to_token.is_cuda:
             raise RuntimeError("batched direct checksum requires CUDA req_to_token")
         if len(req_pool_indices) == 0:
-            return AsyncChecksumBatch([], [], torch.empty(0, dtype=TAG_DTYPE), None)
+            return AsyncChecksumBatch(
+                [],
+                [],
+                torch.empty(0, dtype=TAG_DTYPE),
+                torch.empty((0, 0), dtype=TAG_DTYPE),
+                [],
+                int(checksum_page_size),
+                [],
+                None,
+            )
         if not (len(req_pool_indices) == len(bootstrap_rooms) == len(num_tokens)):
             raise RuntimeError("batched checksum metadata length mismatch")
         batch_size = len(req_pool_indices)
@@ -2111,6 +2906,29 @@ class KVPageProtectionManager:
         if len(starts_list) != batch_size:
             raise RuntimeError("batched checksum starts length mismatch")
         num_tokens_list = [int(x) for x in num_tokens]
+        checksum_page_size = int(checksum_page_size)
+        if checksum_page_size <= 0:
+            raise RuntimeError("checksum_page_size must be positive")
+        if any(n < 0 for n in num_tokens_list):
+            raise RuntimeError("batched checksum lengths must be non-negative")
+        table_rows, table_columns = req_to_token.shape
+        if any(index < 0 or index >= table_rows for index in req_pool_indices):
+            raise RuntimeError("batched checksum request-pool index is out of bounds")
+        if any(
+            start < 0 or start + n > table_columns
+            for start, n in zip(starts_list, num_tokens_list, strict=True)
+        ):
+            raise RuntimeError("batched checksum token range is out of bounds")
+        page_counts = [
+            (
+                (start % checksum_page_size + n + checksum_page_size - 1)
+                // checksum_page_size
+                if n > 0
+                else 0
+            )
+            for start, n in zip(starts_list, num_tokens_list, strict=True)
+        ]
+        max_num_pages = max(1, max(page_counts))
         evicted_list = (
             [int(x) for x in swa_evicted_lens]
             if swa_evicted_lens is not None
@@ -2124,10 +2942,12 @@ class KVPageProtectionManager:
         ]
 
         try:
-            from sgl_kernel.kvcacheio import kv_checksum_direct_table_batched as _op
+            from sgl_kernel.kvcacheio import (
+                kv_checksum_direct_table_batched_with_pages as _op,
+            )
         except Exception as e:  # pragma: no cover - depends on CUDA build
             raise RuntimeError(
-                f"sgl_kernel kv_checksum_direct_table_batched unavailable ({e})"
+                f"sgl_kernel kv_checksum_direct_table_batched_with_pages unavailable ({e})"
             ) from e
 
         device = req_to_token.device
@@ -2168,6 +2988,17 @@ class KVPageProtectionManager:
             self._checksum_cache.accum is None
             or device_changed
             or self._checksum_cache.batch_capacity < batch_size
+            or self._checksum_cache.page_capacity < max_num_pages
+            or (
+                need_two_pass
+                and (
+                    self._checksum_cache.secondary_accum is None
+                    or self._checksum_cache.secondary_accum.numel() < batch_size
+                    or self._checksum_cache.secondary_page_accum is None
+                    or self._checksum_cache.secondary_page_accum.shape[1]
+                    < max_num_pages
+                )
+            )
         )
         if (
             workspace_resize
@@ -2188,9 +3019,18 @@ class KVPageProtectionManager:
             final_out,
             secondary_accum,
             secondary_out,
+            page_accum,
+            page_out,
+            secondary_page_accum,
+            secondary_page_out,
             metadata_host,
             metadata_device,
-        ) = self._checksum_cache.batch_slices(batch_size, device)
+        ) = self._checksum_cache.batch_slices(
+            batch_size,
+            max_num_pages,
+            device,
+            need_secondary=need_two_pass,
+        )
         active_metadata_size = 5 * batch_size
         metadata_host[:active_metadata_size].copy_(
             torch.tensor(
@@ -2229,6 +3069,7 @@ class KVPageProtectionManager:
             metadata_copy_event.record(stream)
             if not need_two_pass:
                 accum.zero_()
+                page_accum.zero_()
                 _op(
                     buffer_ptrs,
                     row_strides,
@@ -2239,19 +3080,26 @@ class KVPageProtectionManager:
                     req_pool_t,
                     starts_t,
                     lengths_t,
+                    starts_t,
                     int(max_num_tokens),
                     int(num_lanes),
+                    checksum_page_size,
+                    max_num_pages,
                     has_swa,
                     is_capped,
                     accum,
                     final_out,
+                    page_accum,
+                    page_out,
                 )
                 checksums_t = final_out.clone()
+                page_digests_t = page_out.clone()
             else:
                 empty_mapping = full_to_swa_index_mapping[:0]
                 full_out = None
                 if self._checksum_cache.full_total_bytes > 0:
                     accum.zero_()
+                    page_accum.zero_()
                     full_num_lanes = select_checksum_byte_count(
                         self._checksum_cache.full_total_bytes
                     )
@@ -2265,16 +3113,22 @@ class KVPageProtectionManager:
                         req_pool_t,
                         starts_t,
                         lengths_t,
+                        starts_t,
                         int(max_num_tokens),
                         int(full_num_lanes),
+                        checksum_page_size,
+                        max_num_pages,
                         False,
                         False,
                         accum,
                         final_out,
+                        page_accum,
+                        page_out,
                     )
                     full_out = final_out
 
                 secondary_accum.zero_()
+                secondary_page_accum.zero_()
                 swa_num_lanes = select_checksum_byte_count(
                     self._checksum_cache.swa_total_bytes
                 )
@@ -2288,17 +3142,27 @@ class KVPageProtectionManager:
                     req_pool_t,
                     swa_starts_t,
                     swa_lengths_t,
+                    starts_t,
                     int(max_swa_tokens),
                     int(swa_num_lanes),
+                    checksum_page_size,
+                    max_num_pages,
                     True,
                     False,
                     secondary_accum,
                     secondary_out,
+                    secondary_page_accum,
+                    secondary_page_out,
                 )
                 checksums_t = (
                     secondary_out.clone()
                     if full_out is None
                     else torch.bitwise_xor(full_out, secondary_out)
+                )
+                page_digests_t = (
+                    secondary_page_out.clone()
+                    if full_out is None
+                    else torch.bitwise_xor(page_out, secondary_page_out)
                 )
             if workspace_event is None:
                 workspace_event = torch.cuda.Event()
@@ -2308,18 +3172,40 @@ class KVPageProtectionManager:
             bootstrap_rooms=[int(x) for x in bootstrap_rooms],
             num_tokens=num_tokens_list,
             checksums_t=checksums_t,
+            page_digests_t=page_digests_t,
+            page_counts=page_counts,
+            page_size=checksum_page_size,
+            logical_starts=starts_list,
             stream=stream,
         )
 
     def compare_destination_checksum(
-        self, expected: ChecksumPlan, actual_checksum: int, *, rid: Optional[str] = None
+        self,
+        expected: ChecksumPlan,
+        actual_checksum: int | ChecksumPlan,
+        *,
+        rid: Optional[str] = None,
     ) -> bool:
         """Compare a precomputed destination checksum and update metrics."""
         if self.metrics is not None:
-            self.metrics.increment_kv_transfer_checksum_checked_pages(
-                int(expected.num_tokens)
+            checked_pages = (
+                len(expected.page_digests)
+                or (int(expected.num_tokens) + TRANSFER_CHECKSUM_DIGEST_PAGE_SIZE - 1)
+                // TRANSFER_CHECKSUM_DIGEST_PAGE_SIZE
             )
-        ok = compare_checksums(expected, actual_checksum)
+            self.metrics.increment_kv_transfer_checksum_checked_pages(checked_pages)
+        actual_plan = (
+            actual_checksum
+            if isinstance(actual_checksum, ChecksumPlan)
+            else ChecksumPlan(
+                bootstrap_room=expected.bootstrap_room,
+                num_tokens=expected.num_tokens,
+                checksum=int(actual_checksum),
+            )
+        )
+        ok = compare_checksums(expected, actual_plan.checksum)
+        if expected.page_digests:
+            ok = ok and first_checksum_page_mismatch(expected, actual_plan) is None
         if not ok and self.metrics is not None:
             self.metrics.increment_kv_transfer_checksum_mismatches()
         del rid

@@ -246,6 +246,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.is_not_in_free_group:
             free_page_indices = torch.unique(free_index // self.page_size)
+            self._record_page_free(free_page_indices)
             free_page_indices = self._filter_transfer_pinned_pages(free_page_indices)
             if free_page_indices.numel() == 0:
                 return

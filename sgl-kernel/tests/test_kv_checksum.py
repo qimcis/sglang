@@ -1,8 +1,7 @@
-"""Parity tests for the production KV transfer checksum CUDA op.
+"""Parity tests for the production KV transfer checksum CUDA ops.
 
-The public ABI is intentionally limited to ``kv_checksum_direct_table_batched``.
-These tests compare that batched op against the Python reference hash for plain
-MHA/MLA buffers and SWA buffers translated through the full-to-SWA mapping.
+The legacy root-only ABI remains bit-identical. The page-digest ABI adds an
+independent 64-bit digest per fixed logical token page in the same KV read pass.
 """
 
 import pytest
@@ -10,6 +9,7 @@ import torch
 
 from sglang.srt.mem_cache.kv_page_tags import (
     _CKSUM32_SEED,
+    KVPageHistory,
     KVPageProtectionManager,
     KVProtectionConfig,
     _fmix32_scalar,
@@ -24,7 +24,11 @@ pytestmark = pytest.mark.skipif(
 
 def _have_batched_op() -> bool:
     try:
-        from sgl_kernel.kvcacheio import kv_checksum_direct_table_batched  # noqa: F401
+        from sgl_kernel.kvcacheio import (  # noqa: F401
+            kv_checksum_direct_table_batched,
+            kv_checksum_direct_table_batched_with_pages,
+            kv_page_history_record,
+        )
 
         return True
     except Exception:
@@ -150,7 +154,69 @@ def _reference(pool, req_to_token, req_idx, start, length, swa_evicted=0):
     return swa_checksum if full_checksum is None else full_checksum ^ swa_checksum
 
 
-def _batched(pool, req_to_token, req_indices, starts, lengths, swa_evicted_lens=None):
+def _page_digest_reference(pool, req_to_token, req_idx, start, length, page_size):
+    positions = torch.arange(start, start + length, dtype=torch.long, device="cuda")
+    locs = req_to_token[req_idx, start : start + length].to(torch.long)
+    rows = []
+    start_layer = getattr(pool, "start_layer", 0)
+    for layer_id in range(start_layer, start_layer + pool.layer_num):
+        rows.append(_rows_for_buffer(pool.get_key_buffer(layer_id), locs))
+        try:
+            rows.append(_rows_for_buffer(pool.get_value_buffer(layer_id), locs))
+        except (NotImplementedError, AttributeError):
+            pass
+    selected = torch.cat(rows, dim=1)
+    lanes = (
+        selected.contiguous()
+        .view(torch.uint8)
+        .reshape(length, -1)
+        .view(torch.int64)
+        .cpu()
+        .tolist()
+    )
+
+    u32 = (1 << 32) - 1
+    u64 = (1 << 64) - 1
+    seed_hi = 0xC4A35A71
+    pos_mul_hi = 0x27D4EB2F
+    lane_mul_hi = 0x165667B1
+    value_mul_hi = 0x9E3779B9
+    digests = []
+    first_page = start // page_size
+    last_page = (start + length - 1) // page_size
+    for page_position in range(first_page, last_page + 1):
+        begin = max(start, page_position * page_size)
+        end = min(start + length, (page_position + 1) * page_size)
+        row_begin = begin - start
+        row_end = end - start
+        low = hash_rows_with_positions(
+            selected[row_begin:row_end],
+            positions=positions[row_begin:row_end],
+        )
+        high_raw = 0
+        for row_offset, position in enumerate(range(begin, end), start=row_begin):
+            seed_pos = seed_hi ^ ((position * pos_mul_hi) & u32)
+            for lane_index, value_signed in enumerate(lanes[row_offset]):
+                value = value_signed & u64
+                chunk = seed_pos
+                chunk ^= (lane_index * lane_mul_hi) & u32
+                chunk ^= ((value & u32) * value_mul_hi) & u32
+                chunk ^= (value >> 32) & u32
+                high_raw ^= _fmix32_scalar(chunk & u32)
+        high = _fmix32_scalar(seed_hi ^ high_raw ^ (end - begin))
+        digests.append(((high << 32) | low) & u64)
+    return tuple(digests)
+
+
+def _batched_plans(
+    pool,
+    req_to_token,
+    req_indices,
+    starts,
+    lengths,
+    swa_evicted_lens=None,
+    checksum_page_size=64,
+):
     cfg = KVProtectionConfig(enable_transfer_checksum=True)
     manager = KVPageProtectionManager(
         config=cfg,
@@ -168,9 +234,24 @@ def _batched(pool, req_to_token, req_indices, starts, lengths, swa_evicted_lens=
         num_tokens=lengths,
         starts=starts,
         swa_evicted_lens=swa_evicted_lens,
+        checksum_page_size=checksum_page_size,
     )
     assert batch is not None
-    return [plan.checksum for plan in batch.finalize()]
+    return batch.finalize()
+
+
+def _batched(pool, req_to_token, req_indices, starts, lengths, swa_evicted_lens=None):
+    return [
+        plan.checksum
+        for plan in _batched_plans(
+            pool,
+            req_to_token,
+            req_indices,
+            starts,
+            lengths,
+            swa_evicted_lens=swa_evicted_lens,
+        )
+    ]
 
 
 def _one(pool, req_to_token, req_idx, start, length):
@@ -187,6 +268,102 @@ def test_removed_direct_abi_is_not_exported():
     assert not hasattr(kvcacheio, "kv_checksum_direct")
     assert not hasattr(kvcacheio, "kv_checksum_direct_range")
     assert hasattr(kvcacheio, "kv_checksum_direct_table_batched")
+    assert hasattr(kvcacheio, "kv_checksum_direct_table_batched_with_pages")
+
+
+@pytest.mark.skipif(
+    not _have_batched_op(),
+    reason="sgl_kernel page checksum op not built",
+)
+def test_page_digest_parity_and_corruption_localization():
+    torch.manual_seed(20)
+    size, h, d, tokens = 256, 2, 16, 150
+    k = [torch.randint(-120, 120, (size, h, d), dtype=torch.int8, device="cuda")]
+    v = [torch.randint(-120, 120, (size, h, d), dtype=torch.int8, device="cuda")]
+    pool = _Pool(k, v)
+    locs = torch.randperm(size, device="cuda")[:tokens]
+    req_to_token = locs.reshape(1, -1).to(torch.int32)
+    start, length, page_size = 3, 130, 64
+
+    before = _batched_plans(
+        pool,
+        req_to_token,
+        [0],
+        [start],
+        [length],
+        checksum_page_size=page_size,
+    )[0]
+    assert before.page_digests == _page_digest_reference(
+        pool, req_to_token, 0, start, length, page_size
+    )
+
+    k[0][locs[70], 0, 0] += 1
+    after = _batched_plans(
+        pool,
+        req_to_token,
+        [0],
+        [start],
+        [length],
+        checksum_page_size=page_size,
+    )[0]
+    changed_pages = [
+        index
+        for index, (expected, actual) in enumerate(
+            zip(before.page_digests, after.page_digests, strict=True)
+        )
+        if expected != actual
+    ]
+    assert changed_pages == [1]
+    assert before.checksum != after.checksum
+
+
+@pytest.mark.skipif(
+    not _have_batched_op(),
+    reason="sgl_kernel page checksum op not built",
+)
+def test_page_checksum_rejects_out_of_bounds_table_range():
+    pool = _Pool([torch.zeros((16, 1, 8), dtype=torch.float16, device="cuda")], None)
+    req_to_token = torch.arange(8, dtype=torch.int32, device="cuda").reshape(1, -1)
+    manager = KVPageProtectionManager(
+        config=KVProtectionConfig(enable_transfer_checksum=True),
+        allocator=None,
+        num_pages=1,
+        page_size=1,
+        device="cuda",
+        transfer_backend="mooncake",
+    )
+    with pytest.raises(RuntimeError, match="token range is out of bounds"):
+        manager.begin_transfer_checksums_from_table(
+            pool,
+            req_to_token,
+            req_pool_indices=[0],
+            bootstrap_rooms=[1],
+            num_tokens=[5],
+            starts=[4],
+        )
+
+
+@pytest.mark.skipif(
+    not _have_batched_op(),
+    reason="sgl_kernel page history op not built",
+)
+def test_page_history_cuda_ring_retains_last_eight_operations():
+    history = KVPageHistory(size=4, device="cuda")
+    generations = torch.zeros(4, dtype=torch.int64, device="cuda")
+    generations[2] = 3
+    for value in range(10):
+        history.record(
+            [2],
+            KVPageHistory.TAG_REFRESH,
+            generations=generations,
+            values=value,
+            generations_by_page=True,
+        )
+
+    entries = history.materialize(2)
+    assert [entry["sequence"] for entry in entries] == list(range(2, 10))
+    assert entries[-1]["generation"] == 3
+    assert entries[-1]["value"] == "0x0000000000000009"
 
 
 @pytest.mark.skipif(
@@ -294,6 +471,53 @@ def test_manager_reuses_geometric_batch_metadata():
     assert [plan.checksum for plan in second.finalize()] == [
         _reference(pool, req_to_token, i, 0, tokens) for i in range(4)
     ]
+
+
+@pytest.mark.skipif(
+    not _have_batched_op(),
+    reason="sgl_kernel.kv_checksum_direct_table_batched not built",
+)
+def test_manager_packs_page_workspace_below_cached_capacity():
+    torch.manual_seed(21)
+    size, requests, tokens = 1024, 3, 256
+    k = [torch.randn(size, 2, 16, dtype=torch.float16, device="cuda")]
+    v = [torch.randn_like(k[0])]
+    pool = _Pool(k, v)
+    req_to_token = torch.stack(
+        [torch.randperm(size, device="cuda")[:tokens] for _ in range(requests)]
+    ).to(torch.int32)
+    manager = KVPageProtectionManager(
+        config=KVProtectionConfig(enable_transfer_checksum=True),
+        allocator=None,
+        num_pages=1,
+        page_size=1,
+        device="cuda",
+        transfer_backend="mooncake",
+    )
+
+    def launch(length):
+        batch = manager.begin_transfer_checksums_from_table(
+            pool,
+            req_to_token,
+            req_pool_indices=list(range(requests)),
+            bootstrap_rooms=list(range(100, 100 + requests)),
+            num_tokens=[length] * requests,
+        )
+        return batch.finalize()
+
+    launch(tokens)
+    assert manager._checksum_cache.page_capacity == 4
+    page_accum_ptr = manager._checksum_cache.page_accum.data_ptr()
+
+    length = 129
+    plans = launch(length)
+    assert manager._checksum_cache.page_capacity == 4
+    assert manager._checksum_cache.page_accum.data_ptr() == page_accum_ptr
+    for req_idx, plan in enumerate(plans):
+        assert plan.checksum == _reference(pool, req_to_token, req_idx, 0, length)
+        assert plan.page_digests == _page_digest_reference(
+            pool, req_to_token, req_idx, 0, length, 64
+        )
 
 
 @pytest.mark.skipif(

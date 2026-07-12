@@ -47,6 +47,82 @@ def kv_checksum_direct_table_batched(
     )
 
 
+def kv_checksum_direct_table_batched_with_pages(
+    buffer_ptrs: torch.Tensor,
+    row_strides: torch.Tensor,
+    row_nbytes: torch.Tensor,
+    swa_buffer_flags: torch.Tensor,
+    full_to_swa_index_mapping: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    starts: torch.Tensor,
+    lengths: torch.Tensor,
+    logical_starts: torch.Tensor,
+    max_num_tokens: int,
+    num_lanes: int,
+    page_size: int,
+    max_num_pages: int,
+    has_swa: bool,
+    is_capped: bool,
+    accum: torch.Tensor,
+    out: torch.Tensor,
+    page_accum: torch.Tensor,
+    page_out: torch.Tensor,
+) -> None:
+    """Batched direct-KV root checksum and uint64 logical-page digests."""
+    torch.ops.sgl_kernel.kv_checksum_direct_table_batched_with_pages.default(
+        buffer_ptrs,
+        row_strides,
+        row_nbytes,
+        swa_buffer_flags,
+        full_to_swa_index_mapping,
+        req_to_token,
+        req_pool_indices,
+        starts,
+        lengths,
+        logical_starts,
+        int(max_num_tokens),
+        int(num_lanes),
+        int(page_size),
+        int(max_num_pages),
+        bool(has_swa),
+        bool(is_capped),
+        accum,
+        out,
+        page_accum,
+        page_out,
+    )
+
+
+def kv_page_history_record(
+    page_ids: torch.Tensor,
+    operation: int,
+    generations: torch.Tensor,
+    generations_by_page: bool,
+    bootstrap_room: int,
+    page_positions: torch.Tensor,
+    page_position: int,
+    values: torch.Tensor,
+    value: int,
+    cursor: torch.Tensor,
+    records: torch.Tensor,
+) -> None:
+    """Record one bounded page-history event per page with one CUDA launch."""
+    torch.ops.sgl_kernel.kv_page_history_record.default(
+        page_ids,
+        int(operation),
+        generations,
+        bool(generations_by_page),
+        int(bootstrap_room),
+        page_positions,
+        int(page_position),
+        values,
+        int(value),
+        cursor,
+        records,
+    )
+
+
 def transfer_kv_per_layer(
     src_k: torch.Tensor,
     dst_k: torch.Tensor,

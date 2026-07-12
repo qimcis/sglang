@@ -11,11 +11,13 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import _OffsetAttentionTagTable
 from sglang.srt.mem_cache.kv_page_tags import (
     AttentionTagManifest,
     AttentionTagManifestGroup,
     KVAttentionTagMismatch,
     KVAttentionTagTable,
+    KVPageHistory,
     KVPageProtectionManager,
     KVProtectionConfig,
     KVTransferPageTagMismatch,
@@ -162,6 +164,28 @@ class TestAttentionTagTable(CustomTestCase):
         self.assertTrue(ok_after)
         self.assertFalse(bool(mask_after.any().item()))
 
+    def test_history_retains_last_eight_operations(self):
+        history = KVPageHistory(size=4, device="cpu")
+        for value in range(10):
+            history.record([2], KVPageHistory.TAG_REFRESH, values=[value])
+
+        entries = history.materialize(2)
+        self.assertEqual([entry["sequence"] for entry in entries], list(range(2, 10)))
+        self.assertEqual(entries[-1]["operation"], "tag_refresh")
+        self.assertEqual(entries[-1]["value"], "0x0000000000000009")
+
+    def test_swa_offset_table_forwards_free_history(self):
+        table = KVAttentionTagTable(num_pages=16, device="cpu", enable_history=True)
+        offset_table = _OffsetAttentionTagTable(table, offset=8)
+        local_pages = torch.tensor([2])
+        offset_table.bump_generations(local_pages)
+        offset_table.record_free(local_pages)
+        offset_table.record_free_released(local_pages)
+
+        self.assertEqual(table.generation_of(torch.tensor([10])).tolist(), [1])
+        operations = [entry["operation"] for entry in table.history.materialize(10)]
+        self.assertEqual(operations, ["alloc", "free", "free_released"])
+
 
 class TestAttentionTagManifest(CustomTestCase):
     def test_manifest_pages_and_refresh(self):
@@ -206,7 +230,10 @@ class TestAttentionTagManifest(CustomTestCase):
 
 class TestProtectionManager(CustomTestCase):
     def _make_manager(self, metrics=None):
-        cfg = KVProtectionConfig(enable_attention_tags=True)
+        cfg = KVProtectionConfig(
+            enable_attention_tags=True,
+            enable_page_history=True,
+        )
         return KVPageProtectionManager(
             cfg,
             allocator=None,
@@ -247,6 +274,9 @@ class TestProtectionManager(CustomTestCase):
         self.assertEqual(mismatches[0].rid, "r-bad")
         self.assertIsInstance(mismatches[0], KVAttentionTagMismatch)
         self.assertEqual(mismatches[0].bootstrap_room, 2)
+        self.assertIsNotNone(mismatches[0].incident)
+        self.assertEqual(mismatches[0].incident.kind, "attention_tag")
+        self.assertTrue(mismatches[0].incident.history)
         self.assertEqual(metrics.mismatches, 1)
 
     def test_combined_verification_reports_both_tag_families(self):

@@ -427,6 +427,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         seq_len: int,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Create expected transfer tags retained locally and sent to prefill."""
+        if _is_fake_transfer(req, self.scheduler.server_args):
+            req.kv_transfer_page_tag_manifest = None
+            return None, None
         manager = getattr(self.scheduler, "kv_protection_manager", None)
         if (
             manager is None
@@ -526,7 +529,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "KV transfer page tag preparation failed for rid=%s: %s", req.rid, e
             )
             req.kv_transfer_page_tag_manifest = None
-            return None, None
+            from sglang.srt.mem_cache.kv_page_tags import (
+                KVProtectionBookkeepingError,
+                attach_kv_protection_incident,
+                emit_kv_protection_incident,
+            )
+
+            error = KVProtectionBookkeepingError(
+                rid=req.rid,
+                bootstrap_room=req.bootstrap_room,
+                cause="transfer_page_tag_preparation",
+                detail=str(e),
+            )
+            attach_kv_protection_incident(
+                error, kind="transfer_page_tag", phase="tag_preparation"
+            )
+            emit_kv_protection_incident(error, logger)
+            raise error from e
 
     def _swa_retractable_len(self, req: Req) -> int:
         if not self._uses_swa_tail_prealloc():
@@ -1225,16 +1244,49 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size)
-            transfer_page_tag_ids, transfer_page_tags = (
-                self._prepare_transfer_page_tags(
-                    req=decode_req.req,
-                    page_indices=page_indices,
-                    page_position_start=total_prefix_len // page_size,
-                    state_indices=state_indices,
-                    state_types=state_types,
-                    seq_len=seq_len,
+            try:
+                transfer_page_tag_ids, transfer_page_tags = (
+                    self._prepare_transfer_page_tags(
+                        req=decode_req.req,
+                        page_indices=page_indices,
+                        page_position_start=total_prefix_len // page_size,
+                        state_indices=state_indices,
+                        state_types=state_types,
+                        seq_len=seq_len,
+                    )
                 )
-            )
+            except Exception as error:
+                prepare_abort(
+                    decode_req.req,
+                    str(error),
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                self.scheduler.output_streamer.stream_output(
+                    [decode_req.req], decode_req.req.return_logprob
+                )
+                self._clean_hicache_prefetch_resources(decode_req)
+                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+                self.req_to_metadata_buffer_idx_allocator.free(
+                    decode_req.metadata_buffer_index
+                )
+                decode_req.metadata_buffer_index = -1
+                failed_reqs.append(decode_req)
+                indices_to_remove.add(i)
+                if prefix_match is not None:
+                    reserved_restore_tokens -= prefix_match.restore_token_count
+                full_allocatable_tokens = self._allocatable_token_budgets(
+                    retractable_tokens=retractable_tokens,
+                    count_retracted=True,
+                    extra_reserved_reqs=len(preallocated_reqs),
+                    hicache_reserved_tokens=reserved_restore_tokens,
+                )
+                if uses_swa_tail_prealloc:
+                    swa_allocatable_tokens += swa_required
+                if self.scheduler.metrics_reporter.enable_metrics:
+                    self.scheduler.metrics_collector.increment_transfer_failed_reqs()
+                continue
             self.transfer_queue.pin_transfer_pages(decode_req, page_indices)
             metadata_kwargs = {"decode_prefix_len": total_prefix_len}
             if transfer_page_tag_ids is not None and transfer_page_tags is not None:
@@ -1691,10 +1743,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.transfer_pinned_page_generations = ()
 
     def _clear_receiver(self, decode_req: DecodeRequest) -> None:
-        self._release_transfer_pins(decode_req)
         if decode_req.kv_receiver is not None:
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
+        self._release_transfer_pins(decode_req)
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
@@ -1818,7 +1870,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Register baseline KV attention tags for the transferred prompt pages
         # so a later cross-request page reuse is detectable before decode
         # attention reads them (gated; no-op when disabled).
-        self._register_kv_attention_tags(decode_req.req)
+        if self._register_kv_attention_tags(decode_req.req):
+            self._clear_receiver(decode_req)
+            return
 
         self._clear_receiver(decode_req)
         decode_req.req.time_stats.set_wait_queue_entry_time()
@@ -1826,39 +1880,76 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def _verify_transfer_checksum(self, req: Req, meta_bootstrap_room) -> bool:
         """Return True if the request was aborted due to a checksum mismatch."""
+        if _is_fake_transfer(req, self.scheduler.server_args):
+            return False
         manager = getattr(self.scheduler, "kv_protection_manager", None)
         if manager is None or not manager.config.checksum_enabled:
             return False
         try:
-            from sglang.srt.mem_cache.kv_page_tags import ChecksumPlan
-
+            manifest_error = getattr(req, "_kv_transfer_manifest_error", None)
+            if manifest_error is not None:
+                raise ValueError(manifest_error)
             expected = getattr(req, "_kv_transfer_expected_checksum", None)
             if expected is None:
-                # Slot map: 0=room 1=checksum 2=num_tokens 3=checksum_present.
-                if int(meta_bootstrap_room[3].item()) == 0:
-                    return False
+                raise ValueError("missing checksum page manifest")
+            if getattr(req, "_kv_transfer_legacy_checksum", False):
+                if (
+                    meta_bootstrap_room.numel() < 4
+                    or int(meta_bootstrap_room[3].item()) != 1
+                ):
+                    raise ValueError("missing legacy checksum metadata")
+                legacy_num_tokens = int(meta_bootstrap_room[2].item())
+                if legacy_num_tokens != expected.num_tokens:
+                    raise ValueError("legacy checksum token count mismatch")
+                from sglang.srt.mem_cache.kv_page_tags import ChecksumPlan
+
                 expected = ChecksumPlan(
-                    bootstrap_room=req.bootstrap_room or 0,
-                    num_tokens=int(meta_bootstrap_room[2].item()),
+                    bootstrap_room=expected.bootstrap_room,
+                    num_tokens=legacy_num_tokens,
                     checksum=int(meta_bootstrap_room[1].item()),
                 )
+                req._kv_transfer_expected_checksum = expected
             num_tokens = expected.num_tokens
             if num_tokens <= 0 or req.req_pool_idx is None:
-                return False
-            actual = getattr(req, "_kv_transfer_actual_checksum", None)
+                raise ValueError("checksum page manifest has invalid token count")
+            actual = getattr(req, "_kv_transfer_actual_checksum_plan", None)
             if actual is not None:
                 err = None
                 if not manager.compare_destination_checksum(
                     expected, actual, rid=req.rid
                 ):
-                    from sglang.srt.mem_cache.kv_page_tags import KVChecksumError
+                    from sglang.srt.mem_cache.kv_page_tags import (
+                        KVChecksumError,
+                        first_checksum_page_mismatch,
+                    )
+
+                    mismatch_page = first_checksum_page_mismatch(expected, actual)
+                    digest_index = (
+                        None
+                        if mismatch_page is None
+                        else mismatch_page
+                        - expected.logical_start // max(expected.page_size, 1)
+                    )
 
                     err = KVChecksumError(
                         rid=req.rid,
                         bootstrap_room=req.bootstrap_room or 0,
                         expected_checksum=expected.checksum,
-                        actual_checksum=actual,
+                        actual_checksum=actual.checksum,
                         num_checked_tokens=num_tokens,
+                        page_position=mismatch_page,
+                        expected_page_digest=(
+                            expected.page_digests[digest_index]
+                            if digest_index is not None
+                            and 0 <= digest_index < len(expected.page_digests)
+                            else None
+                        ),
+                        actual_page_digest=(
+                            actual.page_digests[digest_index]
+                            if digest_index is not None
+                            and 0 <= digest_index < len(actual.page_digests)
+                            else None
+                        ),
                     )
             else:
                 from sglang.srt.mem_cache.kv_page_tags import KVChecksumError
@@ -1880,9 +1971,34 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             logger.error(
                 "KV transfer checksum verification error for rid=%s: %s", req.rid, e
             )
-            return False
+            from sglang.srt.mem_cache.kv_page_tags import KVChecksumError
+
+            if manager.metrics is not None:
+                manager.metrics.increment_kv_transfer_checksum_mismatches()
+            err = KVChecksumError(
+                rid=req.rid,
+                bootstrap_room=req.bootstrap_room or 0,
+                num_checked_tokens=getattr(
+                    getattr(req, "_kv_transfer_expected_checksum", None),
+                    "num_tokens",
+                    None,
+                ),
+                cause="manifest_error",
+                detail=str(e),
+            )
         if err is None:
             return False
+        from sglang.srt.mem_cache.kv_page_tags import (
+            attach_kv_protection_incident,
+            emit_kv_protection_incident,
+        )
+
+        attach_kv_protection_incident(
+            err,
+            kind="transfer_checksum",
+            phase="checksum_verify",
+        )
+        emit_kv_protection_incident(err, logger)
         logger.error(str(err))
         prepare_abort(
             req,
@@ -1898,6 +2014,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if manager is None or not manager.config.checksum_enabled:
             return None, []
         from sglang.srt.mem_cache.kv_page_tags import (
+            TRANSFER_CHECKSUM_DIGEST_PAGE_SIZE,
             ChecksumPlan,
             swa_checksum_evicted_len,
         )
@@ -1908,34 +2025,75 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req
             for decode_req in decode_reqs
             if decode_req.req.req_pool_idx is not None
+            and not _is_fake_transfer(decode_req.req, self.scheduler.server_args)
         ]
         if not eligible_reqs:
             return None, []
-        metadata_indices = [
-            decode_req.metadata_buffer_index for decode_req in eligible_reqs
-        ]
-        metadata_rows = (
-            self.metadata_buffers.bootstrap_room[metadata_indices, :4].detach().cpu()
-        )
-
         req_pool_indices = []
         bootstrap_rooms = []
         num_tokens = []
         swa_evicted = []
         reqs = []
-        for decode_req, meta in zip(eligible_reqs, metadata_rows, strict=True):
+        for decode_req in eligible_reqs:
             req = decode_req.req
-            _, checksum, n, present = (int(x) for x in meta.tolist())
-            if present == 0 or n <= 0:
+            try:
+                get_checksum_plan = getattr(
+                    decode_req.kv_receiver, "get_checksum_plan", None
+                )
+                expected = (
+                    get_checksum_plan() if get_checksum_plan is not None else None
+                )
+            except Exception as e:
+                req._kv_transfer_manifest_error = str(e)
                 continue
-            expected = ChecksumPlan(
-                bootstrap_room=req.bootstrap_room or 0,
-                num_tokens=n,
-                checksum=checksum,
-            )
+            uses_legacy_checksum = getattr(
+                decode_req.kv_receiver,
+                "uses_legacy_checksum_completion",
+                lambda: False,
+            )()
+            if expected is None and uses_legacy_checksum:
+                expected = ChecksumPlan(
+                    bootstrap_room=int(req.bootstrap_room or 0),
+                    num_tokens=len(req.origin_input_ids),
+                    checksum=0,
+                )
+                req._kv_transfer_legacy_checksum = True
+            if expected is None:
+                continue
             req._kv_transfer_expected_checksum = expected
+            try:
+                n = expected.num_tokens
+                expected_room = int(req.bootstrap_room or 0)
+                actual_tokens = len(req.origin_input_ids)
+                table = self.scheduler.req_to_token_pool.req_to_token
+                req_pool_idx = int(req.req_pool_idx)
+                if expected.bootstrap_room != expected_room:
+                    raise ValueError("checksum page manifest bootstrap room mismatch")
+                if (
+                    not uses_legacy_checksum
+                    and expected.page_size != TRANSFER_CHECKSUM_DIGEST_PAGE_SIZE
+                ):
+                    raise ValueError("checksum page manifest page size mismatch")
+                if not uses_legacy_checksum and expected.logical_start != 0:
+                    raise ValueError("checksum page manifest logical start mismatch")
+                if n != actual_tokens:
+                    raise ValueError(
+                        "checksum page manifest token count mismatch: "
+                        f"expected={actual_tokens}, actual={n}"
+                    )
+                if (
+                    req_pool_idx < 0
+                    or req_pool_idx >= table.shape[0]
+                    or n > table.shape[1]
+                ):
+                    raise ValueError(
+                        "checksum page manifest token range is out of bounds"
+                    )
+            except Exception as e:
+                req._kv_transfer_manifest_error = str(e)
+                continue
             reqs.append(req)
-            req_pool_indices.append(int(req.req_pool_idx))
+            req_pool_indices.append(req_pool_idx)
             bootstrap_rooms.append(int(req.bootstrap_room or 0))
             num_tokens.append(n)
             swa_evicted.append(swa_checksum_evicted_len(n, sliding_window, page_size))
@@ -1952,25 +2110,22 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         return batch, reqs
 
-    def _register_kv_attention_tags(self, req: Req) -> None:
+    def _register_kv_attention_tags(self, req: Req) -> bool:
         manager = getattr(self.scheduler, "kv_protection_manager", None)
         if manager is None or not manager.config.enable_attention_tags:
-            return
+            return False
         try:
             from sglang.srt.mem_cache.kv_page_tags import AttentionTagManifestGroup
 
             page_size = manager.page_size
             seq_len = len(req.origin_input_ids)
             if seq_len == 0 or req.req_pool_idx is None:
-                return
+                return False
             kv_loc = self.scheduler.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :seq_len
             ]
             # First token's loc within each logical page -> physical page id.
             first_locs = kv_loc[::page_size]
-            page_positions = torch.arange(
-                first_locs.numel(), dtype=torch.long, device=first_locs.device
-            )
             page_physical_ids = first_locs // page_size
             full_manifest = manager.register_attention_tags(
                 page_physical_ids=page_physical_ids,
@@ -2012,11 +2167,34 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 req.kv_attention_tag_manifest = manifests[0]
             else:
                 req.kv_attention_tag_manifest = None
-        except Exception as e:  # never break serving on a protection bookkeeping error
+            return False
+        except Exception as e:
             logger.error(
                 "KV attention tag registration failed for rid=%s: %s", req.rid, e
             )
             req.kv_attention_tag_manifest = None
+            from sglang.srt.mem_cache.kv_page_tags import (
+                KVProtectionBookkeepingError,
+                attach_kv_protection_incident,
+                emit_kv_protection_incident,
+            )
+
+            error = KVProtectionBookkeepingError(
+                rid=req.rid,
+                bootstrap_room=req.bootstrap_room,
+                cause="attention_tag_registration",
+                detail=str(e),
+            )
+            attach_kv_protection_incident(
+                error, kind="attention_tag", phase="tag_registration"
+            )
+            emit_kv_protection_incident(error, logger)
+            prepare_abort(
+                req,
+                str(error),
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return True
 
     def _write_staged_transfer_page_tags(self, req: Req) -> bool:
         """Return True if the request was aborted due to tag write failure."""
@@ -2035,9 +2213,25 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             logger.error(
                 "KV transfer page tag write failed for staged rid=%s: %s", req.rid, e
             )
+            from sglang.srt.mem_cache.kv_page_tags import (
+                KVProtectionBookkeepingError,
+                attach_kv_protection_incident,
+                emit_kv_protection_incident,
+            )
+
+            error = KVProtectionBookkeepingError(
+                rid=req.rid,
+                bootstrap_room=req.bootstrap_room,
+                cause="transfer_page_tag_commit",
+                detail=str(e),
+            )
+            attach_kv_protection_incident(
+                error, kind="transfer_page_tag", phase="tag_commit"
+            )
+            emit_kv_protection_incident(error, logger)
             prepare_abort(
                 req,
-                f"KV transfer page tag write failed: {e}",
+                str(error),
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             return True
@@ -2129,7 +2323,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 for req, plan in zip(
                     checksum_reqs, checksum_batch.finalize(), strict=True
                 ):
-                    req._kv_transfer_actual_checksum = plan.checksum
+                    req._kv_transfer_actual_checksum_plan = plan
             except Exception as e:
                 logger.error(
                     "KV transfer checksum destination batch finalize failed: %s", e
@@ -2189,10 +2383,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     continue
                 finalize_checksum_batch_once()
                 self._commit_transfer_to_req(decode_req)
-                if hasattr(decode_req.req, "_kv_transfer_actual_checksum"):
-                    delattr(decode_req.req, "_kv_transfer_actual_checksum")
+                if hasattr(decode_req.req, "_kv_transfer_actual_checksum_plan"):
+                    delattr(decode_req.req, "_kv_transfer_actual_checksum_plan")
                 if hasattr(decode_req.req, "_kv_transfer_expected_checksum"):
                     delattr(decode_req.req, "_kv_transfer_expected_checksum")
+                if hasattr(decode_req.req, "_kv_transfer_manifest_error"):
+                    delattr(decode_req.req, "_kv_transfer_manifest_error")
+                if hasattr(decode_req.req, "_kv_transfer_legacy_checksum"):
+                    delattr(decode_req.req, "_kv_transfer_legacy_checksum")
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):

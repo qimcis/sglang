@@ -39,11 +39,19 @@ class TestGating(CustomTestCase):
     def test_non_pd_is_always_disabled(self):
         with envs.SGLANG_KV_PAGE_PROTECTION.override(
             True
-        ), envs.SGLANG_KV_TRANSFER_CHECKSUM.override(True):
+        ), envs.SGLANG_KV_PAGE_HISTORY.override(
+            True
+        ), envs.SGLANG_KV_TRANSFER_CHECKSUM.override(
+            True
+        ), envs.SGLANG_ENABLE_LEGACY_KV_PROTECTION_COMPLETION.override(
+            True
+        ):
             cfg = KVProtectionConfig.from_env(is_pd_decode=False)
         self.assertFalse(cfg.enabled)
         self.assertFalse(cfg.enable_attention_tags)
         self.assertFalse(cfg.checksum_enabled)
+        self.assertFalse(cfg.enable_page_history)
+        self.assertFalse(cfg.allow_legacy_completion)
 
     def test_pd_disabled_by_default(self):
         # Neither env var set -> disabled even in PD.
@@ -56,18 +64,28 @@ class TestGating(CustomTestCase):
     def test_pd_attention_tags_enabled(self):
         with envs.SGLANG_KV_PAGE_PROTECTION.override(
             True
-        ), envs.SGLANG_KV_TRANSFER_CHECKSUM.override(False):
+        ), envs.SGLANG_KV_PAGE_HISTORY.override(
+            True
+        ), envs.SGLANG_KV_TRANSFER_CHECKSUM.override(
+            False
+        ):
             cfg = KVProtectionConfig.from_env(is_pd_decode=True)
         self.assertTrue(cfg.enabled)
         self.assertTrue(cfg.enable_attention_tags)
+        self.assertTrue(cfg.enable_page_history)
         self.assertFalse(cfg.checksum_enabled)
 
     def test_pd_checksum_enabled(self):
         with envs.SGLANG_KV_PAGE_PROTECTION.override(
             False
-        ), envs.SGLANG_KV_TRANSFER_CHECKSUM.override(True):
+        ), envs.SGLANG_KV_TRANSFER_CHECKSUM.override(
+            True
+        ), envs.SGLANG_ENABLE_LEGACY_KV_PROTECTION_COMPLETION.override(
+            True
+        ):
             cfg = KVProtectionConfig.from_env(is_pd_decode=True)
         self.assertTrue(cfg.checksum_enabled)
+        self.assertTrue(cfg.allow_legacy_completion)
 
 
 class TestFailFast(CustomTestCase):

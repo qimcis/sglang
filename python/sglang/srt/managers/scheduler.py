@@ -3172,9 +3172,32 @@ class Scheduler(
             mismatches = manager.verify_protection_batch(
                 attention_items, transfer_items
             )
-        except Exception as e:  # protection must never crash the decode loop
-            logger.error("KV attention tag verification error: %s", e)
-            return
+        except Exception as e:  # fail closed without crashing the decode loop
+            logger.exception("KV attention tag verification error")
+            from sglang.srt.mem_cache.kv_page_tags import (
+                KVProtectionBookkeepingError,
+                attach_kv_protection_incident,
+            )
+
+            mismatches = []
+            for req in batch.reqs:
+                if (
+                    getattr(req, "kv_attention_tag_manifest", None) is None
+                    and getattr(req, "kv_transfer_page_tag_manifest", None) is None
+                ):
+                    continue
+                error = KVProtectionBookkeepingError(
+                    rid=req.rid,
+                    bootstrap_room=req.bootstrap_room,
+                    cause="pre_attention_verification",
+                    detail=str(e),
+                )
+                attach_kv_protection_incident(
+                    error, kind="attention_tag", phase="pre_attention"
+                )
+                mismatches.append(error)
+            if not mismatches:
+                return
 
         if not mismatches:
             try:
@@ -3206,11 +3229,18 @@ class Scheduler(
 
         bad_rids = {m.rid for m in mismatches}
         rid_to_req = {req.rid: req for req in batch.reqs}
+        aborted_rids = set()
         for m in mismatches:
             req = rid_to_req.get(m.rid)
             if req is None:
                 continue
+            from sglang.srt.mem_cache.kv_page_tags import emit_kv_protection_incident
+
+            emit_kv_protection_incident(m, logger)
             logger.error("Aborting request due to %s", m)
+            if m.rid in aborted_rids:
+                continue
+            aborted_rids.add(m.rid)
             mismatch_type = type(m).__name__
             req.finished_reason = FINISH_ABORT(
                 f"{mismatch_type}: {m}",

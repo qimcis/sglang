@@ -347,6 +347,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor req_pool_indices, Tensor starts, Tensor lengths, int max_num_tokens, "
       "int num_lanes, bool has_swa, bool is_capped, Tensor! accum, Tensor! out) -> ()");
   m.impl("kv_checksum_direct_table_batched", torch::kCUDA, &kv_checksum_direct_table_batched);
+  m.def(
+      "kv_checksum_direct_table_batched_with_pages(Tensor buffer_ptrs, Tensor row_strides, Tensor row_nbytes, "
+      "Tensor swa_buffer_flags, Tensor full_to_swa_index_mapping, Tensor req_to_token, "
+      "Tensor req_pool_indices, Tensor starts, Tensor lengths, Tensor logical_starts, int max_num_tokens, "
+      "int num_lanes, int page_size, int max_num_pages, bool has_swa, bool is_capped, Tensor! accum, Tensor! out, "
+      "Tensor! page_accum, Tensor! page_out) -> ()");
+  m.impl("kv_checksum_direct_table_batched_with_pages", torch::kCUDA, &kv_checksum_direct_table_batched_with_pages);
+  m.def(
+      "kv_page_history_record(Tensor page_ids, int operation, Tensor generations, bool generations_by_page, "
+      "int bootstrap_room, Tensor page_positions, int page_position, Tensor values, int value, "
+      "Tensor(a!) cursor, Tensor(b!) records) -> ()");
+  m.impl("kv_page_history_record", torch::kCUDA, &kv_page_history_record);
 
   /*
    * From csrc/memory

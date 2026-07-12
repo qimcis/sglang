@@ -797,6 +797,7 @@ class SchedulerDisaggregationPrefillMixin:
                     checksum_reqs, checksum_batch.finalize(), strict=True
                 ):
                     req.kv_transfer_checksum = plan
+                    req.disagg_kv_sender.set_checksum_plan(plan)
             except Exception as e:
                 logger.error("KV transfer checksum batch finalize failed: %s", e)
                 for req in checksum_reqs:

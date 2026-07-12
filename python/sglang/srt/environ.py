@@ -316,9 +316,15 @@ class Envs:
     # Enable a sidecar uint64 page-tag buffer that detects stale/wrong/mid-decode
     # KV page reuse before decode attention reads pages.
     SGLANG_KV_PAGE_PROTECTION = EnvBool(False)
+    # Retain the last eight ownership operations for every physical page. This
+    # costs 328 bytes per page and is intended only for targeted diagnostics.
+    SGLANG_KV_PAGE_HISTORY = EnvBool(False)
     # Enable full direct-KV transfer checksums. When enabled, every transferred
     # token row is checksummed and the direct CUDA kernel is required.
     SGLANG_KV_TRANSFER_CHECKSUM = EnvBool(False)
+    # Rolling-upgrade escape hatch for old prefills that send three-frame,
+    # nonce-less checksum completions. Keep disabled after a prefill-first rollout.
+    SGLANG_ENABLE_LEGACY_KV_PROTECTION_COMPLETION = EnvBool(False)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.

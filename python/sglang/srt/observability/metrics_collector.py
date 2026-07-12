@@ -557,6 +557,16 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="Total number of KV pages verified against attention tags.",
             labelnames=labels.keys(),
         )
+        self.kv_transfer_page_tag_mismatches_total = Counter(
+            name="sglang:kv_transfer_page_tag_mismatches_total",
+            documentation="Number of requests failed due to a transfer-written page tag mismatch.",
+            labelnames=labels.keys(),
+        )
+        self.kv_transfer_page_tag_checked_pages_total = Counter(
+            name="sglang:kv_transfer_page_tag_checked_pages_total",
+            documentation="Total number of transfer-written KV page tags verified.",
+            labelnames=labels.keys(),
+        )
         self.kv_transfer_checksum_mismatches_total = Counter(
             name="sglang:kv_transfer_checksum_mismatches_total",
             documentation="Number of requests failed due to a KV transfer checksum mismatch.",
@@ -1143,6 +1153,16 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_kv_attention_tag_checked_pages(self, count: int) -> None:
         if count > 0:
             self.kv_attention_tag_checked_pages_total.labels(**self.labels).inc(count)
+
+    def increment_kv_transfer_page_tag_mismatches(self, count: int = 1) -> None:
+        if count > 0:
+            self.kv_transfer_page_tag_mismatches_total.labels(**self.labels).inc(count)
+
+    def increment_kv_transfer_page_tag_checked_pages(self, count: int) -> None:
+        if count > 0:
+            self.kv_transfer_page_tag_checked_pages_total.labels(**self.labels).inc(
+                count
+            )
 
     def increment_kv_transfer_checksum_mismatches(self, count: int = 1) -> None:
         if count > 0:

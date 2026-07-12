@@ -655,6 +655,42 @@ void kv_checksum_direct_table_batched(
     at::Tensor& accum,
     at::Tensor& out);
 
+// Same root checksum plus independent uint64 digests for fixed logical pages.
+void kv_checksum_direct_table_batched_with_pages(
+    const at::Tensor& buffer_ptrs,
+    const at::Tensor& row_strides,
+    const at::Tensor& row_nbytes,
+    const at::Tensor& swa_buffer_flags,
+    const at::Tensor& full_to_swa_index_mapping,
+    const at::Tensor& req_to_token,
+    const at::Tensor& req_pool_indices,
+    const at::Tensor& starts,
+    const at::Tensor& lengths,
+    const at::Tensor& logical_starts,
+    int64_t max_num_tokens,
+    int64_t num_lanes,
+    int64_t page_size,
+    int64_t max_num_pages,
+    bool has_swa,
+    bool is_capped,
+    at::Tensor& accum,
+    at::Tensor& out,
+    at::Tensor& page_accum,
+    at::Tensor& page_out);
+
+void kv_page_history_record(
+    const at::Tensor& page_ids,
+    int64_t operation,
+    const at::Tensor& generations,
+    bool generations_by_page,
+    int64_t bootstrap_room,
+    const at::Tensor& page_positions,
+    int64_t page_position,
+    const at::Tensor& values,
+    int64_t value,
+    at::Tensor& cursor,
+    at::Tensor& records);
+
 /*
  * From csrc/memory
  */

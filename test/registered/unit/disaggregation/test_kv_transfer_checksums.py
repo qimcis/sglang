@@ -5,14 +5,17 @@ production table-batched op lives in ``sgl-kernel/tests/test_kv_checksum.py``.
 """
 
 import unittest
+from dataclasses import replace
 
 import torch
 
 from sglang.srt.mem_cache.kv_page_tags import (
+    TRANSFER_CHECKSUM_DIGEST_PAGE_SIZE,
     ChecksumPlan,
     KVPageProtectionManager,
     KVProtectionConfig,
     compare_checksums,
+    first_checksum_page_mismatch,
     hash_rows_with_positions,
     select_checksum_token_indices,
     swa_checksum_evicted_len,
@@ -69,7 +72,7 @@ class TestChecksumExcludesPhysicalPageIds(CustomTestCase):
 
     def test_same_logical_bytes_different_physical_slots_match(self):
         torch.manual_seed(1)
-        size, h, d, layers, tokens = 64, 2, 4, 2, 10
+        size, h, d, layers = 64, 2, 4, 2
         src = [
             torch.randint(0, 100, (size, h, d), dtype=torch.int32)
             for _ in range(layers)
@@ -122,6 +125,66 @@ class TestChecksumSelectionAndPayload(CustomTestCase):
         self.assertTrue(compare_checksums(plan, -2))
         self.assertFalse(compare_checksums(plan, 0xFFFF_FFFD))
 
+    def test_page_manifest_wire_roundtrip(self):
+        plan = ChecksumPlan(
+            bootstrap_room=5,
+            num_tokens=130,
+            checksum=0xFFFF_FFFE,
+            page_size=TRANSFER_CHECKSUM_DIGEST_PAGE_SIZE,
+            logical_start=0,
+            page_digests=(1, 1 << 63, (1 << 64) - 1),
+        )
+        payload = plan.to_wire_bytes(transfer_nonce=123)
+        restored = ChecksumPlan.from_wire_bytes(
+            payload,
+            expected_transfer_nonce=123,
+            expected_bootstrap_room=5,
+        )
+        self.assertEqual(restored, plan)
+
+    def test_page_manifest_rejects_truncation_and_stale_identity(self):
+        plan = ChecksumPlan(
+            bootstrap_room=5,
+            num_tokens=65,
+            checksum=7,
+            page_size=TRANSFER_CHECKSUM_DIGEST_PAGE_SIZE,
+            page_digests=(11, 12),
+        )
+        payload = plan.to_wire_bytes(transfer_nonce=123)
+        with self.assertRaisesRegex(ValueError, "payload length mismatch"):
+            ChecksumPlan.from_wire_bytes(payload[:-1])
+        with self.assertRaisesRegex(ValueError, "nonce mismatch"):
+            ChecksumPlan.from_wire_bytes(payload, expected_transfer_nonce=124)
+        with self.assertRaisesRegex(ValueError, "bootstrap room mismatch"):
+            ChecksumPlan.from_wire_bytes(payload, expected_bootstrap_room=6)
+
+    def test_page_manifest_rejects_invalid_shape(self):
+        base = ChecksumPlan(
+            bootstrap_room=5,
+            num_tokens=65,
+            checksum=7,
+            page_size=TRANSFER_CHECKSUM_DIGEST_PAGE_SIZE,
+            page_digests=(11, 12),
+        )
+        with self.assertRaisesRegex(ValueError, "digest count mismatch"):
+            replace(base, page_digests=(11,)).to_wire_bytes(transfer_nonce=1)
+        with self.assertRaisesRegex(ValueError, "page_size"):
+            replace(base, page_size=32).to_wire_bytes(transfer_nonce=1)
+        with self.assertRaisesRegex(ValueError, "transfer nonce"):
+            base.to_wire_bytes(transfer_nonce=0)
+
+    def test_first_page_mismatch_uses_logical_page_position(self):
+        expected = ChecksumPlan(
+            bootstrap_room=5,
+            num_tokens=80,
+            checksum=1,
+            page_size=TRANSFER_CHECKSUM_DIGEST_PAGE_SIZE,
+            logical_start=32,
+            page_digests=(11, 12),
+        )
+        actual = replace(expected, checksum=2, page_digests=(11, 13))
+        self.assertEqual(first_checksum_page_mismatch(expected, actual), 1)
+
     def test_swa_evicted_len_is_page_aligned(self):
         self.assertEqual(swa_checksum_evicted_len(100, 32, 16), 64)
         self.assertEqual(swa_checksum_evicted_len(100, 32, 1), 68)
@@ -144,7 +207,7 @@ class TestManagerCompare(CustomTestCase):
         expected = ChecksumPlan(bootstrap_room=3, num_tokens=8, checksum=123)
         self.assertTrue(manager.compare_destination_checksum(expected, 123, rid="r"))
         self.assertFalse(manager.compare_destination_checksum(expected, 124, rid="r"))
-        self.assertEqual(metrics.checked, 16)
+        self.assertEqual(metrics.checked, 2)
         self.assertEqual(metrics.mismatches, 1)
 
     def test_batched_table_requires_cuda_req_to_token(self):

@@ -59,6 +59,9 @@ class KVTransferPagePinManager:
             page_id = int(page_id_raw)
             if self._pin_counts.get(page_id, 0) > 0:
                 self._deferred_free_pages.add(page_id)
+                table = self.allocator.attention_tag_table
+                if table is not None:
+                    table.record_free([page_id], deferred=True)
             else:
                 unpinned.append(page_id)
         if len(unpinned) == len(page_ids):
@@ -138,6 +141,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         if not page_ids:
             return
         pages = torch.tensor(page_ids, dtype=torch.int64, device=self.device)
+        if self.attention_tag_table is not None:
+            self.attention_tag_table.record_free_released(pages)
         if self.need_sort:
             self.release_pages = torch.cat((pages, self.release_pages))
         else:
@@ -157,6 +162,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         if self.attention_tag_table is None:
             return
         self.attention_tag_table.bump_generations(page_ids)
+
+    def _record_page_free(self, page_ids) -> None:
+        if self.attention_tag_table is not None:
+            self.attention_tag_table.record_free(page_ids)
 
     @property
     def size_full(self):

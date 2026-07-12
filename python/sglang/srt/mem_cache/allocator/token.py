@@ -71,6 +71,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.is_not_in_free_group:
+            self._record_page_free(free_index)
             free_index = self._filter_transfer_pinned_pages(free_index)
             if free_index.numel() == 0:
                 return
