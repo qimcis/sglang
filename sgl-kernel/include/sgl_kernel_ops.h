@@ -149,7 +149,21 @@ void fast_topk_transform_interface(
     at::Tensor& dst_page_table,
     const at::Tensor& src_page_table,
     const at::Tensor& cu_seqlens_q,
-    std::optional<at::Tensor> row_starts_opt = std::nullopt);
+    std::optional<at::Tensor> row_starts_opt = std::nullopt,
+    std::optional<at::Tensor> protection_request_indices_opt = std::nullopt,
+    int64_t protection_page_size = 0,
+    int64_t protection_page_offset = 0,
+    std::optional<at::Tensor> protection_actual_tags_opt = std::nullopt,
+    std::optional<at::Tensor> protection_actual_generations_opt = std::nullopt,
+    std::optional<at::Tensor> protection_actual_transfer_tags_opt = std::nullopt,
+    std::optional<at::Tensor> protection_owner_request_indices_opt = std::nullopt,
+    std::optional<at::Tensor> protection_owner_page_positions_opt = std::nullopt,
+    std::optional<at::Tensor> protection_expected_tags_opt = std::nullopt,
+    std::optional<at::Tensor> protection_expected_generations_opt = std::nullopt,
+    std::optional<at::Tensor> protection_expected_transfer_tags_opt = std::nullopt,
+    std::optional<at::Tensor> protection_request_epochs_opt = std::nullopt,
+    std::optional<at::Tensor> protection_validated_epochs_opt = std::nullopt,
+    std::optional<at::Tensor> protection_status_opt = std::nullopt);
 void fast_topk_transform_ragged_interface(
     const at::Tensor& score,
     const at::Tensor& lengths,

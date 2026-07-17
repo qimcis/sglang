@@ -2287,17 +2287,19 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 )
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
-            expected_tags = {
-                int(page_id): int(tag)
-                for page_id, tag in zip(tag_ids, tag_values, strict=True)
-            }
-            if len(expected_tags) != len(tag_ids):
-                self.kv_mgr.record_failure(
-                    self.bootstrap_room,
-                    "Duplicate expected KV transfer page ids",
-                )
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                return
+            # DSA transfers latent KV and indexer state under the same page owner.
+            expected_tags = {}
+            for page_id, tag in zip(tag_ids, tag_values, strict=True):
+                page_id = int(page_id)
+                tag = int(tag)
+                if page_id in expected_tags and expected_tags[page_id] != tag:
+                    self.kv_mgr.record_failure(
+                        self.bootstrap_room,
+                        "Conflicting expected KV transfer tags for one page id",
+                    )
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                    return
+                expected_tags[page_id] = tag
             with self.kv_mgr.request_status_lock:
                 self.kv_mgr.transfer_page_tag_expected_table[self.bootstrap_room] = (
                     expected_tags

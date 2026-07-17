@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 
 namespace {
@@ -45,6 +46,71 @@ struct FastTopKParams {
   int32_t* __restrict__ lengths;           // [B]
   int64_t input_stride;
 };
+
+constexpr int32_t kKVPageInvalidMapping = 0x01;
+constexpr int32_t kKVPageOwnerMismatch = 0x02;
+constexpr int32_t kKVPagePositionMismatch = 0x04;
+constexpr int32_t kKVPageAttentionTagMismatch = 0x08;
+constexpr int32_t kKVPageGenerationMismatch = 0x10;
+constexpr int32_t kKVPageTransferTagMismatch = 0x20;
+
+struct KVTopKProtectionParams {
+  const int64_t* __restrict__ request_indices;  // [B]
+  int32_t page_size;
+  int32_t page_offset;
+  int32_t num_physical_pages;
+  int32_t num_request_slots;
+  const int64_t* __restrict__ actual_tags;
+  const int64_t* __restrict__ actual_generations;
+  const int32_t* __restrict__ actual_transfer_tags;
+  const int32_t* __restrict__ owner_request_indices;
+  const int32_t* __restrict__ owner_page_positions;
+  const int64_t* __restrict__ expected_tags;
+  const int64_t* __restrict__ expected_generations;
+  const int32_t* __restrict__ expected_transfer_tags;
+  const int32_t* __restrict__ request_epochs;
+  int32_t* __restrict__ validated_epochs;
+  int32_t* __restrict__ status;
+};
+
+__device__ __forceinline__ int32_t validate_selected_token_slot(
+    const KVTopKProtectionParams& protection,
+    int32_t request_idx,
+    int32_t logical_position,
+    int32_t token_slot,
+    int32_t length) {
+  int32_t validation_status = 0;
+  if (logical_position < 0 || logical_position >= length || token_slot <= 0) {
+    return kKVPageInvalidMapping;
+  }
+
+  const int64_t physical_page = static_cast<int64_t>(token_slot) / protection.page_size;
+  const int32_t physical_offset = token_slot % protection.page_size;
+  const int32_t logical_page = logical_position / protection.page_size;
+  const int32_t logical_offset = logical_position % protection.page_size;
+  const int64_t sidecar_page = physical_page + protection.page_offset;
+  if (physical_offset != logical_offset || sidecar_page <= 0 || sidecar_page >= protection.num_physical_pages) {
+    return kKVPageInvalidMapping;
+  }
+
+  const auto page = static_cast<int32_t>(sidecar_page);
+  if (protection.owner_request_indices[page] != request_idx) {
+    validation_status |= kKVPageOwnerMismatch;
+  }
+  if (protection.owner_page_positions[page] != logical_page) {
+    validation_status |= kKVPagePositionMismatch;
+  }
+  if (protection.actual_tags[page] != protection.expected_tags[page]) {
+    validation_status |= kKVPageAttentionTagMismatch;
+  }
+  if (protection.actual_generations[page] != protection.expected_generations[page]) {
+    validation_status |= kKVPageGenerationMismatch;
+  }
+  if (protection.actual_transfer_tags[page] != protection.expected_transfer_tags[page]) {
+    validation_status |= kKVPageTransferTagMismatch;
+  }
+  return validation_status;
+}
 
 // when length <= TopK, we can directly write the indices
 __device__ void naive_topk_cuda(const float* __restrict__ score, int32_t* __restrict__ indice, int32_t length) {
@@ -297,6 +363,84 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // decode
   }
 }
 
+__global__ __launch_bounds__(kThreadsPerBlock)  // protected decode
+    void topk_transform_decode_protected_kernel(
+        const FastTopKParams params,
+        int32_t* __restrict__ dst_page_table,
+        const int32_t* __restrict__ src_page_table,
+        int64_t src_stride,
+        int32_t src_num_cols,
+        int32_t score_num_cols,
+        const KVTopKProtectionParams protection) {
+  const auto bid = static_cast<uint64_t>(blockIdx.x);
+  const auto tid = threadIdx.x;
+  const auto length = params.lengths[bid];
+  const auto src_page_entry = src_page_table + bid * src_stride;
+  const auto dst_page_entry = dst_page_table + bid * TopK;
+  const auto score = params.input + bid * params.input_stride;
+  const auto request_idx_i64 = protection.request_indices[bid];
+  const bool request_idx_valid =
+      request_idx_i64 >= 0 && request_idx_i64 < static_cast<int64_t>(protection.num_request_slots);
+  const auto request_idx = request_idx_valid ? static_cast<int32_t>(request_idx_i64) : -1;
+  const bool graph_padding = request_idx == 0;
+
+  __shared__ int32_t s_validation_status;
+  const bool row_shape_valid =
+      request_idx_valid && !graph_padding && length >= 0 && length <= src_num_cols && length <= score_num_cols;
+  if (tid == 0) {
+    s_validation_status = (graph_padding || row_shape_valid) ? 0 : kKVPageInvalidMapping;
+  }
+  __syncthreads();
+
+  const auto validate_and_store = [&](int32_t output_position, int32_t logical_position) {
+    if (logical_position < 0 || logical_position >= length || logical_position >= src_num_cols) {
+      dst_page_entry[output_position] = 0;
+      ::atomicOr(&s_validation_status, kKVPageInvalidMapping);
+      return;
+    }
+
+    const auto token_slot = src_page_entry[logical_position];
+    const auto entry_status =
+        validate_selected_token_slot(protection, request_idx, logical_position, token_slot, length);
+    dst_page_entry[output_position] = entry_status == 0 ? token_slot : 0;
+    if (entry_status != 0) {
+      ::atomicOr(&s_validation_status, entry_status);
+    }
+  };
+
+  if (graph_padding || !row_shape_valid) {
+    for (auto i = static_cast<int32_t>(tid); i < TopK; i += kThreadsPerBlock) {
+      dst_page_entry[i] = 0;
+    }
+  } else if (length <= TopK) {
+    for (auto i = static_cast<int32_t>(tid); i < TopK; i += kThreadsPerBlock) {
+      if (i < length) {
+        validate_and_store(i, i);
+      } else {
+        dst_page_entry[i] = -1;
+      }
+    }
+  } else {
+    __shared__ int32_t s_indices[TopK];
+    fast_topk_cuda_tl(score, s_indices, 0, length);
+    static_assert(TopK % kThreadsPerBlock == 0);
+    static_assert(TopK / kThreadsPerBlock == 2);
+    validate_and_store(tid, s_indices[tid]);
+    validate_and_store(tid + kThreadsPerBlock, s_indices[tid + kThreadsPerBlock]);
+  }
+
+  __syncthreads();
+  if (tid == 0 && request_idx > 0) {
+    if (s_validation_status != 0) {
+      ::atomicOr(protection.status + request_idx, s_validation_status);
+    }
+    // The post-forward status check may trust this marker only after all
+    // sanitized output and status writes are globally visible.
+    __threadfence();
+    ::atomicExch(protection.validated_epochs + request_idx, protection.request_epochs[request_idx]);
+  }
+}
+
 __global__ __launch_bounds__(kThreadsPerBlock)  // prefill
     void topk_transform_prefill_kernel(
         const FastTopKParams params,
@@ -430,6 +574,14 @@ void setup_kernel_smem_once() {
   TORCH_CHECK(result == cudaSuccess, "set_up_kernel_once failed:", ::cudaGetErrorString(result));
 }
 
+void check_protection_tensor(
+    const at::Tensor& tensor, const at::Tensor& reference, at::ScalarType dtype, const char* name) {
+  TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
+  TORCH_CHECK(tensor.device() == reference.device(), name, " must be on the score device");
+  TORCH_CHECK(tensor.dim() == 1 && tensor.is_contiguous(), name, " must be a contiguous 1D tensor");
+  TORCH_CHECK(tensor.scalar_type() == dtype, name, " has an invalid dtype");
+}
+
 }  // namespace
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
@@ -459,7 +611,21 @@ void fast_topk_transform_interface(
     at::Tensor& dst_page_table,
     const at::Tensor& src_page_table,
     const at::Tensor& cu_seqlens_q,
-    std::optional<at::Tensor> row_starts_opt) {
+    std::optional<at::Tensor> row_starts_opt,
+    std::optional<at::Tensor> protection_request_indices_opt,
+    int64_t protection_page_size,
+    int64_t protection_page_offset,
+    std::optional<at::Tensor> protection_actual_tags_opt,
+    std::optional<at::Tensor> protection_actual_generations_opt,
+    std::optional<at::Tensor> protection_actual_transfer_tags_opt,
+    std::optional<at::Tensor> protection_owner_request_indices_opt,
+    std::optional<at::Tensor> protection_owner_page_positions_opt,
+    std::optional<at::Tensor> protection_expected_tags_opt,
+    std::optional<at::Tensor> protection_expected_generations_opt,
+    std::optional<at::Tensor> protection_expected_transfer_tags_opt,
+    std::optional<at::Tensor> protection_request_epochs_opt,
+    std::optional<at::Tensor> protection_validated_epochs_opt,
+    std::optional<at::Tensor> protection_status_opt) {
   CHECK_CUDA(score);
   CHECK_CUDA(lengths);
   CHECK_CUDA(dst_page_table);
@@ -470,6 +636,19 @@ void fast_topk_transform_interface(
   }
   const auto params = get_params(score, lengths, row_starts_opt);
   const auto B = score.size(0);
+  TORCH_CHECK(score.scalar_type() == at::kFloat, "score must be float32");
+  TORCH_CHECK(lengths.scalar_type() == at::kInt, "lengths must be int32");
+  TORCH_CHECK(dst_page_table.scalar_type() == at::kInt, "dst_page_table must be int32");
+  TORCH_CHECK(src_page_table.scalar_type() == at::kInt, "src_page_table must be int32");
+  TORCH_CHECK(cu_seqlens_q.scalar_type() == at::kInt, "cu_seqlens_q must be int32");
+  TORCH_CHECK(lengths.device() == score.device(), "lengths must be on the score device");
+  TORCH_CHECK(dst_page_table.device() == score.device(), "dst_page_table must be on the score device");
+  TORCH_CHECK(src_page_table.device() == score.device(), "src_page_table must be on the score device");
+  TORCH_CHECK(cu_seqlens_q.device() == score.device(), "cu_seqlens_q must be on the score device");
+  if (row_starts_opt.has_value()) {
+    TORCH_CHECK(row_starts_opt->scalar_type() == at::kInt, "row_starts must be int32");
+    TORCH_CHECK(row_starts_opt->device() == score.device(), "row_starts must be on the score device");
+  }
   TORCH_CHECK(dst_page_table.dim() == 2 && dst_page_table.is_contiguous());
   TORCH_CHECK(src_page_table.dim() == 2 && src_page_table.stride(1) == 1);
   TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_q.is_contiguous());
@@ -490,7 +669,109 @@ void fast_topk_transform_interface(
   // decode: row_starts_opt is null, invokes the decode kernel
   // target verify: row_starts_opt is null, invokes the prefill kernel
   const auto is_decode = !row_starts_opt.has_value() && prefill_bs == B;
-  if (is_decode) {
+  const bool any_protection =
+      protection_request_indices_opt.has_value() || protection_page_size != 0 || protection_page_offset != 0 ||
+      protection_actual_tags_opt.has_value() || protection_actual_generations_opt.has_value() ||
+      protection_actual_transfer_tags_opt.has_value() || protection_owner_request_indices_opt.has_value() ||
+      protection_owner_page_positions_opt.has_value() || protection_expected_tags_opt.has_value() ||
+      protection_expected_generations_opt.has_value() || protection_expected_transfer_tags_opt.has_value() ||
+      protection_request_epochs_opt.has_value() || protection_validated_epochs_opt.has_value() ||
+      protection_status_opt.has_value();
+  const bool complete_protection =
+      protection_request_indices_opt.has_value() && protection_actual_tags_opt.has_value() &&
+      protection_actual_generations_opt.has_value() && protection_actual_transfer_tags_opt.has_value() &&
+      protection_owner_request_indices_opt.has_value() && protection_owner_page_positions_opt.has_value() &&
+      protection_expected_tags_opt.has_value() && protection_expected_generations_opt.has_value() &&
+      protection_expected_transfer_tags_opt.has_value() && protection_request_epochs_opt.has_value() &&
+      protection_validated_epochs_opt.has_value() && protection_status_opt.has_value();
+  TORCH_CHECK(!any_protection || complete_protection, "topk KV protection arguments must be provided together");
+
+  if (complete_protection) {
+    TORCH_CHECK(is_decode, "topk KV protection currently supports decode only");
+    TORCH_CHECK(
+        protection_page_size > 0 && protection_page_size <= std::numeric_limits<int32_t>::max(),
+        "topk KV protection page size is out of range");
+    TORCH_CHECK(
+        protection_page_offset >= 0 && protection_page_offset <= std::numeric_limits<int32_t>::max(),
+        "topk KV protection page offset is out of range");
+    TORCH_CHECK(
+        src_page_table.size(1) <= std::numeric_limits<int32_t>::max() &&
+            score.size(1) <= std::numeric_limits<int32_t>::max(),
+        "topk KV protection input is too wide");
+
+    const auto& request_indices = protection_request_indices_opt.value();
+    const auto& actual_tags = protection_actual_tags_opt.value();
+    const auto& actual_generations = protection_actual_generations_opt.value();
+    const auto& actual_transfer_tags = protection_actual_transfer_tags_opt.value();
+    const auto& owner_request_indices = protection_owner_request_indices_opt.value();
+    const auto& owner_page_positions = protection_owner_page_positions_opt.value();
+    const auto& expected_tags = protection_expected_tags_opt.value();
+    const auto& expected_generations = protection_expected_generations_opt.value();
+    const auto& expected_transfer_tags = protection_expected_transfer_tags_opt.value();
+    const auto& request_epochs = protection_request_epochs_opt.value();
+    auto& validated_epochs = protection_validated_epochs_opt.value();
+    auto& status = protection_status_opt.value();
+
+    check_protection_tensor(request_indices, score, at::kLong, "protection_request_indices");
+    check_protection_tensor(actual_tags, score, at::kLong, "protection_actual_tags");
+    check_protection_tensor(actual_generations, score, at::kLong, "protection_actual_generations");
+    check_protection_tensor(actual_transfer_tags, score, at::kInt, "protection_actual_transfer_tags");
+    check_protection_tensor(owner_request_indices, score, at::kInt, "protection_owner_request_indices");
+    check_protection_tensor(owner_page_positions, score, at::kInt, "protection_owner_page_positions");
+    check_protection_tensor(expected_tags, score, at::kLong, "protection_expected_tags");
+    check_protection_tensor(expected_generations, score, at::kLong, "protection_expected_generations");
+    check_protection_tensor(expected_transfer_tags, score, at::kInt, "protection_expected_transfer_tags");
+    check_protection_tensor(request_epochs, score, at::kInt, "protection_request_epochs");
+    check_protection_tensor(validated_epochs, score, at::kInt, "protection_validated_epochs");
+    check_protection_tensor(status, score, at::kInt, "protection_status");
+
+    TORCH_CHECK(request_indices.size(0) == B, "topk KV protection request-index batch mismatch");
+    const auto num_physical_pages = actual_tags.size(0);
+    TORCH_CHECK(
+        num_physical_pages > 0 && num_physical_pages <= std::numeric_limits<int32_t>::max(),
+        "topk KV protection physical sidecar size is out of range");
+    TORCH_CHECK(
+        actual_generations.size(0) == num_physical_pages && actual_transfer_tags.size(0) == num_physical_pages &&
+            owner_request_indices.size(0) == num_physical_pages && owner_page_positions.size(0) == num_physical_pages &&
+            expected_tags.size(0) == num_physical_pages && expected_generations.size(0) == num_physical_pages &&
+            expected_transfer_tags.size(0) == num_physical_pages,
+        "topk KV protection physical sidecar length mismatch");
+    const auto num_request_slots = request_epochs.size(0);
+    TORCH_CHECK(
+        num_request_slots > 0 && num_request_slots <= std::numeric_limits<int32_t>::max(),
+        "topk KV protection request sidecar size is out of range");
+    TORCH_CHECK(
+        validated_epochs.size(0) == num_request_slots && status.size(0) == num_request_slots,
+        "topk KV protection request sidecar length mismatch");
+
+    const KVTopKProtectionParams protection{
+        .request_indices = request_indices.data_ptr<int64_t>(),
+        .page_size = static_cast<int32_t>(protection_page_size),
+        .page_offset = static_cast<int32_t>(protection_page_offset),
+        .num_physical_pages = static_cast<int32_t>(num_physical_pages),
+        .num_request_slots = static_cast<int32_t>(num_request_slots),
+        .actual_tags = actual_tags.data_ptr<int64_t>(),
+        .actual_generations = actual_generations.data_ptr<int64_t>(),
+        .actual_transfer_tags = actual_transfer_tags.data_ptr<int32_t>(),
+        .owner_request_indices = owner_request_indices.data_ptr<int32_t>(),
+        .owner_page_positions = owner_page_positions.data_ptr<int32_t>(),
+        .expected_tags = expected_tags.data_ptr<int64_t>(),
+        .expected_generations = expected_generations.data_ptr<int64_t>(),
+        .expected_transfer_tags = expected_transfer_tags.data_ptr<int32_t>(),
+        .request_epochs = request_epochs.data_ptr<int32_t>(),
+        .validated_epochs = validated_epochs.data_ptr<int32_t>(),
+        .status = status.data_ptr<int32_t>(),
+    };
+    setup_kernel_smem_once<topk_transform_decode_protected_kernel, kSmem>();
+    topk_transform_decode_protected_kernel<<<grid, block, kSmem, stream>>>(
+        params,
+        dst_page_table.data_ptr<int32_t>(),
+        src_page_table.data_ptr<int32_t>(),
+        src_stride,
+        static_cast<int32_t>(src_page_table.size(1)),
+        static_cast<int32_t>(score.size(1)),
+        protection);
+  } else if (is_decode) {
     setup_kernel_smem_once<topk_transform_decode_kernel, kSmem>();
     topk_transform_decode_kernel<<<grid, block, kSmem, stream>>>(
         params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride);

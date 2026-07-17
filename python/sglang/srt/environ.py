@@ -316,6 +316,9 @@ class Envs:
     # Enable a sidecar uint64 page-tag buffer that detects stale/wrong/mid-decode
     # KV page reuse before decode attention reads pages.
     SGLANG_KV_PAGE_PROTECTION = EnvBool(False)
+    # Expert A/B kill-switch: keep page protection enabled but use the
+    # scheduler-side validator instead of producer-fused DSA top-k validation.
+    SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION = EnvBool(False)
     # Retain the last eight ownership operations for every physical page. This
     # costs 328 bytes per page and is intended only for targeted diagnostics.
     SGLANG_KV_PAGE_HISTORY = EnvBool(False)

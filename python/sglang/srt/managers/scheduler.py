@@ -856,6 +856,52 @@ class Scheduler(
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
 
+    def init_kv_attention_tag_table(self):
+        from sglang.srt.mem_cache.kv_page_tags import (
+            KVAttentionTagTable,
+            KVProtectionConfig,
+            assert_protection_supported,
+        )
+
+        config = KVProtectionConfig.from_env(
+            is_pd_decode=self.server_args.disaggregation_mode == "decode"
+        )
+        if not config.enable_attention_tags:
+            return
+
+        _, allocator = self.tp_worker.get_memory_pool()
+        is_cuda_device = current_platform.is_cuda()
+        assert_protection_supported(
+            config,
+            allocator=allocator,
+            is_spec_decode=not self.spec_algorithm.is_none(),
+            pp_size=self.ps.pp_size,
+            enable_dp_attention=self.server_args.enable_dp_attention,
+            radix_cache_enabled=not self.server_args.disable_radix_cache,
+            is_cuda_device=is_cuda_device,
+            device_capability_major=(
+                torch.cuda.get_device_capability(allocator.device)[0]
+                if is_cuda_device
+                else None
+            ),
+        )
+        page_size = allocator.page_size
+        num_pages = (
+            int(allocator.attention_tag_num_pages())
+            if hasattr(allocator, "attention_tag_num_pages")
+            else allocator.size // max(page_size, 1)
+        )
+        table = KVAttentionTagTable(
+            max(1, num_pages),
+            device=allocator.device,
+            num_request_slots=self.tp_worker.model_runner.req_to_token_pool.req_to_token.shape[
+                0
+            ],
+            enable_history=config.enable_page_history,
+        )
+        allocator.attach_attention_tag_table(table)
+        self.tp_worker.model_runner.kv_attention_tag_table = table
+
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
@@ -866,6 +912,11 @@ class Scheduler(
 
         # Allocate KV cache pools for all workers.
         self.init_memory_pools()
+
+        # Graph-visible protection buffers must exist before attention backend
+        # construction and CUDA graph capture. The decode-side manager adopts
+        # this table later, once disaggregation is initialized.
+        self.init_kv_attention_tag_table()
 
         # TODO: make memory profile consider cuda graph memory as well
         self.init_all_attention_backends()
@@ -3105,6 +3156,11 @@ class Scheduler(
         manager = self.kv_protection_manager
         if manager is None or not manager.config.enable_attention_tags:
             return
+        use_fused_verification = getattr(
+            self.tp_worker.model_runner,
+            "kv_fused_page_protection_enabled",
+            False,
+        )
         try:
             page_size = manager.page_size
             attention_items = []
@@ -3130,7 +3186,14 @@ class Scheduler(
                 # when the just-appended token opens a new page.
                 if logical_pos % page_size == 0:
                     refresh_candidates.append(
-                        (i, req.rid, attention_manifest, transfer_manifest, logical_pos)
+                        (
+                            i,
+                            req.rid,
+                            req.req_pool_idx,
+                            attention_manifest,
+                            transfer_manifest,
+                            logical_pos,
+                        )
                     )
 
             if refresh_candidates:
@@ -3151,6 +3214,7 @@ class Scheduler(
                 for (
                     i,
                     rid,
+                    req_pool_idx,
                     attention_manifest,
                     transfer_manifest,
                     logical_pos,
@@ -3158,6 +3222,7 @@ class Scheduler(
                     pending_refreshes.append(
                         (
                             rid,
+                            req_pool_idx,
                             attention_manifest,
                             transfer_manifest,
                             logical_pos,
@@ -3169,8 +3234,10 @@ class Scheduler(
                             ),
                         )
                     )
-            mismatches = manager.verify_protection_batch(
-                attention_items, transfer_items
+            mismatches = (
+                []
+                if use_fused_verification
+                else manager.verify_protection_batch(attention_items, transfer_items)
             )
         except Exception as e:  # fail closed without crashing the decode loop
             logger.exception("KV attention tag verification error")
@@ -3203,6 +3270,7 @@ class Scheduler(
             try:
                 for (
                     _,
+                    req_pool_idx,
                     attention_manifest,
                     transfer_manifest,
                     logical_pos,
@@ -3213,6 +3281,7 @@ class Scheduler(
                         manager.refresh_tail_page(
                             attention_manifest,
                             logical_pos=logical_pos,
+                            request_pool_idx=req_pool_idx,
                             physical_page_id=physical_page_id,
                             swa_physical_page_id=swa_physical_page_id,
                         )
@@ -3220,6 +3289,7 @@ class Scheduler(
                         manager.refresh_transfer_page_tag_tail_page(
                             transfer_manifest,
                             logical_pos=logical_pos,
+                            request_pool_idx=req_pool_idx,
                             physical_page_id=physical_page_id,
                             swa_physical_page_id=swa_physical_page_id,
                         )
@@ -3273,6 +3343,7 @@ class Scheduler(
             try:
                 for (
                     rid,
+                    req_pool_idx,
                     attention_manifest,
                     transfer_manifest,
                     logical_pos,
@@ -3285,6 +3356,7 @@ class Scheduler(
                         manager.refresh_tail_page(
                             attention_manifest,
                             logical_pos=logical_pos,
+                            request_pool_idx=req_pool_idx,
                             physical_page_id=physical_page_id,
                             swa_physical_page_id=swa_physical_page_id,
                         )
@@ -3292,6 +3364,7 @@ class Scheduler(
                         manager.refresh_transfer_page_tag_tail_page(
                             transfer_manifest,
                             logical_pos=logical_pos,
+                            request_pool_idx=req_pool_idx,
                             physical_page_id=physical_page_id,
                             swa_physical_page_id=swa_physical_page_id,
                         )
@@ -3533,6 +3606,148 @@ class Scheduler(
 
         return ret
 
+    def _finalize_fused_kv_protection_result(
+        self,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> None:
+        check = result.fused_kv_page_protection_check
+        if check is None:
+            return
+
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+            result.copy_done = None
+        elif isinstance(result.next_token_ids, torch.Tensor):
+            # The non-overlap path already needs this synchronization to publish
+            # tokens. Do it before inspecting validation status so protection
+            # adds no earlier model-completion wait.
+            result.next_token_ids = result.next_token_ids.tolist()
+
+        error = check.materialize_error()
+        result.fused_kv_page_protection_check = None
+        if error is not None:
+            (
+                result.fused_kv_page_protection_failed_rids,
+                result.fused_kv_page_protection_deferred_release_rids,
+            ) = self._handle_fused_kv_protection_failure(batch, error)
+
+    def _handle_fused_kv_protection_failure(
+        self, batch: ScheduleBatch, error
+    ) -> Tuple[set, set]:
+        from sglang.srt.mem_cache.kv_page_tags import (
+            KVProtectionBookkeepingError,
+            attach_kv_protection_incident,
+            emit_kv_protection_incident,
+        )
+
+        if not (
+            len(error.batch_indices)
+            == len(error.request_pool_indices)
+            == len(error.statuses)
+        ):
+            raise RuntimeError("fused KV protection result length mismatch") from error
+
+        bad_indices = []
+        for index, request_pool_index in zip(
+            error.batch_indices, error.request_pool_indices
+        ):
+            index = int(index)
+            if index < 0 or index >= batch.batch_size():
+                raise RuntimeError(
+                    "fused KV protection batch index is out of bounds"
+                ) from error
+            expected_request_pool_index = int(batch.req_pool_indices_cpu[index])
+            if expected_request_pool_index != int(request_pool_index):
+                raise RuntimeError(
+                    "fused KV protection request-pool identity mismatch"
+                ) from error
+            bad_indices.append(index)
+        if len(set(bad_indices)) != len(bad_indices):
+            raise RuntimeError("duplicate fused KV protection batch index") from error
+        bad_indices.sort()
+
+        status_by_index = dict(zip(error.batch_indices, error.statuses))
+        bad_reqs = [batch.reqs[index] for index in bad_indices]
+        manager = self.kv_protection_manager
+        mismatches = []
+        try:
+            attention_items = [
+                (req.rid, req.kv_attention_tag_manifest)
+                for req in bad_reqs
+                if getattr(req, "kv_attention_tag_manifest", None) is not None
+            ]
+            transfer_items = [
+                (req.rid, req.kv_transfer_page_tag_manifest)
+                for req in bad_reqs
+                if getattr(req, "kv_transfer_page_tag_manifest", None) is not None
+            ]
+            mismatches = manager.verify_protection_batch(
+                attention_items, transfer_items
+            )
+        except Exception:
+            logger.exception("Failed to materialize fused KV protection incident")
+
+        mismatches_by_rid = {}
+        for mismatch in mismatches:
+            mismatches_by_rid.setdefault(mismatch.rid, []).append(mismatch)
+
+        deferred_release_rids = set()
+        for index, req in zip(bad_indices, bad_reqs):
+            req_mismatches = mismatches_by_rid.get(req.rid, [])
+            if not req_mismatches:
+                status = int(status_by_index.get(index, 0))
+                mismatch = KVProtectionBookkeepingError(
+                    rid=req.rid,
+                    bootstrap_room=req.bootstrap_room,
+                    cause="producer_fused_dsa_topk_validation",
+                    detail=f"status=0x{status:08x}",
+                )
+                attach_kv_protection_incident(
+                    mismatch, kind="attention_tag", phase="producer_fused_dsa_topk"
+                )
+                req_mismatches = [mismatch]
+
+            deferred_release = getattr(
+                req, "kv_fused_protection_deferred_release", False
+            )
+            already_finished = getattr(
+                req, "finished_reason", None
+            ) is not None or getattr(req, "is_retracted", False)
+            if not deferred_release and not already_finished:
+                for mismatch in req_mismatches:
+                    emit_kv_protection_incident(mismatch, logger)
+                mismatch = req_mismatches[0]
+                mismatch_type = type(mismatch).__name__
+                req.finished_reason = FINISH_ABORT(
+                    f"{mismatch_type}: {mismatch}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    mismatch_type,
+                )
+                req.to_finish = None
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(rid=req.rid), req
+                )
+
+            is_inflight = (
+                self.enable_overlap
+                and self.cur_batch is not None
+                and any(current_req is req for current_req in self.cur_batch.reqs)
+            )
+            if is_inflight:
+                # The next overlap iteration was launched before this result was
+                # synchronized. Its fused producer remains fail-closed; retain
+                # the request's KV until that protected drain finishes.
+                req.kv_fused_protection_deferred_release = True
+                deferred_release_rids.add(req.rid)
+            else:
+                if (
+                    req.req_pool_idx is not None or self.tree_cache.supports_mamba()
+                ) and not getattr(req, "kv_committed_freed", False):
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                req.kv_fused_protection_deferred_release = False
+        return {req.rid for req in bad_reqs}, deferred_release_rids
+
     def _maybe_report_active_ranks(self) -> None:
         if not (
             self.server_args.enable_dp_attention
@@ -3588,6 +3803,7 @@ class Scheduler(
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():
+            self._finalize_fused_kv_protection_result(batch, result)
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():

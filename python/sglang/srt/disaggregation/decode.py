@@ -369,6 +369,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             allocator=allocator,
             num_pages=num_pages,
             page_size=page_size,
+            num_request_slots=self.scheduler.req_to_token_pool.req_to_token.shape[0],
             device=allocator.device,
             metrics_collector=metrics_collector,
             transfer_backend=(
@@ -459,6 +460,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 append_manifest(
                     manager.register_transfer_page_tags(
                         page_physical_ids=full_pages.tolist(),
+                        request_pool_idx=req.req_pool_idx,
                         page_positions=positions.tolist(),
                         bootstrap_room=req.bootstrap_room or 0,
                     )
@@ -497,6 +499,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     append_manifest(
                         manager.register_transfer_page_tags(
                             page_physical_ids=page_ids,
+                            request_pool_idx=req.req_pool_idx,
                             page_positions=positions.tolist(),
                             bootstrap_room=req.bootstrap_room or 0,
                         )
@@ -2129,6 +2132,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             page_physical_ids = first_locs // page_size
             full_manifest = manager.register_attention_tags(
                 page_physical_ids=page_physical_ids,
+                request_pool_idx=req.req_pool_idx,
                 bootstrap_room=req.bootstrap_room or 0,
             )
             manifests = [full_manifest] if full_manifest is not None else []
@@ -2153,6 +2157,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 swa_manifest = manager.register_attention_tags(
                     page_physical_ids=swa_page_ids,
+                    request_pool_idx=req.req_pool_idx,
                     page_positions=swa_page_positions,
                     bootstrap_room=req.bootstrap_room or 0,
                 )

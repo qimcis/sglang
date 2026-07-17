@@ -249,5 +249,310 @@ def test_topk_transform_ragged_kernel(
     )
 
 
+def _make_kv_protection_case(seq_len: int):
+    batch_size = 2
+    page_size = 64
+    pages_per_request = (seq_len + page_size - 1) // page_size
+    logical_positions = torch.arange(seq_len, device="cuda", dtype=torch.int32)
+    logical_pages = logical_positions // page_size
+    logical_offsets = logical_positions % page_size
+    src_page_table = torch.stack(
+        [
+            (logical_pages + 1 + row * pages_per_request) * page_size + logical_offsets
+            for row in range(batch_size)
+        ]
+    ).contiguous()
+    score = torch.arange(seq_len, device="cuda", dtype=torch.float32).repeat(
+        batch_size, 1
+    )
+    lengths = torch.full((batch_size,), seq_len, device="cuda", dtype=torch.int32)
+    cu_seqlens_q = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32)
+
+    num_physical_pages = batch_size * pages_per_request + 1
+    page_ids = torch.arange(num_physical_pages, device="cuda", dtype=torch.int64)
+    owner_request_indices = torch.full(
+        (num_physical_pages,), -1, device="cuda", dtype=torch.int32
+    )
+    owner_page_positions = torch.full_like(owner_request_indices, -1)
+    for row in range(batch_size):
+        begin = 1 + row * pages_per_request
+        end = begin + pages_per_request
+        owner_request_indices[begin:end] = row + 1
+        owner_page_positions[begin:end] = torch.arange(
+            pages_per_request, device="cuda", dtype=torch.int32
+        )
+
+    actual_tags = page_ids * 17 + 3
+    actual_generations = page_ids * 5 + 1
+    actual_transfer_tags = (page_ids * 11 + 7).to(torch.int32)
+    protection = {
+        "request_indices": torch.tensor([1, 2], device="cuda", dtype=torch.int64),
+        "page_size": page_size,
+        "page_table_page_offset": 0,
+        "actual_tags": actual_tags,
+        "actual_generations": actual_generations,
+        "actual_transfer_tags": actual_transfer_tags,
+        "owner_request_indices": owner_request_indices,
+        "owner_page_positions": owner_page_positions,
+        "expected_tags": actual_tags.clone(),
+        "expected_generations": actual_generations.clone(),
+        "expected_transfer_tags": actual_transfer_tags.clone(),
+        "request_epochs": torch.tensor([0, 3, 5], device="cuda", dtype=torch.int32),
+        "validated_epochs": torch.full((3,), -1, device="cuda", dtype=torch.int32),
+        "status": torch.zeros(3, device="cuda", dtype=torch.int32),
+    }
+    return score, lengths, src_page_table, cu_seqlens_q, protection
+
+
+@pytest.mark.parametrize("seq_len", [2048, 4096])
+@torch.inference_mode()
+def test_topk_transform_kv_protection_valid(seq_len: int) -> None:
+    score, lengths, src_page_table, cu_seqlens_q, protection = _make_kv_protection_case(
+        seq_len
+    )
+    expected = _ref_torch_transform_decode_impl(score, seq_len, src_page_table, 2048)
+    actual = fast_topk_transform_fused(
+        score=score,
+        lengths=lengths,
+        page_table_size_1=src_page_table,
+        cu_seqlens_q=cu_seqlens_q,
+        topk=2048,
+        kv_page_protection=protection,
+    )
+
+    torch.testing.assert_close(
+        torch.sort(actual, dim=-1).values,
+        torch.sort(expected, dim=-1).values,
+    )
+    assert protection["status"].tolist() == [0, 0, 0]
+    assert protection["validated_epochs"].tolist() == [-1, 3, 5]
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected_status"),
+    [
+        ("zero_slot", 0x01),
+        ("negative_slot", 0x01),
+        ("out_of_range_slot", 0x01),
+        ("same_page_offset", 0x01),
+        ("owner", 0x02),
+        ("position", 0x04),
+        ("attention_tag", 0x08),
+        ("generation", 0x10),
+        ("transfer_tag", 0x20),
+    ],
+)
+@pytest.mark.parametrize("seq_len", [2048, 4096])
+@torch.inference_mode()
+def test_topk_transform_kv_protection_faults(
+    fault: str, expected_status: int, seq_len: int
+) -> None:
+    score, lengths, src_page_table, cu_seqlens_q, protection = _make_kv_protection_case(
+        seq_len
+    )
+    logical_position = seq_len - 2
+    page_size = protection["page_size"]
+    physical_page = int(src_page_table[0, logical_position].item()) // page_size
+
+    if fault == "zero_slot":
+        src_page_table[0, logical_position] = 0
+    elif fault == "negative_slot":
+        src_page_table[0, logical_position] = -1
+    elif fault == "out_of_range_slot":
+        src_page_table[0, logical_position] = (
+            protection["actual_tags"].numel() * page_size + logical_position % page_size
+        )
+    elif fault == "same_page_offset":
+        src_page_table[0, logical_position] += 1
+    elif fault == "owner":
+        protection["owner_request_indices"][physical_page] = 2
+    elif fault == "position":
+        protection["owner_page_positions"][physical_page] += 1
+    elif fault == "attention_tag":
+        protection["expected_tags"][physical_page] += 1
+    elif fault == "generation":
+        protection["expected_generations"][physical_page] += 1
+    elif fault == "transfer_tag":
+        protection["expected_transfer_tags"][physical_page] += 1
+    else:
+        raise AssertionError(f"unknown fault: {fault}")
+
+    actual = fast_topk_transform_fused(
+        score=score,
+        lengths=lengths,
+        page_table_size_1=src_page_table,
+        cu_seqlens_q=cu_seqlens_q,
+        topk=2048,
+        kv_page_protection=protection,
+    )
+
+    assert protection["status"][1].item() == expected_status
+    assert protection["status"][2].item() == 0
+    assert protection["validated_epochs"].tolist() == [-1, 3, 5]
+    assert torch.any(actual[0] == 0)
+    assert not torch.any(actual[1] == 0)
+
+
+@torch.inference_mode()
+def test_topk_transform_kv_protection_ignores_unselected_page() -> None:
+    seq_len = 4096
+    score, lengths, src_page_table, cu_seqlens_q, protection = _make_kv_protection_case(
+        seq_len
+    )
+    unselected_page = int(src_page_table[0, 0].item()) // protection["page_size"]
+    protection["expected_tags"][unselected_page] += 1
+
+    actual = fast_topk_transform_fused(
+        score,
+        lengths,
+        src_page_table,
+        cu_seqlens_q,
+        2048,
+        kv_page_protection=protection,
+    )
+
+    assert protection["status"].tolist() == [0, 0, 0]
+    assert protection["validated_epochs"].tolist() == [-1, 3, 5]
+    assert not torch.any(actual == 0)
+
+
+@pytest.mark.parametrize("bad_length", [-1, 4097])
+@torch.inference_mode()
+def test_topk_transform_kv_protection_rejects_bad_length(
+    bad_length: int,
+) -> None:
+    score, lengths, src_page_table, cu_seqlens_q, protection = _make_kv_protection_case(
+        4096
+    )
+    lengths[0] = bad_length
+
+    actual = fast_topk_transform_fused(
+        score,
+        lengths,
+        src_page_table,
+        cu_seqlens_q,
+        2048,
+        kv_page_protection=protection,
+    )
+
+    assert protection["status"][1].item() == 0x01
+    assert protection["status"][2].item() == 0
+    assert protection["validated_epochs"].tolist() == [-1, 3, 5]
+    assert torch.all(actual[0] == 0)
+
+
+@torch.inference_mode()
+def test_topk_transform_kv_protection_page_offset() -> None:
+    score, lengths, src_page_table, cu_seqlens_q, protection = _make_kv_protection_case(
+        4096
+    )
+    page_offset = 7
+    for name in (
+        "actual_tags",
+        "actual_generations",
+        "actual_transfer_tags",
+        "owner_request_indices",
+        "owner_page_positions",
+        "expected_tags",
+        "expected_generations",
+        "expected_transfer_tags",
+    ):
+        sidecar = protection[name]
+        shifted = sidecar.new_zeros(sidecar.numel() + page_offset)
+        shifted[page_offset:] = sidecar
+        protection[name] = shifted
+    protection["page_table_page_offset"] = page_offset
+
+    actual = fast_topk_transform_fused(
+        score,
+        lengths,
+        src_page_table,
+        cu_seqlens_q,
+        2048,
+        kv_page_protection=protection,
+    )
+
+    assert protection["status"].tolist() == [0, 0, 0]
+    assert protection["validated_epochs"].tolist() == [-1, 3, 5]
+    assert not torch.any(actual == 0)
+
+
+@torch.inference_mode()
+def test_topk_transform_kv_protection_graph_padding_uses_safe_slot() -> None:
+    score, lengths, src_page_table, cu_seqlens_q, protection = _make_kv_protection_case(
+        2048
+    )
+    protection["request_indices"][0] = 0
+
+    actual = fast_topk_transform_fused(
+        score,
+        lengths,
+        src_page_table,
+        cu_seqlens_q,
+        2048,
+        kv_page_protection=protection,
+    )
+
+    assert torch.all(actual[0] == 0)
+    assert not torch.any(actual[1] == 0)
+    assert protection["status"].tolist() == [0, 0, 0]
+    assert protection["validated_epochs"].tolist() == [-1, -1, 5]
+
+
+@torch.inference_mode()
+def test_topk_transform_kv_protection_cuda_graph_replay() -> None:
+    seq_len = 4096
+    score, lengths, src_page_table, cu_seqlens_q, protection = _make_kv_protection_case(
+        seq_len
+    )
+    logical_position = seq_len - 2
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        fast_topk_transform_fused(
+            score,
+            lengths,
+            src_page_table,
+            cu_seqlens_q,
+            2048,
+            kv_page_protection=protection,
+        )
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    protection["validated_epochs"].fill_(-1)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = fast_topk_transform_fused(
+            score,
+            lengths,
+            src_page_table,
+            cu_seqlens_q,
+            2048,
+            kv_page_protection=protection,
+        )
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert protection["status"][1].item() == 0
+    assert protection["validated_epochs"][1].item() == 3
+
+    src_page_table[0, logical_position] += 1
+    graph.replay()
+    torch.cuda.synchronize()
+    assert protection["status"][1].item() == 0x01
+    assert protection["validated_epochs"][1].item() == 3
+    assert torch.any(output[0] == 0)
+
+    src_page_table[0, logical_position] -= 1
+    protection["status"].zero_()
+    protection["request_epochs"][1] += 1
+    graph.replay()
+    torch.cuda.synchronize()
+    assert protection["status"][1].item() == 0
+    assert protection["validated_epochs"][1].item() == 4
+    assert not torch.any(output[0] == 0)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

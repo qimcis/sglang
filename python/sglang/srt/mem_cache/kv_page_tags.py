@@ -78,6 +78,9 @@ _I32_SIGN = 1 << 31
 
 # Transfer page tags are conceptually uint32; torch stores the bit pattern in int32.
 TRANSFER_PAGE_TAG_DTYPE = torch.int32
+KV_PAGE_INVALID_MAPPING = 1 << 0
+KV_PAGE_VALIDATION_INCOMPLETE = 1 << 30
+KV_PAGE_VALIDATION_REMOTE_FAILURE = 1 << 29
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +90,25 @@ TRANSFER_PAGE_TAG_DTYPE = torch.int32
 
 class KVPageProtectionError(Exception):
     """Base class for KV page protection failures."""
+
+
+class KVFusedProtectionError(KVPageProtectionError):
+    """Raised after fused validation fails and before token publication."""
+
+    def __init__(
+        self,
+        *,
+        batch_indices: Sequence[int],
+        request_pool_indices: Sequence[int],
+        statuses: Sequence[int],
+    ):
+        self.batch_indices = tuple(int(index) for index in batch_indices)
+        self.request_pool_indices = tuple(int(index) for index in request_pool_indices)
+        self.statuses = tuple(int(status) for status in statuses)
+        super().__init__(
+            "Fused KV page validation failed before token publication "
+            f"(batch_indices={self.batch_indices}, statuses={self.statuses})"
+        )
 
 
 class KVProtectionBookkeepingError(KVPageProtectionError):
@@ -406,6 +428,16 @@ class KVProtectionConfig:
         )
 
 
+def should_use_fused_kv_page_protection(tag_table: object, *, supported: bool) -> bool:
+    """Select fused validation when available and not explicitly disabled."""
+    if tag_table is None or not supported:
+        return False
+
+    from sglang.srt.environ import envs
+
+    return not envs.SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION.get()
+
+
 # ---------------------------------------------------------------------------
 # Unsupported-layout fail-fast
 # ---------------------------------------------------------------------------
@@ -429,6 +461,11 @@ def assert_protection_supported(
     allocator: object = None,
     transfer_backend: Optional[str] = None,
     is_spec_decode: bool = False,
+    pp_size: int = 1,
+    enable_dp_attention: bool = False,
+    radix_cache_enabled: bool = False,
+    is_cuda_device: Optional[bool] = None,
+    device_capability_major: Optional[int] = None,
 ) -> None:
     """Fail-fast when protection is enabled on an unsupported configuration.
 
@@ -456,6 +493,42 @@ def assert_protection_supported(
             "(multiple tokens/pages committed per step). Disable "
             "SGLANG_KV_PAGE_PROTECTION or speculative decoding."
         )
+
+    if config.enable_attention_tags and pp_size > 1:
+        raise RuntimeError(
+            "KV attention-tag protection does not yet support pipeline "
+            "parallelism. Set --pp-size 1 or disable SGLANG_KV_PAGE_PROTECTION."
+        )
+
+    if config.enable_attention_tags and enable_dp_attention:
+        raise RuntimeError(
+            "KV attention-tag protection does not yet support DP attention. "
+            "Disable --enable-dp-attention or SGLANG_KV_PAGE_PROTECTION."
+        )
+
+    if config.enable_attention_tags and radix_cache_enabled:
+        raise RuntimeError(
+            "KV attention-tag protection does not yet support shared radix-prefix "
+            "pages. Set --disable-radix-cache or disable "
+            "SGLANG_KV_PAGE_PROTECTION."
+        )
+
+    if config.enable_attention_tags:
+        from sglang.srt.environ import envs
+
+        fused_validation_enabled = (
+            not envs.SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION.get()
+        )
+        if fused_validation_enabled and (
+            is_cuda_device is False
+            or (device_capability_major is not None and device_capability_major != 9)
+        ):
+            raise RuntimeError(
+                "Producer-fused DSA KV page protection requires an NVIDIA "
+                "Hopper SM90 GPU. Set "
+                "SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION=1 to use scheduler "
+                "validation, or disable SGLANG_KV_PAGE_PROTECTION."
+            )
 
     if config.checksum_enabled and transfer_backend is not None:
         backend = str(transfer_backend).lower()
@@ -1313,7 +1386,12 @@ class KVAttentionTagTable:
     """
 
     def __init__(
-        self, num_pages: int, device: str = "cpu", *, enable_history: bool = False
+        self,
+        num_pages: int,
+        device: str = "cpu",
+        *,
+        num_request_slots: int = 2,
+        enable_history: bool = False,
     ):
         # +1 so physical page ids (which are 1-based in the paged allocator) fit.
         self._size = num_pages + 1
@@ -1322,6 +1400,28 @@ class KVAttentionTagTable:
         self.generations = torch.zeros(self._size, dtype=TAG_DTYPE, device=device)
         self.transfer_page_tags = torch.zeros(
             self._size, dtype=TRANSFER_PAGE_TAG_DTYPE, device=device
+        )
+        self.owner_request_indices = torch.full(
+            (self._size,), -1, dtype=torch.int32, device=device
+        )
+        self.owner_page_positions = torch.full(
+            (self._size,), -1, dtype=torch.int32, device=device
+        )
+        self.expected_tags = torch.zeros(self._size, dtype=TAG_DTYPE, device=device)
+        self.expected_generations = torch.zeros(
+            self._size, dtype=TAG_DTYPE, device=device
+        )
+        self.expected_transfer_page_tags = torch.zeros(
+            self._size, dtype=TRANSFER_PAGE_TAG_DTYPE, device=device
+        )
+        self.request_epochs = torch.zeros(
+            num_request_slots, dtype=torch.int32, device=device
+        )
+        self.validated_epochs = torch.full(
+            (num_request_slots,), -1, dtype=torch.int32, device=device
+        )
+        self.validation_status = torch.zeros(
+            num_request_slots, dtype=torch.int32, device=device
         )
         self.history = KVPageHistory(self._size, device) if enable_history else None
         self._history_warning_emitted = False
@@ -1365,7 +1465,7 @@ class KVAttentionTagTable:
         """
         if page_ids.numel() == 0:
             return
-        page_ids = page_ids.to(self.device, dtype=torch.long).reshape(-1)
+        page_ids = page_ids.to(self.generations.device, dtype=torch.long).reshape(-1)
         self.generations.index_add_(
             0, page_ids, torch.ones_like(page_ids, dtype=TAG_DTYPE)
         )
@@ -1378,19 +1478,126 @@ class KVAttentionTagTable:
         )
 
     def generation_of(self, page_ids: torch.Tensor) -> torch.Tensor:
-        page_ids = page_ids.to(self.device, dtype=torch.long).reshape(-1)
+        page_ids = page_ids.to(self.generations.device, dtype=torch.long).reshape(-1)
         return self.generations.index_select(0, page_ids)
 
     def write_tags(self, page_ids: torch.Tensor, tags: torch.Tensor) -> None:
         """Scatter attention ownership tags into the sidecar buffer."""
         if page_ids.numel() == 0:
             return
-        page_ids = page_ids.to(self.device, dtype=torch.long).reshape(-1)
-        tags = tags.to(self.device, dtype=TAG_DTYPE).reshape(-1)
+        page_ids = page_ids.to(self.tags.device, dtype=torch.long).reshape(-1)
+        tags = tags.to(self.tags.device, dtype=TAG_DTYPE).reshape(-1)
         self.tags.index_copy_(0, page_ids, tags)
 
+    def write_expected_owner(
+        self,
+        page_ids: torch.Tensor,
+        *,
+        request_pool_idx: int,
+        page_positions: torch.Tensor,
+        generations: torch.Tensor,
+        attention_tags: Optional[torch.Tensor] = None,
+        transfer_page_tags: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Publish the immutable owner record consumed by protected DSA top-k."""
+        if page_ids.numel() == 0:
+            return
+        if request_pool_idx <= 0 or request_pool_idx >= self.request_epochs.numel():
+            raise RuntimeError("protected DSA request-pool index is out of bounds")
+        page_ids = page_ids.to(
+            self.owner_request_indices.device, dtype=torch.long
+        ).reshape(-1)
+        count = page_ids.numel()
+        positions = page_positions.to(
+            self.owner_page_positions.device, dtype=torch.int32
+        ).reshape(-1)
+        expected_generations = generations.to(
+            self.expected_generations.device, dtype=TAG_DTYPE
+        ).reshape(-1)
+        if positions.numel() != count or expected_generations.numel() != count:
+            raise RuntimeError("protected DSA owner metadata length mismatch")
+        owners = torch.full(
+            (count,),
+            int(request_pool_idx),
+            dtype=torch.int32,
+            device=self.owner_request_indices.device,
+        )
+        self.owner_request_indices.index_copy_(0, page_ids, owners)
+        self.owner_page_positions.index_copy_(0, page_ids, positions)
+        self.expected_generations.index_copy_(0, page_ids, expected_generations)
+        if attention_tags is not None:
+            self.expected_tags.index_copy_(
+                0,
+                page_ids,
+                attention_tags.to(self.expected_tags.device, dtype=TAG_DTYPE).reshape(
+                    -1
+                ),
+            )
+        if transfer_page_tags is not None:
+            self.expected_transfer_page_tags.index_copy_(
+                0,
+                page_ids,
+                transfer_page_tags.to(
+                    self.expected_transfer_page_tags.device,
+                    dtype=TRANSFER_PAGE_TAG_DTYPE,
+                ).reshape(-1),
+            )
+
+    def begin_fused_forward(self, request_pool_indices: torch.Tensor) -> None:
+        if request_pool_indices.numel() == 0:
+            return
+        indices = request_pool_indices.to(
+            self.request_epochs.device, dtype=torch.long
+        ).reshape(-1)
+        valid = indices.gt(0) & indices.lt(self.request_epochs.numel())
+        safe_indices = torch.where(valid, indices, 0)
+        self.validation_status.index_fill_(0, safe_indices, 0)
+        self.request_epochs.index_add_(0, safe_indices, valid.to(torch.int32))
+
+    def fused_failure_status(self, request_pool_indices: torch.Tensor) -> torch.Tensor:
+        indices = request_pool_indices.to(
+            self.request_epochs.device, dtype=torch.long
+        ).reshape(-1)
+        invalid = indices.lt(0) | indices.ge(self.request_epochs.numel())
+        safe_indices = torch.where(invalid, 0, indices)
+        status = self.validation_status.index_select(0, safe_indices)
+        request_epochs = self.request_epochs.index_select(0, safe_indices)
+        validated_epochs = self.validated_epochs.index_select(0, safe_indices)
+        incomplete = validated_epochs.ne(request_epochs).to(torch.int32)
+        failure_status = status | (incomplete * KV_PAGE_VALIDATION_INCOMPLETE)
+        failure_status = torch.where(
+            invalid,
+            torch.full_like(failure_status, KV_PAGE_INVALID_MAPPING),
+            failure_status,
+        )
+        return torch.where(indices.eq(0), 0, failure_status)
+
+    def fused_forward_args(
+        self,
+        *,
+        request_indices: torch.Tensor,
+        page_size: int,
+        page_table_page_offset: int = 0,
+    ) -> Dict[str, object]:
+        return {
+            "request_indices": request_indices,
+            "page_table_page_offset": int(page_table_page_offset),
+            "page_size": int(page_size),
+            "actual_tags": self.tags,
+            "actual_generations": self.generations,
+            "actual_transfer_tags": self.transfer_page_tags,
+            "owner_request_indices": self.owner_request_indices,
+            "owner_page_positions": self.owner_page_positions,
+            "expected_tags": self.expected_tags,
+            "expected_generations": self.expected_generations,
+            "expected_transfer_tags": self.expected_transfer_page_tags,
+            "request_epochs": self.request_epochs,
+            "validated_epochs": self.validated_epochs,
+            "status": self.validation_status,
+        }
+
     def read_tags(self, page_ids: torch.Tensor) -> torch.Tensor:
-        page_ids = page_ids.to(self.device, dtype=torch.long).reshape(-1)
+        page_ids = page_ids.to(self.tags.device, dtype=torch.long).reshape(-1)
         return self.tags.index_select(0, page_ids)
 
     def write_transfer_page_tags(
@@ -1399,16 +1606,27 @@ class KVAttentionTagTable:
         """Scatter transfer-written page tags into the sidecar buffer."""
         if page_ids.numel() == 0:
             return
-        page_ids = page_ids.to(self.device, dtype=torch.long).reshape(-1)
-        tags = tags.to(self.device, dtype=TRANSFER_PAGE_TAG_DTYPE).reshape(-1)
+        page_ids = page_ids.to(
+            self.transfer_page_tags.device, dtype=torch.long
+        ).reshape(-1)
+        tags = tags.to(
+            self.transfer_page_tags.device, dtype=TRANSFER_PAGE_TAG_DTYPE
+        ).reshape(-1)
         self.transfer_page_tags.index_copy_(0, page_ids, tags)
 
     def read_transfer_page_tags(self, page_ids: torch.Tensor) -> torch.Tensor:
-        page_ids = page_ids.to(self.device, dtype=torch.long).reshape(-1)
+        page_ids = page_ids.to(
+            self.transfer_page_tags.device, dtype=torch.long
+        ).reshape(-1)
         return self.transfer_page_tags.index_select(0, page_ids)
 
     def record_free(self, page_ids, *, deferred: bool = False) -> None:
-        page_ids_t = torch.as_tensor(page_ids, dtype=torch.long, device=self.device)
+        page_ids_t = torch.as_tensor(
+            page_ids, dtype=torch.long, device=self.generations.device
+        ).reshape(-1)
+        if page_ids_t.numel() == 0:
+            return
+        self.owner_request_indices.index_fill_(0, page_ids_t, -1)
         self._record_history(
             page_ids_t,
             KVPageHistory.FREE_DEFERRED if deferred else KVPageHistory.FREE,
@@ -1417,7 +1635,9 @@ class KVAttentionTagTable:
         )
 
     def record_free_released(self, page_ids) -> None:
-        page_ids_t = torch.as_tensor(page_ids, dtype=torch.long, device=self.device)
+        page_ids_t = torch.as_tensor(
+            page_ids, dtype=torch.long, device=self.generations.device
+        )
         self._record_history(
             page_ids_t,
             KVPageHistory.FREE_RELEASED,
@@ -2232,6 +2452,7 @@ class KVPageProtectionManager:
         allocator: object,
         num_pages: int,
         page_size: int,
+        num_request_slots: int = 2,
         device: str = "cpu",
         metrics_collector: object = None,
         transfer_backend: Optional[str] = None,
@@ -2259,15 +2480,30 @@ class KVPageProtectionManager:
                     history_bytes / (1024 * 1024),
                     num_pages + 1,
                 )
-            self.table = KVAttentionTagTable(
-                num_pages,
-                device=device,
-                enable_history=config.enable_page_history,
-            )
-            if allocator is not None and hasattr(
-                allocator, "attach_attention_tag_table"
-            ):
-                allocator.attach_attention_tag_table(self.table)
+            attached_table = getattr(allocator, "attention_tag_table", None)
+            if attached_table is not None:
+                if not isinstance(attached_table, KVAttentionTagTable):
+                    raise RuntimeError("invalid preallocated KV attention-tag table")
+                if attached_table.size != num_pages + 1:
+                    raise RuntimeError(
+                        "preallocated KV attention-tag table size mismatch"
+                    )
+                if attached_table.request_epochs.numel() != num_request_slots:
+                    raise RuntimeError("preallocated KV request-slot count mismatch")
+                if config.enable_page_history and attached_table.history is None:
+                    raise RuntimeError("preallocated KV page history is missing")
+                self.table = attached_table
+            else:
+                self.table = KVAttentionTagTable(
+                    num_pages,
+                    device=device,
+                    num_request_slots=num_request_slots,
+                    enable_history=config.enable_page_history,
+                )
+                if allocator is not None and hasattr(
+                    allocator, "attach_attention_tag_table"
+                ):
+                    allocator.attach_attention_tag_table(self.table)
 
     # -- attention ownership tags ------------------------------------------
 
@@ -2275,6 +2511,7 @@ class KVPageProtectionManager:
         self,
         *,
         page_physical_ids: Sequence[int],
+        request_pool_idx: int = 1,
         bootstrap_room: int,
         page_positions: Optional[Sequence[int]] = None,
     ) -> Optional[AttentionTagManifest]:
@@ -2300,6 +2537,13 @@ class KVPageProtectionManager:
         self.table.write_tags(
             manifest.physical_page_ids_t,
             manifest.expected_tags_t,
+        )
+        self.table.write_expected_owner(
+            manifest.physical_page_ids_t,
+            request_pool_idx=request_pool_idx,
+            page_positions=manifest.page_positions_t,
+            generations=manifest.generations_t,
+            attention_tags=manifest.expected_tags_t,
         )
         self.table._record_history(
             manifest.physical_page_ids_t,
@@ -2385,6 +2629,7 @@ class KVPageProtectionManager:
         manifest: Optional[AttentionTagManifest],
         *,
         logical_pos: int,
+        request_pool_idx: int = 1,
         physical_page_id: torch.Tensor,
         swa_physical_page_id: Optional[torch.Tensor] = None,
     ) -> Optional[torch.cuda.Event]:
@@ -2406,12 +2651,14 @@ class KVPageProtectionManager:
                 self.refresh_tail_page(
                     manifests[0],
                     logical_pos=logical_pos,
+                    request_pool_idx=request_pool_idx,
                     physical_page_id=physical_page_id,
                 )
             if len(manifests) > 1 and swa_physical_page_id is not None:
                 self.refresh_tail_page(
                     manifests[1],
                     logical_pos=logical_pos,
+                    request_pool_idx=request_pool_idx,
                     physical_page_id=swa_physical_page_id,
                 )
             return
@@ -2427,6 +2674,16 @@ class KVPageProtectionManager:
         )
         self.table.write_tags(page_id_t, expected_t)
         page_position = int(logical_pos) // manifest.page_size
+        entry_index = manifest._entry_index_for_page_position(page_position)
+        if entry_index is None:
+            raise RuntimeError("attention tag tail page is missing from its manifest")
+        self.table.write_expected_owner(
+            page_id_t,
+            request_pool_idx=request_pool_idx,
+            page_positions=manifest.page_positions_t[entry_index : entry_index + 1],
+            generations=manifest.generations_t[entry_index : entry_index + 1],
+            attention_tags=expected_t,
+        )
         self.table._record_history(
             page_id_t,
             KVPageHistory.TAG_REFRESH,
@@ -2443,6 +2700,7 @@ class KVPageProtectionManager:
         self,
         *,
         page_physical_ids: Sequence[int],
+        request_pool_idx: int = 1,
         bootstrap_room: int,
         page_positions: Optional[Sequence[int]] = None,
         write_actual: bool = False,
@@ -2471,6 +2729,13 @@ class KVPageProtectionManager:
                 manifest.physical_page_ids_t,
                 manifest.expected_tags_t,
             )
+        self.table.write_expected_owner(
+            manifest.physical_page_ids_t,
+            request_pool_idx=request_pool_idx,
+            page_positions=manifest.page_positions_t,
+            generations=manifest.generations_t,
+            transfer_page_tags=manifest.expected_tags_t,
+        )
         self.table._record_history(
             manifest.physical_page_ids_t,
             KVPageHistory.TRANSFER_EXPECTED,
@@ -2539,6 +2804,7 @@ class KVPageProtectionManager:
         manifest: Optional[TransferPageTagManifest],
         *,
         logical_pos: int,
+        request_pool_idx: int = 1,
         physical_page_id: torch.Tensor,
         swa_physical_page_id: Optional[torch.Tensor] = None,
     ) -> None:
@@ -2555,12 +2821,14 @@ class KVPageProtectionManager:
                 self.refresh_transfer_page_tag_tail_page(
                     manifests[0],
                     logical_pos=logical_pos,
+                    request_pool_idx=request_pool_idx,
                     physical_page_id=physical_page_id,
                 )
             if len(manifests) > 1 and swa_physical_page_id is not None:
                 self.refresh_transfer_page_tag_tail_page(
                     manifests[1],
                     logical_pos=logical_pos,
+                    request_pool_idx=request_pool_idx,
                     physical_page_id=swa_physical_page_id,
                 )
             return
@@ -2576,6 +2844,16 @@ class KVPageProtectionManager:
         )
         self.table.write_transfer_page_tags(page_id_t, expected_t)
         page_position = int(logical_pos) // manifest.page_size
+        entry_index = manifest._entry_index_for_page_position(page_position)
+        if entry_index is None:
+            raise RuntimeError("transfer tag tail page is missing from its manifest")
+        self.table.write_expected_owner(
+            page_id_t,
+            request_pool_idx=request_pool_idx,
+            page_positions=manifest.page_positions_t[entry_index : entry_index + 1],
+            generations=manifest.generations_t[entry_index : entry_index + 1],
+            transfer_page_tags=expected_t,
+        )
         self.table._record_history(
             page_id_t,
             KVPageHistory.TRANSFER_WRITE,

@@ -253,6 +253,43 @@ class TestMooncakeChecksumManifest(CustomTestCase):
         )
         self.assertEqual(manager.request_status[7], KVPoll.Failed)
 
+    def test_receiver_accepts_idempotent_duplicate_expected_page_tags(self):
+        manager = self._decode_manager(attention_tags=True, checksum=False)
+        receiver = object.__new__(MooncakeKVReceiver)
+        receiver.kv_mgr = manager
+        receiver.bootstrap_infos = []
+        receiver.bootstrap_room = 7
+        receiver.transfer_nonce = 9
+
+        receiver.send_metadata(
+            np.asarray([1], dtype=np.int32),
+            transfer_page_tag_ids=np.asarray([2, 2], dtype=np.int32),
+            transfer_page_tags=np.asarray([3, 3], dtype=np.int32),
+        )
+
+        self.assertEqual(manager.transfer_page_tag_expected_table[7], {2: 3})
+        manager.update_status.assert_not_called()
+
+    def test_receiver_rejects_conflicting_duplicate_expected_page_tags(self):
+        manager = self._decode_manager(attention_tags=True, checksum=False)
+        receiver = object.__new__(MooncakeKVReceiver)
+        receiver.kv_mgr = manager
+        receiver.bootstrap_infos = []
+        receiver.bootstrap_room = 7
+        receiver.transfer_nonce = 9
+
+        receiver.send_metadata(
+            np.asarray([1], dtype=np.int32),
+            transfer_page_tag_ids=np.asarray([2, 2], dtype=np.int32),
+            transfer_page_tags=np.asarray([3, 4], dtype=np.int32),
+        )
+
+        manager.update_status.assert_called_once_with(7, KVPoll.Failed)
+        self.assertIn(
+            "Conflicting expected KV transfer tags",
+            manager.record_failure.call_args.args[1],
+        )
+
     def test_transfer_nonce_is_optional_for_old_senders(self):
         message = [
             b"7",

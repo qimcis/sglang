@@ -13,6 +13,7 @@ import torch
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import _OffsetAttentionTagTable
 from sglang.srt.mem_cache.kv_page_tags import (
+    KV_PAGE_VALIDATION_INCOMPLETE,
     AttentionTagManifest,
     AttentionTagManifestGroup,
     KVAttentionTagMismatch,
@@ -185,6 +186,67 @@ class TestAttentionTagTable(CustomTestCase):
         self.assertEqual(table.generation_of(torch.tensor([10])).tolist(), [1])
         operations = [entry["operation"] for entry in table.history.materialize(10)]
         self.assertEqual(operations, ["alloc", "free", "free_released"])
+
+    def test_fused_forward_requires_current_epoch_completion(self):
+        table = KVAttentionTagTable(num_pages=16, num_request_slots=4, device="cpu")
+        request_indices = torch.tensor([1, 2])
+
+        table.begin_fused_forward(request_indices)
+        self.assertEqual(
+            table.fused_failure_status(request_indices).tolist(),
+            [KV_PAGE_VALIDATION_INCOMPLETE, KV_PAGE_VALIDATION_INCOMPLETE],
+        )
+
+        table.validated_epochs[1] = table.request_epochs[1]
+        table.validated_epochs[2] = table.request_epochs[2]
+        table.validation_status[2] = 8
+        self.assertEqual(table.fused_failure_status(request_indices).tolist(), [0, 8])
+
+    def test_begin_fused_forward_clears_stale_status(self):
+        table = KVAttentionTagTable(num_pages=16, num_request_slots=3, device="cpu")
+        table.validation_status[1] = 16
+        table.begin_fused_forward(torch.tensor([1]))
+
+        self.assertEqual(table.validation_status[1].item(), 0)
+        self.assertEqual(table.request_epochs[1].item(), 1)
+
+    def test_graph_padding_slot_zero_is_ignored(self):
+        table = KVAttentionTagTable(num_pages=16, num_request_slots=3, device="cpu")
+        table.begin_fused_forward(torch.tensor([0, 1]))
+
+        self.assertEqual(table.request_epochs.tolist(), [0, 1, 0])
+        self.assertEqual(
+            table.fused_failure_status(torch.tensor([0, 1])).tolist(),
+            [0, KV_PAGE_VALIDATION_INCOMPLETE],
+        )
+
+    def test_invalid_request_slot_fails_closed_without_indexing_sidecars(self):
+        table = KVAttentionTagTable(num_pages=16, num_request_slots=3, device="cpu")
+        request_indices = torch.tensor([-1, 3, 1])
+
+        table.begin_fused_forward(request_indices)
+
+        self.assertEqual(table.request_epochs.tolist(), [0, 1, 0])
+        self.assertEqual(
+            table.fused_failure_status(request_indices).tolist(),
+            [1, 1, KV_PAGE_VALIDATION_INCOMPLETE],
+        )
+
+    def test_free_invalidates_stale_request_slot_owner(self):
+        table = KVAttentionTagTable(num_pages=16, num_request_slots=3, device="cpu")
+        page = torch.tensor([3])
+        table.write_expected_owner(
+            page,
+            request_pool_idx=1,
+            page_positions=torch.tensor([0]),
+            generations=torch.tensor([1], dtype=torch.int64),
+            attention_tags=torch.tensor([11], dtype=torch.int64),
+            transfer_page_tags=torch.tensor([13], dtype=torch.int32),
+        )
+
+        table.record_free(page)
+
+        self.assertEqual(table.owner_request_indices[3].item(), -1)
 
 
 class TestAttentionTagManifest(CustomTestCase):

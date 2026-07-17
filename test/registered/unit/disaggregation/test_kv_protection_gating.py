@@ -11,6 +11,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv_page_tags import (
     KVProtectionConfig,
     assert_protection_supported,
+    should_use_fused_kv_page_protection,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -87,6 +88,18 @@ class TestGating(CustomTestCase):
         self.assertTrue(cfg.checksum_enabled)
         self.assertTrue(cfg.allow_legacy_completion)
 
+    def test_fused_validation_kill_switch(self):
+        table = object()
+        with envs.SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION.override(False):
+            self.assertTrue(should_use_fused_kv_page_protection(table, supported=True))
+            self.assertFalse(should_use_fused_kv_page_protection(None, supported=True))
+            self.assertFalse(
+                should_use_fused_kv_page_protection(table, supported=False)
+            )
+
+        with envs.SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION.override(True):
+            self.assertFalse(should_use_fused_kv_page_protection(table, supported=True))
+
 
 class TestFailFast(CustomTestCase):
     def test_disabled_config_never_raises(self):
@@ -133,6 +146,60 @@ class TestFailFast(CustomTestCase):
                 allocator=_FakePagedAllocator(),
                 is_spec_decode=True,
             )
+
+    def test_pipeline_parallel_fails_fast_for_attention_tags(self):
+        with self.assertRaisesRegex(RuntimeError, "pipeline parallelism"):
+            assert_protection_supported(
+                KVProtectionConfig(enable_attention_tags=True),
+                allocator=_FakePagedAllocator(),
+                pp_size=2,
+            )
+
+    def test_dp_attention_fails_fast_for_attention_tags(self):
+        with self.assertRaisesRegex(RuntimeError, "DP attention"):
+            assert_protection_supported(
+                KVProtectionConfig(enable_attention_tags=True),
+                allocator=_FakePagedAllocator(),
+                enable_dp_attention=True,
+            )
+
+    def test_radix_cache_fails_fast_for_attention_tags(self):
+        with self.assertRaisesRegex(RuntimeError, "shared radix-prefix"):
+            assert_protection_supported(
+                KVProtectionConfig(enable_attention_tags=True),
+                allocator=_FakePagedAllocator(),
+                radix_cache_enabled=True,
+            )
+
+    def test_non_hopper_device_fails_fast_for_attention_tags(self):
+        with envs.SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION.override(False):
+            with self.assertRaisesRegex(RuntimeError, "Hopper SM90"):
+                assert_protection_supported(
+                    KVProtectionConfig(enable_attention_tags=True),
+                    allocator=_FakePagedAllocator(),
+                    device_capability_major=8,
+                )
+            with self.assertRaisesRegex(RuntimeError, "NVIDIA Hopper SM90"):
+                assert_protection_supported(
+                    KVProtectionConfig(enable_attention_tags=True),
+                    allocator=_FakePagedAllocator(),
+                    is_cuda_device=False,
+                    device_capability_major=9,
+                )
+
+        with envs.SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION.override(True):
+            assert_protection_supported(
+                KVProtectionConfig(enable_attention_tags=True),
+                allocator=_FakePagedAllocator(),
+                is_cuda_device=False,
+                device_capability_major=8,
+            )
+
+        assert_protection_supported(
+            KVProtectionConfig(enable_attention_tags=True),
+            allocator=_FakePagedAllocator(),
+            device_capability_major=9,
+        )
 
 
 if __name__ == "__main__":
