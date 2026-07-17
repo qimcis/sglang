@@ -1,0 +1,33 @@
+python/sglang/srt/managers/tp_worker.py
+  s_5f73f26aee7f01::t_813c0ad57060c6 518,533-535,545-547
+python/sglang/srt/mem_cache/kv_page_tags.py
+  s_5f73f26aee7f01::t_6bf720248d49ad 81-83,95-113,431-440,464-468,497-532,1389-1394,1404-1425,1468,1481,1488-1489,1492-1598,1600,1609-1614,1618-1620,1624-1629,1638-1640,2455,2483-2506,2514,2541-2547,2632,2654,2661,2677-2686,2703,2732-2738,2807,2824,2831,2847-2856
+python/sglang/srt/model_executor/model_runner.py
+  s_5f73f26aee7f01::t_2ddab576679b83 333-378,386,2548,2558-2562,2566,2962-2972,3018-3020,3054-3085,3197,3208-3240
+sgl-kernel/csrc/common_extension.cc
+  s_5f73f26aee7f01::t_82b360ca218798 93-102
+sgl-kernel/csrc/common_extension_rocm.cc
+  s_5f73f26aee7f01::t_8b949211255648 41-50
+sgl-kernel/tests/test_topk.py
+  s_5f73f26aee7f01::t_6908cc74206613 252-556
+test/registered/unit/disaggregation/test_mooncake_checksum_manifest.py
+  s_5f73f26aee7f01::t_1db43087cf85bb 256-292
+test/registered/unit/managers/test_fused_kv_protection_retry.py
+  s_5f73f26aee7f01::t_90908724398b45 1-435
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1af2091086b26f2c877639d7a8f0307fc2fc419f",
+  "prompts": {},
+  "sessions": {
+    "s_5f73f26aee7f01": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_099a8b759ffeqnA7QziBATTLQD",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
