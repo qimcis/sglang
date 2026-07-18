@@ -1,0 +1,77 @@
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/analyze.py
+  s_5f73f26aee7f01::t_ac17ba5c8798a4 1-164
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/analyze_nsys.py
+  s_5f73f26aee7f01::t_8c666016e37ff6 1-177
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/artifacts-optimized-v7/FINAL_AUDIT.md
+  s_414cd192908149::t_85ad8735c3abf7 1-103
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/artifacts-optimized-v7/SUMMARY.md
+  s_5f73f26aee7f01::t_4a06fb3b5f5def 1-26
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/artifacts-optimized-v7/fused/repeat1.json
+  s_5f73f26aee7f01::t_51f8f6e0d65cd3 1-136
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/artifacts-optimized-v7/fused/repeat2.json
+  s_5f73f26aee7f01::t_4d787d560cf143 1-136
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/artifacts-optimized-v7/nsys-v5/SUMMARY.md
+  s_5f73f26aee7f01::t_3486c94b64f6cc 1-29
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/artifacts-optimized-v7/nsys-v5/fused/workload.json
+  s_5f73f26aee7f01::t_f343304e0e0949 1-43
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/artifacts-optimized-v7/nsys-v5/off/workload.json
+  s_5f73f26aee7f01::t_971147c9f7da6c 1-43
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/artifacts-optimized-v7/nsys-v5/scheduler/workload.json
+  s_5f73f26aee7f01::t_1bb3e3d6a650a4 1-43
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/artifacts-optimized-v7/nsys-v5/summary.json
+  s_5f73f26aee7f01::t_49e01249411dc1 1-184
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/artifacts-optimized-v7/off/repeat1.json
+  s_5f73f26aee7f01::t_99ccf26975386e 1-136
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/artifacts-optimized-v7/off/repeat2.json
+  s_5f73f26aee7f01::t_18fcbcf583edbb 1-136
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/artifacts-optimized-v7/scheduler/repeat1.json
+  s_5f73f26aee7f01::t_c8401999808ca1 1-136
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/artifacts-optimized-v7/scheduler/repeat2.json
+  s_5f73f26aee7f01::t_e798f6e100e277 1-136
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/artifacts-optimized-v7/summary.json
+  s_5f73f26aee7f01::t_518cd5af191deb 1-95
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/build_wheels.sh
+  s_5f73f26aee7f01::t_f6ccb94ad9e343 1-45
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/repack_kernel_wheel.sh
+  s_5f73f26aee7f01::t_94af9c7718818c 1-44
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/repack_python_wheel.sh
+  s_5f73f26aee7f01::t_9c9a3782a51d38 1-81
+profile/coreweave_glm52_kv_validation_mode_ab_20260714/run_nsys_campaign.sh
+  s_5f73f26aee7f01::t_cc2e1b04e6ff64 1-270
+python/sglang/srt/model_executor/model_runner.py
+  s_414cd192908149::t_e83522c08c4a30 3069-3078
+sgl-kernel/benchmark/bench_topk_transform_kv_protection.py
+  s_5f73f26aee7f01::t_7f73fd0dabbf70 1-123
+sgl-kernel/csrc/kvcacheio/checksum.cu
+  s_5f73f26aee7f01::t_4db6a2bad3cd29 73,230-233,293-295,299-358,418-440,442-446,448,465,541-547,559-561,563,565-566,576-594,597,639-640,664-665,691-692,716-717,721-739,742,777,812-859,871
+sgl-kernel/tests/test_kv_checksum.py
+  s_5f73f26aee7f01::t_d0a187fab9e4b1 15-16,159-164,166-169,172-178,193-206,208-236,300-410,513-514,530,652-673,701-702,705-707,827-828,831-833,846,858,866,879-881,928,936,949-958
+test/registered/unit/managers/test_fused_kv_protection_retry.py
+  s_5f73f26aee7f01::t_0cd9c9572b8125 5,21,69-113,254-255,257,280-284
+test/registered/unit/mem_cache/test_kv_attention_tags.py
+  s_414cd192908149::t_a23a13d4b3597c 204-208
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "603045b1ac2b99fc7fe6bed1b522878a2cc1d726",
+  "prompts": {},
+  "sessions": {
+    "s_414cd192908149": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_092e40640ffew2SWf2GjqC7eiw",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    },
+    "s_5f73f26aee7f01": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_099a8b759ffeqnA7QziBATTLQD",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
