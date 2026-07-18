@@ -1,0 +1,33 @@
+python/sglang/jit_kernel/flash_attention.py
+  s_5f73f26aee7f01::t_e3f6801cbbba94 46,172,175-176
+python/sglang/jit_kernel/flash_attention_v3.py
+  s_5f73f26aee7f01::t_a7969d98cc498f 34,136,150,186
+python/sglang/srt/layers/attention/flashattention_backend.py
+  s_5f73f26aee7f01::t_aa7cb8e1e111e4 23,76,149-157,265-299,817-822,1541,1619,2554-2559
+sgl-kernel/csrc/flash_extension.cc
+  s_5f73f26aee7f01::t_39f247e11adfce 62-82
+sgl-kernel/include/sgl_flash_kernel_ops.h
+  s_5f73f26aee7f01::t_1d98353863db95 87-107
+sgl-kernel/python/sgl_kernel/flash_attn.py
+  s_5f73f26aee7f01::t_92bc2f85a6a38e 73,230,270-289,381-400
+test/registered/jit/test_fa3_kv_page_protection.py
+  s_5f73f26aee7f01::t_e2eb6414e02a66 1-389
+test/registered/unit/jit_kernel/test_flash_attention_dispatch.py
+  s_5f73f26aee7f01::t_8a8b89ba22f214 1-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1e4a3c627cede97e20af922a5265aea1fb709ae3",
+  "prompts": {},
+  "sessions": {
+    "s_5f73f26aee7f01": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_099a8b759ffeqnA7QziBATTLQD",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
