@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import torch
 
@@ -18,6 +18,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.kv_page_tags import (
     KV_PAGE_VALIDATION_REMOTE_FAILURE,
+    KVAttentionTagTable,
     KVFusedProtectionError,
 )
 from sglang.srt.model_executor.model_runner import (
@@ -65,6 +66,51 @@ def _request(rid, pool_idx):
 
 
 class TestFusedKVProtectionRetry(CustomTestCase):
+    def test_fused_forward_args_support_dsa_and_fa3_call_shapes(self):
+        table = KVAttentionTagTable.__new__(KVAttentionTagTable)
+        for name in (
+            "tags",
+            "generations",
+            "transfer_page_tags",
+            "owner_request_indices",
+            "owner_page_positions",
+            "expected_tags",
+            "expected_generations",
+            "expected_transfer_page_tags",
+            "request_epochs",
+            "validated_epochs",
+            "validation_status",
+        ):
+            setattr(table, name, torch.empty(0))
+
+        request_indices = torch.tensor([1, 2])
+        dsa_args = table.fused_forward_args(
+            request_indices=request_indices,
+            page_size=64,
+        )
+        self.assertIs(dsa_args["request_indices"], request_indices)
+        self.assertIsNone(dsa_args["seqlens"])
+        self.assertIsNone(dsa_args["page_table"])
+
+        seqlens = torch.tensor([64, 128], dtype=torch.int32)
+        page_table = torch.arange(4, dtype=torch.int32).view(2, 2)
+        fa3_args = table.fused_forward_args(
+            request_indices=request_indices,
+            seqlens=seqlens,
+            page_table=page_table,
+            page_size=64,
+            page_table_2=page_table,
+            page_table_2_page_offset=7,
+            page_table_2_window_size=4096,
+            validate_full_mapping=True,
+        )
+        self.assertIs(fa3_args["seqlens"], seqlens)
+        self.assertIs(fa3_args["page_table"], page_table)
+        self.assertIs(fa3_args["page_table_2"], page_table)
+        self.assertEqual(fa3_args["page_table_2_page_offset"], 7)
+        self.assertEqual(fa3_args["page_table_2_window_size"], 4096)
+        self.assertTrue(fa3_args["validate_full_mapping"])
+
     def _scheduler(self):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.kv_protection_manager = SimpleNamespace(
@@ -205,10 +251,10 @@ class TestFusedKVProtectionRetry(CustomTestCase):
             batch_size=2,
             req_pool_indices=torch.tensor([1, 2], dtype=torch.int64),
         )
+        statuses = torch.zeros(2, dtype=torch.int32)
+        failed = torch.zeros(2, dtype=torch.int32)
         table = SimpleNamespace(
-            fused_failure_status=MagicMock(
-                return_value=torch.zeros(2, dtype=torch.int32)
-            )
+            fused_failure_status=MagicMock(return_value=(statuses, failed))
         )
 
         work = MagicMock()
@@ -231,6 +277,11 @@ class TestFusedKVProtectionRetry(CustomTestCase):
             error = check.materialize_error()
 
         work.wait.assert_called_once_with()
+        table.fused_failure_status.assert_called_once_with(ANY, return_failed=True)
+        torch.testing.assert_close(
+            table.fused_failure_status.call_args.args[0],
+            forward_batch.req_pool_indices,
+        )
         self.assertIsInstance(error, KVFusedProtectionError)
         self.assertEqual(error.batch_indices, (1,))
         self.assertEqual(error.request_pool_indices, (2,))

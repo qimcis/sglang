@@ -12,6 +12,8 @@ from sglang.srt.mem_cache.kv_page_tags import (
     KVPageHistory,
     KVPageProtectionManager,
     KVProtectionConfig,
+    _direct_metadata_from_pool,
+    _DirectKVChecksumCache,
     _fmix32_scalar,
     hash_rows_with_positions,
     select_checksum_byte_count,
@@ -154,26 +156,31 @@ def _reference(pool, req_to_token, req_idx, start, length, swa_evicted=0):
     return swa_checksum if full_checksum is None else full_checksum ^ swa_checksum
 
 
-def _page_digest_reference(pool, req_to_token, req_idx, start, length, page_size):
+def _page_digest_reference(
+    pool, req_to_token, req_idx, start, length, page_size, swa_evicted=0
+):
+    if length == 0:
+        return ()
+
     positions = torch.arange(start, start + length, dtype=torch.long, device="cuda")
-    locs = req_to_token[req_idx, start : start + length].to(torch.long)
-    rows = []
+    full_locs = req_to_token[req_idx, start : start + length].to(torch.long)
+    full_rows = []
+    swa_rows = []
+    layers_mapping = getattr(pool, "layers_mapping", None)
     start_layer = getattr(pool, "start_layer", 0)
     for layer_id in range(start_layer, start_layer + pool.layer_num):
+        locs = full_locs
+        is_swa = layers_mapping is not None and bool(layers_mapping[layer_id][1])
+        if is_swa:
+            locs = pool.full_to_swa_index_mapping.index_select(
+                0, full_locs[swa_evicted:]
+            ).clamp_min(0)
+        rows = swa_rows if is_swa else full_rows
         rows.append(_rows_for_buffer(pool.get_key_buffer(layer_id), locs))
         try:
             rows.append(_rows_for_buffer(pool.get_value_buffer(layer_id), locs))
         except (NotImplementedError, AttributeError):
             pass
-    selected = torch.cat(rows, dim=1)
-    lanes = (
-        selected.contiguous()
-        .view(torch.uint8)
-        .reshape(length, -1)
-        .view(torch.int64)
-        .cpu()
-        .tolist()
-    )
 
     u32 = (1 << 32) - 1
     u64 = (1 << 64) - 1
@@ -181,31 +188,52 @@ def _page_digest_reference(pool, req_to_token, req_idx, start, length, page_size
     pos_mul_hi = 0x27D4EB2F
     lane_mul_hi = 0x165667B1
     value_mul_hi = 0x9E3779B9
-    digests = []
     first_page = start // page_size
     last_page = (start + length - 1) // page_size
-    for page_position in range(first_page, last_page + 1):
-        begin = max(start, page_position * page_size)
-        end = min(start + length, (page_position + 1) * page_size)
-        row_begin = begin - start
-        row_end = end - start
-        low = hash_rows_with_positions(
-            selected[row_begin:row_end],
-            positions=positions[row_begin:row_end],
+    digests = {page_position: 0 for page_position in range(first_page, last_page + 1)}
+
+    def xor_rows(rows, selected_positions):
+        if not rows or selected_positions.numel() == 0:
+            return
+        selected = torch.cat(rows, dim=1)
+        selected_length = selected_positions.numel()
+        lanes = (
+            selected.contiguous()
+            .view(torch.uint8)
+            .reshape(selected_length, -1)
+            .view(torch.int64)
+            .cpu()
+            .tolist()
         )
-        high_raw = 0
-        for row_offset, position in enumerate(range(begin, end), start=row_begin):
-            seed_pos = seed_hi ^ ((position * pos_mul_hi) & u32)
-            for lane_index, value_signed in enumerate(lanes[row_offset]):
-                value = value_signed & u64
-                chunk = seed_pos
-                chunk ^= (lane_index * lane_mul_hi) & u32
-                chunk ^= ((value & u32) * value_mul_hi) & u32
-                chunk ^= (value >> 32) & u32
-                high_raw ^= _fmix32_scalar(chunk & u32)
-        high = _fmix32_scalar(seed_hi ^ high_raw ^ (end - begin))
-        digests.append(((high << 32) | low) & u64)
-    return tuple(digests)
+        selected_start = int(selected_positions[0].item())
+        selected_end = selected_start + selected_length
+        selected_first_page = selected_start // page_size
+        selected_last_page = (selected_end - 1) // page_size
+        for page_position in range(selected_first_page, selected_last_page + 1):
+            begin = max(selected_start, page_position * page_size)
+            end = min(selected_end, (page_position + 1) * page_size)
+            row_begin = begin - selected_start
+            row_end = end - selected_start
+            low = hash_rows_with_positions(
+                selected[row_begin:row_end],
+                positions=selected_positions[row_begin:row_end],
+            )
+            high_raw = 0
+            for row_offset, position in enumerate(range(begin, end), start=row_begin):
+                seed_pos = seed_hi ^ ((position * pos_mul_hi) & u32)
+                for lane_index, value_signed in enumerate(lanes[row_offset]):
+                    value = value_signed & u64
+                    chunk = seed_pos
+                    chunk ^= (lane_index * lane_mul_hi) & u32
+                    chunk ^= ((value & u32) * value_mul_hi) & u32
+                    chunk ^= (value >> 32) & u32
+                    high_raw ^= _fmix32_scalar(chunk & u32)
+            high = _fmix32_scalar(seed_hi ^ high_raw ^ (end - begin))
+            digests[page_position] ^= ((high << 32) | low) & u64
+
+    xor_rows(full_rows, positions)
+    xor_rows(swa_rows, positions[swa_evicted:])
+    return tuple(digests[page] for page in range(first_page, last_page + 1))
 
 
 def _batched_plans(
@@ -269,6 +297,117 @@ def test_removed_direct_abi_is_not_exported():
     assert not hasattr(kvcacheio, "kv_checksum_direct_range")
     assert hasattr(kvcacheio, "kv_checksum_direct_table_batched")
     assert hasattr(kvcacheio, "kv_checksum_direct_table_batched_with_pages")
+    assert hasattr(kvcacheio, "kv_checksum_direct_table_batched_with_pages_compact")
+    dense_schema = str(
+        torch.ops.sgl_kernel.kv_checksum_direct_table_batched_with_pages.default._schema
+    )
+    compact_schema = str(
+        torch.ops.sgl_kernel.kv_checksum_direct_table_batched_with_pages_compact.default._schema
+    )
+    assert "page_output_offsets" not in dense_schema
+    assert "page_output_offsets" in compact_schema
+
+
+@pytest.mark.skipif(
+    not _have_batched_op(),
+    reason="sgl_kernel page checksum op not built",
+)
+def test_dense_page_checksum_abi_retains_original_call_shape():
+    from sgl_kernel.kvcacheio import (
+        kv_checksum_direct_table_batched,
+        kv_checksum_direct_table_batched_with_pages,
+    )
+
+    torch.manual_seed(22)
+    size, tokens, page_size = 256, 80, 64
+    k = [torch.randn(size, 2, 16, dtype=torch.float16, device="cuda")]
+    v = [torch.randn_like(k[0])]
+    pool = _Pool(k, v)
+    req_to_token = torch.stack(
+        [torch.randperm(size, device="cuda")[:tokens] for _ in range(2)]
+    ).to(torch.int32)
+
+    def unsupported(reason):
+        raise AssertionError(reason)
+
+    (
+        buffer_ptrs,
+        row_strides,
+        row_nbytes,
+        swa_buffer_flags,
+        full_to_swa_index_mapping,
+        total_bytes,
+    ) = _direct_metadata_from_pool(
+        pool,
+        req_to_token.device,
+        _DirectKVChecksumCache(),
+        unsupported,
+    )
+    req_pool_indices = torch.arange(2, dtype=torch.int64, device="cuda")
+    starts = torch.tensor([3, 0], dtype=torch.int64, device="cuda")
+    lengths = torch.tensor([65, 10], dtype=torch.int64, device="cuda")
+    max_num_tokens = int(lengths.max().item())
+    max_num_pages = 2
+    accum = torch.zeros(2, dtype=torch.int32, device="cuda")
+    out = torch.empty(2, dtype=torch.int64, device="cuda")
+    page_accum = torch.zeros((2, max_num_pages), dtype=torch.int64, device="cuda")
+    page_out = torch.full_like(page_accum, -7)
+
+    kv_checksum_direct_table_batched_with_pages(
+        buffer_ptrs,
+        row_strides,
+        row_nbytes,
+        swa_buffer_flags,
+        full_to_swa_index_mapping,
+        req_to_token,
+        req_pool_indices,
+        starts,
+        lengths,
+        starts,
+        max_num_tokens,
+        select_checksum_byte_count(total_bytes),
+        page_size,
+        max_num_pages,
+        False,
+        False,
+        accum,
+        out,
+        page_accum,
+        page_out,
+    )
+    root_accum = torch.zeros_like(accum)
+    root_out = torch.empty_like(out)
+    kv_checksum_direct_table_batched(
+        buffer_ptrs,
+        row_strides,
+        row_nbytes,
+        swa_buffer_flags,
+        full_to_swa_index_mapping,
+        req_to_token,
+        req_pool_indices,
+        starts,
+        lengths,
+        max_num_tokens,
+        select_checksum_byte_count(total_bytes),
+        False,
+        False,
+        root_accum,
+        root_out,
+    )
+    torch.testing.assert_close(accum, root_accum, rtol=0, atol=0)
+    torch.testing.assert_close(out, root_out, rtol=0, atol=0)
+    for req_idx, (start, length) in enumerate(zip(starts.tolist(), lengths.tolist())):
+        assert out[req_idx].item() == _reference(
+            pool, req_to_token, req_idx, start, length
+        )
+        expected_pages = _page_digest_reference(
+            pool, req_to_token, req_idx, start, length, page_size
+        )
+        expected_pages += (0,) * (max_num_pages - len(expected_pages))
+        assert (
+            tuple(value & ((1 << 64) - 1) for value in page_out[req_idx].tolist())
+            == expected_pages
+        )
 
 
 @pytest.mark.skipif(
@@ -371,7 +510,8 @@ def test_page_history_cuda_ring_retains_last_eight_operations():
     reason="sgl_kernel.kv_checksum_direct_table_batched not built",
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.int8])
-def test_mha_batched_parity(dtype):
+@pytest.mark.parametrize("table_dtype", [torch.int32, torch.int64])
+def test_mha_batched_parity(dtype, table_dtype):
     torch.manual_seed(0)
     size, h, d, layers, tokens = 256, 4, 16, 6, 64
     if dtype == torch.int8:
@@ -387,7 +527,7 @@ def test_mha_batched_parity(dtype):
         k = [torch.randn(size, h, d, dtype=dtype, device="cuda") for _ in range(layers)]
         v = [torch.randn(size, h, d, dtype=dtype, device="cuda") for _ in range(layers)]
     pool = _Pool(k, v)
-    req_to_token = torch.empty((3, tokens), dtype=torch.int32, device="cuda")
+    req_to_token = torch.empty((3, tokens), dtype=table_dtype, device="cuda")
     for req_idx in range(req_to_token.shape[0]):
         req_to_token[req_idx].copy_(torch.randperm(size, device="cuda")[:tokens])
 
@@ -509,6 +649,28 @@ def test_manager_packs_page_workspace_below_cached_capacity():
     assert manager._checksum_cache.page_capacity == 4
     page_accum_ptr = manager._checksum_cache.page_accum.data_ptr()
 
+    ragged = manager.begin_transfer_checksums_from_table(
+        pool,
+        req_to_token,
+        req_pool_indices=list(range(requests)),
+        bootstrap_rooms=list(range(100, 100 + requests)),
+        starts=[0, 3, 0],
+        num_tokens=[0, 65, 129],
+    )
+    assert ragged.page_counts == [0, 2, 3]
+    assert ragged.max_num_pages == 3
+    assert ragged.packed_results_t.numel() == requests + sum(ragged.page_counts)
+    ragged_plans = ragged.finalize()
+    assert [len(plan.page_digests) for plan in ragged_plans] == [0, 2, 3]
+    for req_idx, (start, length, plan) in enumerate(
+        zip([0, 3, 0], [0, 65, 129], ragged_plans, strict=True)
+    ):
+        assert plan.checksum == _reference(pool, req_to_token, req_idx, start, length)
+        if length > 0:
+            assert plan.page_digests == _page_digest_reference(
+                pool, req_to_token, req_idx, start, length, 64
+            )
+
     length = 129
     plans = launch(length)
     assert manager._checksum_cache.page_capacity == 4
@@ -536,9 +698,13 @@ def test_mla_k_only_batched_parity():
         torch.randperm(size, device="cuda")[:tokens].reshape(1, -1).to(torch.int32)
     )
 
-    got = _one(pool, req_to_token, 0, 0, tokens)
+    plan = _batched_plans(pool, req_to_token, [0], [0], [tokens])[0]
+    got = plan.checksum
     expected = _reference(pool, req_to_token, 0, 0, tokens)
     assert got == expected
+    assert plan.page_digests == _page_digest_reference(
+        pool, req_to_token, 0, 0, tokens, 64
+    )
 
 
 @pytest.mark.skipif(
@@ -658,9 +824,13 @@ def test_swa_batched_parity_uses_full_to_swa_mapping():
     pool = _SWAPool(full_k, full_v, swa_k, swa_v, mapping)
     req_to_token = full_locs.reshape(1, -1).to(torch.int32)
 
-    got = _one(pool, req_to_token, 0, 0, tokens)
+    plan = _batched_plans(pool, req_to_token, [0], [0], [tokens])[0]
+    got = plan.checksum
     expected = _reference(pool, req_to_token, 0, 0, tokens)
     assert got == expected
+    assert plan.page_digests == _page_digest_reference(
+        pool, req_to_token, 0, 0, tokens, 64
+    )
 
     swa_k[0][swa_locs[7], 0, 0] += 1.0
     corrupted = _one(pool, req_to_token, 0, 0, tokens)
@@ -673,7 +843,7 @@ def test_swa_batched_parity_uses_full_to_swa_mapping():
 )
 def test_swa_checksum_excludes_untransferred_prefix():
     torch.manual_seed(13)
-    full_size, swa_size, h, d, tokens, evicted = 128, 64, 2, 16, 32, 16
+    full_size, swa_size, h, d, tokens, evicted = 256, 192, 2, 16, 150, 70
     full_k = [torch.randn(full_size, h, d, device="cuda", dtype=torch.float16)]
     full_v = [torch.randn_like(full_k[0])]
     swa_k = [torch.randn(swa_size, h, d, device="cuda", dtype=torch.float16)]
@@ -685,7 +855,7 @@ def test_swa_checksum_excludes_untransferred_prefix():
     pool = _SWAPool(full_k, full_v, swa_k, swa_v, mapping)
     req_to_token = full_locs.reshape(1, -1).to(torch.int32)
 
-    got = _batched(
+    plan = _batched_plans(
         pool,
         req_to_token,
         [0],
@@ -693,6 +863,7 @@ def test_swa_checksum_excludes_untransferred_prefix():
         [tokens],
         swa_evicted_lens=[evicted],
     )[0]
+    got = plan.checksum
     full_rows = torch.cat(
         [_rows_for_buffer(buf, full_locs) for buf in (full_k + full_v)], dim=1
     )
@@ -705,6 +876,9 @@ def test_swa_checksum_excludes_untransferred_prefix():
         swa_rows, positions=torch.arange(evicted, tokens, device="cuda")
     )
     assert got == expected
+    assert plan.page_digests == _page_digest_reference(
+        pool, req_to_token, 0, 0, tokens, 64, swa_evicted=evicted
+    )
 
     swa_k[0][0].add_(1)
     unchanged = _batched(
@@ -751,7 +925,7 @@ def test_swa_two_pass_is_independent_per_request():
     pool = _SWAPool(full_k, full_v, swa_k, swa_v, mapping)
     req_to_token = req_to_token.to(torch.int32)
 
-    got = _batched(
+    plans = _batched_plans(
         pool,
         req_to_token,
         [0, 1],
@@ -759,6 +933,7 @@ def test_swa_two_pass_is_independent_per_request():
         lengths,
         swa_evicted_lens=evicted,
     )
+    got = [plan.checksum for plan in plans]
     expected = [
         _reference(
             pool,
@@ -771,6 +946,16 @@ def test_swa_two_pass_is_independent_per_request():
         for req_idx in range(2)
     ]
     assert got == expected
+    for req_idx, plan in enumerate(plans):
+        assert plan.page_digests == _page_digest_reference(
+            pool,
+            req_to_token,
+            req_idx,
+            starts[req_idx],
+            lengths[req_idx],
+            64,
+            swa_evicted=evicted[req_idx],
+        )
 
 
 @pytest.mark.skipif(

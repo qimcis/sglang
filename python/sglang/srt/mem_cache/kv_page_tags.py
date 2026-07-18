@@ -1549,15 +1549,34 @@ class KVAttentionTagTable:
         indices = request_pool_indices.to(
             self.request_epochs.device, dtype=torch.long
         ).reshape(-1)
+        if self.request_epochs.is_cuda:
+            torch.ops.sgl_kernel.kv_page_protection_begin_forward(
+                indices, self.request_epochs, self.validation_status
+            )
+            return
         valid = indices.gt(0) & indices.lt(self.request_epochs.numel())
         safe_indices = torch.where(valid, indices, 0)
         self.validation_status.index_fill_(0, safe_indices, 0)
         self.request_epochs.index_add_(0, safe_indices, valid.to(torch.int32))
 
-    def fused_failure_status(self, request_pool_indices: torch.Tensor) -> torch.Tensor:
+    def fused_failure_status(
+        self, request_pool_indices: torch.Tensor, *, return_failed: bool = False
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         indices = request_pool_indices.to(
             self.request_epochs.device, dtype=torch.long
         ).reshape(-1)
+        if self.request_epochs.is_cuda:
+            failure_status = torch.empty_like(indices, dtype=torch.int32)
+            failed = torch.empty_like(indices, dtype=torch.int32)
+            torch.ops.sgl_kernel.kv_page_protection_failure_status(
+                indices,
+                self.request_epochs,
+                self.validated_epochs,
+                self.validation_status,
+                failure_status,
+                failed,
+            )
+            return (failure_status, failed) if return_failed else failure_status
         invalid = indices.lt(0) | indices.ge(self.request_epochs.numel())
         safe_indices = torch.where(invalid, 0, indices)
         status = self.validation_status.index_select(0, safe_indices)
@@ -1570,19 +1589,34 @@ class KVAttentionTagTable:
             torch.full_like(failure_status, KV_PAGE_INVALID_MAPPING),
             failure_status,
         )
-        return torch.where(indices.eq(0), 0, failure_status)
+        failure_status = torch.where(indices.eq(0), 0, failure_status)
+        if return_failed:
+            return failure_status, failure_status.ne(0).to(torch.int32)
+        return failure_status
 
     def fused_forward_args(
         self,
         *,
         request_indices: torch.Tensor,
+        seqlens: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
         page_size: int,
+        page_table_2: Optional[torch.Tensor] = None,
         page_table_page_offset: int = 0,
+        page_table_2_page_offset: int = 0,
+        page_table_2_window_size: int = 0,
+        validate_full_mapping: bool = False,
     ) -> Dict[str, object]:
         return {
             "request_indices": request_indices,
+            "seqlens": seqlens,
+            "page_table": page_table,
+            "page_table_2": page_table_2,
             "page_table_page_offset": int(page_table_page_offset),
+            "page_table_2_page_offset": int(page_table_2_page_offset),
+            "page_table_2_window_size": int(page_table_2_window_size),
             "page_size": int(page_size),
+            "validate_full_mapping": bool(validate_full_mapping),
             "actual_tags": self.tags,
             "actual_generations": self.generations,
             "actual_transfer_tags": self.transfer_page_tags,
@@ -2082,6 +2116,7 @@ class _DirectKVChecksumCache:
         self,
         batch_size: int,
         max_num_pages: int,
+        total_num_pages: int,
         device: torch.device,
         *,
         need_secondary: bool,
@@ -2114,10 +2149,10 @@ class _DirectKVChecksumCache:
             )
             self.page_out = torch.empty_like(self.page_accum)
             self.metadata_host = torch.empty(
-                (5 * capacity,), dtype=TAG_DTYPE, device="cpu", pin_memory=True
+                (6 * capacity + 1,), dtype=TAG_DTYPE, device="cpu", pin_memory=True
             )
             self.metadata_device = torch.empty(
-                (5 * capacity,), dtype=TAG_DTYPE, device=device
+                (6 * capacity + 1,), dtype=TAG_DTYPE, device=device
             )
             self.batch_capacity = capacity
             self.page_capacity = page_capacity
@@ -2151,22 +2186,25 @@ class _DirectKVChecksumCache:
         )
         active_page_slots = batch_size * max_num_pages
 
-        def active_page_view(workspace: torch.Tensor) -> torch.Tensor:
+        def active_page_accum_view(workspace: torch.Tensor) -> torch.Tensor:
             # Slicing both dimensions of rounded storage leaves a widened row
             # stride. Pack the active flat prefix without allocating instead.
             return workspace.view(-1)[:active_page_slots].view(
                 batch_size, max_num_pages
             )
 
+        def active_page_output_view(workspace: torch.Tensor) -> torch.Tensor:
+            return workspace.view(-1)[:total_num_pages]
+
         return (
             self.accum[:batch_size],
             self.final_out[:batch_size],
             secondary_accum[:batch_size],
             secondary_out[:batch_size],
-            active_page_view(self.page_accum),
-            active_page_view(self.page_out),
-            active_page_view(secondary_page_accum),
-            active_page_view(secondary_page_out),
+            active_page_accum_view(self.page_accum),
+            active_page_output_view(self.page_out),
+            active_page_accum_view(secondary_page_accum),
+            active_page_output_view(secondary_page_out),
             self.metadata_host,
             self.metadata_device,
         )
@@ -2178,9 +2216,9 @@ class AsyncChecksumBatch:
 
     bootstrap_rooms: List[int]
     num_tokens: List[int]
-    checksums_t: torch.Tensor
-    page_digests_t: torch.Tensor
+    packed_results_t: torch.Tensor
     page_counts: List[int]
+    max_num_pages: int
     page_size: int
     logical_starts: List[int]
     stream: Optional[torch.cuda.Stream]
@@ -2190,23 +2228,20 @@ class AsyncChecksumBatch:
         if self.finalized is not None:
             return self.finalized
         if self.stream is not None:
-            torch.cuda.current_stream(self.checksums_t.device).wait_stream(self.stream)
-        checksums = self.checksums_t.detach().cpu().tolist()
-        valid_page_rows = [
-            self.page_digests_t[index, :page_count]
-            for index, page_count in enumerate(self.page_counts)
-            if page_count
-        ]
-        packed_page_digests = (
-            torch.cat(valid_page_rows).detach().cpu().tolist()
-            if valid_page_rows
-            else []
-        )
+            torch.cuda.current_stream(self.packed_results_t.device).wait_stream(
+                self.stream
+            )
+        packed_results = self.packed_results_t.detach().cpu()
+        batch_size = len(self.page_counts)
+        checksums = packed_results[:batch_size].tolist()
+        page_values = packed_results[batch_size:]
         page_digests = []
-        offset = 0
+        page_offset = 0
         for page_count in self.page_counts:
-            page_digests.append(packed_page_digests[offset : offset + page_count])
-            offset += page_count
+            page_digests.append(
+                page_values[page_offset : page_offset + page_count].tolist()
+            )
+            page_offset += page_count
         self.finalized = [
             ChecksumPlan(
                 bootstrap_room=room,
@@ -3169,8 +3204,8 @@ class KVPageProtectionManager:
                 [],
                 [],
                 torch.empty(0, dtype=TAG_DTYPE),
-                torch.empty((0, 0), dtype=TAG_DTYPE),
                 [],
+                0,
                 int(checksum_page_size),
                 [],
                 None,
@@ -3206,6 +3241,10 @@ class KVPageProtectionManager:
             )
             for start, n in zip(starts_list, num_tokens_list, strict=True)
         ]
+        page_offsets = [0]
+        for page_count in page_counts:
+            page_offsets.append(page_offsets[-1] + page_count)
+        total_num_pages = page_offsets[-1]
         max_num_pages = max(1, max(page_counts))
         evicted_list = (
             [int(x) for x in swa_evicted_lens]
@@ -3221,11 +3260,11 @@ class KVPageProtectionManager:
 
         try:
             from sgl_kernel.kvcacheio import (
-                kv_checksum_direct_table_batched_with_pages as _op,
+                kv_checksum_direct_table_batched_with_pages_compact as _op,
             )
         except Exception as e:  # pragma: no cover - depends on CUDA build
             raise RuntimeError(
-                f"sgl_kernel kv_checksum_direct_table_batched_with_pages unavailable ({e})"
+                f"sgl_kernel compact page checksum op unavailable ({e})"
             ) from e
 
         device = req_to_token.device
@@ -3306,11 +3345,11 @@ class KVPageProtectionManager:
         ) = self._checksum_cache.batch_slices(
             batch_size,
             max_num_pages,
+            total_num_pages,
             device,
             need_secondary=need_two_pass,
         )
-        active_metadata_size = 5 * batch_size
-        metadata_host[:active_metadata_size].copy_(
+        metadata_host[: 5 * batch_size].copy_(
             torch.tensor(
                 [
                     req_pool_indices,
@@ -3322,11 +3361,16 @@ class KVPageProtectionManager:
                 dtype=TAG_DTYPE,
             ).reshape(-1)
         )
+        active_metadata_size = 6 * batch_size + 1
+        metadata_host[5 * batch_size : active_metadata_size].copy_(
+            torch.tensor(page_offsets, dtype=TAG_DTYPE)
+        )
         req_pool_t = metadata_device[:batch_size]
         starts_t = metadata_device[batch_size : 2 * batch_size]
         lengths_t = metadata_device[2 * batch_size : 3 * batch_size]
         swa_starts_t = metadata_device[3 * batch_size : 4 * batch_size]
-        swa_lengths_t = metadata_device[4 * batch_size : active_metadata_size]
+        swa_lengths_t = metadata_device[4 * batch_size : 5 * batch_size]
+        page_offsets_t = metadata_device[5 * batch_size : active_metadata_size]
 
         if (
             self._checksum_cache.stream is None
@@ -3338,6 +3382,13 @@ class KVPageProtectionManager:
         max_num_tokens = max(num_tokens_list)
         max_swa_tokens = max(swa_lengths_list)
         with torch.cuda.stream(stream):
+            packed_results_t = torch.empty(
+                batch_size + total_num_pages,
+                dtype=TAG_DTYPE,
+                device=device,
+            )
+            checksums_t = packed_results_t[:batch_size]
+            page_digests_t = packed_results_t[batch_size:]
             metadata_device[:active_metadata_size].copy_(
                 metadata_host[:active_metadata_size], non_blocking=True
             )
@@ -3346,7 +3397,6 @@ class KVPageProtectionManager:
                 self._checksum_cache.metadata_copy_event = metadata_copy_event
             metadata_copy_event.record(stream)
             if not need_two_pass:
-                accum.zero_()
                 page_accum.zero_()
                 _op(
                     buffer_ptrs,
@@ -3359,6 +3409,7 @@ class KVPageProtectionManager:
                     starts_t,
                     lengths_t,
                     starts_t,
+                    page_offsets_t,
                     int(max_num_tokens),
                     int(num_lanes),
                     checksum_page_size,
@@ -3366,17 +3417,14 @@ class KVPageProtectionManager:
                     has_swa,
                     is_capped,
                     accum,
-                    final_out,
+                    checksums_t,
                     page_accum,
-                    page_out,
+                    page_digests_t,
                 )
-                checksums_t = final_out.clone()
-                page_digests_t = page_out.clone()
             else:
                 empty_mapping = full_to_swa_index_mapping[:0]
                 full_out = None
                 if self._checksum_cache.full_total_bytes > 0:
-                    accum.zero_()
                     page_accum.zero_()
                     full_num_lanes = select_checksum_byte_count(
                         self._checksum_cache.full_total_bytes
@@ -3392,6 +3440,7 @@ class KVPageProtectionManager:
                         starts_t,
                         lengths_t,
                         starts_t,
+                        page_offsets_t,
                         int(max_num_tokens),
                         int(full_num_lanes),
                         checksum_page_size,
@@ -3405,8 +3454,11 @@ class KVPageProtectionManager:
                     )
                     full_out = final_out
 
-                secondary_accum.zero_()
                 secondary_page_accum.zero_()
+                if full_out is not None:
+                    secondary_page_out.zero_()
+                else:
+                    page_digests_t.zero_()
                 swa_num_lanes = select_checksum_byte_count(
                     self._checksum_cache.swa_total_bytes
                 )
@@ -3421,6 +3473,7 @@ class KVPageProtectionManager:
                     swa_starts_t,
                     swa_lengths_t,
                     starts_t,
+                    page_offsets_t,
                     int(max_swa_tokens),
                     int(swa_num_lanes),
                     checksum_page_size,
@@ -3428,20 +3481,13 @@ class KVPageProtectionManager:
                     True,
                     False,
                     secondary_accum,
-                    secondary_out,
+                    checksums_t if full_out is None else secondary_out,
                     secondary_page_accum,
-                    secondary_page_out,
+                    page_digests_t if full_out is None else secondary_page_out,
                 )
-                checksums_t = (
-                    secondary_out.clone()
-                    if full_out is None
-                    else torch.bitwise_xor(full_out, secondary_out)
-                )
-                page_digests_t = (
-                    secondary_page_out.clone()
-                    if full_out is None
-                    else torch.bitwise_xor(page_out, secondary_page_out)
-                )
+                if full_out is not None:
+                    torch.bitwise_xor(full_out, secondary_out, out=checksums_t)
+                    torch.bitwise_xor(page_out, secondary_page_out, out=page_digests_t)
             if workspace_event is None:
                 workspace_event = torch.cuda.Event()
                 self._checksum_cache.workspace_event = workspace_event
@@ -3449,9 +3495,9 @@ class KVPageProtectionManager:
         return AsyncChecksumBatch(
             bootstrap_rooms=[int(x) for x in bootstrap_rooms],
             num_tokens=num_tokens_list,
-            checksums_t=checksums_t,
-            page_digests_t=page_digests_t,
+            packed_results_t=packed_results_t,
             page_counts=page_counts,
+            max_num_pages=max_num_pages,
             page_size=checksum_page_size,
             logical_starts=starts_list,
             stream=stream,

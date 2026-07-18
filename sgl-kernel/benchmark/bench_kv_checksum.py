@@ -13,7 +13,7 @@ import time
 import torch
 from sgl_kernel.kvcacheio import (
     kv_checksum_direct_table_batched,
-    kv_checksum_direct_table_batched_with_pages,
+    kv_checksum_direct_table_batched_with_pages_compact,
 )
 
 from sglang.srt.mem_cache.kv_page_tags import (
@@ -92,6 +92,9 @@ def _benchmark_config(layers, heads, head_dim, dtype, slots, tokens, batch, mla)
     root_out = torch.empty(batch, dtype=torch.int64, device="cuda")
     page_size = 64
     page_count = (tokens + page_size - 1) // page_size
+    page_output_offsets = torch.arange(
+        0, (batch + 1) * page_count, page_count, dtype=torch.int64, device="cuda"
+    )
     page_accum = torch.zeros((batch, page_count), dtype=torch.int64, device="cuda")
     page_out = torch.empty_like(page_accum)
 
@@ -116,9 +119,8 @@ def _benchmark_config(layers, heads, head_dim, dtype, slots, tokens, batch, mla)
         )
 
     def root_with_pages():
-        accum.zero_()
         page_accum.zero_()
-        kv_checksum_direct_table_batched_with_pages(
+        kv_checksum_direct_table_batched_with_pages_compact(
             buffer_ptrs,
             row_strides,
             row_nbytes,
@@ -129,6 +131,7 @@ def _benchmark_config(layers, heads, head_dim, dtype, slots, tokens, batch, mla)
             starts,
             lengths,
             logical_starts,
+            page_output_offsets,
             tokens,
             num_lanes,
             page_size,

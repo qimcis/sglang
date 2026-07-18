@@ -3066,8 +3066,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         request_pool_indices = forward_batch.req_pool_indices[
             : forward_batch.batch_size
         ]
-        statuses = table.fused_failure_status(request_pool_indices)
-        failed = statuses.ne(0).to(torch.int32)
+        status_result = table.fused_failure_status(
+            request_pool_indices, return_failed=True
+        )
+        if isinstance(status_result, tuple):
+            statuses, failed = status_result
+        else:
+            # Retain compatibility with lightweight test doubles and downstream
+            # tables while the shipped CUDA table emits both tensors in one op.
+            statuses = status_result
+            failed = statuses.ne(0).to(torch.int32)
         work = None
         if self.tp_size > 1:
             work = dist.all_reduce(

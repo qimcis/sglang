@@ -1,0 +1,184 @@
+{
+  "kernel_rows": {
+    "off": {
+      "unprotected_topk": {
+        "instances": 6552,
+        "total_us": 68757.965,
+        "avg_us": 10.494194902319903
+      },
+      "protected_topk_64": {
+        "instances": 0,
+        "total_us": 0.0,
+        "avg_us": 0
+      },
+      "begin_status": {
+        "instances": 0,
+        "total_us": 0.0,
+        "avg_us": 0
+      },
+      "failure_status": {
+        "instances": 0,
+        "total_us": 0.0,
+        "avg_us": 0
+      },
+      "status_allreduce": {
+        "instances": 0,
+        "total_us": 0.0,
+        "avg_us": 0
+      },
+      "checksum_scan": {
+        "instances": 8,
+        "total_us": 2800.067,
+        "avg_us": 350.008375
+      },
+      "checksum_finalizer": {
+        "instances": 8,
+        "total_us": 19.488,
+        "avg_us": 2.436
+      }
+    },
+    "scheduler": {
+      "unprotected_topk": {
+        "instances": 6552,
+        "total_us": 68761.386,
+        "avg_us": 10.494717032967033
+      },
+      "protected_topk_64": {
+        "instances": 0,
+        "total_us": 0.0,
+        "avg_us": 0
+      },
+      "begin_status": {
+        "instances": 0,
+        "total_us": 0.0,
+        "avg_us": 0
+      },
+      "failure_status": {
+        "instances": 0,
+        "total_us": 0.0,
+        "avg_us": 0
+      },
+      "status_allreduce": {
+        "instances": 0,
+        "total_us": 0.0,
+        "avg_us": 0
+      },
+      "checksum_scan": {
+        "instances": 8,
+        "total_us": 2799.521,
+        "avg_us": 349.940125
+      },
+      "checksum_finalizer": {
+        "instances": 8,
+        "total_us": 19.744,
+        "avg_us": 2.468
+      }
+    },
+    "fused": {
+      "unprotected_topk": {
+        "instances": 0,
+        "total_us": 0.0,
+        "avg_us": 0
+      },
+      "protected_topk_64": {
+        "instances": 6552,
+        "total_us": 83489.207,
+        "avg_us": 12.74255296092796
+      },
+      "begin_status": {
+        "instances": 319,
+        "total_us": 290.112,
+        "avg_us": 0.9094420062695925
+      },
+      "failure_status": {
+        "instances": 312,
+        "total_us": 536.002,
+        "avg_us": 1.7179551282051282
+      },
+      "status_allreduce": {
+        "instances": 312,
+        "total_us": 6117.576,
+        "avg_us": 19.607615384615382
+      },
+      "checksum_scan": {
+        "instances": 8,
+        "total_us": 2802.275,
+        "avg_us": 350.284375
+      },
+      "checksum_finalizer": {
+        "instances": 8,
+        "total_us": 18.848,
+        "avg_us": 2.356
+      }
+    }
+  },
+  "cuda_api_rows": {
+    "off": {
+      "cudaGraphLaunch": {
+        "instances": 319,
+        "total_us": 1268719.308,
+        "avg_us": 3977.176514106583
+      },
+      "cudaLaunchKernel": {
+        "instances": 9450,
+        "total_us": 96565.238,
+        "avg_us": 10.218543703703704
+      },
+      "cudaMemcpyAsync": {
+        "instances": 3639,
+        "total_us": 31276.919,
+        "avg_us": 8.59492140697994
+      }
+    },
+    "scheduler": {
+      "cudaGraphLaunch": {
+        "instances": 319,
+        "total_us": 1178730.704,
+        "avg_us": 3695.080576802508
+      },
+      "cudaLaunchKernel": {
+        "instances": 17714,
+        "total_us": 249852.844,
+        "avg_us": 14.104823529411764
+      },
+      "cudaMemcpyAsync": {
+        "instances": 4107,
+        "total_us": 33029.796,
+        "avg_us": 8.042317019722425
+      }
+    },
+    "fused": {
+      "cudaGraphLaunch": {
+        "instances": 319,
+        "total_us": 1101418.904,
+        "avg_us": 3452.723836990596
+      },
+      "cudaLaunchKernel": {
+        "instances": 13456,
+        "total_us": 157058.985,
+        "avg_us": 11.672041096908442
+      },
+      "cudaMemcpyAsync": {
+        "instances": 4672,
+        "total_us": 32699.14,
+        "avg_us": 6.998959760273972
+      }
+    }
+  },
+  "total_kernel_instances": {
+    "off": 1076827,
+    "scheduler": 1085091,
+    "fused": 1081130
+  },
+  "derived": {
+    "graph_launches": 319,
+    "begin_status_instances": 319,
+    "completed_status_instances": 312,
+    "protected_topk_instances_per_status_step": 21.0,
+    "protected_topk_increment_us_per_status_step": 47.20455448717945,
+    "local_status_us_per_status_step": 2.6273971344747205,
+    "status_collective_us_per_status_step": 19.607615384615382,
+    "attributed_fused_increment_us_per_status_step": 69.43956700626956,
+    "scheduler_extra_gpu_kernels_per_status_step": 12.695512820512821
+  }
+}

@@ -249,9 +249,8 @@ def test_topk_transform_ragged_kernel(
     )
 
 
-def _make_kv_protection_case(seq_len: int):
+def _make_kv_protection_case(seq_len: int, page_size: int = 64):
     batch_size = 2
-    page_size = 64
     pages_per_request = (seq_len + page_size - 1) // page_size
     logical_positions = torch.arange(seq_len, device="cuda", dtype=torch.int32)
     logical_pages = logical_positions // page_size
@@ -304,11 +303,99 @@ def _make_kv_protection_case(seq_len: int):
     return score, lengths, src_page_table, cu_seqlens_q, protection
 
 
-@pytest.mark.parametrize("seq_len", [2048, 4096])
 @torch.inference_mode()
-def test_topk_transform_kv_protection_valid(seq_len: int) -> None:
+def test_kv_protection_status_orchestration() -> None:
+    from sglang.srt.mem_cache.kv_page_tags import (
+        KV_PAGE_INVALID_MAPPING,
+        KV_PAGE_VALIDATION_INCOMPLETE,
+        KVAttentionTagTable,
+    )
+
+    table = KVAttentionTagTable(1, device="cuda", num_request_slots=4)
+    table.request_epochs.copy_(
+        torch.tensor([0, 4, 9, 12], device="cuda", dtype=torch.int32)
+    )
+    table.validated_epochs.copy_(
+        torch.tensor([-1, 5, 9, 12], device="cuda", dtype=torch.int32)
+    )
+    table.validation_status.copy_(
+        torch.tensor([99, 8, 16, 32], device="cuda", dtype=torch.int32)
+    )
+    request_indices = torch.tensor([-1, 0, 1, 3, 4], device="cuda", dtype=torch.int64)
+
+    table.begin_fused_forward(request_indices)
+    assert table.request_epochs.tolist() == [0, 5, 9, 13]
+    assert table.validation_status.tolist() == [0, 0, 16, 0]
+
+    # Request 1 completed this epoch with a fault; request 3 did not publish.
+    table.validation_status[1] = 8
+    statuses, failed = table.fused_failure_status(request_indices, return_failed=True)
+    assert statuses.tolist() == [
+        KV_PAGE_INVALID_MAPPING,
+        0,
+        8,
+        KV_PAGE_VALIDATION_INCOMPLETE,
+        KV_PAGE_INVALID_MAPPING,
+    ]
+    assert failed.tolist() == [1, 0, 1, 1, 1]
+
+
+@torch.inference_mode()
+def test_kv_protection_status_orchestration_cuda_graph() -> None:
+    request_indices = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int64)
+    request_epochs = torch.zeros(3, device="cuda", dtype=torch.int32)
+    validated_epochs = torch.full((3,), -1, device="cuda", dtype=torch.int32)
+    status = torch.full((3,), 7, device="cuda", dtype=torch.int32)
+    failure_status = torch.empty(3, device="cuda", dtype=torch.int32)
+    failed = torch.empty_like(failure_status)
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        torch.ops.sgl_kernel.kv_page_protection_begin_forward(
+            request_indices, request_epochs, status
+        )
+        torch.ops.sgl_kernel.kv_page_protection_failure_status(
+            request_indices,
+            request_epochs,
+            validated_epochs,
+            status,
+            failure_status,
+            failed,
+        )
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    request_epochs.zero_()
+    validated_epochs.fill_(-1)
+    status.fill_(7)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        torch.ops.sgl_kernel.kv_page_protection_begin_forward(
+            request_indices, request_epochs, status
+        )
+        torch.ops.sgl_kernel.kv_page_protection_failure_status(
+            request_indices,
+            request_epochs,
+            validated_epochs,
+            status,
+            failure_status,
+            failed,
+        )
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert request_epochs.tolist() == [0, 1, 1]
+    assert status.tolist() == [0, 0, 0]
+    assert failure_status.tolist() == [0, 1 << 30, 1 << 30]
+    assert failed.tolist() == [0, 1, 1]
+
+
+@pytest.mark.parametrize("seq_len", [2048, 4096])
+@pytest.mark.parametrize("page_size", [32, 64])
+@torch.inference_mode()
+def test_topk_transform_kv_protection_valid(seq_len: int, page_size: int) -> None:
     score, lengths, src_page_table, cu_seqlens_q, protection = _make_kv_protection_case(
-        seq_len
+        seq_len, page_size=page_size
     )
     expected = _ref_torch_transform_decode_impl(score, seq_len, src_page_table, 2048)
     actual = fast_topk_transform_fused(
@@ -328,6 +415,62 @@ def test_topk_transform_kv_protection_valid(seq_len: int) -> None:
     assert protection["validated_epochs"].tolist() == [-1, 3, 5]
 
 
+@torch.inference_mode()
+def test_topk_transform_kv_protection_generic_page_size() -> None:
+    seq_len = 2048
+    score, lengths, src_page_table, cu_seqlens_q, protection = _make_kv_protection_case(
+        seq_len, page_size=32
+    )
+    expected = _ref_torch_transform_decode_impl(score, seq_len, src_page_table, 2048)
+    actual = fast_topk_transform_fused(
+        score,
+        lengths,
+        src_page_table,
+        cu_seqlens_q,
+        2048,
+        kv_page_protection=protection,
+    )
+
+    torch.testing.assert_close(
+        torch.sort(actual, dim=-1).values,
+        torch.sort(expected, dim=-1).values,
+    )
+    assert protection["status"].tolist() == [0, 0, 0]
+    assert protection["validated_epochs"].tolist() == [-1, 3, 5]
+
+
+@torch.inference_mode()
+def test_topk_transform_kv_protection_revalidates_after_epoch_publication() -> None:
+    seq_len = 2048
+    score, lengths, src_page_table, cu_seqlens_q, protection = _make_kv_protection_case(
+        seq_len
+    )
+    fast_topk_transform_fused(
+        score,
+        lengths,
+        src_page_table,
+        cu_seqlens_q,
+        2048,
+        kv_page_protection=protection,
+    )
+    assert protection["validated_epochs"].tolist() == [-1, 3, 5]
+
+    physical_page = int(src_page_table[0, 0].item()) // protection["page_size"]
+    protection["owner_request_indices"][physical_page] = 2
+    actual = fast_topk_transform_fused(
+        score,
+        lengths,
+        src_page_table,
+        cu_seqlens_q,
+        2048,
+        kv_page_protection=protection,
+    )
+
+    assert protection["status"][1].item() == 0x02
+    assert protection["validated_epochs"].tolist() == [-1, 3, 5]
+    assert torch.any(actual[0] == 0)
+
+
 @pytest.mark.parametrize(
     ("fault", "expected_status"),
     [
@@ -343,15 +486,15 @@ def test_topk_transform_kv_protection_valid(seq_len: int) -> None:
     ],
 )
 @pytest.mark.parametrize("seq_len", [2048, 4096])
+@pytest.mark.parametrize("page_size", [32, 64])
 @torch.inference_mode()
 def test_topk_transform_kv_protection_faults(
-    fault: str, expected_status: int, seq_len: int
+    fault: str, expected_status: int, seq_len: int, page_size: int
 ) -> None:
     score, lengths, src_page_table, cu_seqlens_q, protection = _make_kv_protection_case(
-        seq_len
+        seq_len, page_size=page_size
     )
     logical_position = seq_len - 2
-    page_size = protection["page_size"]
     physical_page = int(src_page_table[0, logical_position].item()) // page_size
 
     if fault == "zero_slot":

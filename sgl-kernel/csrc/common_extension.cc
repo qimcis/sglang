@@ -89,6 +89,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
   m.impl("fast_topk", torch::kCUDA, &fast_topk_interface);
+  m.def("kv_page_protection_begin_forward(Tensor request_indices, Tensor(a!) request_epochs, Tensor(b!) status) -> ()");
+  m.impl("kv_page_protection_begin_forward", torch::kCUDA, &kv_page_protection_begin_forward);
+  m.def(
+      "kv_page_protection_failure_status(Tensor request_indices, Tensor request_epochs, Tensor validated_epochs, "
+      "Tensor status, Tensor(a!) failure_status, Tensor(b!) failed) -> ()");
+  m.impl("kv_page_protection_failure_status", torch::kCUDA, &kv_page_protection_failure_status);
   m.def(
       "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor(a!) dst_page_table, Tensor src_page_table, "
       "Tensor "
@@ -362,6 +368,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int num_lanes, int page_size, int max_num_pages, bool has_swa, bool is_capped, Tensor! accum, Tensor! out, "
       "Tensor! page_accum, Tensor! page_out) -> ()");
   m.impl("kv_checksum_direct_table_batched_with_pages", torch::kCUDA, &kv_checksum_direct_table_batched_with_pages);
+  m.def(
+      "kv_checksum_direct_table_batched_with_pages_compact(Tensor buffer_ptrs, Tensor row_strides, Tensor row_nbytes, "
+      "Tensor swa_buffer_flags, Tensor full_to_swa_index_mapping, Tensor req_to_token, "
+      "Tensor req_pool_indices, Tensor starts, Tensor lengths, Tensor logical_starts, Tensor page_output_offsets, "
+      "int max_num_tokens, int num_lanes, int page_size, int max_num_pages, bool has_swa, bool is_capped, "
+      "Tensor! accum, Tensor! out, Tensor! page_accum, Tensor! page_out) -> ()");
+  m.impl(
+      "kv_checksum_direct_table_batched_with_pages_compact",
+      torch::kCUDA,
+      &kv_checksum_direct_table_batched_with_pages_compact);
   m.def(
       "kv_page_history_record(Tensor page_ids, int operation, Tensor generations, bool generations_by_page, "
       "int bootstrap_room, Tensor page_positions, int page_position, Tensor values, int value, "

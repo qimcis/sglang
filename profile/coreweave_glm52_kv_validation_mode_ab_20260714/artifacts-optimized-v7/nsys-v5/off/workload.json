@@ -1,0 +1,43 @@
+{
+  "config": {
+    "input_tokens": 8172,
+    "max_output_tokens": 1000,
+    "max_concurrency": 1,
+    "duration_secs": 30,
+    "drain_timeout_secs": 900,
+    "model": "@cf/staging/glm-5.2-kv-exact-h200"
+  },
+  "iterations": [
+    {
+      "concurrency": 1,
+      "completed": 1,
+      "failed": 0,
+      "measurement_secs": 30.000953949,
+      "drain_secs": 57.918536037,
+      "drain_timed_out": false,
+      "total_completion_tokens": 1000,
+      "total_throughput_tps": 11.374042321665385,
+      "per_request_tps": {
+        "avg": 12.999582054311247,
+        "p50": 12.999582054311247,
+        "p90": 12.999582054311247,
+        "p95": 12.999582054311247,
+        "p99": 12.999582054311247
+      },
+      "ttft_ms": {
+        "avg": 0.038868999999999994,
+        "p50": 0.038868999999999994,
+        "p90": 0.038868999999999994,
+        "p95": 0.038868999999999994,
+        "p99": 0.038868999999999994
+      },
+      "total_duration_ms": {
+        "avg": 87919.382993,
+        "p50": 87919.382993,
+        "p90": 87919.382993,
+        "p95": 87919.382993,
+        "p99": 87919.382993
+      }
+    }
+  ]
+}

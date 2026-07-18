@@ -1,0 +1,37 @@
+# Keep transfer checksum and the prefill environment identical across all arms.
+# Mode overlays only change decode.env, so the prefill pod remains stable after
+# the initial wheel/checksum rollout.
+model:
+  servedName: "@cf/staging/glm-5.2-kv-exact-h200"
+
+inferenceServer:
+  env:
+    - name: FLASHINFER_DISABLE_VERSION_CHECK
+      value: "1"
+    - name: MC_ENABLE_DEST_DEVICE_AFFINITY
+      value: "1"
+    - name: MC_MAX_EP_PER_CTX
+      value: "512"
+    - name: SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK
+      value: "1"
+    - name: SGLANG_WARMUP_TIMEOUT
+      value: "3600"
+    - name: SGLANG_DISAGGREGATION_WAITING_TIMEOUT
+      value: "900"
+    - name: SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT
+      value: "900"
+    - name: SGLANG_KV_PAGE_HISTORY
+      value: "0"
+    - name: SGLANG_KV_TRANSFER_CHECKSUM
+      value: "1"
+    - name: SGLANG_ENABLE_LEGACY_KV_PROTECTION_COMPLETION
+      value: "0"
+    - name: SGLANG_TEST_KV_FAULT
+      value: none
+
+prefill:
+  env:
+    - name: SGLANG_KV_PAGE_PROTECTION
+      value: "1"
+    - name: SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION
+      value: "0"

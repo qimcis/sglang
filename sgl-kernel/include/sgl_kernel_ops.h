@@ -143,6 +143,15 @@ void fast_topk_interface(
     at::Tensor& indices,
     const at::Tensor& lengths,
     std::optional<at::Tensor> row_starts_opt = std::nullopt);
+void kv_page_protection_begin_forward(
+    const at::Tensor& request_indices, at::Tensor& request_epochs, at::Tensor& status);
+void kv_page_protection_failure_status(
+    const at::Tensor& request_indices,
+    const at::Tensor& request_epochs,
+    const at::Tensor& validated_epochs,
+    const at::Tensor& status,
+    at::Tensor& failure_status,
+    at::Tensor& failed);
 void fast_topk_transform_interface(
     const at::Tensor& score,
     const at::Tensor& lengths,
@@ -681,6 +690,30 @@ void kv_checksum_direct_table_batched_with_pages(
     const at::Tensor& starts,
     const at::Tensor& lengths,
     const at::Tensor& logical_starts,
+    int64_t max_num_tokens,
+    int64_t num_lanes,
+    int64_t page_size,
+    int64_t max_num_pages,
+    bool has_swa,
+    bool is_capped,
+    at::Tensor& accum,
+    at::Tensor& out,
+    at::Tensor& page_accum,
+    at::Tensor& page_out);
+
+// Compact variant writes each request's valid pages at caller-provided prefix offsets.
+void kv_checksum_direct_table_batched_with_pages_compact(
+    const at::Tensor& buffer_ptrs,
+    const at::Tensor& row_strides,
+    const at::Tensor& row_nbytes,
+    const at::Tensor& swa_buffer_flags,
+    const at::Tensor& full_to_swa_index_mapping,
+    const at::Tensor& req_to_token,
+    const at::Tensor& req_pool_indices,
+    const at::Tensor& starts,
+    const at::Tensor& lengths,
+    const at::Tensor& logical_starts,
+    const at::Tensor& page_output_offsets,
     int64_t max_num_tokens,
     int64_t num_lanes,
     int64_t page_size,

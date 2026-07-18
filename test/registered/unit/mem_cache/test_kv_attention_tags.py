@@ -201,6 +201,11 @@ class TestAttentionTagTable(CustomTestCase):
         table.validated_epochs[2] = table.request_epochs[2]
         table.validation_status[2] = 8
         self.assertEqual(table.fused_failure_status(request_indices).tolist(), [0, 8])
+        statuses, failed = table.fused_failure_status(
+            request_indices, return_failed=True
+        )
+        self.assertEqual(statuses.tolist(), [0, 8])
+        self.assertEqual(failed.tolist(), [0, 1])
 
     def test_begin_fused_forward_clears_stale_status(self):
         table = KVAttentionTagTable(num_pages=16, num_request_slots=3, device="cpu")
