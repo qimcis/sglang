@@ -524,8 +524,7 @@ def assert_protection_supported(
             or (device_capability_major is not None and device_capability_major != 9)
         ):
             raise RuntimeError(
-                "Producer-fused DSA KV page protection requires an NVIDIA "
-                "Hopper SM90 GPU. Set "
+                "Fused KV page protection requires an NVIDIA Hopper SM90 GPU. Set "
                 "SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION=1 to use scheduler "
                 "validation, or disable SGLANG_KV_PAGE_PROTECTION."
             )

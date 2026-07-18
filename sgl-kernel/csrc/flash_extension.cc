@@ -59,7 +59,27 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    int      sm_margin,"
       "    Tensor?  sinks,"
       "    Tensor?  sparse_mask_fine,"  // [total_q, max_k_blocks, num_int32_per_block]
-      "    bool     only_qv"
+      "    bool     only_qv,"
+      "    Tensor?  protection_request_indices,"
+      "    Tensor?  protection_seqlens,"
+      "    Tensor?  protection_page_table,"
+      "    Tensor?  protection_page_table_2,"
+      "    int      protection_page_table_page_offset,"
+      "    int      protection_page_table_2_page_offset,"
+      "    int      protection_page_table_2_window_size,"
+      "    int      protection_page_size,"
+      "    bool     protection_validate_full_mapping,"
+      "    Tensor?  protection_actual_tags,"
+      "    Tensor?  protection_actual_generations,"
+      "    Tensor?  protection_actual_transfer_tags,"
+      "    Tensor?  protection_owner_request_indices,"
+      "    Tensor?  protection_owner_page_positions,"
+      "    Tensor?  protection_expected_tags,"
+      "    Tensor?  protection_expected_generations,"
+      "    Tensor?  protection_expected_transfer_tags,"
+      "    Tensor?  protection_request_epochs,"
+      "    Tensor(b!)? protection_validated_epochs,"
+      "    Tensor(c!)? protection_status"
       ") -> (Tensor(a!), Tensor, Tensor, Tensor)");  // first return aliases out
 
   m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));

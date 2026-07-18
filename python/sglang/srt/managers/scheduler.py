@@ -3700,11 +3700,11 @@ class Scheduler(
                 mismatch = KVProtectionBookkeepingError(
                     rid=req.rid,
                     bootstrap_room=req.bootstrap_room,
-                    cause="producer_fused_dsa_topk_validation",
+                    cause="fused_kv_page_validation",
                     detail=f"status=0x{status:08x}",
                 )
                 attach_kv_protection_incident(
-                    mismatch, kind="attention_tag", phase="producer_fused_dsa_topk"
+                    mismatch, kind="attention_tag", phase="fused_kv_page_validation"
                 )
                 req_mismatches = [mismatch]
 
