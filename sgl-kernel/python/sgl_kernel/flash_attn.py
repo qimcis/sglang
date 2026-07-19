@@ -70,6 +70,7 @@ def flash_attn_with_kvcache(
     aux_tensors=None,
     ver=3,
     out=None,
+    kv_page_protection=None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -226,6 +227,7 @@ def flash_attn_with_kvcache(
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     rotary_seqlens = maybe_contiguous(rotary_seqlens)
     attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
+    protection = kv_page_protection or {}
 
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
@@ -265,6 +267,26 @@ def flash_attn_with_kvcache(
         sinks,
         None,  # sparse_mask_fine
         only_qv,
+        protection.get("request_indices"),
+        protection.get("seqlens"),
+        protection.get("page_table"),
+        protection.get("page_table_2"),
+        protection.get("page_table_page_offset", 0),
+        protection.get("page_table_2_page_offset", 0),
+        protection.get("page_table_2_window_size", 0),
+        protection.get("page_size", 0),
+        protection.get("validate_full_mapping", False),
+        protection.get("actual_tags"),
+        protection.get("actual_generations"),
+        protection.get("actual_transfer_tags"),
+        protection.get("owner_request_indices"),
+        protection.get("owner_page_positions"),
+        protection.get("expected_tags"),
+        protection.get("expected_generations"),
+        protection.get("expected_transfer_tags"),
+        protection.get("request_epochs"),
+        protection.get("validated_epochs"),
+        protection.get("status"),
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out
@@ -356,6 +378,26 @@ def flash_attn_varlen_func(
         sinks=sinks,
         sparse_mask_fine=None,
         only_qv=only_qv,
+        protection_request_indices=None,
+        protection_seqlens=None,
+        protection_page_table=None,
+        protection_page_table_2=None,
+        protection_page_table_page_offset=0,
+        protection_page_table_2_page_offset=0,
+        protection_page_table_2_window_size=0,
+        protection_page_size=0,
+        protection_validate_full_mapping=False,
+        protection_actual_tags=None,
+        protection_actual_generations=None,
+        protection_actual_transfer_tags=None,
+        protection_owner_request_indices=None,
+        protection_owner_page_positions=None,
+        protection_expected_tags=None,
+        protection_expected_generations=None,
+        protection_expected_transfer_tags=None,
+        protection_request_epochs=None,
+        protection_validated_epochs=None,
+        protection_status=None,
     )
 
     return (out, softmax_lse, *rest) if return_softmax_lse else out

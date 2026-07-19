@@ -43,6 +43,7 @@ def flash_attn_with_kvcache(
     aux_tensors=None,
     ver=3,
     out=None,
+    kv_page_protection=None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -168,8 +169,11 @@ def flash_attn_with_kvcache(
             return_softmax_lse=return_softmax_lse,
             sinks=sinks,
             out=out,
+            kv_page_protection=kv_page_protection,
         )
     elif ver == 4:
+        if kv_page_protection is not None:
+            raise RuntimeError("KV page protection is supported only by FA3")
         from .flash_attention_v4 import (
             flash_attn_with_kvcache as fa4_flash_attn_with_kvcache,
         )

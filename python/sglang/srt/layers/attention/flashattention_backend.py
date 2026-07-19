@@ -20,6 +20,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
     cp_attn_forward_extend,
 )
+from sglang.srt.mem_cache.kv_page_tags import should_use_fused_kv_page_protection
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -72,6 +73,7 @@ class FlashAttentionMetadata:
     swa_out_cache_loc: torch.Tensor = None
     # Precomputed FA3 scheduler metadata (avoids per-layer prepare_varlen_num_blocks)
     scheduler_metadata: torch.Tensor = None
+    kv_page_protection: Optional[dict] = None
 
     # Encoder metadata
     # Cumulative sequence lengths for encoder key
@@ -144,6 +146,15 @@ class FlashAttentionBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.kv_attention_tag_table = getattr(
+            model_runner, "kv_attention_tag_table", None
+        )
+        allocator = model_runner.token_to_kv_pool_allocator
+        self.kv_page_protection_swa_offset = (
+            int(allocator.attention_tag_swa_page_offset())
+            if hasattr(allocator, "attention_tag_swa_page_offset")
+            else 0
+        )
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.page_size = model_runner.page_size
@@ -250,6 +261,41 @@ class FlashAttentionBackend(AttentionBackend):
         # unset uses the existing per-layer metadata path.
         self._disable_scheduler_metadata_precompute = bool(
             getattr(server_args, "enable_dp_attention", False)
+        )
+        self.kv_fused_page_protection_enabled = should_use_fused_kv_page_protection(
+            self.kv_attention_tag_table,
+            supported=(
+                self.fa_impl_ver == 3
+                and getattr(self, "attention_chunk_size", None) is None
+            ),
+        )
+        if self.kv_fused_page_protection_enabled:
+            model_runner.kv_fused_page_protection_enabled = True
+
+    def _set_kv_page_protection(
+        self,
+        metadata: FlashAttentionMetadata,
+        request_indices: torch.Tensor,
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ) -> None:
+        table = self.kv_attention_tag_table
+        if (
+            not self.kv_fused_page_protection_enabled
+            or not forward_mode.is_decode_or_idle()
+            or spec_info is not None
+            or metadata.page_table is None
+        ):
+            metadata.kv_page_protection = None
+            return
+        metadata.kv_page_protection = table.fused_forward_args(
+            request_indices=request_indices,
+            seqlens=metadata.cache_seqlens_int32,
+            page_table=metadata.page_table,
+            page_size=self.page_size,
+            page_table_2=metadata.swa_page_table,
+            page_table_2_page_offset=self.kv_page_protection_swa_offset,
+            page_table_2_window_size=int(self.sliding_window_size or 0),
         )
 
     def _compute_scheduler_metadata(
@@ -768,6 +814,12 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 self.forward_metadata_spec_decode_expand.page_table = expand_page_table
 
+        self._set_kv_page_protection(
+            metadata,
+            forward_batch.req_pool_indices[:batch_size],
+            forward_batch.forward_mode,
+            forward_batch.spec_info,
+        )
         self.forward_metadata = metadata
 
     def forward_extend(
@@ -1486,6 +1538,7 @@ class FlashAttentionBackend(AttentionBackend):
                     out=_fa_out,
                     ver=self.fa_impl_ver,
                     scheduler_metadata=sched_meta,
+                    kv_page_protection=metadata.kv_page_protection,
                     **kwargs,
                 )
                 if use_cascade_attn:
@@ -1563,6 +1616,7 @@ class FlashAttentionBackend(AttentionBackend):
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
                 num_splits=self.num_splits,
+                kv_page_protection=metadata.kv_page_protection,
                 ver=self.fa_impl_ver,
             )
             if use_cascade_attn:
@@ -2497,6 +2551,12 @@ class FlashAttentionBackend(AttentionBackend):
                 self.req_to_token[text_row, text_col]
             )
 
+        self._set_kv_page_protection(
+            metadata,
+            req_pool_indices,
+            forward_mode,
+            spec_info,
+        )
         self.forward_metadata = metadata
         self.forward_metadata_spec_decode_expand = metadata_expand
 
