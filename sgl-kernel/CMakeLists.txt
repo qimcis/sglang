@@ -279,6 +279,7 @@ set(SOURCES
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
     "csrc/kvcacheio/transfer.cu"
+    "csrc/kvcacheio/checksum.cu"
     "csrc/mamba/causal_conv1d.cu"
     "csrc/memory/weak_ref_tensor.cpp"
 

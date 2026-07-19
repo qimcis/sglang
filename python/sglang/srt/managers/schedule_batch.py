@@ -738,6 +738,7 @@ class Req(ReqDllmMixin):
         self.kv_allocated_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.kv_fused_protection_deferred_release = False
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
@@ -1465,6 +1466,7 @@ class Req(ReqDllmMixin):
         self.kv_committed_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.kv_fused_protection_deferred_release = False
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
@@ -2820,6 +2822,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             reqs=self.reqs[:],
             req_to_token_pool=self.req_to_token_pool,
             req_pool_indices=self.req_pool_indices,
+            req_pool_indices_cpu=self.req_pool_indices_cpu,
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,

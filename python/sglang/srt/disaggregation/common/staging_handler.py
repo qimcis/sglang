@@ -333,6 +333,9 @@ class DecodeStagingHandler:
             else:
                 page_idx_tensor = kv_indices
 
+            if not self._verify_staging_destination_pages(decode_req, page_idx_tensor):
+                return False
+
             scatter_staging_to_kv(
                 staging_view,
                 k_buffers,
@@ -345,6 +348,52 @@ class DecodeStagingHandler:
                 self.total_kv_heads,
             )
 
+        return True
+
+    def _verify_staging_destination_pages(
+        self, decode_req: DecodeRequest, page_idx_tensor: torch.Tensor
+    ) -> bool:
+        manager = getattr(self.scheduler, "kv_protection_manager", None)
+        table = getattr(manager, "table", None)
+        expected_pages = getattr(decode_req, "transfer_pinned_page_ids", ())
+        expected_generations = getattr(
+            decode_req, "transfer_pinned_page_generations", ()
+        )
+        if table is None or not expected_pages or not expected_generations:
+            return True
+
+        expected_by_page = {
+            int(page): int(generation)
+            for page, generation in zip(
+                expected_pages, expected_generations, strict=False
+            )
+        }
+        page_ids = page_idx_tensor.to(device=table.device, dtype=torch.long).reshape(-1)
+        actual_generations = table.generation_of(page_ids).detach().cpu().tolist()
+        actual_pages = page_ids.detach().cpu().tolist()
+        for i, (page, actual_generation) in enumerate(
+            zip(actual_pages, actual_generations, strict=True)
+        ):
+            expected_generation = expected_by_page.get(int(page))
+            if expected_generation == int(actual_generation):
+                continue
+            message = (
+                "KV staging destination page changed before scatter "
+                f"(rid={decode_req.req.rid}, bootstrap_room={decode_req.req.bootstrap_room}, "
+                f"logical_page_offset={i}, page_id={int(page)}, "
+                f"expected_generation={expected_generation}, "
+                f"actual_generation={int(actual_generation)})"
+            )
+            logger.error(message)
+            try:
+                decode_req.kv_receiver.abort()
+                decode_req.kv_receiver.kv_mgr.record_failure(
+                    decode_req.kv_receiver.bootstrap_room,
+                    message,
+                )
+            except Exception:
+                logger.exception("Failed to abort receiver after stale staging page")
+            return False
         return True
 
     def _submit_last_scatter(self, decode_req: DecodeRequest) -> int:

@@ -49,6 +49,7 @@ def fast_topk_transform_fused(
     cu_seqlens_q: torch.Tensor,
     topk: int,
     row_starts: Optional[torch.Tensor] = None,
+    kv_page_protection: Optional[dict] = None,
 ) -> torch.Tensor:
     """
     Get the topk indices of the score tensor and then transform the topk indices
@@ -65,6 +66,8 @@ def fast_topk_transform_fused(
             For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i]]
             of the score tensor. It's only used for cases where the key is
             ragged, i.e. during extend and draft extend.
+        kv_page_protection: Optional DSA selected-slot protection sidecars. This
+            is supported only for paged decode.
     Returns:
         The topk indices tensor of shape (B, topk)
     """
@@ -74,8 +77,34 @@ def fast_topk_transform_fused(
     assert score.dim() == 2
     src_page_table = page_table_size_1
     dst_page_table = score.new_empty((score.shape[0], topk), dtype=torch.int32)
+    protection_args = (
+        (None, 0, 0) + (None,) * 11
+        if kv_page_protection is None
+        else (
+            kv_page_protection["request_indices"],
+            kv_page_protection["page_size"],
+            kv_page_protection["page_table_page_offset"],
+            kv_page_protection["actual_tags"],
+            kv_page_protection["actual_generations"],
+            kv_page_protection["actual_transfer_tags"],
+            kv_page_protection["owner_request_indices"],
+            kv_page_protection["owner_page_positions"],
+            kv_page_protection["expected_tags"],
+            kv_page_protection["expected_generations"],
+            kv_page_protection["expected_transfer_tags"],
+            kv_page_protection["request_epochs"],
+            kv_page_protection["validated_epochs"],
+            kv_page_protection["status"],
+        )
+    )
     torch.ops.sgl_kernel.fast_topk_transform_fused(
-        score, lengths, dst_page_table, src_page_table, cu_seqlens_q, row_starts
+        score,
+        lengths,
+        dst_page_table,
+        src_page_table,
+        cu_seqlens_q,
+        row_starts,
+        *protection_args,
     )
     return dst_page_table
 
