@@ -1,0 +1,33 @@
+python/sglang/jit_kernel/flash_attention.py
+  s_5f73f26aee7f01::t_8d18bc66b56d30 46,172,175-176
+python/sglang/jit_kernel/flash_attention_v3.py
+  s_5f73f26aee7f01::t_72729718e028ef 34,136,150,186
+python/sglang/srt/layers/attention/flashattention_backend.py
+  s_5f73f26aee7f01::t_c5912f9359fce7 23,76,149-157,265-299,817-822,1541,1619,2554-2559
+sgl-kernel/CMakeLists.txt
+  s_5f73f26aee7f01::t_b9bba85d788138 180-223
+sgl-kernel/csrc/flash_extension.cc
+  s_5f73f26aee7f01::t_feb9aff43f7ac0 62-82
+sgl-kernel/include/sgl_flash_kernel_ops.h
+  s_5f73f26aee7f01::t_d7caf6fbd7a614 87-107
+sgl-kernel/python/sgl_kernel/flash_attn.py
+  s_5f73f26aee7f01::t_d98c465f714fca 73,230,270-289,381-400
+sgl-kernel/sgl-attn-kv-page-protection.patch
+  s_5f73f26aee7f01::t_d9e0b691a0c198 1-574
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "934da48deff830a4d6f4b69c55a4ca16d8ca0a96",
+  "prompts": {},
+  "sessions": {
+    "s_5f73f26aee7f01": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_099a8b759ffeqnA7QziBATTLQD",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
