@@ -331,12 +331,59 @@ class RankZeroFilter(logging.Filter):
 
 
 @dataclass
+class FusedKVPageProtectionCheck:
+    request_pool_indices: torch.Tensor
+    statuses: torch.Tensor
+    failed: torch.Tensor
+    work: Optional[Any] = None
+
+    def wait(self) -> None:
+        if self.work is not None:
+            self.work.wait()
+            self.work = None
+
+    def copy_to_cpu(self) -> None:
+        self.wait()
+        self.request_pool_indices = self.request_pool_indices.to(
+            "cpu", non_blocking=True
+        )
+        self.statuses = self.statuses.to("cpu", non_blocking=True)
+        self.failed = self.failed.to("cpu", non_blocking=True)
+
+    def materialize_error(self):
+        self.wait()
+        if not bool(self.failed.any().item()):
+            return None
+
+        from sglang.srt.mem_cache.kv_page_tags import (
+            KV_PAGE_VALIDATION_REMOTE_FAILURE,
+            KVFusedProtectionError,
+        )
+
+        remote_failure = self.failed.bool() & self.statuses.eq(0)
+        statuses = self.statuses | (
+            remote_failure.to(torch.int32) * KV_PAGE_VALIDATION_REMOTE_FAILURE
+        )
+        bad_batch_indices = self.failed.nonzero(as_tuple=False).flatten()
+        bad_request_indices = self.request_pool_indices.index_select(
+            0, bad_batch_indices.to(self.request_pool_indices.device)
+        )
+        bad_statuses = statuses.index_select(0, bad_batch_indices)
+        return KVFusedProtectionError(
+            batch_indices=bad_batch_indices.cpu().tolist(),
+            request_pool_indices=bad_request_indices.cpu().tolist(),
+            statuses=bad_statuses.cpu().tolist(),
+        )
+
+
+@dataclass
 class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
     can_run_graph: bool
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
+    fused_kv_page_protection_check: Optional[FusedKVPageProtectionCheck] = None
 
 
 class ModelRunner(ModelRunnerKVCacheMixin):
@@ -2498,6 +2545,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self,
         next_token_ids: torch.Tensor,
         forward_batch: ForwardBatch,
+        failed: Optional[torch.Tensor] = None,
     ):
         """Update the ngram embedding token table after sampling."""
         ngram_embedding_info = forward_batch.ngram_embedding_info
@@ -2507,10 +2555,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.seq_lens
         )
         ngram_embedding_info.out_req_lens[: forward_batch.batch_size] = 1
+        row_indices = forward_batch.req_pool_indices
+        if failed is not None:
+            row_indices = torch.where(
+                failed.bool(), torch.zeros_like(row_indices), row_indices
+            )
         update_token_table_decode(
             ne_token_table=ngram_embedding_info.token_table,
             tokens=next_token_ids.to(torch.int32),
-            row_indices=forward_batch.req_pool_indices,
+            row_indices=row_indices,
             column_starts=ngram_embedding_info.out_column_starts,
         )
 
@@ -2906,6 +2959,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         self.forward_pass_id += 1
 
+        table = getattr(self, "kv_attention_tag_table", None)
+        if (
+            table is not None
+            and getattr(self, "kv_fused_page_protection_enabled", False)
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.spec_info is None
+        ):
+            table.begin_fused_forward(
+                forward_batch.req_pool_indices[: forward_batch.batch_size]
+            )
+
         # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = (
@@ -2951,6 +3015,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     split_forward_count,
                 )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
+        output.fused_kv_page_protection_check = (
+            self._start_fused_kv_page_protection_check(forward_batch, table)
+        )
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
         if (experts_capturer := get_global_experts_capturer()) is not None:
@@ -2983,6 +3050,46 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.maybe_recover_ep_ranks()
 
         return output
+
+    def _start_fused_kv_page_protection_check(
+        self, forward_batch: ForwardBatch, table
+    ) -> Optional[FusedKVPageProtectionCheck]:
+        if (
+            table is None
+            or not getattr(self, "kv_fused_page_protection_enabled", False)
+            or not forward_batch.forward_mode.is_decode()
+            or forward_batch.spec_info is not None
+            or forward_batch.batch_size == 0
+        ):
+            return None
+
+        request_pool_indices = forward_batch.req_pool_indices[
+            : forward_batch.batch_size
+        ]
+        status_result = table.fused_failure_status(
+            request_pool_indices, return_failed=True
+        )
+        if isinstance(status_result, tuple):
+            statuses, failed = status_result
+        else:
+            # Retain compatibility with lightweight test doubles and downstream
+            # tables while the shipped CUDA table emits both tensors in one op.
+            statuses = status_result
+            failed = statuses.ne(0).to(torch.int32)
+        work = None
+        if self.tp_size > 1:
+            work = dist.all_reduce(
+                failed,
+                op=dist.ReduceOp.MAX,
+                group=self.tp_group.device_group,
+                async_op=True,
+            )
+        return FusedKVPageProtectionCheck(
+            request_pool_indices=request_pool_indices,
+            statuses=statuses,
+            failed=failed,
+            work=work,
+        )
 
     def _forward_raw(
         self,
@@ -3095,6 +3202,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self,
         logits_output: LogitsProcessorOutput,
         forward_batch: ForwardBatch,
+        fused_kv_page_protection_check: Optional[FusedKVPageProtectionCheck] = None,
     ) -> torch.Tensor:
         """Sample and compute logprobs and update logits_output.
 
@@ -3105,23 +3213,40 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Returns:
             A list of next_token_ids
         """
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        try:
+            self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
-        # Sample the next tokens
-        next_token_ids = self.sampler(
-            logits_output,
-            forward_batch.sampling_info,
-            forward_batch.return_logprob,
-            forward_batch.top_logprobs_nums,
-            forward_batch.token_ids_logprobs,
-            # For prefill, we only use the position of the last token.
-            (
-                forward_batch.positions
-                if forward_batch.forward_mode.is_decode()
-                else forward_batch.seq_lens - 1
-            ),
+            # Sample the next tokens while the TP failure reduction is in flight.
+            next_token_ids = self.sampler(
+                logits_output,
+                forward_batch.sampling_info,
+                forward_batch.return_logprob,
+                forward_batch.top_logprobs_nums,
+                forward_batch.token_ids_logprobs,
+                # For prefill, we only use the position of the last token.
+                (
+                    forward_batch.positions
+                    if forward_batch.forward_mode.is_decode()
+                    else forward_batch.seq_lens - 1
+                ),
+            )
+        except BaseException:
+            if fused_kv_page_protection_check is not None:
+                fused_kv_page_protection_check.wait()
+            raise
+        failed = (
+            fused_kv_page_protection_check.failed
+            if fused_kv_page_protection_check is not None
+            else None
         )
-        self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
+        if (
+            getattr(forward_batch, "ngram_embedding_info", None) is not None
+            and failed is not None
+        ):
+            fused_kv_page_protection_check.wait()
+        self.maybe_update_ngram_token_table(
+            next_token_ids, forward_batch, failed=failed
+        )
         return next_token_ids
 
     def compute_logprobs_only(

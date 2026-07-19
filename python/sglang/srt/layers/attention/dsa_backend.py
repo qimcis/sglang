@@ -15,9 +15,6 @@ from typing import (
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
-from sglang.srt.runtime_context import get_parallel
-
-logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
@@ -49,8 +46,12 @@ from sglang.srt.layers.attention.utils import (
     mla_quantize_and_rope_for_fp8,
     seqlens_expand_triton,
 )
+from sglang.srt.mem_cache.kv_page_tags import should_use_fused_kv_page_protection
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip, is_sm100_supported
+
+logger = logging.getLogger(__name__)
 
 if is_cuda():
     import deep_gemm
@@ -179,6 +180,7 @@ class DSAMetadata:
     indexer_seq_lens: Optional[torch.Tensor] = None
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
+    kv_page_protection: Optional[dict] = None
 
 
 @torch.compile
@@ -324,6 +326,9 @@ class DeepseekSparseAttnBackend(
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.kv_attention_tag_table = getattr(
+            model_runner, "kv_attention_tag_table", None
+        )
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
@@ -335,6 +340,29 @@ class DeepseekSparseAttnBackend(
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
+        fused_protection_supported = (
+            self.dsa_decode_impl == "fa3"
+            and self.dsa_topk_backend.is_sgl_kernel()
+            and envs.SGLANG_DSA_FUSE_TOPK.get()
+            and self.hisparse_coordinator is None
+        )
+        fused_protection_requested = (
+            self.kv_attention_tag_table is not None
+            and not envs.SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION.get()
+        )
+        if fused_protection_requested and not fused_protection_supported:
+            raise RuntimeError(
+                "Fused DSA KV page protection requires FA3 decode and the SGL "
+                "fused top-k path without HiSparse. Set "
+                "SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION=1 to use scheduler "
+                "validation explicitly."
+            )
+        self.kv_fused_page_protection_enabled = should_use_fused_kv_page_protection(
+            self.kv_attention_tag_table,
+            supported=fused_protection_supported,
+        )
+        if self.kv_fused_page_protection_enabled:
+            model_runner.kv_fused_page_protection_enabled = True
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -597,6 +625,26 @@ class DeepseekSparseAttnBackend(
             0, max_seqlen_k, page_size, device=page_table.device, dtype=torch.int32
         )
         return page_table[:, strided_indices] // page_size
+
+    def _set_kv_page_protection(
+        self,
+        metadata: DSAMetadata,
+        request_indices: torch.Tensor,
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ) -> None:
+        table = self.kv_attention_tag_table
+        protection = (
+            table.fused_forward_args(
+                request_indices=request_indices,
+                page_size=self.real_page_size,
+            )
+            if self.kv_fused_page_protection_enabled
+            and forward_mode.is_decode_or_idle()
+            and spec_info is None
+            else None
+        )
+        object.__setattr__(metadata, "kv_page_protection", protection)
 
     def init_forward_metadata_out_graph(
         self,
@@ -892,6 +940,12 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
         )
+        self._set_kv_page_protection(
+            metadata,
+            forward_batch.req_pool_indices[:batch_size],
+            forward_batch.forward_mode,
+            forward_batch.spec_info,
+        )
         self.forward_metadata = metadata
 
     def _cal_indexer_k_start_end(
@@ -1155,6 +1209,12 @@ class DeepseekSparseAttnBackend(
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
         )
         self.decode_cuda_graph_metadata[bs] = metadata
+        self._set_kv_page_protection(
+            metadata,
+            req_pool_indices,
+            forward_mode,
+            spec_info,
+        )
         self.forward_metadata = metadata
 
     def _apply_cuda_graph_metadata(
@@ -1343,6 +1403,12 @@ class DeepseekSparseAttnBackend(
                 )
             )
 
+        self._set_kv_page_protection(
+            metadata,
+            req_pool_indices,
+            forward_mode,
+            spec_info,
+        )
         self.forward_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph_from_precomputed(
@@ -1900,6 +1966,8 @@ class DeepseekSparseAttnBackend(
         qk_rope_dim = k_rope_cache.shape[-1]
         k_rope_cache = k_rope_cache.view(-1, page_size, 1, qk_rope_dim)
         c_kv_cache = c_kv_cache.view(-1, page_size, 1, v_head_dim)
+        # Protected DSA mappings are validated and sanitized by top-k before
+        # this attention kernel consumes them.
         o = flash_attn_with_kvcache(
             q=q_rope,
             k_cache=k_rope_cache,

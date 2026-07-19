@@ -515,6 +515,7 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
+                fused_kv_page_protection_check=out.fused_kv_page_protection_check,
             )
 
             if is_verify:
@@ -529,7 +530,9 @@ class TpModelWorker(BaseTpWorker):
 
                 def sample_batch_func():
                     batch_result.next_token_ids = self.model_runner.sample(
-                        logits_output, forward_batch
+                        logits_output,
+                        forward_batch,
+                        out.fused_kv_page_protection_check,
                     )
                     return batch_result
 
@@ -539,7 +542,9 @@ class TpModelWorker(BaseTpWorker):
             if not forward_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
                 batch_result.next_token_ids = self.model_runner.sample(
-                    logits_output, forward_batch
+                    logits_output,
+                    forward_batch,
+                    out.fused_kv_page_protection_check,
                 )
             else:
                 # For prefill-only requests, create dummy token IDs on CPU

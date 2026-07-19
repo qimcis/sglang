@@ -38,8 +38,16 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("fast_topk", torch::kCUDA, &fast_topk_interface);
 
   m.def(
-      "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_page_table, Tensor src_page_table, Tensor "
-      "cu_seqlens_q, Tensor? row_starts) -> ()");
+      "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor(a!) dst_page_table, Tensor src_page_table, "
+      "Tensor "
+      "cu_seqlens_q, Tensor? row_starts, Tensor? protection_request_indices=None, int protection_page_size=0, int "
+      "protection_page_offset=0, Tensor? protection_actual_tags=None, Tensor? protection_actual_generations=None, "
+      "Tensor? protection_actual_transfer_tags=None, Tensor? protection_owner_request_indices=None, Tensor? "
+      "protection_owner_page_positions=None, Tensor? protection_expected_tags=None, Tensor? "
+      "protection_expected_generations=None, Tensor? protection_expected_transfer_tags=None, Tensor? "
+      "protection_request_epochs=None, Tensor(b!)? protection_validated_epochs=None, Tensor(c!)? "
+      "protection_status=None) -> "
+      "()");
   m.impl("fast_topk_transform_fused", torch::kCUDA, &fast_topk_transform_interface);
 
   m.def(

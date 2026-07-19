@@ -472,6 +472,7 @@ class TestNixlNodeFailure(CustomTestCase):
             4: KVPoll.Transferring,
             5: KVPoll.Success,
         }
+        mgr.request_status_lock = threading.Lock()
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.update_status = CommonKVManager.update_status.__get__(mgr, CommonKVManager)
@@ -501,10 +502,20 @@ class TestNixlNodeFailure(CustomTestCase):
     def test_late_failed_update_does_not_resurrect_cleared_room(self):
         mgr = object.__new__(CommonKVManager)
         mgr.request_status = {}
+        mgr.request_status_lock = threading.Lock()
 
         CommonKVManager.update_status(mgr, 9, KVPoll.Failed)
 
         self.assertNotIn(9, mgr.request_status)
+
+    def test_success_does_not_resurrect_failed_room(self):
+        mgr = object.__new__(CommonKVManager)
+        mgr.request_status = {9: KVPoll.Failed}
+        mgr.request_status_lock = threading.Lock()
+
+        CommonKVManager.update_status(mgr, 9, KVPoll.Success)
+
+        self.assertEqual(mgr.request_status[9], KVPoll.Failed)
 
 
 class TestNixlStaging(CustomTestCase):
