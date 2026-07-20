@@ -1069,13 +1069,14 @@ class ModelRunnerKVCacheMixin:
             KVProtectionConfig,
         )
 
+        disaggregation_mode = self.server_args.disaggregation_mode
         protection_config = KVProtectionConfig.from_env(
-            is_pd_decode=self.server_args.disaggregation_mode == "decode"
+            is_pd_decode=disaggregation_mode in ("prefill", "decode")
         )
         reserved_bytes = (
             KV_CHECKSUM_MAX_WORKSPACE_BYTES if protection_config.checksum_enabled else 0
         )
-        if protection_config.enable_attention_tags:
+        if disaggregation_mode == "decode" and protection_config.enable_attention_tags:
             protected_tokens = (
                 config.full_max_total_num_tokens or config.max_total_num_tokens
             ) + (config.swa_max_total_num_tokens or 0)

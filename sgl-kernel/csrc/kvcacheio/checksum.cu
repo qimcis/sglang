@@ -61,6 +61,7 @@ __device__ __forceinline__ uint32_t cksum_chunk32(uint64_t value, uint32_t seed_
 struct BufMeta {
   const char* base;
   int64_t stride;
+  int64_t nrows;
   int32_t nlanes;  // 8-byte lanes per row
   int32_t flags;
 };
@@ -75,6 +76,7 @@ __global__ void __launch_bounds__(BLOCK) kv_checksum_direct_table_batched_kernel
     const uint64_t* __restrict__ buffer_ptrs,
     const int64_t* __restrict__ row_strides,
     const int64_t* __restrict__ row_nbytes,
+    const int64_t* __restrict__ buffer_num_rows,
     const int64_t* __restrict__ swa_buffer_flags,
     const int64_t* __restrict__ full_to_swa_index_mapping,
     const bool has_swa,
@@ -123,6 +125,7 @@ __global__ void __launch_bounds__(BLOCK) kv_checksum_direct_table_batched_kernel
     const int64_t stride = row_strides[b];
     m.base = reinterpret_cast<const char*>(ptr);
     m.stride = stride;
+    m.nrows = buffer_num_rows[b];
     m.nlanes = static_cast<int32_t>(row_nbytes[b] >> 3);
     int32_t flags = (swa_buffer_flags[b] != 0) ? kFlagSwa : 0;
     if (((ptr | static_cast<uint64_t>(stride)) & 15u) == 0) flags |= kFlagVec16;
@@ -151,10 +154,6 @@ __global__ void __launch_bounds__(BLOCK) kv_checksum_direct_table_batched_kernel
       // Unmapped SWA rows are out of the sliding window; slot 0 is the reserved
       // dummy row and is consistently zero on both source and destination.
       if (swa_loc < 0) swa_loc = 0;
-      valid_loc = swa_loc < full_to_swa_mapping_size;
-    }
-    if (!valid_loc && lane == 0) {
-      atomicExch(reinterpret_cast<unsigned long long*>(out + req), ~0ULL);
     }
     if (valid_loc) {
       const uint32_t seed_pos = kCksumSeed ^ (static_cast<uint32_t>(position) * kPosMul);
@@ -174,6 +173,10 @@ __global__ void __launch_bounds__(BLOCK) kv_checksum_direct_table_batched_kernel
         }
         const BufMeta m = smeta[b];
         const int64_t loc = (m.flags & kFlagSwa) ? swa_loc : full_loc;
+        if (loc < 0 || loc >= m.nrows) {
+          valid_loc = false;
+          break;
+        }
         const char* base = m.base + loc * m.stride;
         int32_t limit = m.nlanes;
         if constexpr (kCapped) {
@@ -218,21 +221,26 @@ __global__ void __launch_bounds__(BLOCK) kv_checksum_direct_table_batched_kernel
         consumed += static_cast<uint64_t>(m.nlanes);
       }
 
+      if (valid_loc) {
 #pragma unroll
-      for (int offset = 16; offset > 0; offset >>= 1) {
-        local ^= __shfl_xor_sync(0xffffffffu, local, offset);
-        if constexpr (kPageDigests) {
-          page_local_hi ^= __shfl_xor_sync(0xffffffffu, page_local_hi, offset);
+        for (int offset = 16; offset > 0; offset >>= 1) {
+          local ^= __shfl_xor_sync(0xffffffffu, local, offset);
+          if constexpr (kPageDigests) {
+            page_local_hi ^= __shfl_xor_sync(0xffffffffu, page_local_hi, offset);
+          }
+        }
+        if (lane == 0) {
+          warp_acc[warp] = local;
+          if constexpr (kPageDigests) {
+            const int64_t logical_page_start = logical_starts[req] / page_size;
+            warp_page_idx[warp] = static_cast<int32_t>(position / page_size - logical_page_start);
+            warp_page_acc[warp] = (static_cast<uint64_t>(page_local_hi) << 32) | local;
+          }
         }
       }
-      if (lane == 0) {
-        warp_acc[warp] = local;
-        if constexpr (kPageDigests) {
-          const int64_t logical_page_start = logical_starts[req] / page_size;
-          warp_page_idx[warp] = static_cast<int32_t>(position / page_size - logical_page_start);
-          warp_page_acc[warp] = (static_cast<uint64_t>(page_local_hi) << 32) | local;
-        }
-      }
+    }
+    if (!valid_loc && lane == 0) {
+      atomicExch(reinterpret_cast<unsigned long long*>(out + req), ~0ULL);
     }
   }
   __syncthreads();
@@ -463,6 +471,7 @@ static void launch_kv_checksum_kernel(
     const uint64_t* __restrict__ buffer_ptrs,
     const int64_t* __restrict__ row_strides,
     const int64_t* __restrict__ row_nbytes,
+    const int64_t* __restrict__ buffer_num_rows,
     const int64_t* __restrict__ swa_buffer_flags,
     const int64_t* __restrict__ full_to_swa_index_mapping,
     bool has_swa,
@@ -491,6 +500,7 @@ static void launch_kv_checksum_kernel(
           buffer_ptrs,                                                               \
           row_strides,                                                               \
           row_nbytes,                                                                \
+          buffer_num_rows,                                                           \
           swa_buffer_flags,                                                          \
           full_to_swa_index_mapping,                                                 \
           has_swa,                                                                   \
@@ -528,6 +538,7 @@ static void kv_checksum_direct_table_batched_impl(
     const at::Tensor& buffer_ptrs,
     const at::Tensor& row_strides,
     const at::Tensor& row_nbytes,
+    const at::Tensor& buffer_num_rows,
     const at::Tensor& swa_buffer_flags,
     const at::Tensor& full_to_swa_index_mapping,
     const at::Tensor& req_to_token,
@@ -553,6 +564,7 @@ static void kv_checksum_direct_table_batched_impl(
   TORCH_CHECK(buffer_ptrs.scalar_type() == at::kLong, "buffer_ptrs must be int64");
   TORCH_CHECK(row_strides.scalar_type() == at::kLong, "row_strides must be int64");
   TORCH_CHECK(row_nbytes.scalar_type() == at::kLong, "row_nbytes must be int64");
+  TORCH_CHECK(buffer_num_rows.scalar_type() == at::kLong, "buffer_num_rows must be int64");
   TORCH_CHECK(swa_buffer_flags.scalar_type() == at::kLong, "swa_buffer_flags must be int64");
   TORCH_CHECK(full_to_swa_index_mapping.scalar_type() == at::kLong, "full_to_swa_index_mapping must be int64");
   TORCH_CHECK(req_pool_indices.scalar_type() == at::kLong, "req_pool_indices must be int64");
@@ -563,20 +575,22 @@ static void kv_checksum_direct_table_batched_impl(
   TORCH_CHECK(
       req_to_token.is_cuda() && accum.is_cuda() && out.is_cuda(), "req_to_token/accum/out must be CUDA tensors");
   TORCH_CHECK(
-      buffer_ptrs.is_cuda() && row_strides.is_cuda() && row_nbytes.is_cuda() && swa_buffer_flags.is_cuda() &&
-          full_to_swa_index_mapping.is_cuda() && req_pool_indices.is_cuda() && starts.is_cuda() && lengths.is_cuda(),
+      buffer_ptrs.is_cuda() && row_strides.is_cuda() && row_nbytes.is_cuda() && buffer_num_rows.is_cuda() &&
+          swa_buffer_flags.is_cuda() && full_to_swa_index_mapping.is_cuda() && req_pool_indices.is_cuda() &&
+          starts.is_cuda() && lengths.is_cuda(),
       "all metadata tensors must be CUDA tensors");
   const auto device = req_to_token.device();
   TORCH_CHECK(
       buffer_ptrs.device() == device && row_strides.device() == device && row_nbytes.device() == device &&
-          swa_buffer_flags.device() == device && full_to_swa_index_mapping.device() == device &&
-          req_pool_indices.device() == device && starts.device() == device && lengths.device() == device &&
-          accum.device() == device && out.device() == device,
+          buffer_num_rows.device() == device && swa_buffer_flags.device() == device &&
+          full_to_swa_index_mapping.device() == device && req_pool_indices.device() == device &&
+          starts.device() == device && lengths.device() == device && accum.device() == device && out.device() == device,
       "all checksum tensors must be on the same CUDA device");
   const at::cuda::OptionalCUDAGuard device_guard(device_of(req_to_token));
   TORCH_CHECK(buffer_ptrs.is_contiguous(), "buffer_ptrs must be contiguous");
   TORCH_CHECK(row_strides.is_contiguous(), "row_strides must be contiguous");
   TORCH_CHECK(row_nbytes.is_contiguous(), "row_nbytes must be contiguous");
+  TORCH_CHECK(buffer_num_rows.is_contiguous(), "buffer_num_rows must be contiguous");
   TORCH_CHECK(swa_buffer_flags.is_contiguous(), "swa_buffer_flags must be contiguous");
   TORCH_CHECK(full_to_swa_index_mapping.is_contiguous(), "full_to_swa_index_mapping must be contiguous");
   TORCH_CHECK(req_pool_indices.is_contiguous(), "req_pool_indices must be contiguous");
@@ -601,7 +615,9 @@ static void kv_checksum_direct_table_batched_impl(
       max_num_tokens >= 0 && max_num_tokens <= std::numeric_limits<int>::max(),
       "max_num_tokens exceeds supported range");
   TORCH_CHECK(
-      row_strides.numel() == B && row_nbytes.numel() == B && swa_buffer_flags.numel() == B, "metadata length mismatch");
+      row_strides.numel() == B && row_nbytes.numel() == B && buffer_num_rows.numel() == B &&
+          swa_buffer_flags.numel() == B,
+      "metadata length mismatch");
   // has_swa/is_capped are computed by the Python caller; the mapping must be
   // present whenever SWA is requested so the kernel never dereferences a null
   // mapping.
@@ -709,6 +725,7 @@ static void kv_checksum_direct_table_batched_impl(
           reinterpret_cast<const uint64_t*>(buffer_ptrs.data_ptr<int64_t>()),
           row_strides.data_ptr<int64_t>(),
           row_nbytes.data_ptr<int64_t>(),
+          buffer_num_rows.data_ptr<int64_t>(),
           swa_buffer_flags.data_ptr<int64_t>(),
           full_to_swa_index_mapping.data_ptr<int64_t>(),
           has_swa,
@@ -739,6 +756,7 @@ static void kv_checksum_direct_table_batched_impl(
           reinterpret_cast<const uint64_t*>(buffer_ptrs.data_ptr<int64_t>()),
           row_strides.data_ptr<int64_t>(),
           row_nbytes.data_ptr<int64_t>(),
+          buffer_num_rows.data_ptr<int64_t>(),
           swa_buffer_flags.data_ptr<int64_t>(),
           full_to_swa_index_mapping.data_ptr<int64_t>(),
           has_swa,
@@ -771,6 +789,7 @@ static void kv_checksum_direct_table_batched_impl(
           reinterpret_cast<const uint64_t*>(buffer_ptrs.data_ptr<int64_t>()),
           row_strides.data_ptr<int64_t>(),
           row_nbytes.data_ptr<int64_t>(),
+          buffer_num_rows.data_ptr<int64_t>(),
           swa_buffer_flags.data_ptr<int64_t>(),
           full_to_swa_index_mapping.data_ptr<int64_t>(),
           has_swa,
@@ -801,6 +820,7 @@ static void kv_checksum_direct_table_batched_impl(
           reinterpret_cast<const uint64_t*>(buffer_ptrs.data_ptr<int64_t>()),
           row_strides.data_ptr<int64_t>(),
           row_nbytes.data_ptr<int64_t>(),
+          buffer_num_rows.data_ptr<int64_t>(),
           swa_buffer_flags.data_ptr<int64_t>(),
           full_to_swa_index_mapping.data_ptr<int64_t>(),
           has_swa,
@@ -865,6 +885,7 @@ void kv_checksum_direct_table_batched(
     const at::Tensor& buffer_ptrs,
     const at::Tensor& row_strides,
     const at::Tensor& row_nbytes,
+    const at::Tensor& buffer_num_rows,
     const at::Tensor& swa_buffer_flags,
     const at::Tensor& full_to_swa_index_mapping,
     const at::Tensor& req_to_token,
@@ -882,6 +903,7 @@ void kv_checksum_direct_table_batched(
       buffer_ptrs,
       row_strides,
       row_nbytes,
+      buffer_num_rows,
       swa_buffer_flags,
       full_to_swa_index_mapping,
       req_to_token,
@@ -907,6 +929,7 @@ void kv_checksum_direct_table_batched_with_pages(
     const at::Tensor& buffer_ptrs,
     const at::Tensor& row_strides,
     const at::Tensor& row_nbytes,
+    const at::Tensor& buffer_num_rows,
     const at::Tensor& swa_buffer_flags,
     const at::Tensor& full_to_swa_index_mapping,
     const at::Tensor& req_to_token,
@@ -929,6 +952,7 @@ void kv_checksum_direct_table_batched_with_pages(
       buffer_ptrs,
       row_strides,
       row_nbytes,
+      buffer_num_rows,
       swa_buffer_flags,
       full_to_swa_index_mapping,
       req_to_token,
@@ -954,6 +978,7 @@ void kv_checksum_direct_table_batched_with_pages_compact(
     const at::Tensor& buffer_ptrs,
     const at::Tensor& row_strides,
     const at::Tensor& row_nbytes,
+    const at::Tensor& buffer_num_rows,
     const at::Tensor& swa_buffer_flags,
     const at::Tensor& full_to_swa_index_mapping,
     const at::Tensor& req_to_token,
@@ -976,6 +1001,7 @@ void kv_checksum_direct_table_batched_with_pages_compact(
       buffer_ptrs,
       row_strides,
       row_nbytes,
+      buffer_num_rows,
       swa_buffer_flags,
       full_to_swa_index_mapping,
       req_to_token,

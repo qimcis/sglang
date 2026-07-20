@@ -43,6 +43,7 @@ Design constraints (hard requirements):
 
 from __future__ import annotations
 
+import heapq
 import json
 import logging
 import os
@@ -50,7 +51,7 @@ import struct
 import time
 import uuid
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -801,6 +802,20 @@ class AttentionTagManifest:
     expected_tags_t: torch.Tensor
     revision: int = 0
     max_num_pages: Optional[int] = None
+    _replacement_heap: List[Tuple[int, int]] = field(
+        default_factory=list, init=False, repr=False
+    )
+
+    def __post_init__(self) -> None:
+        if self.max_num_pages is None:
+            return
+        if self.max_num_pages <= 0 or self.num_pages > self.max_num_pages:
+            raise ValueError("invalid bounded attention tag manifest size")
+        self._replacement_heap = [
+            (int(page_position), index)
+            for index, page_position in enumerate(self.page_positions)
+        ]
+        heapq.heapify(self._replacement_heap)
 
     @classmethod
     def from_pages(
@@ -973,15 +988,16 @@ class AttentionTagManifest:
                 return i
         return None
 
-    def _prune_to_max_pages(self) -> None:
-        if self.max_num_pages is None or self.num_pages <= self.max_num_pages:
-            return
-        first = self.num_pages - self.max_num_pages
-        self.page_positions = self.page_positions[first:]
-        self.physical_page_ids_t = self.physical_page_ids_t[first:].clone()
-        self.page_positions_t = self.page_positions_t[first:].clone()
-        self.generations_t = self.generations_t[first:].clone()
-        self.expected_tags_t = self.expected_tags_t[first:].clone()
+    def _entry_index_for_new_page(self, page_position: int) -> int:
+        if self.max_num_pages is not None and self.num_pages >= self.max_num_pages:
+            _, entry_index = heapq.heappop(self._replacement_heap)
+            self.page_positions[entry_index] = page_position
+        else:
+            entry_index = len(self.page_positions)
+            self.page_positions.append(page_position)
+        if self.max_num_pages is not None:
+            heapq.heappush(self._replacement_heap, (page_position, entry_index))
+        return entry_index
 
     def refresh_page_tensor(
         self,
@@ -995,8 +1011,7 @@ class AttentionTagManifest:
         entry_index = self._entry_index_for_page_position(page_position)
         is_new_page = entry_index is None
         if is_new_page:
-            entry_index = len(self.page_positions)
-            self.page_positions.append(page_position)
+            entry_index = self._entry_index_for_new_page(page_position)
 
         physical_page_id = physical_page_id.reshape(1).to(dtype=torch.long)
         generation = generation.reshape(1).to(
@@ -1023,7 +1038,6 @@ class AttentionTagManifest:
         self.expected_tags_t[entry_index : entry_index + 1] = expected_t
 
         self.revision += 1
-        self._prune_to_max_pages()
         return tag_page_id, expected_t
 
 
@@ -1067,6 +1081,20 @@ class TransferPageTagManifest:
     expected_tags_t: torch.Tensor
     revision: int = 0
     max_num_pages: Optional[int] = None
+    _replacement_heap: List[Tuple[int, int]] = field(
+        default_factory=list, init=False, repr=False
+    )
+
+    def __post_init__(self) -> None:
+        if self.max_num_pages is None:
+            return
+        if self.max_num_pages <= 0 or self.num_pages > self.max_num_pages:
+            raise ValueError("invalid bounded transfer page tag manifest size")
+        self._replacement_heap = [
+            (int(page_position), index)
+            for index, page_position in enumerate(self.page_positions)
+        ]
+        heapq.heapify(self._replacement_heap)
 
     @classmethod
     def from_pages(
@@ -1233,15 +1261,16 @@ class TransferPageTagManifest:
                 return i
         return None
 
-    def _prune_to_max_pages(self) -> None:
-        if self.max_num_pages is None or self.num_pages <= self.max_num_pages:
-            return
-        first = self.num_pages - self.max_num_pages
-        self.page_positions = self.page_positions[first:]
-        self.physical_page_ids_t = self.physical_page_ids_t[first:].clone()
-        self.page_positions_t = self.page_positions_t[first:].clone()
-        self.generations_t = self.generations_t[first:].clone()
-        self.expected_tags_t = self.expected_tags_t[first:].clone()
+    def _entry_index_for_new_page(self, page_position: int) -> int:
+        if self.max_num_pages is not None and self.num_pages >= self.max_num_pages:
+            _, entry_index = heapq.heappop(self._replacement_heap)
+            self.page_positions[entry_index] = page_position
+        else:
+            entry_index = len(self.page_positions)
+            self.page_positions.append(page_position)
+        if self.max_num_pages is not None:
+            heapq.heappush(self._replacement_heap, (page_position, entry_index))
+        return entry_index
 
     def refresh_page_tensor(
         self,
@@ -1255,8 +1284,7 @@ class TransferPageTagManifest:
         entry_index = self._entry_index_for_page_position(page_position)
         is_new_page = entry_index is None
         if is_new_page:
-            entry_index = len(self.page_positions)
-            self.page_positions.append(page_position)
+            entry_index = self._entry_index_for_new_page(page_position)
 
         physical_page_id = physical_page_id.reshape(1).to(dtype=torch.long)
         generation = generation.reshape(1).to(
@@ -1283,7 +1311,6 @@ class TransferPageTagManifest:
         self.expected_tags_t[entry_index : entry_index + 1] = expected_t
 
         self.revision += 1
-        self._prune_to_max_pages()
         return tag_page_id, expected_t
 
 
@@ -2192,17 +2219,20 @@ class _DirectKVChecksumCache:
     buffer_ptrs: Optional[torch.Tensor] = None
     row_strides: Optional[torch.Tensor] = None
     row_nbytes: Optional[torch.Tensor] = None
+    buffer_num_rows: Optional[torch.Tensor] = None
     swa_buffer_flags: Optional[torch.Tensor] = None
     full_to_swa_index_mapping: Optional[torch.Tensor] = None
     total_bytes: int = 0
     full_buffer_ptrs: Optional[torch.Tensor] = None
     full_row_strides: Optional[torch.Tensor] = None
     full_row_nbytes: Optional[torch.Tensor] = None
+    full_buffer_num_rows: Optional[torch.Tensor] = None
     full_swa_buffer_flags: Optional[torch.Tensor] = None
     full_total_bytes: int = 0
     swa_buffer_ptrs_only: Optional[torch.Tensor] = None
     swa_row_strides: Optional[torch.Tensor] = None
     swa_row_nbytes: Optional[torch.Tensor] = None
+    swa_buffer_num_rows: Optional[torch.Tensor] = None
     swa_buffer_flags_only: Optional[torch.Tensor] = None
     swa_total_bytes: int = 0
     accum: Optional[torch.Tensor] = None
@@ -2432,12 +2462,21 @@ def _direct_metadata_from_pool(
     device: torch.device,
     cache: Optional[_DirectKVChecksumCache],
     unsupported,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+]:
     metadata_key = (id(kv_pool), str(device), int(kv_pool.layer_num))
     if cache is not None and cache.metadata_key == metadata_key:
         buffer_ptrs = cache.buffer_ptrs
         row_strides = cache.row_strides
         row_nbytes = cache.row_nbytes
+        buffer_num_rows = cache.buffer_num_rows
         swa_buffer_flags = cache.swa_buffer_flags
         full_to_swa_index_mapping = cache.full_to_swa_index_mapping
         total_bytes = cache.total_bytes
@@ -2445,6 +2484,7 @@ def _direct_metadata_from_pool(
             buffer_ptrs is None
             or row_strides is None
             or row_nbytes is None
+            or buffer_num_rows is None
             or swa_buffer_flags is None
             or full_to_swa_index_mapping is None
         ):
@@ -2453,6 +2493,7 @@ def _direct_metadata_from_pool(
             buffer_ptrs,
             row_strides,
             row_nbytes,
+            buffer_num_rows,
             swa_buffer_flags,
             full_to_swa_index_mapping,
             total_bytes,
@@ -2485,6 +2526,7 @@ def _direct_metadata_from_pool(
     ptrs: List[int] = []
     strides: List[int] = []
     nbytes: List[int] = []
+    num_rows: List[int] = []
     total_bytes = 0
     for buf in buffers:
         if not isinstance(buf, torch.Tensor) or not buf.is_cuda:
@@ -2514,11 +2556,13 @@ def _direct_metadata_from_pool(
         ptrs.append(base)
         strides.append(stride0_b)
         nbytes.append(row_b)
+        num_rows.append(int(buf.shape[0]))
         total_bytes += row_b
 
     buffer_ptrs = torch.tensor(ptrs, dtype=TAG_DTYPE, device=device)
     row_strides = torch.tensor(strides, dtype=TAG_DTYPE, device=device)
     row_nbytes = torch.tensor(nbytes, dtype=TAG_DTYPE, device=device)
+    buffer_num_rows = torch.tensor(num_rows, dtype=TAG_DTYPE, device=device)
     swa_buffer_flags = torch.tensor(is_swa_buffer, dtype=TAG_DTYPE, device=device)
     full_indices = [i for i, flag in enumerate(is_swa_buffer) if not flag]
     swa_indices = [i for i, flag in enumerate(is_swa_buffer) if flag]
@@ -2531,6 +2575,7 @@ def _direct_metadata_from_pool(
     full_buffer_ptrs = subset_tensor(ptrs, full_indices)
     full_row_strides = subset_tensor(strides, full_indices)
     full_row_nbytes = subset_tensor(nbytes, full_indices)
+    full_buffer_num_rows = subset_tensor(num_rows, full_indices)
     full_swa_buffer_flags = torch.zeros(
         len(full_indices), dtype=TAG_DTYPE, device=device
     )
@@ -2538,6 +2583,7 @@ def _direct_metadata_from_pool(
     swa_buffer_ptrs_only = subset_tensor(ptrs, swa_indices)
     swa_row_strides = subset_tensor(strides, swa_indices)
     swa_row_nbytes = subset_tensor(nbytes, swa_indices)
+    swa_buffer_num_rows = subset_tensor(num_rows, swa_indices)
     swa_buffer_flags_only = torch.ones(len(swa_indices), dtype=TAG_DTYPE, device=device)
     swa_total_bytes = sum(nbytes[i] for i in swa_indices)
     if any(is_swa_buffer):
@@ -2557,23 +2603,27 @@ def _direct_metadata_from_pool(
         cache.buffer_ptrs = buffer_ptrs
         cache.row_strides = row_strides
         cache.row_nbytes = row_nbytes
+        cache.buffer_num_rows = buffer_num_rows
         cache.swa_buffer_flags = swa_buffer_flags
         cache.full_to_swa_index_mapping = full_to_swa_index_mapping
         cache.total_bytes = total_bytes
         cache.full_buffer_ptrs = full_buffer_ptrs
         cache.full_row_strides = full_row_strides
         cache.full_row_nbytes = full_row_nbytes
+        cache.full_buffer_num_rows = full_buffer_num_rows
         cache.full_swa_buffer_flags = full_swa_buffer_flags
         cache.full_total_bytes = full_total_bytes
         cache.swa_buffer_ptrs_only = swa_buffer_ptrs_only
         cache.swa_row_strides = swa_row_strides
         cache.swa_row_nbytes = swa_row_nbytes
+        cache.swa_buffer_num_rows = swa_buffer_num_rows
         cache.swa_buffer_flags_only = swa_buffer_flags_only
         cache.swa_total_bytes = swa_total_bytes
     return (
         buffer_ptrs,
         row_strides,
         row_nbytes,
+        buffer_num_rows,
         swa_buffer_flags,
         full_to_swa_index_mapping,
         total_bytes,
@@ -3557,6 +3607,7 @@ class KVPageProtectionManager:
             buffer_ptrs,
             row_strides,
             row_nbytes,
+            buffer_num_rows,
             swa_buffer_flags,
             full_to_swa_index_mapping,
             total_bytes,
@@ -3679,6 +3730,7 @@ class KVPageProtectionManager:
                     buffer_ptrs,
                     row_strides,
                     row_nbytes,
+                    buffer_num_rows,
                     swa_buffer_flags,
                     full_to_swa_index_mapping,
                     req_to_token,
@@ -3710,6 +3762,7 @@ class KVPageProtectionManager:
                         self._checksum_cache.full_buffer_ptrs,
                         self._checksum_cache.full_row_strides,
                         self._checksum_cache.full_row_nbytes,
+                        self._checksum_cache.full_buffer_num_rows,
                         self._checksum_cache.full_swa_buffer_flags,
                         empty_mapping,
                         req_to_token,
@@ -3743,6 +3796,7 @@ class KVPageProtectionManager:
                     self._checksum_cache.swa_buffer_ptrs_only,
                     self._checksum_cache.swa_row_strides,
                     self._checksum_cache.swa_row_nbytes,
+                    self._checksum_cache.swa_buffer_num_rows,
                     self._checksum_cache.swa_buffer_flags_only,
                     full_to_swa_index_mapping,
                     req_to_token,
@@ -3764,6 +3818,10 @@ class KVPageProtectionManager:
                 )
                 if full_out is not None:
                     torch.bitwise_xor(full_out, secondary_out, out=checksums_t)
+                    # Plain XOR would cancel two -1 rejection sentinels.
+                    torch.bitwise_or(full_out, secondary_out, out=full_out)
+                    torch.bitwise_right_shift(full_out, 63, out=full_out)
+                    torch.bitwise_or(checksums_t, full_out, out=checksums_t)
                     torch.bitwise_xor(page_out, secondary_page_out, out=page_digests_t)
             if workspace_event is None:
                 workspace_event = torch.cuda.Event()
