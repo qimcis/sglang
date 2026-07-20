@@ -1,0 +1,43 @@
+python/sglang/srt/disaggregation/common/utils.py
+  s_414cd192908149::t_2214852ecfd1b3 29
+python/sglang/srt/disaggregation/decode.py
+  s_5f73f26aee7f01::t_c8e9707cba6b8c 87,381,495,499,508,2167
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_5f73f26aee7f01::t_5dc42006618142 193-195,256,273-322,1251,1256,1261,1344,1362-1367,1379-1383,1443-1450,1480-1484,1490,1492,1495-1503,1578,1580,1584-1592,1616,1618,1622-1630,1653-1656,1660-1670,1674-1677,1696-1711,1740-1741,1748-1816,1821-1825,1839,1869-1882,1884-1931,1989-2022,2024-2029,2031-2040,2042-2052,2054-2059,2062,2066,2114-2119,2150-2157,2163,2188,2319-2323,2530,2561-2581
+python/sglang/srt/environ.py
+  s_414cd192908149::t_35ceafd203f343 328
+python/sglang/srt/layers/attention/dsa_backend.py
+  s_414cd192908149::t_7cce9b1a6c578e 364-365
+python/sglang/srt/managers/scheduler.py
+  s_414cd192908149::t_a4feaadb469efa 3164-3168,3244,3274-3286,3288-3341,3343-3363
+python/sglang/srt/mem_cache/kv_page_tags.py
+  s_5f73f26aee7f01::t_5ddcf0e6133c6b 81-82,420-426,461-463,524-533,551-556,803,813,824-831,848,859,883-893,910,976-985,1026,1069,1079,1090-1097,1112,1123,1147-1157,1174,1236-1245,1286,2093-2107,2244,2249-2291,2294-2299,2317,2319-2320,2322-2325,2396-2397,2656,2663,2715,2735,2907,2927,3345-3454
+python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+  s_5f73f26aee7f01::t_5d62014114ef68 1065-1095
+sgl-kernel/csrc/kvcacheio/checksum.cu
+  s_5f73f26aee7f01::t_fb488a77d44c27 87-90,96,111-116,143,145,149,154,156-157,159-161,163,165,167-183,186-188,190-198,200-206,208-209,211-215,218,222-226,228-234,283,288-330,376,475-478,484,503-506,512,599,642-651,681-687,721-724,730,751-754,760,783-786,792,813-816,822,852-858
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c90e6fde26d956227442cf891db139fbafe37801",
+  "prompts": {},
+  "sessions": {
+    "s_414cd192908149": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_092e40640ffew2SWf2GjqC7eiw",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    },
+    "s_5f73f26aee7f01": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_099a8b759ffeqnA7QziBATTLQD",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
