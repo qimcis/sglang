@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.utils import is_cuda
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
@@ -144,11 +145,10 @@ class PrefillBootstrapQueue:
                 "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
-        self.kv_manager = self._init_kv_manager()
-
         # KV transfer checksum (prefill side, gated). Attention tags are a
         # decode-side concept, so the prefill manager is checksum-only.
         self._init_kv_protection()
+        self.kv_manager = self._init_kv_manager()
 
     def _init_kv_protection(self) -> None:
         import dataclasses
@@ -158,14 +158,13 @@ class PrefillBootstrapQueue:
             KVProtectionConfig,
         )
 
-        config = KVProtectionConfig.from_env(is_pd_decode=True)
+        protocol_config = KVProtectionConfig.from_env(is_pd_decode=True)
+        self.kv_protection_enabled = protocol_config.enabled
         # Prefill only needs the transfer-checksum half; disable attention tags so we
         # do not attach a sidecar table / bump generations on the prefill side.
-        config = dataclasses.replace(config, enable_attention_tags=False)
+        config = dataclasses.replace(protocol_config, enable_attention_tags=False)
         if not config.checksum_enabled:
-            self.scheduler.kv_protection_manager = getattr(
-                self.scheduler, "kv_protection_manager", None
-            )
+            self.scheduler.kv_protection_manager = None
             return
         self.scheduler.kv_protection_manager = KVPageProtectionManager(
             config,
@@ -180,6 +179,7 @@ class PrefillBootstrapQueue:
                 else str(self.transfer_backend)
             ),
             is_spec_decode=False,
+            is_cuda_device=is_cuda(),
         )
 
     def _init_kv_manager(self) -> CommonKVManager:
@@ -214,6 +214,8 @@ class PrefillBootstrapQueue:
                 self.scheduler.model_config.get_total_num_kv_heads()
             )
         kv_args.page_size = self.token_to_kv_pool.page_size
+        kv_args.transfer_page_tag_manager = self.scheduler.kv_protection_manager
+        kv_args.kv_protection_enabled = self.kv_protection_enabled
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()

@@ -361,6 +361,8 @@ class DeepseekSparseAttnBackend(
             self.kv_attention_tag_table,
             supported=fused_protection_supported,
         )
+        if self.kv_attention_tag_table is not None:
+            model_runner.kv_requires_pre_indexer_page_validation = True
         if self.kv_fused_page_protection_enabled:
             model_runner.kv_fused_page_protection_enabled = True
         if self.num_q_heads <= 64:

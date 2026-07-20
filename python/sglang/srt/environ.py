@@ -325,8 +325,7 @@ class Envs:
     # Enable full direct-KV transfer checksums. When enabled, every transferred
     # token row is checksummed and the direct CUDA kernel is required.
     SGLANG_KV_TRANSFER_CHECKSUM = EnvBool(False)
-    # Rolling-upgrade escape hatch for old prefills that send three-frame,
-    # nonce-less checksum completions. Keep disabled after a prefill-first rollout.
+    # Deprecated unsafe legacy mode. Enabling it now fails at startup.
     SGLANG_ENABLE_LEGACY_KV_PROTECTION_COMPLETION = EnvBool(False)
 
     # Scheduler: others:

@@ -84,11 +84,16 @@ __global__ void __launch_bounds__(BLOCK) kv_checksum_direct_table_batched_kernel
     const int64_t* __restrict__ starts,
     const int64_t* __restrict__ lengths,
     const int64_t* __restrict__ logical_starts,
+    int64_t req_to_token_rows,
+    int64_t req_to_token_columns,
+    int64_t max_num_tokens,
+    int64_t full_to_swa_mapping_size,
     int B,
     int64_t cap,
     int64_t page_size,
     int64_t max_num_pages,
     uint32_t* __restrict__ accum,
+    int64_t* __restrict__ out,
     uint64_t* __restrict__ page_accum) {
   extern __shared__ char smem[];
   constexpr int warps_per_block = BLOCK / 32;
@@ -103,6 +108,12 @@ __global__ void __launch_bounds__(BLOCK) kv_checksum_direct_table_batched_kernel
   const int warp = threadIdx.x >> 5;
   const int req = blockIdx.y;
   const int64_t n = lengths[req];
+  const int64_t start = starts[req];
+  const int64_t req_pool_idx = req_pool_indices[req];
+  if (n < 0 || n > max_num_tokens || req_pool_idx < 0 || req_pool_idx >= req_to_token_rows || start < 0 ||
+      start > req_to_token_columns || n > req_to_token_columns - start) {
+    return;
+  }
   // Uniform whole-block exit before any barrier.
   if (static_cast<int64_t>(blockIdx.x) * warps_per_block >= n) return;
 
@@ -129,91 +140,98 @@ __global__ void __launch_bounds__(BLOCK) kv_checksum_direct_table_batched_kernel
 
   const int row = blockIdx.x * warps_per_block + warp;
   if (row < n) {
-    const int64_t position = starts[req] + row;
-    const int64_t req_pool_idx = req_pool_indices[req];
+    const int64_t position = start + row;
     const int64_t full_loc = static_cast<int64_t>(req_to_token[req_pool_idx * req_to_token_stride0 + position]);
+    bool valid_loc = full_loc >= 0 && (!has_swa || full_loc < full_to_swa_mapping_size);
     // The SWA translation depends only on the token, not the buffer: look it
     // up once per row instead of once per (row, buffer).
     int64_t swa_loc = 0;
-    if (has_swa) {
+    if (valid_loc && has_swa) {
       swa_loc = full_to_swa_index_mapping[full_loc];
       // Unmapped SWA rows are out of the sliding window; slot 0 is the reserved
       // dummy row and is consistently zero on both source and destination.
       if (swa_loc < 0) swa_loc = 0;
+      valid_loc = swa_loc < full_to_swa_mapping_size;
     }
-    const uint32_t seed_pos = kCksumSeed ^ (static_cast<uint32_t>(position) * kPosMul);
-    const uint32_t page_seed_pos = kPageSeedHi ^ (static_cast<uint32_t>(position) * kPagePosMulHi);
-
-    uint64_t lane_cap = 0;
-    if constexpr (kCapped) {
-      lane_cap = (cap < 0) ? ~0ULL : static_cast<uint64_t>(cap);
+    if (!valid_loc && lane == 0) {
+      atomicExch(reinterpret_cast<unsigned long long*>(out + req), ~0ULL);
     }
-    uint64_t consumed = 0;
-    uint32_t local = 0;
-    uint32_t page_local_hi = 0;
+    if (valid_loc) {
+      const uint32_t seed_pos = kCksumSeed ^ (static_cast<uint32_t>(position) * kPosMul);
+      const uint32_t page_seed_pos = kPageSeedHi ^ (static_cast<uint32_t>(position) * kPagePosMulHi);
 
-    for (int b = 0; b < B; ++b) {
+      uint64_t lane_cap = 0;
       if constexpr (kCapped) {
-        if (consumed >= lane_cap) break;
+        lane_cap = (cap < 0) ? ~0ULL : static_cast<uint64_t>(cap);
       }
-      const BufMeta m = smeta[b];
-      const int64_t loc = (m.flags & kFlagSwa) ? swa_loc : full_loc;
-      const char* base = m.base + loc * m.stride;
-      int32_t limit = m.nlanes;
-      if constexpr (kCapped) {
-        const uint64_t remaining = lane_cap - consumed;
-        if (remaining < static_cast<uint64_t>(m.nlanes)) {
-          limit = static_cast<int32_t>(remaining);
+      uint64_t consumed = 0;
+      uint32_t local = 0;
+      uint32_t page_local_hi = 0;
+
+      for (int b = 0; b < B; ++b) {
+        if constexpr (kCapped) {
+          if (consumed >= lane_cap) break;
         }
-      }
-
-      if (m.flags & kFlagVec16) {
-        const ulonglong2* p2 = reinterpret_cast<const ulonglong2*>(base);
-        const int32_t npairs = limit >> 1;
-#pragma unroll 4
-        for (int32_t t = lane; t < npairs; t += 32) {
-          const ulonglong2 v = p2[t];
-          const uint64_t gl = consumed + (static_cast<uint64_t>(t) * 2);
-          local ^= cksum_chunk32(v.x, seed_pos, gl);
-          local ^= cksum_chunk32(v.y, seed_pos, gl + 1);
-          if constexpr (kPageDigests) {
-            page_local_hi ^= page_chunk_hi32(v.x, page_seed_pos, gl);
-            page_local_hi ^= page_chunk_hi32(v.y, page_seed_pos, gl + 1);
+        const BufMeta m = smeta[b];
+        const int64_t loc = (m.flags & kFlagSwa) ? swa_loc : full_loc;
+        const char* base = m.base + loc * m.stride;
+        int32_t limit = m.nlanes;
+        if constexpr (kCapped) {
+          const uint64_t remaining = lane_cap - consumed;
+          if (remaining < static_cast<uint64_t>(m.nlanes)) {
+            limit = static_cast<int32_t>(remaining);
           }
         }
-        if ((limit & 1) && lane == 0) {
+
+        if (m.flags & kFlagVec16) {
+          const ulonglong2* p2 = reinterpret_cast<const ulonglong2*>(base);
+          const int32_t npairs = limit >> 1;
+#pragma unroll 4
+          for (int32_t t = lane; t < npairs; t += 32) {
+            const ulonglong2 v = p2[t];
+            const uint64_t gl = consumed + (static_cast<uint64_t>(t) * 2);
+            local ^= cksum_chunk32(v.x, seed_pos, gl);
+            local ^= cksum_chunk32(v.y, seed_pos, gl + 1);
+            if constexpr (kPageDigests) {
+              page_local_hi ^= page_chunk_hi32(v.x, page_seed_pos, gl);
+              page_local_hi ^= page_chunk_hi32(v.y, page_seed_pos, gl + 1);
+            }
+          }
+          if ((limit & 1) && lane == 0) {
+            const uint64_t* p = reinterpret_cast<const uint64_t*>(base);
+            local ^= cksum_chunk32(p[limit - 1], seed_pos, consumed + static_cast<uint64_t>(limit - 1));
+            if constexpr (kPageDigests) {
+              page_local_hi ^=
+                  page_chunk_hi32(p[limit - 1], page_seed_pos, consumed + static_cast<uint64_t>(limit - 1));
+            }
+          }
+        } else {
           const uint64_t* p = reinterpret_cast<const uint64_t*>(base);
-          local ^= cksum_chunk32(p[limit - 1], seed_pos, consumed + static_cast<uint64_t>(limit - 1));
-          if constexpr (kPageDigests) {
-            page_local_hi ^= page_chunk_hi32(p[limit - 1], page_seed_pos, consumed + static_cast<uint64_t>(limit - 1));
-          }
-        }
-      } else {
-        const uint64_t* p = reinterpret_cast<const uint64_t*>(base);
 #pragma unroll 4
-        for (int32_t j = lane; j < limit; j += 32) {
-          local ^= cksum_chunk32(p[j], seed_pos, consumed + static_cast<uint64_t>(j));
-          if constexpr (kPageDigests) {
-            page_local_hi ^= page_chunk_hi32(p[j], page_seed_pos, consumed + static_cast<uint64_t>(j));
+          for (int32_t j = lane; j < limit; j += 32) {
+            local ^= cksum_chunk32(p[j], seed_pos, consumed + static_cast<uint64_t>(j));
+            if constexpr (kPageDigests) {
+              page_local_hi ^= page_chunk_hi32(p[j], page_seed_pos, consumed + static_cast<uint64_t>(j));
+            }
           }
         }
+        consumed += static_cast<uint64_t>(m.nlanes);
       }
-      consumed += static_cast<uint64_t>(m.nlanes);
-    }
 
 #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      local ^= __shfl_xor_sync(0xffffffffu, local, offset);
-      if constexpr (kPageDigests) {
-        page_local_hi ^= __shfl_xor_sync(0xffffffffu, page_local_hi, offset);
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        local ^= __shfl_xor_sync(0xffffffffu, local, offset);
+        if constexpr (kPageDigests) {
+          page_local_hi ^= __shfl_xor_sync(0xffffffffu, page_local_hi, offset);
+        }
       }
-    }
-    if (lane == 0) {
-      warp_acc[warp] = local;
-      if constexpr (kPageDigests) {
-        const int64_t logical_page_start = logical_starts[req] / page_size;
-        warp_page_idx[warp] = static_cast<int32_t>(position / page_size - logical_page_start);
-        warp_page_acc[warp] = (static_cast<uint64_t>(page_local_hi) << 32) | local;
+      if (lane == 0) {
+        warp_acc[warp] = local;
+        if constexpr (kPageDigests) {
+          const int64_t logical_page_start = logical_starts[req] / page_size;
+          warp_page_idx[warp] = static_cast<int32_t>(position / page_size - logical_page_start);
+          warp_page_acc[warp] = (static_cast<uint64_t>(page_local_hi) << 32) | local;
+        }
       }
     }
   }
@@ -262,8 +280,52 @@ __global__ void kv_checksum_finalize_batched_kernel(
     const uint32_t* __restrict__ accum, const int64_t* __restrict__ lengths, int M, int64_t* __restrict__ out) {
   const int req = blockIdx.x * blockDim.x + threadIdx.x;
   if (req >= M) return;
+  if (out[req] == -1) return;
   const uint32_t h = cksum_fmix32(kCksumSeed ^ accum[req] ^ static_cast<uint32_t>(lengths[req]));
   out[req] = static_cast<int64_t>(h);
+}
+
+__global__ void kv_checksum_validate_metadata_kernel(
+    const int64_t* __restrict__ req_pool_indices,
+    const int64_t* __restrict__ starts,
+    const int64_t* __restrict__ lengths,
+    int M,
+    int64_t req_to_token_rows,
+    int64_t req_to_token_columns,
+    int64_t max_num_tokens,
+    const int64_t* __restrict__ page_output_offsets,
+    const int64_t* __restrict__ logical_starts,
+    int64_t page_size,
+    int64_t max_num_pages,
+    int64_t page_out_size,
+    int64_t* __restrict__ out) {
+  const int req = blockIdx.x * blockDim.x + threadIdx.x;
+  if (req >= M) return;
+  const int64_t req_pool_idx = req_pool_indices[req];
+  const int64_t start = starts[req];
+  const int64_t length = lengths[req];
+  bool invalid = length < 0 || length > max_num_tokens || req_pool_idx < 0 || req_pool_idx >= req_to_token_rows ||
+                 start < 0 || start > req_to_token_columns || length > req_to_token_columns - start;
+  int64_t required_pages = 0;
+  if (logical_starts != nullptr) {
+    const int64_t logical_start = logical_starts[req];
+    const int64_t logical_page_start = logical_start / page_size;
+    required_pages = length > 0 ? (start + length - 1) / page_size - logical_page_start + 1 : 0;
+    invalid =
+        invalid || logical_start < 0 || logical_start > start || required_pages < 0 || required_pages > max_num_pages;
+  }
+  if (page_output_offsets != nullptr) {
+    const int64_t output_begin = page_output_offsets[req];
+    const int64_t output_end = page_output_offsets[req + 1];
+    invalid = invalid || output_begin < 0 || output_end < output_begin || output_end > page_out_size ||
+              output_end - output_begin != required_pages || (req == 0 && output_begin != 0) ||
+              (req == M - 1 && output_end != page_out_size);
+  }
+  if (invalid) {
+    // Valid checksums are uint32 values represented in int64, so -1 cannot be
+    // mistaken for a successful result by an asynchronous caller.
+    out[req] = -1;
+  }
 }
 
 __global__ void kv_checksum_finalize_pages_batched_kernel(
@@ -311,6 +373,7 @@ __global__ void kv_checksum_finalize_requests_with_pages_kernel(
     int64_t* __restrict__ page_out) {
   const int req = blockIdx.x;
   if (req >= M) return;
+  if (out[req] == -1) return;
   const int64_t scan_begin = starts[req];
   const int64_t scan_end = scan_begin + lengths[req];
   const int64_t logical_page_start = logical_starts[req] / page_size;
@@ -409,11 +472,16 @@ static void launch_kv_checksum_kernel(
     const int64_t* __restrict__ starts,
     const int64_t* __restrict__ lengths,
     const int64_t* __restrict__ logical_starts,
+    int64_t req_to_token_rows,
+    int64_t req_to_token_columns,
+    int64_t max_num_tokens,
+    int64_t full_to_swa_mapping_size,
     int B,
     int64_t num_lanes,
     int64_t page_size,
     int64_t max_num_pages,
     uint32_t* __restrict__ accum,
+    int64_t* __restrict__ out,
     uint64_t* __restrict__ page_accum,
     bool with_page_digests,
     bool derive_root_from_pages) {
@@ -432,11 +500,16 @@ static void launch_kv_checksum_kernel(
           starts,                                                                    \
           lengths,                                                                   \
           logical_starts,                                                            \
+          req_to_token_rows,                                                         \
+          req_to_token_columns,                                                      \
+          max_num_tokens,                                                            \
+          full_to_swa_mapping_size,                                                  \
           B,                                                                         \
           num_lanes,                                                                 \
           page_size,                                                                 \
           max_num_pages,                                                             \
           accum,                                                                     \
+          out,                                                                       \
           page_accum)
   if (with_page_digests) {
     if (derive_root_from_pages) {
@@ -523,6 +596,7 @@ static void kv_checksum_direct_table_batched_impl(
   const int B = static_cast<int>(buffer_ptrs.numel());
   const int M = static_cast<int>(lengths.numel());
   TORCH_CHECK(M <= 65535, "checksum batch exceeds CUDA grid-y limit");
+  TORCH_CHECK(B > 0 || M == 0, "checksum requires at least one KV buffer");
   TORCH_CHECK(
       max_num_tokens >= 0 && max_num_tokens <= std::numeric_limits<int>::max(),
       "max_num_tokens exceeds supported range");
@@ -565,13 +639,21 @@ static void kv_checksum_direct_table_batched_impl(
         page_output_offsets.defined() || page_out.numel() >= static_cast<int64_t>(M) * max_num_pages,
         "dense page_out is too small");
   }
-  if (M == 0 || B == 0) return;
+  if (M == 0) return;
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  C10_CUDA_CHECK(cudaMemsetAsync(accum.data_ptr<int32_t>(), 0, static_cast<size_t>(M) * sizeof(int32_t), stream));
+  C10_CUDA_CHECK(cudaMemsetAsync(out.data_ptr<int64_t>(), 0, static_cast<size_t>(M) * sizeof(int64_t), stream));
+  if (with_page_digests) {
+    const int64_t page_slots = static_cast<int64_t>(M) * max_num_pages;
+    C10_CUDA_CHECK(
+        cudaMemsetAsync(page_accum.data_ptr<int64_t>(), 0, static_cast<size_t>(page_slots) * sizeof(int64_t), stream));
+  }
 
   const int64_t max_len = max_num_tokens;
   // clang-format splits CUDA launch delimiters in this file into `> > >`, which nvcc rejects.
   // clang-format off
   if (max_len <= 0) {
-    auto stream = at::cuda::getCurrentCUDAStream();
     if (with_page_digests) {
       if (page_output_offsets.defined()) {
         kv_checksum_finalize_requests_with_pages_kernel<<<M, 256, 0, stream>>>(
@@ -596,11 +678,17 @@ static void kv_checksum_direct_table_batched_impl(
           M,
           out.data_ptr<int64_t>());
     }
+    kv_checksum_validate_metadata_kernel<<<(M + 255) / 256, 256, 0, stream>>>(
+        req_pool_indices.data_ptr<int64_t>(), starts.data_ptr<int64_t>(), lengths.data_ptr<int64_t>(), M,
+        req_to_token.size(0), req_to_token.size(1), max_num_tokens,
+        page_output_offsets.defined() ? page_output_offsets.data_ptr<int64_t>() : nullptr,
+        with_page_digests ? logical_starts.data_ptr<int64_t>() : nullptr, page_size, max_num_pages,
+        page_output_offsets.defined() ? page_out.numel() : 0,
+        out.data_ptr<int64_t>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }
 
-  auto stream = at::cuda::getCurrentCUDAStream();
   constexpr int kBlock = 256;
   const int warps_per_block = kBlock / 32;
   const int grid_x = (static_cast<int>(max_len) + warps_per_block - 1) / warps_per_block;
@@ -630,11 +718,16 @@ static void kv_checksum_direct_table_batched_impl(
           starts.data_ptr<int64_t>(),
           lengths.data_ptr<int64_t>(),
           with_page_digests ? logical_starts.data_ptr<int64_t>() : nullptr,
+          req_to_token.size(0),
+          req_to_token.size(1),
+          max_num_tokens,
+          full_to_swa_index_mapping.numel(),
           B,
           num_lanes,
           page_size,
           max_num_pages,
           reinterpret_cast<uint32_t*>(accum.data_ptr<int32_t>()),
+          out.data_ptr<int64_t>(),
           with_page_digests ? reinterpret_cast<uint64_t*>(page_accum.data_ptr<int64_t>()) : nullptr,
           with_page_digests,
           page_output_offsets.defined());
@@ -655,11 +748,16 @@ static void kv_checksum_direct_table_batched_impl(
           starts.data_ptr<int64_t>(),
           lengths.data_ptr<int64_t>(),
           with_page_digests ? logical_starts.data_ptr<int64_t>() : nullptr,
+          req_to_token.size(0),
+          req_to_token.size(1),
+          max_num_tokens,
+          full_to_swa_index_mapping.numel(),
           B,
           num_lanes,
           page_size,
           max_num_pages,
           reinterpret_cast<uint32_t*>(accum.data_ptr<int32_t>()),
+          out.data_ptr<int64_t>(),
           with_page_digests ? reinterpret_cast<uint64_t*>(page_accum.data_ptr<int64_t>()) : nullptr,
           with_page_digests,
           page_output_offsets.defined());
@@ -682,11 +780,16 @@ static void kv_checksum_direct_table_batched_impl(
           starts.data_ptr<int64_t>(),
           lengths.data_ptr<int64_t>(),
           with_page_digests ? logical_starts.data_ptr<int64_t>() : nullptr,
+          req_to_token.size(0),
+          req_to_token.size(1),
+          max_num_tokens,
+          full_to_swa_index_mapping.numel(),
           B,
           num_lanes,
           page_size,
           max_num_pages,
           reinterpret_cast<uint32_t*>(accum.data_ptr<int32_t>()),
+          out.data_ptr<int64_t>(),
           with_page_digests ? reinterpret_cast<uint64_t*>(page_accum.data_ptr<int64_t>()) : nullptr,
           with_page_digests,
           page_output_offsets.defined());
@@ -707,11 +810,16 @@ static void kv_checksum_direct_table_batched_impl(
           starts.data_ptr<int64_t>(),
           lengths.data_ptr<int64_t>(),
           with_page_digests ? logical_starts.data_ptr<int64_t>() : nullptr,
+          req_to_token.size(0),
+          req_to_token.size(1),
+          max_num_tokens,
+          full_to_swa_index_mapping.numel(),
           B,
           num_lanes,
           page_size,
           max_num_pages,
           reinterpret_cast<uint32_t*>(accum.data_ptr<int32_t>()),
+          out.data_ptr<int64_t>(),
           with_page_digests ? reinterpret_cast<uint64_t*>(page_accum.data_ptr<int64_t>()) : nullptr,
           with_page_digests,
           page_output_offsets.defined());
@@ -741,6 +849,13 @@ static void kv_checksum_direct_table_batched_impl(
         M,
         out.data_ptr<int64_t>());
   }
+  kv_checksum_validate_metadata_kernel<<<(M + 255) / 256, 256, 0, stream>>>(
+      req_pool_indices.data_ptr<int64_t>(), starts.data_ptr<int64_t>(), lengths.data_ptr<int64_t>(), M,
+      req_to_token.size(0), req_to_token.size(1), max_num_tokens,
+      page_output_offsets.defined() ? page_output_offsets.data_ptr<int64_t>() : nullptr,
+      with_page_digests ? logical_starts.data_ptr<int64_t>() : nullptr, page_size, max_num_pages,
+      page_output_offsets.defined() ? page_out.numel() : 0,
+      out.data_ptr<int64_t>());
   // clang-format on
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 #endif

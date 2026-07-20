@@ -78,6 +78,8 @@ _I32_SIGN = 1 << 31
 
 # Transfer page tags are conceptually uint32; torch stores the bit pattern in int32.
 TRANSFER_PAGE_TAG_DTYPE = torch.int32
+KV_ATTENTION_TAG_BYTES_PER_PAGE = 48
+KV_CHECKSUM_MAX_WORKSPACE_BYTES = 512 * 1024 * 1024
 KV_PAGE_INVALID_MAPPING = 1 << 0
 KV_PAGE_VALIDATION_INCOMPLETE = 1 << 30
 KV_PAGE_VALIDATION_REMOTE_FAILURE = 1 << 29
@@ -415,15 +417,18 @@ class KVProtectionConfig:
         if not enable_attention_tags and not enable_transfer_checksum:
             return cls.disabled()
 
+        if envs.SGLANG_ENABLE_LEGACY_KV_PROTECTION_COMPLETION.get():
+            raise RuntimeError(
+                "Legacy nonce-less KV protection completion is not safe and is "
+                "no longer supported. Upgrade prefill workers before enabling "
+                "KV page protection or transfer checksums."
+            )
+
         return cls(
             enable_attention_tags=enable_attention_tags,
             enable_transfer_checksum=enable_transfer_checksum,
             enable_page_history=(
                 enable_attention_tags and envs.SGLANG_KV_PAGE_HISTORY.get()
-            ),
-            allow_legacy_completion=(
-                (enable_attention_tags or enable_transfer_checksum)
-                and envs.SGLANG_ENABLE_LEGACY_KV_PROTECTION_COMPLETION.get()
             ),
         )
 
@@ -453,6 +458,9 @@ SUPPORTED_ALLOCATOR_CLASSES = (
 
 # Transfer backends for which the transfer-checksum manifest exchange is wired.
 SUPPORTED_CHECKSUM_BACKENDS = ("mooncake",)
+# Fake accepts tag metadata for no-transfer scheduler coverage; Mooncake is the
+# only production backend that transports and commits it.
+SUPPORTED_ATTENTION_TAG_BACKENDS = ("mooncake", "fake")
 
 
 def assert_protection_supported(
@@ -513,6 +521,16 @@ def assert_protection_supported(
             "SGLANG_KV_PAGE_PROTECTION."
         )
 
+    if config.enable_attention_tags and transfer_backend is not None:
+        backend = str(transfer_backend).lower()
+        if backend not in SUPPORTED_ATTENTION_TAG_BACKENDS:
+            raise RuntimeError(
+                "KV attention tags are enabled but transfer backend "
+                f"{transfer_backend!r} does not transport page-tag metadata. "
+                f"Supported backends: {SUPPORTED_ATTENTION_TAG_BACKENDS}. "
+                "Set SGLANG_KV_PAGE_PROTECTION=0 or use a supported backend."
+            )
+
     if config.enable_attention_tags:
         from sglang.srt.environ import envs
 
@@ -529,6 +547,12 @@ def assert_protection_supported(
                 "SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION=1 to use scheduler "
                 "validation, or disable SGLANG_KV_PAGE_PROTECTION."
             )
+
+    if config.checksum_enabled and is_cuda_device is False:
+        raise RuntimeError(
+            "KV transfer checksums require the NVIDIA CUDA checksum kernel. "
+            "Set SGLANG_KV_TRANSFER_CHECKSUM=0 or run on CUDA."
+        )
 
     if config.checksum_enabled and transfer_backend is not None:
         backend = str(transfer_backend).lower()
@@ -776,6 +800,7 @@ class AttentionTagManifest:
     generations_t: torch.Tensor
     expected_tags_t: torch.Tensor
     revision: int = 0
+    max_num_pages: Optional[int] = None
 
     @classmethod
     def from_pages(
@@ -785,6 +810,7 @@ class AttentionTagManifest:
         physical_page_ids: Sequence[int],
         generations: Sequence[int],
         page_positions: Optional[Sequence[int]] = None,
+        max_num_pages: Optional[int] = None,
     ) -> AttentionTagManifest:
         phys = list(physical_page_ids)
         gens = list(generations)
@@ -795,6 +821,14 @@ class AttentionTagManifest:
         assert len(phys) == len(
             positions
         ), "physical_page_ids/page_positions length mismatch"
+        if max_num_pages is not None:
+            max_num_pages = int(max_num_pages)
+            if max_num_pages <= 0:
+                raise ValueError("max_num_pages must be positive")
+            first = max(0, len(phys) - max_num_pages)
+            phys = phys[first:]
+            gens = gens[first:]
+            positions = positions[first:]
         expected = [
             compute_attention_tag_scalar(phys[i], positions[i], bootstrap_room, gens[i])
             for i in range(len(phys))
@@ -811,6 +845,7 @@ class AttentionTagManifest:
             page_positions_t=page_positions_t,
             generations_t=generations_t,
             expected_tags_t=expected_tags_t,
+            max_num_pages=max_num_pages,
         )
 
     @classmethod
@@ -821,6 +856,7 @@ class AttentionTagManifest:
         physical_page_ids: torch.Tensor,
         generations: torch.Tensor,
         page_positions: Optional[Sequence[int] | torch.Tensor] = None,
+        max_num_pages: Optional[int] = None,
     ) -> AttentionTagManifest:
         pages_t = physical_page_ids.reshape(-1).to(dtype=torch.long)
         generations_t = generations.reshape(-1).to(
@@ -844,6 +880,17 @@ class AttentionTagManifest:
             )
         if generations_t.numel() != num_pages or positions_t.numel() != num_pages:
             raise RuntimeError("attention tag tensor metadata length mismatch")
+        if max_num_pages is not None:
+            max_num_pages = int(max_num_pages)
+            if max_num_pages <= 0:
+                raise ValueError("max_num_pages must be positive")
+            first = max(0, num_pages - max_num_pages)
+            if first:
+                pages_t = pages_t[first:].clone()
+                generations_t = generations_t[first:].clone()
+                positions_t = positions_t[first:].clone()
+                positions = positions[first:] if positions else []
+                num_pages -= first
         expected_tags_t = compute_attention_tags_tensor(
             pages_t,
             positions_t,
@@ -860,6 +907,7 @@ class AttentionTagManifest:
             page_positions_t=positions_t,
             generations_t=generations_t,
             expected_tags_t=expected_tags_t,
+            max_num_pages=max_num_pages,
         )
 
     @property
@@ -925,6 +973,16 @@ class AttentionTagManifest:
                 return i
         return None
 
+    def _prune_to_max_pages(self) -> None:
+        if self.max_num_pages is None or self.num_pages <= self.max_num_pages:
+            return
+        first = self.num_pages - self.max_num_pages
+        self.page_positions = self.page_positions[first:]
+        self.physical_page_ids_t = self.physical_page_ids_t[first:].clone()
+        self.page_positions_t = self.page_positions_t[first:].clone()
+        self.generations_t = self.generations_t[first:].clone()
+        self.expected_tags_t = self.expected_tags_t[first:].clone()
+
     def refresh_page_tensor(
         self,
         *,
@@ -965,6 +1023,7 @@ class AttentionTagManifest:
         self.expected_tags_t[entry_index : entry_index + 1] = expected_t
 
         self.revision += 1
+        self._prune_to_max_pages()
         return tag_page_id, expected_t
 
 
@@ -1007,6 +1066,7 @@ class TransferPageTagManifest:
     generations_t: torch.Tensor
     expected_tags_t: torch.Tensor
     revision: int = 0
+    max_num_pages: Optional[int] = None
 
     @classmethod
     def from_pages(
@@ -1016,6 +1076,7 @@ class TransferPageTagManifest:
         physical_page_ids: Sequence[int],
         generations: Sequence[int],
         page_positions: Optional[Sequence[int]] = None,
+        max_num_pages: Optional[int] = None,
     ) -> TransferPageTagManifest:
         phys = list(physical_page_ids)
         gens = list(generations)
@@ -1026,6 +1087,14 @@ class TransferPageTagManifest:
         assert len(phys) == len(
             positions
         ), "physical_page_ids/page_positions length mismatch"
+        if max_num_pages is not None:
+            max_num_pages = int(max_num_pages)
+            if max_num_pages <= 0:
+                raise ValueError("max_num_pages must be positive")
+            first = max(0, len(phys) - max_num_pages)
+            phys = phys[first:]
+            gens = gens[first:]
+            positions = positions[first:]
         expected = [
             compute_transfer_page_tag_scalar(
                 phys[i], positions[i], bootstrap_room, gens[i]
@@ -1040,6 +1109,7 @@ class TransferPageTagManifest:
             page_positions_t=torch.tensor(positions, dtype=TAG_DTYPE),
             generations_t=torch.tensor(gens, dtype=TAG_DTYPE),
             expected_tags_t=transfer_page_tags_to_tensor(expected),
+            max_num_pages=max_num_pages,
         )
 
     @classmethod
@@ -1050,6 +1120,7 @@ class TransferPageTagManifest:
         physical_page_ids: torch.Tensor,
         generations: torch.Tensor,
         page_positions: Optional[Sequence[int] | torch.Tensor] = None,
+        max_num_pages: Optional[int] = None,
     ) -> TransferPageTagManifest:
         pages_t = physical_page_ids.reshape(-1).to(dtype=torch.long)
         generations_t = generations.reshape(-1).to(
@@ -1073,6 +1144,17 @@ class TransferPageTagManifest:
             )
         if generations_t.numel() != num_pages or positions_t.numel() != num_pages:
             raise RuntimeError("transfer page tag tensor metadata length mismatch")
+        if max_num_pages is not None:
+            max_num_pages = int(max_num_pages)
+            if max_num_pages <= 0:
+                raise ValueError("max_num_pages must be positive")
+            first = max(0, num_pages - max_num_pages)
+            if first:
+                pages_t = pages_t[first:].clone()
+                generations_t = generations_t[first:].clone()
+                positions_t = positions_t[first:].clone()
+                positions = positions[first:] if positions else []
+                num_pages -= first
         expected_tags_t = compute_transfer_page_tags_tensor(
             pages_t,
             positions_t,
@@ -1089,6 +1171,7 @@ class TransferPageTagManifest:
             page_positions_t=positions_t,
             generations_t=generations_t,
             expected_tags_t=expected_tags_t,
+            max_num_pages=max_num_pages,
         )
 
     @property
@@ -1150,6 +1233,16 @@ class TransferPageTagManifest:
                 return i
         return None
 
+    def _prune_to_max_pages(self) -> None:
+        if self.max_num_pages is None or self.num_pages <= self.max_num_pages:
+            return
+        first = self.num_pages - self.max_num_pages
+        self.page_positions = self.page_positions[first:]
+        self.physical_page_ids_t = self.physical_page_ids_t[first:].clone()
+        self.page_positions_t = self.page_positions_t[first:].clone()
+        self.generations_t = self.generations_t[first:].clone()
+        self.expected_tags_t = self.expected_tags_t[first:].clone()
+
     def refresh_page_tensor(
         self,
         *,
@@ -1190,6 +1283,7 @@ class TransferPageTagManifest:
         self.expected_tags_t[entry_index : entry_index + 1] = expected_t
 
         self.revision += 1
+        self._prune_to_max_pages()
         return tag_page_id, expected_t
 
 
@@ -1997,6 +2091,21 @@ class ChecksumPlan:
         )
 
     @classmethod
+    def wire_identity(cls, payload: bytes) -> Tuple[int, int]:
+        """Read the nonce and room before accepting a completion payload."""
+        if (
+            not isinstance(payload, bytes)
+            or len(payload) < _CHECKSUM_MANIFEST_HEADER.size
+        ):
+            raise ValueError("checksum page manifest is truncated")
+        if len(payload) > _CHECKSUM_MANIFEST_MAX_BYTES:
+            raise ValueError("checksum page manifest exceeds the wire size limit")
+        header = _CHECKSUM_MANIFEST_HEADER.unpack_from(payload)
+        if header[0] != _CHECKSUM_MANIFEST_MAGIC:
+            raise ValueError("checksum page manifest has invalid magic")
+        return int(header[4]), int(header[5])
+
+    @classmethod
     def from_wire_bytes(
         cls,
         payload: bytes,
@@ -2132,16 +2241,62 @@ class _DirectKVChecksumCache:
         torch.Tensor,
         torch.Tensor,
     ]:
-        if (
+        resize_primary = (
             self.accum is None
             or self.accum.device != device
             or self.batch_capacity < batch_size
             or self.page_capacity < max_num_pages
-        ):
+        )
+        capacity = (
+            max(8, 1 << (batch_size - 1).bit_length())
+            if resize_primary
+            else self.batch_capacity
+        )
+        page_capacity = (
+            1 << (max_num_pages - 1).bit_length()
+            if resize_primary
+            else self.page_capacity
+        )
+        primary_workspace_bytes = (
+            capacity * (4 + 8)
+            + capacity * page_capacity * 8 * 2
+            + (6 * capacity + 1) * 8
+        )
+        if need_secondary:
+            secondary_workspace_bytes = capacity * (4 + 8) + (
+                capacity * page_capacity * 8 * 2
+            )
+        else:
+            secondary_workspace_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in (
+                    self.secondary_accum,
+                    self.secondary_out,
+                    self.secondary_page_accum,
+                    self.secondary_page_out,
+                )
+                if tensor is not None and tensor.device == device
+            )
+        packed_results_bytes = (batch_size + total_num_pages) * 8
+        workspace_bytes = (
+            primary_workspace_bytes + secondary_workspace_bytes + packed_results_bytes
+        )
+        if workspace_bytes > KV_CHECKSUM_MAX_WORKSPACE_BYTES:
+            raise RuntimeError(
+                "KV checksum workspace exceeds the 512 MiB safety limit "
+                f"(required_bytes={workspace_bytes}, batch_capacity={capacity}, "
+                f"page_capacity={page_capacity})"
+            )
+
+        if resize_primary:
             # Resize both dimensions from the active shape. Keeping each prior
             # high-water mark independently can retain their unused cross-product.
-            capacity = max(8, 1 << (batch_size - 1).bit_length())
-            page_capacity = 1 << (max_num_pages - 1).bit_length()
+            self.accum = None
+            self.final_out = None
+            self.page_accum = None
+            self.page_out = None
+            self.metadata_host = None
+            self.metadata_device = None
             self.accum = torch.empty((capacity,), dtype=torch.int32, device=device)
             self.final_out = torch.empty((capacity,), dtype=TAG_DTYPE, device=device)
             self.page_accum = torch.empty(
@@ -2159,11 +2314,15 @@ class _DirectKVChecksumCache:
         if need_secondary and (
             self.secondary_accum is None
             or self.secondary_accum.device != device
-            or self.secondary_accum.numel() < self.batch_capacity
+            or self.secondary_accum.numel() != self.batch_capacity
             or self.secondary_page_accum is None
-            or self.secondary_page_accum.shape[0] < self.batch_capacity
-            or self.secondary_page_accum.shape[1] < self.page_capacity
+            or self.secondary_page_accum.shape[0] != self.batch_capacity
+            or self.secondary_page_accum.shape[1] != self.page_capacity
         ):
+            self.secondary_accum = None
+            self.secondary_out = None
+            self.secondary_page_accum = None
+            self.secondary_page_out = None
             self.secondary_accum = torch.empty(
                 (self.batch_capacity,), dtype=torch.int32, device=device
             )
@@ -2234,6 +2393,8 @@ class AsyncChecksumBatch:
         packed_results = self.packed_results_t.detach().cpu()
         batch_size = len(self.page_counts)
         checksums = packed_results[:batch_size].tolist()
+        if any(int(checksum) < 0 for checksum in checksums):
+            raise RuntimeError("native KV checksum rejected invalid metadata")
         page_values = packed_results[batch_size:]
         page_digests = []
         page_offset = 0
@@ -2492,12 +2653,14 @@ class KVPageProtectionManager:
         metrics_collector: object = None,
         transfer_backend: Optional[str] = None,
         is_spec_decode: bool = False,
+        is_cuda_device: Optional[bool] = None,
     ):
         assert_protection_supported(
             config,
             allocator=allocator,
             transfer_backend=transfer_backend,
             is_spec_decode=is_spec_decode,
+            is_cuda_device=is_cuda_device,
         )
         self.config = config
         self.page_size = page_size
@@ -2549,6 +2712,7 @@ class KVPageProtectionManager:
         request_pool_idx: int = 1,
         bootstrap_room: int,
         page_positions: Optional[Sequence[int]] = None,
+        max_num_pages: Optional[int] = None,
     ) -> Optional[AttentionTagManifest]:
         """Write attention ownership tags for a freshly transferred request.
 
@@ -2568,6 +2732,7 @@ class KVPageProtectionManager:
             pages_t,
             generations_t,
             page_positions=page_positions,
+            max_num_pages=max_num_pages,
         )
         self.table.write_tags(
             manifest.physical_page_ids_t,
@@ -2739,6 +2904,7 @@ class KVPageProtectionManager:
         bootstrap_room: int,
         page_positions: Optional[Sequence[int]] = None,
         write_actual: bool = False,
+        max_num_pages: Optional[int] = None,
     ) -> Optional[TransferPageTagManifest]:
         """Create expected transfer page tags for decode-owned pages.
 
@@ -2758,6 +2924,7 @@ class KVPageProtectionManager:
             pages_t,
             generations_t,
             page_positions=page_positions,
+            max_num_pages=max_num_pages,
         )
         if write_actual:
             self.table.write_transfer_page_tags(
@@ -3173,6 +3340,116 @@ class KVPageProtectionManager:
             )
         if transfer is not None and bool(transfer_mismatch.any().item()):
             result.extend(self._transfer_mismatch_details(transfer, transfer_mismatch))
+        return result
+
+    def verify_full_page_mapping_batch(
+        self,
+        items: Sequence[Tuple[str, int, int, object]],
+        req_to_token: torch.Tensor,
+    ) -> List[KVProtectionBookkeepingError]:
+        """Verify every protected full-cache page-table entry before DSA reads it."""
+        if not self.config.enable_attention_tags or self.table is None:
+            return []
+        if req_to_token.dim() != 2 or req_to_token.device != torch.device(self.device):
+            raise RuntimeError("protected request-token table has an invalid layout")
+
+        result: List[KVProtectionBookkeepingError] = []
+        mapping_entries = []
+        table_rows, table_columns = req_to_token.shape
+        for rid, request_pool_idx, seq_len, grouped_manifest in items:
+            manifests = _iter_attention_manifests(grouped_manifest)
+            if not manifests:
+                continue
+            manifest = manifests[0]
+            expected_num_pages = (int(seq_len) + self.page_size - 1) // self.page_size
+            expected_positions = list(range(expected_num_pages))
+            detail = None
+            if manifest.page_size != self.page_size:
+                detail = "full-cache manifest page size mismatch"
+            elif manifest.page_positions != expected_positions:
+                detail = (
+                    "full-cache manifest does not cover the complete sequence "
+                    f"(expected_pages={expected_num_pages}, actual={manifest.page_positions})"
+                )
+            elif request_pool_idx <= 0 or request_pool_idx >= table_rows:
+                detail = "request-pool index is out of bounds"
+            elif (
+                expected_num_pages
+                and (expected_num_pages - 1) * self.page_size >= table_columns
+            ):
+                detail = "protected sequence exceeds the request-token table"
+            if detail is not None:
+                error = KVProtectionBookkeepingError(
+                    rid=rid,
+                    bootstrap_room=manifest.bootstrap_room,
+                    cause="pre_indexer_page_mapping",
+                    detail=detail,
+                )
+                attach_kv_protection_incident(
+                    error, kind="attention_tag", phase="pre_indexer"
+                )
+                result.append(error)
+                continue
+            if expected_num_pages:
+                mapping_entries.append((rid, request_pool_idx, manifest))
+
+        if not mapping_entries:
+            return result
+
+        request_indices = []
+        token_positions = []
+        expected_pages = []
+        offsets = [0]
+        for _, request_pool_idx, manifest in mapping_entries:
+            count = manifest.num_pages
+            request_indices.append(
+                torch.full(
+                    (count,),
+                    request_pool_idx,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+            )
+            token_positions.append(
+                manifest.page_positions_t.to(device=self.device, dtype=torch.long)
+                * self.page_size
+            )
+            expected_pages.append(manifest.physical_pages_tensor(self.device))
+            offsets.append(offsets[-1] + count)
+
+        request_indices_t = torch.cat(request_indices)
+        token_positions_t = torch.cat(token_positions)
+        expected_pages_t = torch.cat(expected_pages)
+        current_pages = (
+            req_to_token[request_indices_t, token_positions_t] // self.page_size
+        )
+        mismatch = current_pages.ne(expected_pages_t)
+        if not bool(mismatch.any().item()):
+            return result
+
+        bad_indices = torch.nonzero(mismatch).reshape(-1).cpu().tolist()
+        seen_rids = set()
+        for index in bad_indices:
+            owner_index = bisect_right(offsets, int(index)) - 1
+            rid, _, manifest = mapping_entries[owner_index]
+            if rid in seen_rids:
+                continue
+            seen_rids.add(rid)
+            page_offset = int(index) - offsets[owner_index]
+            error = KVProtectionBookkeepingError(
+                rid=rid,
+                bootstrap_room=manifest.bootstrap_room,
+                cause="pre_indexer_page_mapping",
+                detail=(
+                    f"logical_page={manifest.page_positions[page_offset]}, "
+                    f"expected_page={int(expected_pages_t[index].item())}, "
+                    f"actual_page={int(current_pages[index].item())}"
+                ),
+            )
+            attach_kv_protection_incident(
+                error, kind="attention_tag", phase="pre_indexer"
+            )
+            result.append(error)
         return result
 
     # -- transfer checksums ------------------------------------------------

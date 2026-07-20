@@ -3161,6 +3161,11 @@ class Scheduler(
             "kv_fused_page_protection_enabled",
             False,
         )
+        requires_pre_indexer_validation = getattr(
+            self.tp_worker.model_runner,
+            "kv_requires_pre_indexer_page_validation",
+            False,
+        )
         try:
             page_size = manager.page_size
             attention_items = []
@@ -3236,7 +3241,7 @@ class Scheduler(
                     )
             mismatches = (
                 []
-                if use_fused_verification
+                if use_fused_verification and not requires_pre_indexer_validation
                 else manager.verify_protection_batch(attention_items, transfer_items)
             )
         except Exception as e:  # fail closed without crashing the decode loop
@@ -3266,35 +3271,96 @@ class Scheduler(
             if not mismatches:
                 return
 
-        if not mismatches:
+        bad_rids = {m.rid for m in mismatches}
+        refresh_errors = []
+        for (
+            rid,
+            req_pool_idx,
+            attention_manifest,
+            transfer_manifest,
+            logical_pos,
+            physical_page_id,
+            swa_physical_page_id,
+        ) in pending_refreshes:
+            if rid in bad_rids:
+                continue
             try:
-                for (
-                    _,
-                    req_pool_idx,
-                    attention_manifest,
-                    transfer_manifest,
-                    logical_pos,
-                    physical_page_id,
-                    swa_physical_page_id,
-                ) in pending_refreshes:
-                    if attention_manifest is not None:
-                        manager.refresh_tail_page(
-                            attention_manifest,
-                            logical_pos=logical_pos,
-                            request_pool_idx=req_pool_idx,
-                            physical_page_id=physical_page_id,
-                            swa_physical_page_id=swa_physical_page_id,
-                        )
-                    if transfer_manifest is not None:
-                        manager.refresh_transfer_page_tag_tail_page(
-                            transfer_manifest,
-                            logical_pos=logical_pos,
-                            request_pool_idx=req_pool_idx,
-                            physical_page_id=physical_page_id,
-                            swa_physical_page_id=swa_physical_page_id,
-                        )
+                if attention_manifest is not None:
+                    manager.refresh_tail_page(
+                        attention_manifest,
+                        logical_pos=logical_pos,
+                        request_pool_idx=req_pool_idx,
+                        physical_page_id=physical_page_id,
+                        swa_physical_page_id=swa_physical_page_id,
+                    )
+                if transfer_manifest is not None:
+                    manager.refresh_transfer_page_tag_tail_page(
+                        transfer_manifest,
+                        logical_pos=logical_pos,
+                        request_pool_idx=req_pool_idx,
+                        physical_page_id=physical_page_id,
+                        swa_physical_page_id=swa_physical_page_id,
+                    )
             except Exception as e:
-                logger.error("KV attention tag tail refresh error: %s", e)
+                logger.exception("KV attention tag tail refresh error for rid=%s", rid)
+                from sglang.srt.mem_cache.kv_page_tags import (
+                    KVProtectionBookkeepingError,
+                    attach_kv_protection_incident,
+                )
+
+                error = KVProtectionBookkeepingError(
+                    rid=rid,
+                    bootstrap_room=getattr(attention_manifest, "bootstrap_room", None),
+                    cause="tail_page_refresh",
+                    detail=str(e),
+                )
+                attach_kv_protection_incident(
+                    error, kind="attention_tag", phase="pre_attention"
+                )
+                refresh_errors.append(error)
+
+        mismatches.extend(refresh_errors)
+        bad_rids.update(error.rid for error in refresh_errors)
+
+        if requires_pre_indexer_validation:
+            mapping_items = [
+                (
+                    req.rid,
+                    int(req.req_pool_idx),
+                    int(batch.seq_lens_cpu[i].item()),
+                    req.kv_attention_tag_manifest,
+                )
+                for i, req in enumerate(batch.reqs)
+                if req.rid not in bad_rids
+                and req.req_pool_idx is not None
+                and getattr(req, "kv_attention_tag_manifest", None) is not None
+            ]
+            try:
+                mapping_errors = manager.verify_full_page_mapping_batch(
+                    mapping_items, self.req_to_token_pool.req_to_token
+                )
+            except Exception as e:
+                logger.exception("KV pre-indexer page mapping verification error")
+                from sglang.srt.mem_cache.kv_page_tags import (
+                    KVProtectionBookkeepingError,
+                    attach_kv_protection_incident,
+                )
+
+                mapping_errors = []
+                for rid, _, _, manifest in mapping_items:
+                    error = KVProtectionBookkeepingError(
+                        rid=rid,
+                        bootstrap_room=getattr(manifest, "bootstrap_room", None),
+                        cause="pre_indexer_page_mapping",
+                        detail=str(e),
+                    )
+                    attach_kv_protection_incident(
+                        error, kind="attention_tag", phase="pre_indexer"
+                    )
+                    mapping_errors.append(error)
+            mismatches.extend(mapping_errors)
+
+        if not mismatches:
             return
 
         bad_rids = {m.rid for m in mismatches}
@@ -3340,36 +3406,6 @@ class Scheduler(
             batch.out_cache_loc = prepared_out_cache_loc.index_select(
                 0, keep_indices_device
             )
-            try:
-                for (
-                    rid,
-                    req_pool_idx,
-                    attention_manifest,
-                    transfer_manifest,
-                    logical_pos,
-                    physical_page_id,
-                    swa_physical_page_id,
-                ) in pending_refreshes:
-                    if rid in bad_rids:
-                        continue
-                    if attention_manifest is not None:
-                        manager.refresh_tail_page(
-                            attention_manifest,
-                            logical_pos=logical_pos,
-                            request_pool_idx=req_pool_idx,
-                            physical_page_id=physical_page_id,
-                            swa_physical_page_id=swa_physical_page_id,
-                        )
-                    if transfer_manifest is not None:
-                        manager.refresh_transfer_page_tag_tail_page(
-                            transfer_manifest,
-                            logical_pos=logical_pos,
-                            request_pool_idx=req_pool_idx,
-                            physical_page_id=physical_page_id,
-                            swa_physical_page_id=swa_physical_page_id,
-                        )
-            except Exception as e:
-                logger.error("KV attention tag tail refresh error: %s", e)
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC

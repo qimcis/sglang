@@ -84,7 +84,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.utils import get_num_new_pages
+from sglang.srt.utils import get_num_new_pages, is_cuda
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -378,6 +378,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 else str(self.transfer_backend)
             ),
             is_spec_decode=not self.scheduler.spec_algorithm.is_none(),
+            is_cuda_device=is_cuda(),
         )
         self.scheduler.kv_protection_manager = manager
         logger.info(
@@ -491,9 +492,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         page_ids = allocator.attention_tag_swa_page_ids(
                             [int(x) for x in pages.tolist()]
                         )
+                        max_num_pages = (window_size + page_size - 1) // page_size + 1
                     elif st == StateType.DSA:
                         positions = np.arange(pages.size, dtype=np.int64)
                         page_ids = [int(x) for x in pages.tolist()]
+                        max_num_pages = None
                     else:
                         continue
                     append_manifest(
@@ -502,6 +505,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                             request_pool_idx=req.req_pool_idx,
                             page_positions=positions.tolist(),
                             bootstrap_room=req.bootstrap_room or 0,
+                            max_num_pages=max_num_pages,
                         )
                     )
 
@@ -2160,6 +2164,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     request_pool_idx=req.req_pool_idx,
                     page_positions=swa_page_positions,
                     bootstrap_room=req.bootstrap_room or 0,
+                    max_num_pages=((window_size + page_size - 1) // page_size + 1),
                 )
                 if swa_manifest is not None and swa_manifest.num_pages > 0:
                     manifests.append(swa_manifest)
