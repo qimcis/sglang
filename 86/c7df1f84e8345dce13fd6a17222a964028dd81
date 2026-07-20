@@ -1,0 +1,31 @@
+python/sglang/srt/mem_cache/kv_page_tags.py
+  s_414cd192908149::t_34307c7aff91e0 46,54,805-818,991-1000,1014,1084-1097,1264-1273,1287,2222,2229,2235,2465-2473,2479,2487,2496,2529,2559,2565,2578,2586,2606,2613,2619,2626,3610,3733,3765,3799,3821-3824
+python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+  s_5f73f26aee7f01::t_ef2313cdc50a28 1072,1074,1079
+sgl-kernel/csrc/common_extension.cc
+  s_414cd192908149::t_e355bdd94c7b4a 360,366,373
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "86c7df1f84e8345dce13fd6a17222a964028dd81",
+  "prompts": {},
+  "sessions": {
+    "s_414cd192908149": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_092e40640ffew2SWf2GjqC7eiw",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    },
+    "s_5f73f26aee7f01": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_099a8b759ffeqnA7QziBATTLQD",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
