@@ -1,0 +1,19 @@
+python/sglang/srt/layers/moe/moe_runner/runner.py
+  s_5f73f26aee7f01::t_af25145a66d7c6 5,16-23,95-96,110-164,205-206,243-271
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cff1144cfec9260cf6e007bc33ed693fb052ce89",
+  "prompts": {},
+  "sessions": {
+    "s_5f73f26aee7f01": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_099a8b759ffeqnA7QziBATTLQD",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
