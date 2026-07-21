@@ -1793,8 +1793,7 @@ class MooncakeKVManager(CommonKVManager):
                             self.update_status(room_to_be_aborted, KVPoll.Failed)
                         pending_abort = (
                             protection_required
-                            and room_to_be_aborted in self.request_status
-                            and self.request_status[room_to_be_aborted]
+                            and self.request_status.get(room_to_be_aborted)
                             != KVPoll.Success
                             and not retired_nonce
                             and bool(abort_nonce)
@@ -1869,19 +1868,17 @@ class MooncakeKVManager(CommonKVManager):
                     transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
                     transfer_nonce = transfer_info.transfer_nonce
                     with self.request_status_lock:
-                        if (
-                            room not in self.request_status
-                            or self.request_status[room] == KVPoll.Failed
-                        ):
+                        if self.request_status.get(room) == KVPoll.Failed:
                             logger.warning(
                                 "Ignoring Mooncake bootstrap for inactive room=%s",
                                 room,
                             )
                             continue
-                        pending_abort_nonce = self.pending_abort_nonce_by_room.get(
-                            room, 0
-                        )
-                        if pending_abort_nonce == transfer_nonce:
+                        pending_abort_nonce = self.pending_abort_nonce_by_room.get(room)
+                        if (
+                            pending_abort_nonce is not None
+                            and pending_abort_nonce == transfer_nonce
+                        ):
                             self.pending_abort_nonce_by_room.pop(room, None)
                             self._retire_transfer_nonce(room, transfer_nonce)
                             self.update_status(room, KVPoll.Failed)
