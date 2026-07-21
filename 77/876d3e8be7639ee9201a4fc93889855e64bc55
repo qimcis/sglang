@@ -1,0 +1,23 @@
+sgl-kernel/csrc/kvcacheio/checksum.cu
+  s_5f73f26aee7f01::t_c9268cf0cffe05 44-50,52-53,55-56,104-223,227-297,361-477
+sgl-kernel/python/sgl_kernel/__init__.py
+  s_5f73f26aee7f01::t_e26b74dfe045b8 77,207
+sgl-kernel/tests/test_kv_checksum.py
+  s_5f73f26aee7f01::t_affb938fba7096 18,40-48,88-102,220-302,327-361
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "77876d3e8be7639ee9201a4fc93889855e64bc55",
+  "prompts": {},
+  "sessions": {
+    "s_5f73f26aee7f01": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_099a8b759ffeqnA7QziBATTLQD",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
