@@ -84,7 +84,27 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     int64_t sm_margin,
     std::optional<const at::Tensor>& sinks_,      // (h)
     std::optional<at::Tensor> sparse_mask_fine_,  // [total_q, max_k_blocks, num_int32_per_block]
-    bool only_qv);
+    bool only_qv,
+    std::optional<at::Tensor> protection_request_indices_,
+    std::optional<at::Tensor> protection_seqlens_,
+    std::optional<at::Tensor> protection_page_table_,
+    std::optional<at::Tensor> protection_page_table_2_,
+    int64_t protection_page_table_page_offset,
+    int64_t protection_page_table_2_page_offset,
+    int64_t protection_page_table_2_window_size,
+    int64_t protection_page_size,
+    bool protection_validate_full_mapping,
+    std::optional<at::Tensor> protection_actual_tags_,
+    std::optional<at::Tensor> protection_actual_generations_,
+    std::optional<at::Tensor> protection_actual_transfer_tags_,
+    std::optional<at::Tensor> protection_owner_request_indices_,
+    std::optional<at::Tensor> protection_owner_page_positions_,
+    std::optional<at::Tensor> protection_expected_tags_,
+    std::optional<at::Tensor> protection_expected_generations_,
+    std::optional<at::Tensor> protection_expected_transfer_tags_,
+    std::optional<at::Tensor> protection_request_epochs_,
+    std::optional<at::Tensor> protection_validated_epochs_,
+    std::optional<at::Tensor> protection_status_);
 
 /*
  * From flash-attention: get_scheduler_metadata
