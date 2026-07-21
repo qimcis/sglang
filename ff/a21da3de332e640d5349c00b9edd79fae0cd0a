@@ -1,0 +1,35 @@
+python/sglang/multimodal_gen/configs/pipeline_configs/glm_image.py
+  s_5f73f26aee7f01::t_4f72a0a9382205 51-54,64-85,90-92,95,104-108,111,132-133
+python/sglang/multimodal_gen/configs/sample/glmimage.py
+  s_5f73f26aee7f01::t_6129dbb18b0f7c 2,9-12
+python/sglang/multimodal_gen/runtime/disaggregation/scheduler_mixin.py
+  s_5f73f26aee7f01::t_c0aa9b31ec82e6 75
+python/sglang/multimodal_gen/runtime/layers/attention/layer.py
+  s_5f73f26aee7f01::t_c6388279f13ced 534-595,878,913-928,945-1018
+python/sglang/multimodal_gen/runtime/models/dits/glm_image.py
+  s_5f73f26aee7f01::t_7dadec4c958d6a 76-93,554,560-585,587-591
+python/sglang/multimodal_gen/runtime/pipelines/glm_image.py
+  s_5f73f26aee7f01::t_a3329775fd517b 5-8,33-34
+python/sglang/multimodal_gen/runtime/pipelines_core/schedule_batch.py
+  s_5f73f26aee7f01::t_7a8ff61bee2d20 103-113
+python/sglang/multimodal_gen/runtime/pipelines_core/stages/input_validation.py
+  s_5f73f26aee7f01::t_e080889ed66004 93-104,106-112,114-115
+python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/glm_image.py
+  s_5f73f26aee7f01::t_e0e2039f2811b3 4,12-16,134-176,240,244,246,251-252,255,259,261-262,264-276,278,280,288-311,314-315,320-321,345-359,364,367-378,380,406-412,414-427,433-434,615-622,634-694,696-700,706,708,739,741,745-747,749-751,754-757,759-773,890-891,910-919,922-927,930,958,1029,1032,1059-1064,1083-1092
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ffa21da3de332e640d5349c00b9edd79fae0cd0a",
+  "prompts": {},
+  "sessions": {
+    "s_5f73f26aee7f01": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_099a8b759ffeqnA7QziBATTLQD",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
