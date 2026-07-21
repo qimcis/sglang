@@ -531,6 +531,68 @@ class USPAttention(nn.Module):
         effective_skip_sp = (
             self.skip_sequence_parallel or skip_sequence_parallel_override
         )
+        if (
+            not effective_skip_sp
+            and get_sequence_parallel_world_size() > 1
+            and num_replicated_prefix > 0
+            and q.shape[1] != k.shape[1]
+        ):
+            if num_replicated_suffix > 0 or num_replicated_kv_prefix > 0:
+                raise ValueError(
+                    "USPAttention supports at most one replicated-token mode per call."
+                )
+            if attn_mask is not None and (
+                attn_mask.dim() != 2 or attn_mask.shape[:2] != k.shape[:2]
+            ):
+                raise ValueError(
+                    "USPAttention cached-KV replicated-prefix path expects a [B, S_k_local] key mask."
+                )
+            return self._forward_with_cached_kv_and_replicated_text_all_gather(
+                q, k, v, attn_mask, num_replicated_prefix
+            )
+        if (
+            attn_mask is None
+            and not effective_skip_sp
+            and get_ring_parallel_world_size() > 1
+            and num_replicated_prefix > 0
+            and q.shape[1] == k.shape[1]
+        ):
+            return self._forward_with_replicated_prefix_mask_all_gather(
+                q,
+                k,
+                v,
+                torch.ones(q.shape[:2], dtype=torch.bool, device=q.device),
+                num_replicated_prefix,
+            )
+        if (
+            attn_mask is not None
+            and not effective_skip_sp
+            and get_sequence_parallel_world_size() > 1
+            and num_replicated_prefix > 0
+        ):
+            if num_replicated_suffix > 0 or num_replicated_kv_prefix > 0:
+                raise ValueError(
+                    "USPAttention supports at most one replicated-token mode per call."
+                )
+            if attn_mask.dim() != 2 or attn_mask.shape[:2] != q.shape[:2]:
+                raise ValueError(
+                    "USPAttention masked replicated-prefix path expects a [B, S_local] key mask."
+                )
+            if (
+                get_ring_parallel_world_size() == 1
+                and get_ulysses_parallel_world_size() > 1
+            ):
+                return self._forward_with_replicated_prefix(
+                    q,
+                    k,
+                    v,
+                    ctx_attn_metadata,
+                    num_replicated_prefix,
+                    attn_mask=attn_mask,
+                )
+            return self._forward_with_replicated_prefix_mask_all_gather(
+                q, k, v, attn_mask, num_replicated_prefix
+            )
         if attn_mask is not None:
 
             def _prepare_sdpa_mask(
@@ -813,6 +875,7 @@ class USPAttention(nn.Module):
         v: torch.Tensor,
         ctx_attn_metadata,
         num_rep: int,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Ulysses attention where the first *num_rep* tokens are replicated
         across SP ranks (e.g. text tokens) and should NOT be duplicated by the
@@ -847,7 +910,22 @@ class USPAttention(nn.Module):
         k = torch.cat([k_rep, k_shard], dim=1)
         v = torch.cat([v_rep, v_shard], dim=1)
 
-        out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+        if attn_mask is None:
+            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+        else:
+            mask_rep = attn_mask[:, :num_rep]
+            mask_shard = attn_mask[:, num_rep:]
+            gathered_mask_shard = sequence_model_parallel_all_gather(
+                mask_shard.contiguous(), dim=1
+            )
+            gathered_mask = torch.cat([mask_rep, gathered_mask_shard], dim=1)
+            out = self(
+                q,
+                k,
+                v,
+                attn_mask=gathered_mask,
+                skip_sequence_parallel_override=True,
+            )
 
         out_rep = out[:, :num_rep]
         out_shard = out[:, num_rep:]
@@ -863,6 +941,80 @@ class USPAttention(nn.Module):
         out_rep = torch.cat(gathered, dim=2)
 
         return torch.cat([out_rep, out_shard], dim=1)
+
+    def _forward_with_replicated_prefix_mask_all_gather(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: torch.Tensor,
+        num_rep: int,
+    ) -> torch.Tensor:
+        """Correctness fallback for masked replicated prefixes with ring SP."""
+        local_sequence_length = q.shape[1]
+        sp_rank = get_sp_parallel_rank()
+
+        local_mask = attn_mask.clone()
+        if sp_rank != 0:
+            local_mask[:, :num_rep] = False
+
+        q = sequence_model_parallel_all_gather(q.contiguous(), dim=1)
+        k = sequence_model_parallel_all_gather(k.contiguous(), dim=1)
+        v = sequence_model_parallel_all_gather(v.contiguous(), dim=1)
+        gathered_mask = sequence_model_parallel_all_gather(
+            local_mask.contiguous(), dim=1
+        )
+        out = self(
+            q,
+            k,
+            v,
+            attn_mask=gathered_mask,
+            skip_sequence_parallel_override=True,
+        )
+
+        start = sp_rank * local_sequence_length
+        return out[:, start : start + local_sequence_length]
+
+    def _forward_with_cached_kv_and_replicated_text_all_gather(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        num_rep: int,
+    ) -> torch.Tensor:
+        """Gather cached-image KV while keeping one copy of replicated text KV."""
+        local_query_length = q.shape[1]
+        cached_kv_length = k.shape[1] - local_query_length
+        if cached_kv_length < 0:
+            raise ValueError("USPAttention key sequence cannot be shorter than query")
+
+        sp_rank = get_sp_parallel_rank()
+        local_mask = (
+            attn_mask.clone()
+            if attn_mask is not None
+            else torch.ones(k.shape[:2], dtype=torch.bool, device=k.device)
+        )
+        if sp_rank != 0:
+            local_mask[:, :cached_kv_length] = False
+            local_mask[:, cached_kv_length : cached_kv_length + num_rep] = False
+
+        q = sequence_model_parallel_all_gather(q.contiguous(), dim=1)
+        k = sequence_model_parallel_all_gather(k.contiguous(), dim=1)
+        v = sequence_model_parallel_all_gather(v.contiguous(), dim=1)
+        gathered_mask = sequence_model_parallel_all_gather(
+            local_mask.contiguous(), dim=1
+        )
+        out = self(
+            q,
+            k,
+            v,
+            attn_mask=gathered_mask,
+            skip_sequence_parallel_override=True,
+        )
+
+        start = sp_rank * local_query_length
+        return out[:, start : start + local_query_length]
 
     def forward_with_replicated_kv_prefix(
         self,

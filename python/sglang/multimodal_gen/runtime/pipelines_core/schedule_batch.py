@@ -100,6 +100,17 @@ class Req:
     clip_embedding_pos: list[torch.Tensor] | None = None
     clip_embedding_neg: list[torch.Tensor] | None = None
 
+    # GLM-Image conditioning state
+    prior_token_id: torch.Tensor | None = None
+    prior_token_image_ids: list[torch.Tensor] | None = None
+    prior_token_drop_cond: torch.Tensor | None = None
+    prior_token_drop_uncond: torch.Tensor | None = None
+    target_size: torch.Tensor | None = None
+    crop_coords: torch.Tensor | None = None
+    kv_caches: Any | None = None
+    glm_image_kv_cache_keys: list[torch.Tensor] = field(default_factory=list)
+    glm_image_kv_cache_values: list[torch.Tensor] = field(default_factory=list)
+
     pooled_embeds: list[torch.Tensor] = field(default_factory=list)
     neg_pooled_embeds: list[torch.Tensor] = field(default_factory=list)
 

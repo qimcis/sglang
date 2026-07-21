@@ -72,6 +72,7 @@ _EXCLUDE_FIELDS = frozenset(
     {
         "sampling_params",
         "generator",
+        "kv_caches",
         "modules",
         "metrics",
         "extra_step_kwargs",

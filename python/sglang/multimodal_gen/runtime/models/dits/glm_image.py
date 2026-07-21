@@ -73,8 +73,24 @@ class GlmImageLayerKVCache:
             self.k_cache = torch.cat([self.k_cache, k], dim=1)
             self.v_cache = torch.cat([self.v_cache, v], dim=1)
 
-    def get(self):
-        return self.k_cache, self.v_cache
+    def get(self, k: Optional[torch.Tensor] = None, v: Optional[torch.Tensor] = None):
+        if k is None or v is None:
+            return self.k_cache, self.v_cache
+        if self.k_cache is None:
+            return k, v
+
+        if self.k_cache.shape[0] == 1 and k.shape[0] > 1:
+            k_cache = self.k_cache.expand(k.shape[0], -1, -1, -1)
+            v_cache = self.v_cache.expand(v.shape[0], -1, -1, -1)
+        elif self.k_cache.shape[0] == k.shape[0]:
+            k_cache = self.k_cache
+            v_cache = self.v_cache
+        else:
+            raise ValueError(
+                "GLM-Image KV cache batch does not match the denoising batch: "
+                f"{self.k_cache.shape[0]} != {k.shape[0]}"
+            )
+        return torch.cat([k_cache, k], dim=1), torch.cat([v_cache, v], dim=1)
 
     def clear(self):
         self.k_cache = None
@@ -535,22 +551,44 @@ class GlmImageAttention(torch.nn.Module):
             if kv_cache.mode == "write":
                 kv_cache.store(key, value)
             elif kv_cache.mode == "read":
-                k_cache, v_cache = kv_cache.get()
-                key = torch.cat([k_cache, key], dim=1) if k_cache is not None else key
-                value = (
-                    torch.cat([v_cache, value], dim=1) if v_cache is not None else value
-                )
+                key, value = kv_cache.get(key, value)
             elif kv_cache.mode == "skip":
                 pass
 
         # 4. Attention
         if attention_mask is not None:
-            text_attn_mask = attention_mask
-            assert (
-                text_attn_mask.dim() == 2
-            ), "the shape of text_attn_mask should be (batch_size, text_seq_length)"
+            if attention_mask.shape != (batch_size, text_seq_length):
+                raise ValueError(
+                    "GLM-Image attention_mask must have shape "
+                    f"({batch_size}, {text_seq_length}), got {tuple(attention_mask.shape)}"
+                )
+            cached_kv_length = key.shape[1] - (text_seq_length + image_seq_length)
+            if cached_kv_length < 0:
+                raise ValueError("GLM-Image key sequence is shorter than query")
+            attention_mask = torch.cat(
+                [
+                    torch.ones(
+                        batch_size,
+                        cached_kv_length,
+                        device=query.device,
+                        dtype=torch.bool,
+                    ),
+                    attention_mask.to(device=query.device, dtype=torch.bool),
+                    torch.ones(
+                        batch_size,
+                        image_seq_length,
+                        device=query.device,
+                        dtype=torch.bool,
+                    ),
+                ],
+                dim=1,
+            )
         hidden_states = self.attn(
-            query, key, value, num_replicated_prefix=text_seq_length
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            num_replicated_prefix=text_seq_length,
         )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)

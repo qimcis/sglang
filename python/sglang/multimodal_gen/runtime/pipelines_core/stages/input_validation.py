@@ -89,17 +89,32 @@ class InputValidationStage(PipelineStage):
                 raise ValueError(
                     "dynamic_batch_seeds must be a list with one seed per prompt"
                 )
-            base_seeds = [int(item) for item in dynamic_batch_seeds]
             seeds = []
-            for base_seed in base_seeds:
-                seeds.extend([base_seed + i for i in range(num_videos_per_prompt)])
+            for base_seed in dynamic_batch_seeds:
+                if isinstance(base_seed, list):
+                    if len(base_seed) != num_videos_per_prompt:
+                        raise ValueError(
+                            "dynamic_batch_seeds entries that are lists must match "
+                            f"num_outputs_per_prompt ({num_videos_per_prompt}), "
+                            f"got {len(base_seed)}"
+                        )
+                    seeds.extend([int(item) for item in base_seed])
+                else:
+                    base_seed = int(base_seed)
+                    seeds.extend([base_seed + i for i in range(num_videos_per_prompt)])
         elif isinstance(seed, list):
-            if len(seed) != num_videos_per_prompt:
+            effective_batch_size = prompt_count * num_videos_per_prompt
+            if len(seed) == effective_batch_size:
+                seeds = [int(item) for item in seed]
+            elif len(seed) == num_videos_per_prompt:
+                output_seeds = [int(item) for item in seed]
+                seeds = output_seeds * prompt_count
+            else:
                 raise ValueError(
-                    f"seed list length must match num_outputs_per_prompt "
+                    "seed list length must match either the effective batch size "
+                    f"({effective_batch_size}) or num_outputs_per_prompt "
                     f"({num_videos_per_prompt}), got {len(seed)}"
                 )
-            seeds = [int(item) for item in seed]
         else:
             # Keep per-prompt seed streams deterministic and non-overlapping.
             base_seeds = [
