@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import Counter
 from typing import TYPE_CHECKING, Any, Optional
 
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -12,6 +13,14 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
+from sglang.srt.layers.moe.ramp import (
+    build_ramp_routing_stats,
+    maybe_dump_ramp_histogram,
+    maybe_log_ramp_selection,
+    maybe_log_ramp_stats,
+    ramp_enabled,
+    select_ramp_provider,
+)
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
 if TYPE_CHECKING:
@@ -83,6 +92,8 @@ class MoeRunner:
 
         self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
+        self._ramp_call_count = 0
+        self._ramp_selection_counts: Counter[str] = Counter()
 
         SGLANG_CI_DISABLE_MOE_FUSED_FUNC = os.environ.get(
             "SGLANG_CI_DISABLE_MOE_FUSED_FUNC", "0"
@@ -96,6 +107,61 @@ class MoeRunner:
     def run(
         self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
     ) -> CombineInput:
+        ramp_stats = None
+        ramp_is_enabled = ramp_enabled()
+        if ramp_is_enabled:
+            self._ramp_call_count += 1
+            ramp_stats = build_ramp_routing_stats(dispatch_output, self.config)
+            maybe_log_ramp_stats(
+                ramp_stats,
+                call_count=self._ramp_call_count,
+                layer_id=self.config.layer_id,
+                runner_backend=self.runner_backend.value,
+            )
+            maybe_dump_ramp_histogram(
+                ramp_stats,
+                call_count=self._ramp_call_count,
+                layer_id=self.config.layer_id,
+                top_k=self.config.top_k,
+                runner_backend=self.runner_backend.value,
+                dispatch_format=dispatch_output.format.value,
+            )
+
+        ramp_selection = select_ramp_provider(
+            ramp_stats,
+            layer_id=self.config.layer_id,
+            top_k=self.config.top_k,
+        )
+        if ramp_is_enabled:
+            self._ramp_selection_counts[f"select_{ramp_selection.source}"] += 1
+            if ramp_selection.provider:
+                self._ramp_selection_counts[f"provider_{ramp_selection.provider}"] += 1
+
+        if ramp_selection.provider == "triton" and self.runner_backend.is_deep_gemm():
+            triton_result = self._try_run_triton_override(dispatch_output, quant_info)
+            if triton_result is not None:
+                if ramp_is_enabled:
+                    self._ramp_selection_counts["override_triton_ok"] += 1
+                    maybe_log_ramp_selection(
+                        ramp_selection,
+                        counters=self._ramp_selection_counts,
+                        call_count=self._ramp_call_count,
+                        layer_id=self.config.layer_id,
+                        runner_backend=self.runner_backend.value,
+                    )
+                return triton_result
+            if ramp_is_enabled:
+                self._ramp_selection_counts["override_triton_unsupported"] += 1
+
+        if ramp_is_enabled:
+            maybe_log_ramp_selection(
+                ramp_selection,
+                counters=self._ramp_selection_counts,
+                call_count=self._ramp_call_count,
+                layer_id=self.config.layer_id,
+                runner_backend=self.runner_backend.value,
+            )
+
         if self.fused_func is not None and not self.lora_enabled:
             return self.fused_func(dispatch_output, quant_info, self.config)
 
@@ -136,6 +202,8 @@ class MoeRunner:
         )
 
         running_state = {}
+        if ramp_stats is not None:
+            running_state["ramp_routing_stats"] = ramp_stats
         if self.down_gemm_overlap_args is not None:
             running_state["down_gemm_overlap_args"] = self.down_gemm_overlap_args
         if self.meta_overlap_args is not None:
@@ -172,3 +240,32 @@ class MoeRunner:
         assert self.fused_func is None, "Fused func is not supported for overlap args"
         self.down_gemm_overlap_args = None
         self.meta_overlap_args = None
+
+    def _try_run_triton_override(
+        self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo
+    ) -> Optional[CombineInput]:
+        if self.lora_enabled:
+            return None
+        if not dispatch_output.format.is_standard():
+            return None
+
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+        from sglang.srt.layers.moe.moe_runner.triton import (
+            TritonMoeQuantInfo,
+            fused_experts_none_to_triton,
+        )
+
+        if not isinstance(quant_info, DeepGemmMoeQuantInfo):
+            return None
+
+        triton_quant_info = TritonMoeQuantInfo(
+            w13_weight=quant_info.w13_weight,
+            w2_weight=quant_info.w2_weight,
+            use_fp8_w8a8=quant_info.use_fp8,
+            w13_scale=quant_info.w13_scale,
+            w2_scale=quant_info.w2_scale,
+            block_shape=quant_info.block_shape,
+        )
+        return fused_experts_none_to_triton(
+            dispatch_output, triton_quant_info, self.config
+        )

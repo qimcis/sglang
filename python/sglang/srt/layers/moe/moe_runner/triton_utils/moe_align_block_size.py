@@ -5,6 +5,7 @@ from typing import Tuple
 import torch
 import triton
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_xpu
 
 _is_cuda = is_cuda()
@@ -14,6 +15,43 @@ _is_musa = is_musa()
 
 if _is_cuda or _is_hip or _is_xpu or _is_musa:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+
+
+_DSV4_TINY_TOPK6_ALIGN_CACHE: dict[
+    tuple[str, int | None, int, int], tuple[torch.Tensor, torch.Tensor]
+] = {}
+
+
+def _try_dsv4_tiny_topk6_align(
+    topk_ids: torch.Tensor, block_size: int, num_experts: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    if not _is_cuda or not envs.SGLANG_DSV4_TINY_TOPK6_ALIGN.get():
+        return None
+    if num_experts != 256 or topk_ids.shape != (1, 6):
+        return None
+
+    key = (topk_ids.device.type, topk_ids.device.index, block_size, topk_ids.numel())
+    cached = _DSV4_TINY_TOPK6_ALIGN_CACHE.get(key)
+    if cached is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        padding_token_id = topk_ids.numel()
+        sorted_ids_cpu = torch.full(
+            (topk_ids.numel() * block_size,), padding_token_id, dtype=torch.int32
+        )
+        sorted_ids_cpu[torch.arange(topk_ids.numel()) * block_size] = torch.arange(
+            topk_ids.numel(), dtype=torch.int32
+        )
+        num_tokens_post_pad_cpu = torch.tensor(
+            [topk_ids.numel() * block_size], dtype=torch.int32
+        )
+        cached = (
+            sorted_ids_cpu.to(device=topk_ids.device),
+            num_tokens_post_pad_cpu.to(device=topk_ids.device),
+        )
+        _DSV4_TINY_TOPK6_ALIGN_CACHE[key] = cached
+    sorted_ids, num_tokens_post_pad = cached
+    return sorted_ids, topk_ids.view(-1), num_tokens_post_pad
 
 
 def moe_align_block_size(
@@ -54,8 +92,12 @@ def moe_align_block_size(
         Tokens 12 are non-existent (padding) and are ignored in
         the subsequent matrix multiplication.
     - The padding ensures that the total number of tokens is now divisible
-        by block_size for proper block matrix operations.
+    by block_size for proper block matrix operations.
     """
+    dsv4_tiny_result = _try_dsv4_tiny_topk6_align(topk_ids, block_size, num_experts)
+    if dsv4_tiny_result is not None:
+        return dsv4_tiny_result
+
     if topk_ids.numel() < num_experts + 1:
         max_num_tokens_padded = topk_ids.numel() * block_size
     else:

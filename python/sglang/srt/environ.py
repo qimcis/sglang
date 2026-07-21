@@ -415,6 +415,15 @@ class Envs:
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
+
+    # MoE RaMP
+    SGLANG_MOE_RAMP_ENABLE = EnvBool(False)
+    SGLANG_MOE_RAMP_LOG_INTERVAL = EnvInt(1000)
+    SGLANG_MOE_RAMP_HISTOGRAM_PATH = EnvStr(None)
+    SGLANG_MOE_RAMP_HISTOGRAM_INTERVAL = EnvInt(1)
+    SGLANG_MOE_RAMP_PROFILE_JSON = EnvStr(None)
+    SGLANG_MOE_RAMP_PROFILE_PATH = EnvStr(None)
+    SGLANG_DSV4_TINY_TOPK6_ALIGN = EnvBool(False)
     # Force dynamic DeepEP Waterfill with runtime EP all-reduce instead of the
     # default static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
