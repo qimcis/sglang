@@ -3400,7 +3400,11 @@ class KVPageProtectionManager:
         """Verify every protected full-cache page-table entry before DSA reads it."""
         if not self.config.enable_attention_tags or self.table is None:
             return []
-        if req_to_token.dim() != 2 or req_to_token.device != torch.device(self.device):
+        if (
+            not isinstance(req_to_token, torch.Tensor)
+            or req_to_token.dim() != 2
+            or req_to_token.device != self.table.tags.device
+        ):
             raise RuntimeError("protected request-token table has an invalid layout")
 
         result: List[KVProtectionBookkeepingError] = []
@@ -3457,14 +3461,16 @@ class KVPageProtectionManager:
                     (count,),
                     request_pool_idx,
                     dtype=torch.long,
-                    device=self.device,
+                    device=req_to_token.device,
                 )
             )
             token_positions.append(
-                manifest.page_positions_t.to(device=self.device, dtype=torch.long)
+                manifest.page_positions_t.to(
+                    device=req_to_token.device, dtype=torch.long
+                )
                 * self.page_size
             )
-            expected_pages.append(manifest.physical_pages_tensor(self.device))
+            expected_pages.append(manifest.physical_pages_tensor(req_to_token.device))
             offsets.append(offsets[-1] + count)
 
         request_indices_t = torch.cat(request_indices)
