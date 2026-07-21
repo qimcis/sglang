@@ -1,0 +1,35 @@
+python/sglang/jit_kernel/flash_attention.py
+  s_5f73f26aee7f01::t_0388e6eb910c97 46,172,175-176
+python/sglang/jit_kernel/flash_attention_v3.py
+  s_5f73f26aee7f01::t_e0fd9727d1b7cf 34,136,150,186
+python/sglang/srt/layers/attention/flashattention_backend.py
+  s_5f73f26aee7f01::t_05c49fe3d1cbc2 23,76,149-157,265-299,817-822,1541,1619,2554-2559
+sgl-kernel/CMakeLists.txt
+  s_5f73f26aee7f01::t_87b88e20c4e0bf 180-223
+sgl-kernel/csrc/flash_extension.cc
+  s_5f73f26aee7f01::t_47cbea53d5e09a 62-82
+sgl-kernel/include/sgl_flash_kernel_ops.h
+  s_5f73f26aee7f01::t_e34b1ecd9eaf1b 87-107
+sgl-kernel/python/sgl_kernel/flash_attn.py
+  s_5f73f26aee7f01::t_16b3f18af4289c 73,230,270-289,381-400
+sgl-kernel/sgl-attn-kv-page-protection.patch
+  s_5f73f26aee7f01::t_d9b3535cffc5e9 1-574
+test/registered/unit/jit_kernel/test_flash_attention_dispatch.py
+  s_5f73f26aee7f01::t_7d6211d095cec0 1-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b426951d3aced3e876dda527a80931dd0a6678bf",
+  "prompts": {},
+  "sessions": {
+    "s_5f73f26aee7f01": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_099a8b759ffeqnA7QziBATTLQD",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
