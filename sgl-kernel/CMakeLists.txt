@@ -177,6 +177,50 @@ option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              ${DEFAULT_SG
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
 
+if(SGL_KERNEL_ENABLE_FA3)
+    set(SGL_ATTN_KV_PAGE_PROTECTION_PATCH
+        "${CMAKE_CURRENT_SOURCE_DIR}/sgl-attn-kv-page-protection.patch")
+    set(SGL_ATTN_KV_PAGE_PROTECTION_PATCH_SHA256
+        "9439c9f6502e5ed9df2c4ed244bb0ea267278c60c8d7b6aad49cc66ffabf5e28")
+    file(SHA256 "${SGL_ATTN_KV_PAGE_PROTECTION_PATCH}" _sgl_attn_patch_sha256)
+    if(NOT _sgl_attn_patch_sha256 STREQUAL SGL_ATTN_KV_PAGE_PROTECTION_PATCH_SHA256)
+        message(FATAL_ERROR "sgl-attn KV page protection patch hash mismatch")
+    endif()
+
+    find_package(Git REQUIRED)
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" apply --reverse --check
+                "${SGL_ATTN_KV_PAGE_PROTECTION_PATCH}"
+        WORKING_DIRECTORY "${repo-flash-attention_SOURCE_DIR}"
+        RESULT_VARIABLE _sgl_attn_patch_reverse_check_result
+        ERROR_QUIET
+    )
+    if(NOT _sgl_attn_patch_reverse_check_result EQUAL 0)
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" apply --check
+                    "${SGL_ATTN_KV_PAGE_PROTECTION_PATCH}"
+            WORKING_DIRECTORY "${repo-flash-attention_SOURCE_DIR}"
+            RESULT_VARIABLE _sgl_attn_patch_check_result
+            ERROR_VARIABLE _sgl_attn_patch_check_error
+        )
+        if(NOT _sgl_attn_patch_check_result EQUAL 0)
+            message(FATAL_ERROR
+                "sgl-attn KV page protection patch does not apply: ${_sgl_attn_patch_check_error}")
+        endif()
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" apply
+                    "${SGL_ATTN_KV_PAGE_PROTECTION_PATCH}"
+            WORKING_DIRECTORY "${repo-flash-attention_SOURCE_DIR}"
+            RESULT_VARIABLE _sgl_attn_patch_result
+            ERROR_VARIABLE _sgl_attn_patch_error
+        )
+        if(NOT _sgl_attn_patch_result EQUAL 0)
+            message(FATAL_ERROR
+                "Failed to apply sgl-attn KV page protection patch: ${_sgl_attn_patch_error}")
+        endif()
+    endif()
+endif()
+
 if (SGL_KERNEL_ENABLE_BF16)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-DFLASHINFER_ENABLE_BF16"
@@ -279,6 +323,7 @@ set(SOURCES
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
     "csrc/kvcacheio/transfer.cu"
+    "csrc/kvcacheio/checksum.cu"
     "csrc/mamba/causal_conv1d.cu"
     "csrc/memory/weak_ref_tensor.cpp"
 

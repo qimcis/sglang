@@ -143,13 +143,36 @@ void fast_topk_interface(
     at::Tensor& indices,
     const at::Tensor& lengths,
     std::optional<at::Tensor> row_starts_opt = std::nullopt);
+void kv_page_protection_begin_forward(
+    const at::Tensor& request_indices, at::Tensor& request_epochs, at::Tensor& status);
+void kv_page_protection_failure_status(
+    const at::Tensor& request_indices,
+    const at::Tensor& request_epochs,
+    const at::Tensor& validated_epochs,
+    const at::Tensor& status,
+    at::Tensor& failure_status,
+    at::Tensor& failed);
 void fast_topk_transform_interface(
     const at::Tensor& score,
     const at::Tensor& lengths,
     at::Tensor& dst_page_table,
     const at::Tensor& src_page_table,
     const at::Tensor& cu_seqlens_q,
-    std::optional<at::Tensor> row_starts_opt = std::nullopt);
+    std::optional<at::Tensor> row_starts_opt = std::nullopt,
+    std::optional<at::Tensor> protection_request_indices_opt = std::nullopt,
+    int64_t protection_page_size = 0,
+    int64_t protection_page_offset = 0,
+    std::optional<at::Tensor> protection_actual_tags_opt = std::nullopt,
+    std::optional<at::Tensor> protection_actual_generations_opt = std::nullopt,
+    std::optional<at::Tensor> protection_actual_transfer_tags_opt = std::nullopt,
+    std::optional<at::Tensor> protection_owner_request_indices_opt = std::nullopt,
+    std::optional<at::Tensor> protection_owner_page_positions_opt = std::nullopt,
+    std::optional<at::Tensor> protection_expected_tags_opt = std::nullopt,
+    std::optional<at::Tensor> protection_expected_generations_opt = std::nullopt,
+    std::optional<at::Tensor> protection_expected_transfer_tags_opt = std::nullopt,
+    std::optional<at::Tensor> protection_request_epochs_opt = std::nullopt,
+    std::optional<at::Tensor> protection_validated_epochs_opt = std::nullopt,
+    std::optional<at::Tensor> protection_status_opt = std::nullopt);
 void fast_topk_transform_ragged_interface(
     const at::Tensor& score,
     const at::Tensor& lengths,
@@ -635,6 +658,88 @@ void transfer_kv_all_layer_direct_lf_pf(
     const at::Tensor& src_indices,
     const at::Tensor& dst_indices,
     int64_t page_size);
+
+// Batched serving variant. Reads physical slots directly from req_to_token
+// table rows and writes one finalized uint32-compatible checksum per request.
+void kv_checksum_direct_table_batched(
+    const at::Tensor& buffer_ptrs,
+    const at::Tensor& row_strides,
+    const at::Tensor& row_nbytes,
+    const at::Tensor& buffer_num_rows,
+    const at::Tensor& swa_buffer_flags,
+    const at::Tensor& full_to_swa_index_mapping,
+    const at::Tensor& req_to_token,
+    const at::Tensor& req_pool_indices,
+    const at::Tensor& starts,
+    const at::Tensor& lengths,
+    int64_t max_num_tokens,
+    int64_t num_lanes,
+    bool has_swa,
+    bool is_capped,
+    at::Tensor& accum,
+    at::Tensor& out);
+
+// Same root checksum plus independent uint64 digests for fixed logical pages.
+void kv_checksum_direct_table_batched_with_pages(
+    const at::Tensor& buffer_ptrs,
+    const at::Tensor& row_strides,
+    const at::Tensor& row_nbytes,
+    const at::Tensor& buffer_num_rows,
+    const at::Tensor& swa_buffer_flags,
+    const at::Tensor& full_to_swa_index_mapping,
+    const at::Tensor& req_to_token,
+    const at::Tensor& req_pool_indices,
+    const at::Tensor& starts,
+    const at::Tensor& lengths,
+    const at::Tensor& logical_starts,
+    int64_t max_num_tokens,
+    int64_t num_lanes,
+    int64_t page_size,
+    int64_t max_num_pages,
+    bool has_swa,
+    bool is_capped,
+    at::Tensor& accum,
+    at::Tensor& out,
+    at::Tensor& page_accum,
+    at::Tensor& page_out);
+
+// Compact variant writes each request's valid pages at caller-provided prefix offsets.
+void kv_checksum_direct_table_batched_with_pages_compact(
+    const at::Tensor& buffer_ptrs,
+    const at::Tensor& row_strides,
+    const at::Tensor& row_nbytes,
+    const at::Tensor& buffer_num_rows,
+    const at::Tensor& swa_buffer_flags,
+    const at::Tensor& full_to_swa_index_mapping,
+    const at::Tensor& req_to_token,
+    const at::Tensor& req_pool_indices,
+    const at::Tensor& starts,
+    const at::Tensor& lengths,
+    const at::Tensor& logical_starts,
+    const at::Tensor& page_output_offsets,
+    int64_t max_num_tokens,
+    int64_t num_lanes,
+    int64_t page_size,
+    int64_t max_num_pages,
+    bool has_swa,
+    bool is_capped,
+    at::Tensor& accum,
+    at::Tensor& out,
+    at::Tensor& page_accum,
+    at::Tensor& page_out);
+
+void kv_page_history_record(
+    const at::Tensor& page_ids,
+    int64_t operation,
+    const at::Tensor& generations,
+    bool generations_by_page,
+    int64_t bootstrap_room,
+    const at::Tensor& page_positions,
+    int64_t page_position,
+    const at::Tensor& values,
+    int64_t value,
+    at::Tensor& cursor,
+    at::Tensor& records);
 
 /*
  * From csrc/memory

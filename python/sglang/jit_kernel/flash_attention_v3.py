@@ -31,7 +31,7 @@ def _call_fa3_kernel(kernel, *args, out=None, **kwargs):
 def _load_fa3_kernels():
     # By default, we use the implementation from sgl-kernel,
     # which is expected to be more stable and compatible
-    if envs.SGLANG_USE_SGL_FA3_KERNEL.get():
+    if envs.SGLANG_USE_SGL_FA3_KERNEL.get() or envs.SGLANG_KV_PAGE_PROTECTION.get():
         logger.debug(
             f"SGLANG_USE_SGL_FA3_KERNEL=True, use sgl-kernel implementation for FlashAttention v3 "
         )
@@ -133,6 +133,7 @@ def flash_attn_with_kvcache(
     return_softmax_lse=False,
     sinks=None,
     out=None,
+    kv_page_protection=None,
 ):
     if not _is_fa3_supported():
         raise NotImplementedError(
@@ -146,6 +147,7 @@ def flash_attn_with_kvcache(
         assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
 
+    kwargs = {"kv_page_protection": kv_page_protection} if kv_page_protection else {}
     return _call_fa3_kernel(
         _load_fa3_kernels()["flash_attn_with_kvcache"],
         q,
@@ -181,6 +183,7 @@ def flash_attn_with_kvcache(
         return_softmax_lse=return_softmax_lse,
         sinks=sinks,
         out=out,
+        **kwargs,
     )
 
 
