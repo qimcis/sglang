@@ -546,6 +546,38 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             buckets=(1, 5, 10, 50, 100, 500, 1000, 5000, 10000),
         )
 
+        # KV page protection / transfer checksum metrics (PD disaggregation).
+        self.kv_attention_tag_mismatches_total = Counter(
+            name="sglang:kv_attention_tag_mismatches_total",
+            documentation="Number of requests failed due to a KV attention tag mismatch.",
+            labelnames=labels.keys(),
+        )
+        self.kv_attention_tag_checked_pages_total = Counter(
+            name="sglang:kv_attention_tag_checked_pages_total",
+            documentation="Total number of KV pages verified against attention tags.",
+            labelnames=labels.keys(),
+        )
+        self.kv_transfer_page_tag_mismatches_total = Counter(
+            name="sglang:kv_transfer_page_tag_mismatches_total",
+            documentation="Number of requests failed due to a transfer-written page tag mismatch.",
+            labelnames=labels.keys(),
+        )
+        self.kv_transfer_page_tag_checked_pages_total = Counter(
+            name="sglang:kv_transfer_page_tag_checked_pages_total",
+            documentation="Total number of transfer-written KV page tags verified.",
+            labelnames=labels.keys(),
+        )
+        self.kv_transfer_checksum_mismatches_total = Counter(
+            name="sglang:kv_transfer_checksum_mismatches_total",
+            documentation="Number of requests failed due to a KV transfer checksum mismatch.",
+            labelnames=labels.keys(),
+        )
+        self.kv_transfer_checksum_checked_pages_total = Counter(
+            name="sglang:kv_transfer_checksum_checked_pages_total",
+            documentation="Total number of KV pages/tokens covered by transfer checksums.",
+            labelnames=labels.keys(),
+        )
+
         # =================================================================
         # Utilization
         # =================================================================
@@ -1114,6 +1146,34 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_prefill_retries(self, count: int) -> None:
         if count > 0:
             self.num_prefill_retries_total.labels(**self.labels).inc(count)
+
+    def increment_kv_attention_tag_mismatches(self, count: int = 1) -> None:
+        if count > 0:
+            self.kv_attention_tag_mismatches_total.labels(**self.labels).inc(count)
+
+    def increment_kv_attention_tag_checked_pages(self, count: int) -> None:
+        if count > 0:
+            self.kv_attention_tag_checked_pages_total.labels(**self.labels).inc(count)
+
+    def increment_kv_transfer_page_tag_mismatches(self, count: int = 1) -> None:
+        if count > 0:
+            self.kv_transfer_page_tag_mismatches_total.labels(**self.labels).inc(count)
+
+    def increment_kv_transfer_page_tag_checked_pages(self, count: int) -> None:
+        if count > 0:
+            self.kv_transfer_page_tag_checked_pages_total.labels(**self.labels).inc(
+                count
+            )
+
+    def increment_kv_transfer_checksum_mismatches(self, count: int = 1) -> None:
+        if count > 0:
+            self.kv_transfer_checksum_mismatches_total.labels(**self.labels).inc(count)
+
+    def increment_kv_transfer_checksum_checked_pages(self, count: int) -> None:
+        if count > 0:
+            self.kv_transfer_checksum_checked_pages_total.labels(**self.labels).inc(
+                count
+            )
 
     def observe_kv_transfer_metrics(
         self,

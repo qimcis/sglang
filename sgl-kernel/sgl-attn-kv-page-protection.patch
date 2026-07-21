@@ -1,0 +1,574 @@
+diff --git a/hopper/flash.h b/hopper/flash.h
+index 72920b9..3e4cd3f 100644
+--- a/hopper/flash.h
++++ b/hopper/flash.h
+@@ -34,6 +34,38 @@ struct Qkv_params {
+
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+
++struct KV_page_protection_params {
++    int64_t const* __restrict__ request_indices;
++    int const* __restrict__ seqlens;
++    int const* __restrict__ page_table;
++    int64_t page_table_batch_stride;
++    int page_table_num_rows;
++    int page_table_num_cols;
++    int page_table_page_offset;
++    int const* __restrict__ page_table_2;
++    int64_t page_table_2_batch_stride;
++    int page_table_2_num_rows;
++    int page_table_2_num_cols;
++    int page_table_2_page_offset;
++    int page_table_2_window_size;
++    int page_size;
++    int num_sidecar_pages;
++    int num_request_slots;
++    int64_t const* __restrict__ actual_tags;
++    int64_t const* __restrict__ actual_generations;
++    int const* __restrict__ actual_transfer_tags;
++    int const* __restrict__ owner_request_indices;
++    int const* __restrict__ owner_page_positions;
++    int64_t const* __restrict__ expected_tags;
++    int64_t const* __restrict__ expected_generations;
++    int const* __restrict__ expected_transfer_tags;
++    int* __restrict__ request_epochs;
++    int* __restrict__ validated_epochs;
++    int* __restrict__ status;
++};
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
+ struct Flash_fwd_params : public Qkv_params {
+     using index_t = int64_t;
+
+@@ -180,6 +212,8 @@ struct Flash_fwd_params : public Qkv_params {
+     int sparse_mask_fine_q_stride;
+
+     bool use_sparse_mask;
++
++    KV_page_protection_params kv_page_protection;
+ };
+
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+diff --git a/hopper/flash_api.cpp b/hopper/flash_api.cpp
+index 1b650d7..4ca1beb 100644
+--- a/hopper/flash_api.cpp
++++ b/hopper/flash_api.cpp
+@@ -7,6 +7,8 @@
+ #include <ATen/cuda/CUDAContext.h>
+ #include <c10/cuda/CUDAGuard.h>
+
++#include <limits>
++
+ #include <cutlass/numeric_types.h>
+
+ #include "flash.h"
+@@ -689,10 +691,30 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
+         int64_t num_splits,
+         std::optional<bool> pack_gqa_,
+         int64_t sm_margin,
+-        std::optional<const at::Tensor> &sinks_, // (h)
+-        std::optional<at::Tensor> sparse_mask_fine_,  // [total_q, max_k_blocks, num_int32_per_block]
+-        bool only_qv
+-        ) {
++         std::optional<const at::Tensor> &sinks_, // (h)
++         std::optional<at::Tensor> sparse_mask_fine_,  // [total_q, max_k_blocks, num_int32_per_block]
++         bool only_qv,
++         std::optional<at::Tensor> protection_request_indices_,
++         std::optional<at::Tensor> protection_seqlens_,
++         std::optional<at::Tensor> protection_page_table_,
++         std::optional<at::Tensor> protection_page_table_2_,
++         int64_t protection_page_table_page_offset,
++         int64_t protection_page_table_2_page_offset,
++         int64_t protection_page_table_2_window_size,
++         int64_t protection_page_size,
++         bool protection_validate_full_mapping,
++         std::optional<at::Tensor> protection_actual_tags_,
++         std::optional<at::Tensor> protection_actual_generations_,
++         std::optional<at::Tensor> protection_actual_transfer_tags_,
++         std::optional<at::Tensor> protection_owner_request_indices_,
++         std::optional<at::Tensor> protection_owner_page_positions_,
++         std::optional<at::Tensor> protection_expected_tags_,
++         std::optional<at::Tensor> protection_expected_generations_,
++         std::optional<at::Tensor> protection_expected_transfer_tags_,
++         std::optional<at::Tensor> protection_request_epochs_,
++         std::optional<at::Tensor> protection_validated_epochs_,
++         std::optional<at::Tensor> protection_status_
++         ) {
+
+     auto dprops = at::cuda::getCurrentDeviceProperties();
+     bool is_sm8x = dprops->major >= 8;
+@@ -972,6 +994,192 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
+     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+     params.only_qv = only_qv;
+
++    bool const any_kv_page_protection =
++        protection_request_indices_.has_value()
++        || protection_seqlens_.has_value()
++        || protection_page_table_.has_value()
++        || protection_page_table_2_.has_value()
++        || protection_page_table_page_offset != 0
++        || protection_page_table_2_page_offset != 0
++        || protection_page_table_2_window_size != 0
++        || protection_page_size != 0
++        || protection_validate_full_mapping
++        || protection_actual_tags_.has_value()
++        || protection_actual_generations_.has_value()
++        || protection_actual_transfer_tags_.has_value()
++        || protection_owner_request_indices_.has_value()
++        || protection_owner_page_positions_.has_value()
++        || protection_expected_tags_.has_value()
++        || protection_expected_generations_.has_value()
++        || protection_expected_transfer_tags_.has_value()
++        || protection_request_epochs_.has_value()
++        || protection_validated_epochs_.has_value()
++        || protection_status_.has_value();
++    TORCH_CHECK(!any_kv_page_protection || protection_request_indices_.has_value(),
++                "KV page protection metadata is incomplete: request indices are required");
++
++    if (protection_request_indices_.has_value()) {
++        TORCH_CHECK(paged_KV, "KV page protection requires paged KV attention");
++        TORCH_CHECK(params.arch >= 90, "KV page protection requires SM90 or newer");
++        TORCH_CHECK(!kv_batch_idx_.has_value(),
++                    "KV page protection does not support cache_batch_idx remapping");
++        TORCH_CHECK(protection_seqlens_.has_value() && protection_page_table_.has_value(),
++                    "KV page protection requires sequence lengths and a page table");
++        TORCH_CHECK(protection_actual_tags_.has_value() && protection_actual_generations_.has_value()
++                    && protection_actual_transfer_tags_.has_value()
++                    && protection_owner_request_indices_.has_value()
++                    && protection_owner_page_positions_.has_value()
++                    && protection_expected_tags_.has_value()
++                    && protection_expected_generations_.has_value()
++                    && protection_expected_transfer_tags_.has_value()
++                    && protection_request_epochs_.has_value()
++                    && protection_validated_epochs_.has_value()
++                    && protection_status_.has_value(),
++                    "KV page protection metadata is incomplete");
++        TORCH_CHECK(protection_page_table_2_.has_value()
++                    || (protection_page_table_2_page_offset == 0
++                        && protection_page_table_2_window_size == 0),
++                    "secondary KV protection arguments require protection_page_table_2");
++        TORCH_CHECK(protection_page_size > 0, "KV protection page size must be positive");
++        TORCH_CHECK(protection_page_table_page_offset >= 0
++                    && protection_page_table_2_page_offset >= 0,
++                    "KV protection page offsets must be non-negative");
++        TORCH_CHECK(protection_page_size <= std::numeric_limits<int>::max()
++                    && protection_page_table_page_offset <= std::numeric_limits<int>::max()
++                    && protection_page_table_2_page_offset <= std::numeric_limits<int>::max()
++                    && protection_page_table_2_window_size <= std::numeric_limits<int>::max(),
++                    "KV protection integer argument exceeds int32 range");
++
++        auto request_indices = protection_request_indices_.value();
++        auto protection_seqlens = protection_seqlens_.value();
++        auto protection_page_table = protection_page_table_.value();
++        CHECK_DEVICE(request_indices); CHECK_CONTIGUOUS(request_indices);
++        CHECK_DEVICE(protection_seqlens); CHECK_CONTIGUOUS(protection_seqlens);
++        CHECK_DEVICE(protection_page_table);
++        TORCH_CHECK(request_indices.get_device() == q.get_device()
++                    && protection_seqlens.get_device() == q.get_device()
++                    && protection_page_table.get_device() == q.get_device(),
++                    "KV protection metadata must be on the query device");
++        TORCH_CHECK(request_indices.scalar_type() == torch::kInt64,
++                    "protection_request_indices must have dtype int64");
++        TORCH_CHECK(protection_seqlens.scalar_type() == torch::kInt32,
++                    "protection_seqlens must have dtype int32");
++        TORCH_CHECK(protection_page_table.scalar_type() == torch::kInt32,
++                    "protection_page_table must have dtype int32");
++        TORCH_CHECK(protection_page_table.dim() == 2 && protection_page_table.stride(-1) == 1,
++                    "protection_page_table must be a row-major 2D tensor");
++        CHECK_SHAPE(request_indices, batch_size);
++        CHECK_SHAPE(protection_seqlens, batch_size);
++        TORCH_CHECK(protection_page_table.size(0) == batch_size,
++                    "protection_page_table batch size mismatch");
++        if (!protection_validate_full_mapping) {
++            TORCH_CHECK(seqused_k_.has_value()
++                        && protection_seqlens.is_same(seqused_k_.value()),
++                        "KV protection sequence lengths must be the lengths consumed by attention");
++            bool const protects_active_page_table = protection_page_table.is_same(page_table)
++                || (protection_page_table_2_.has_value()
++                    && protection_page_table_2_.value().is_same(page_table));
++            TORCH_CHECK(protects_active_page_table,
++                        "KV protection must validate the page table consumed by attention");
++            TORCH_CHECK(protection_page_size == params.page_size,
++                        "KV protection page size must match the attention page size");
++        }
++
++        auto actual_tags = protection_actual_tags_.value();
++        auto actual_generations = protection_actual_generations_.value();
++        auto actual_transfer_tags = protection_actual_transfer_tags_.value();
++        auto owner_request_indices = protection_owner_request_indices_.value();
++        auto owner_page_positions = protection_owner_page_positions_.value();
++        auto expected_tags = protection_expected_tags_.value();
++        auto expected_generations = protection_expected_generations_.value();
++        auto expected_transfer_tags = protection_expected_transfer_tags_.value();
++        auto request_epochs = protection_request_epochs_.value();
++        auto validated_epochs = protection_validated_epochs_.value();
++        auto status = protection_status_.value();
++        for (auto const& tensor : {actual_tags, actual_generations, actual_transfer_tags,
++                                  owner_request_indices, owner_page_positions, expected_tags,
++                                  expected_generations, expected_transfer_tags, request_epochs,
++                                  validated_epochs, status}) {
++            CHECK_DEVICE(tensor); CHECK_CONTIGUOUS(tensor);
++            TORCH_CHECK(tensor.get_device() == q.get_device(),
++                        "KV page protection sidecars must be on the query device");
++            TORCH_CHECK(tensor.dim() == 1, "KV page protection sidecars must be 1D");
++        }
++        TORCH_CHECK(actual_tags.scalar_type() == torch::kInt64
++                    && actual_generations.scalar_type() == torch::kInt64
++                    && expected_tags.scalar_type() == torch::kInt64
++                    && expected_generations.scalar_type() == torch::kInt64,
++                    "KV page protection tag/generation sidecars must have dtype int64");
++        TORCH_CHECK(actual_transfer_tags.scalar_type() == torch::kInt32
++                    && owner_request_indices.scalar_type() == torch::kInt32
++                    && owner_page_positions.scalar_type() == torch::kInt32
++                    && expected_transfer_tags.scalar_type() == torch::kInt32
++                    && request_epochs.scalar_type() == torch::kInt32
++                    && validated_epochs.scalar_type() == torch::kInt32
++                    && status.scalar_type() == torch::kInt32,
++                    "KV page protection owner/epoch/status sidecars must have dtype int32");
++        int64_t const num_sidecar_pages = actual_tags.numel();
++        TORCH_CHECK(num_sidecar_pages <= std::numeric_limits<int>::max()
++                    && request_epochs.numel() <= std::numeric_limits<int>::max()
++                    && protection_page_table.size(0) <= std::numeric_limits<int>::max()
++                    && protection_page_table.size(1) <= std::numeric_limits<int>::max(),
++                    "KV protection tensor size exceeds int32 range");
++        TORCH_CHECK(actual_generations.numel() == num_sidecar_pages
++                    && actual_transfer_tags.numel() == num_sidecar_pages
++                    && owner_request_indices.numel() == num_sidecar_pages
++                    && owner_page_positions.numel() == num_sidecar_pages
++                    && expected_tags.numel() == num_sidecar_pages
++                    && expected_generations.numel() == num_sidecar_pages
++                    && expected_transfer_tags.numel() == num_sidecar_pages,
++                    "KV page protection physical sidecar size mismatch");
++        TORCH_CHECK(request_epochs.numel() == validated_epochs.numel()
++                    && request_epochs.numel() == status.numel(),
++                    "KV page protection request sidecar size mismatch");
++
++        params.kv_page_protection.request_indices = request_indices.data_ptr<int64_t>();
++        params.kv_page_protection.seqlens = protection_seqlens.data_ptr<int>();
++        params.kv_page_protection.page_table = protection_page_table.data_ptr<int>();
++        params.kv_page_protection.page_table_batch_stride = protection_page_table.stride(0);
++        params.kv_page_protection.page_table_num_rows = protection_page_table.size(0);
++        params.kv_page_protection.page_table_num_cols = protection_page_table.size(1);
++        params.kv_page_protection.page_table_page_offset = protection_page_table_page_offset;
++        if (protection_page_table_2_.has_value()) {
++            auto protection_page_table_2 = protection_page_table_2_.value();
++            CHECK_DEVICE(protection_page_table_2);
++            TORCH_CHECK(protection_page_table_2.get_device() == q.get_device(),
++                        "protection_page_table_2 must be on the query device");
++            TORCH_CHECK(protection_page_table_2.scalar_type() == torch::kInt32
++                        && protection_page_table_2.dim() == 2
++                        && protection_page_table_2.stride(-1) == 1,
++                        "protection_page_table_2 must be a row-major int32 tensor");
++            TORCH_CHECK(protection_page_table_2.size(0) == batch_size,
++                        "protection_page_table_2 batch size mismatch");
++            TORCH_CHECK(protection_page_table_2.size(0) <= std::numeric_limits<int>::max()
++                        && protection_page_table_2.size(1) <= std::numeric_limits<int>::max(),
++                        "protection_page_table_2 size exceeds int32 range");
++            params.kv_page_protection.page_table_2 = protection_page_table_2.data_ptr<int>();
++            params.kv_page_protection.page_table_2_batch_stride = protection_page_table_2.stride(0);
++            params.kv_page_protection.page_table_2_num_rows = protection_page_table_2.size(0);
++            params.kv_page_protection.page_table_2_num_cols = protection_page_table_2.size(1);
++            params.kv_page_protection.page_table_2_page_offset = protection_page_table_2_page_offset;
++            params.kv_page_protection.page_table_2_window_size = protection_page_table_2_window_size;
++        }
++        params.kv_page_protection.page_size = protection_page_size;
++        params.kv_page_protection.num_sidecar_pages = num_sidecar_pages;
++        params.kv_page_protection.num_request_slots = request_epochs.numel();
++        params.kv_page_protection.actual_tags = actual_tags.data_ptr<int64_t>();
++        params.kv_page_protection.actual_generations = actual_generations.data_ptr<int64_t>();
++        params.kv_page_protection.actual_transfer_tags = actual_transfer_tags.data_ptr<int>();
++        params.kv_page_protection.owner_request_indices = owner_request_indices.data_ptr<int>();
++        params.kv_page_protection.owner_page_positions = owner_page_positions.data_ptr<int>();
++        params.kv_page_protection.expected_tags = expected_tags.data_ptr<int64_t>();
++        params.kv_page_protection.expected_generations = expected_generations.data_ptr<int64_t>();
++        params.kv_page_protection.expected_transfer_tags = expected_transfer_tags.data_ptr<int>();
++        params.kv_page_protection.request_epochs = request_epochs.data_ptr<int>();
++        params.kv_page_protection.validated_epochs = validated_epochs.data_ptr<int>();
++        params.kv_page_protection.status = status.data_ptr<int>();
++    }
++
+     // This needs to be set after get_num_splits
+     at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
+     // We don't use the persistent scheduler if Split and not Varlen
+diff --git a/hopper/flash_fwd_combine_kernel.h b/hopper/flash_fwd_combine_kernel.h
+index 0566769..9017ff7 100644
+--- a/hopper/flash_fwd_combine_kernel.h
++++ b/hopper/flash_fwd_combine_kernel.h
+@@ -16,6 +16,7 @@
+
+ #include "seqlen.h"
+ #include "utils.h"
++#include "kv_page_protection.cuh"
+
+ namespace flash {
+
+@@ -147,6 +148,7 @@ public:
+         int const* const num_splits_dynamic_ptr = nullptr;
+         int const* const varlen_batch_idx_ptr = nullptr;
+         int* const semaphore_to_reset = nullptr;
++        KV_page_protection_params kv_page_protection{};
+     };
+
+     // Kernel entry point API
+@@ -167,6 +169,7 @@ public:
+         int const* const num_splits_dynamic_ptr = nullptr;
+         int const* const varlen_batch_idx_ptr = nullptr;
+         int* const semaphore_to_reset = nullptr;
++        KV_page_protection_params kv_page_protection{};
+     };
+
+     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
+@@ -195,2 +198,3 @@ public:
++            args.kv_page_protection,
+         };
+     }
+@@ -215,6 +218,7 @@ public:
+             cutlass::arch::wait_on_dependent_grids();
+             *params.semaphore_to_reset = 0;
+         }
++        if (!validate_kv_pages(params.kv_page_protection, batch)) { return; }
+         if (num_splits <= 1) { return; }
+         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.seqused};
+         int const offset = seqlen_info.offset;
+diff --git a/hopper/flash_fwd_combine_launch_template.h b/hopper/flash_fwd_combine_launch_template.h
+index a2ff25d..664eca6 100644
+--- a/hopper/flash_fwd_combine_launch_template.h
++++ b/hopper/flash_fwd_combine_launch_template.h
+@@ -35,7 +35,8 @@ void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool e
+         {params.o_row_stride, _1{}, params.o_head_stride, !Varlen ? params.o_batch_stride : 0},  // stride_O
+         static_cast<float*>(params.softmax_lse_ptr),
+         {_1{}, !Varlen ? params.seqlen_q : params.total_q, !Varlen ? params.h * params.seqlen_q : 0},  // stride_LSE
+-        params.cu_seqlens_q, params.seqused_q, params.num_splits_dynamic_ptr, params.varlen_batch_idx_ptr, params.tile_count_semaphore
++        params.cu_seqlens_q, params.seqused_q, params.num_splits_dynamic_ptr, params.varlen_batch_idx_ptr, params.tile_count_semaphore,
++        params.kv_page_protection
+     };
+
+     typename CombineKernel::Params kernel_params = CombineKernel::to_underlying_arguments(args);
+diff --git a/hopper/flash_fwd_kernel_sm90.h b/hopper/flash_fwd_kernel_sm90.h
+index 0fe87b8..91c736f 100644
+--- a/hopper/flash_fwd_kernel_sm90.h
++++ b/hopper/flash_fwd_kernel_sm90.h
+@@ -20,6 +20,7 @@
+ #include "utils.h"
+ #include "softmax.h"
+ #include "tile_scheduler.hpp"
++#include "kv_page_protection.cuh"
+
+ namespace flash {
+
+@@ -131,6 +132,7 @@ public:
+         EpilogueArguments epilogue{};
+         cutlass::KernelHardwareInfo hw_info{};
+         TileSchedulerArguments scheduler{};
++        KV_page_protection_params kv_page_protection{};
+     };
+
+     // Kernel entry point API
+@@ -139,6 +141,7 @@ public:
+         EpilogueParams epilogue{};
+         cutlass::KernelHardwareInfo hw_info{};
+         TileSchedulerParams scheduler{};
++        KV_page_protection_params kv_page_protection{};
+     };
+
+     //
+@@ -166,7 +169,8 @@ public:
+             CollectiveMainloop::to_underlying_arguments(args.mainloop),
+             CollectiveEpilogue::to_underlying_arguments(args.epilogue),
+             hw_info,
+-            TileScheduler::to_underlying_arguments(args.scheduler)
++            TileScheduler::to_underlying_arguments(args.scheduler),
++            args.kv_page_protection
+         };
+     }
+
+@@ -381,6 +385,10 @@ public:
+                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
+                     params.mainloop.seqlens_rotary
+                 };
++                if (!validate_kv_pages(params.kv_page_protection, get<2>(block_coord))) {
++                    scheduler.prefetch_next_work(params.scheduler, work_tile_info);
++                    continue;
++                }
+                 if constexpr (AppendKV) {
+                     bool tile_new_valid = mainloop.load_kv_new(
+                         params.mainloop, pipeline_k_new, pipeline_v_new,
+@@ -430,6 +438,15 @@ public:
+                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
+                     params.mainloop.seqlens_rotary
+                 };
++                if (!validate_kv_pages(params.kv_page_protection, bidb)) {
++                    work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info);
++                    if constexpr (Split && Varlen) {
++                        if (!work_tile_info.is_valid(params.scheduler)) {
++                            cutlass::arch::launch_dependent_grids();
++                        }
++                    }
++                    continue;
++                }
+                 if constexpr (AppendKV) {
+                     bool tile_new_valid = mainloop.store_kv_new(
+                         params.mainloop, pipeline_k_new, pipeline_v_new, smem_pipe_read_new,
+diff --git a/hopper/flash_fwd_launch_template.h b/hopper/flash_fwd_launch_template.h
+index 6206928..5eb32bc 100644
+--- a/hopper/flash_fwd_launch_template.h
++++ b/hopper/flash_fwd_launch_template.h
+@@ -177,9 +177,13 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+
+     int device;
+     CHECK_CUDA(cudaGetDevice(&device));
+-    typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
++    typename AttnKernel::Arguments attn_args {
+         mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
+-    });
++    };
++    if constexpr (Arch >= 90) {
++        attn_args.kv_page_protection = params.kv_page_protection;
++    }
++    typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments(attn_args);
+
+     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
+     dim3 block_dims = AttnKernel::get_block_shape();
+diff --git a/hopper/kv_page_protection.cuh b/hopper/kv_page_protection.cuh
+new file mode 100644
+index 0000000..fd5648c
+--- /dev/null
++++ b/hopper/kv_page_protection.cuh
+@@ -0,0 +1,136 @@
++#pragma once
++
++#include <cuda.h>
++#include <cuda_runtime.h>
++
++#include "flash.h"
++
++namespace flash {
++
++enum KVPageProtectionStatus : int {
++    KV_PAGE_INVALID_MAPPING = 1 << 0,
++    KV_PAGE_OWNER_MISMATCH = 1 << 1,
++    KV_PAGE_POSITION_MISMATCH = 1 << 2,
++    KV_PAGE_ATTENTION_TAG_MISMATCH = 1 << 3,
++    KV_PAGE_GENERATION_MISMATCH = 1 << 4,
++    KV_PAGE_TRANSFER_TAG_MISMATCH = 1 << 5,
++};
++
++CUTLASS_DEVICE
++int validate_kv_page_table(
++        KV_page_protection_params const& params,
++        int batch,
++        int request_idx,
++        int seqlen,
++        int const* page_table,
++        int64_t page_table_batch_stride,
++        int page_table_num_rows,
++        int page_table_num_cols,
++        int page_offset,
++        int first_page) {
++    int lane_status = 0;
++    if (batch < 0 || batch >= page_table_num_rows || seqlen < 0 || params.page_size <= 0) {
++        lane_status |= KV_PAGE_INVALID_MAPPING;
++    } else {
++        int64_t const num_pages =
++            (static_cast<int64_t>(seqlen) + params.page_size - 1) / params.page_size;
++        if (first_page < 0 || first_page > num_pages || num_pages > page_table_num_cols) {
++            lane_status |= KV_PAGE_INVALID_MAPPING;
++        } else {
++            int const lane = threadIdx.x % 32;
++            for (int64_t page_position = first_page + lane; page_position < num_pages; page_position += 32) {
++                int const local_page = page_table[batch * page_table_batch_stride + page_position];
++                int64_t const page = local_page > 0
++                    ? static_cast<int64_t>(local_page) + page_offset
++                    : local_page;
++                if (page <= 0 || page >= params.num_sidecar_pages) {
++                    lane_status |= KV_PAGE_INVALID_MAPPING;
++                    continue;
++                }
++                if (params.owner_request_indices[page] != request_idx) {
++                    lane_status |= KV_PAGE_OWNER_MISMATCH;
++                }
++                if (params.owner_page_positions[page] != static_cast<int>(page_position)) {
++                    lane_status |= KV_PAGE_POSITION_MISMATCH;
++                }
++                if (params.actual_tags[page] != params.expected_tags[page]) {
++                    lane_status |= KV_PAGE_ATTENTION_TAG_MISMATCH;
++                }
++                if (params.actual_generations[page] != params.expected_generations[page]) {
++                    lane_status |= KV_PAGE_GENERATION_MISMATCH;
++                }
++                if (params.actual_transfer_tags[page] != params.expected_transfer_tags[page]) {
++                    lane_status |= KV_PAGE_TRANSFER_TAG_MISMATCH;
++                }
++            }
++        }
++    }
++    return lane_status;
++}
++
++CUTLASS_DEVICE
++bool validate_kv_pages(KV_page_protection_params const& params, int batch) {
++    if (params.request_indices == nullptr) { return true; }
++
++    int const lane = threadIdx.x % 32;
++    int64_t request_idx_64 = lane == 0 ? params.request_indices[batch] : 0;
++    request_idx_64 = __shfl_sync(0xffffffff, request_idx_64, 0);
++    if (request_idx_64 == 0) { return true; }
++    if (request_idx_64 < 0 || request_idx_64 >= params.num_request_slots) { return false; }
++    int const request_idx = static_cast<int>(request_idx_64);
++
++    int epoch = lane == 0 ? atomicAdd(params.request_epochs + request_idx, 0) : 0;
++    int validated_epoch = lane == 0 ? atomicAdd(params.validated_epochs + request_idx, 0) : 0;
++    epoch = __shfl_sync(0xffffffff, epoch, 0);
++    validated_epoch = __shfl_sync(0xffffffff, validated_epoch, 0);
++    if (validated_epoch == epoch) {
++        int cached_status = lane == 0 ? atomicAdd(params.status + request_idx, 0) : 0;
++        cached_status = __shfl_sync(0xffffffff, cached_status, 0);
++        return cached_status == 0;
++    }
++
++    int const seqlen = params.seqlens[batch];
++    int lane_status = validate_kv_page_table(
++        params,
++        batch,
++        request_idx,
++        seqlen,
++        params.page_table,
++        params.page_table_batch_stride,
++        params.page_table_num_rows,
++        params.page_table_num_cols,
++        params.page_table_page_offset,
++        0);
++    if (params.page_table_2 != nullptr) {
++        int const first_page = params.page_table_2_window_size > 0
++            ? max(0, seqlen - params.page_table_2_window_size) / params.page_size
++            : 0;
++        lane_status |= validate_kv_page_table(
++            params,
++            batch,
++            request_idx,
++            seqlen,
++            params.page_table_2,
++            params.page_table_2_batch_stride,
++            params.page_table_2_num_rows,
++            params.page_table_2_num_cols,
++            params.page_table_2_page_offset,
++            first_page);
++    }
++
++    #pragma unroll
++    for (int offset = 16; offset > 0; offset /= 2) {
++        lane_status |= __shfl_xor_sync(0xffffffff, lane_status, offset);
++    }
++    if (lane == 0) {
++        if (lane_status != 0) {
++            atomicOr(params.status + request_idx, lane_status);
++        }
++        __threadfence();
++        atomicExch(params.validated_epochs + request_idx, epoch);
++    }
++    lane_status = __shfl_sync(0xffffffff, lane_status, 0);
++    return lane_status == 0;
++}
++
++} // namespace flash

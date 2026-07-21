@@ -47,6 +47,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._clear_transfer_page_pins()
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead
@@ -61,6 +62,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         select_index = self.free_pages[:need_size]
         self.free_pages = self.free_pages[need_size:]
+        if self.attention_tag_table is not None:
+            self._bump_page_generations(select_index)
         return select_index
 
     def free(self, free_index: torch.Tensor):
@@ -68,6 +71,10 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.is_not_in_free_group:
+            self._record_page_free(free_index)
+            free_index = self._filter_transfer_pinned_pages(free_index)
+            if free_index.numel() == 0:
+                return
             if self.need_sort:
                 self.release_pages = torch.cat((self.release_pages, free_index))
             else:

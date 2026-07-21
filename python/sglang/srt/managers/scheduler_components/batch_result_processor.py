@@ -665,15 +665,35 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        failed_rids = result.fused_kv_page_protection_failed_rids or set()
+        newly_deferred_rids = (
+            result.fused_kv_page_protection_deferred_release_rids or set()
+        )
         for i, req in enumerate(batch.reqs):
             req: Req
 
-            if (self.enable_overlap or self.enable_overlap_mlx) and (
-                req.finished() or req.is_retracted
-            ):
-                # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
-                # And all the over-allocated tokens will be freed in `release_kv_cache`.
-                continue
+            if req.finished() or req.is_retracted:
+                is_protection_drain = req.rid in failed_rids or getattr(
+                    req, "kv_fused_protection_deferred_release", False
+                )
+                if (
+                    getattr(req, "kv_fused_protection_deferred_release", False)
+                    and req.rid not in newly_deferred_rids
+                ):
+                    if (
+                        req.req_pool_idx is not None or self.tree_cache.supports_mamba()
+                    ) and not getattr(req, "kv_committed_freed", False):
+                        release_kv_cache(req, self.tree_cache, is_insert=False)
+                    req.kv_fused_protection_deferred_release = False
+                if (
+                    is_protection_drain
+                    or self.enable_overlap
+                    or self.enable_overlap_mlx
+                ):
+                    # Overlap can finish a request while its previous result is
+                    # queued. Protection failures use the same drain behavior in
+                    # non-overlap mode to prevent failed-token publication.
+                    continue
 
             # next_token_id is a per-req list: 1 token for non-spec, the verified
             # run for spec (already grammar-truncated in _resolve_spec_v2_tokens).
