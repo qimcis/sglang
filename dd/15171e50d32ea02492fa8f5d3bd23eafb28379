@@ -1,0 +1,19 @@
+python/sglang/srt/mem_cache/kv_page_tags.py
+  s_5f73f26aee7f01::t_0593faf568759a 3403-3407,3464,3468-3470,3473
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "dd15171e50d32ea02492fa8f5d3bd23eafb28379",
+  "prompts": {},
+  "sessions": {
+    "s_5f73f26aee7f01": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_099a8b759ffeqnA7QziBATTLQD",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
