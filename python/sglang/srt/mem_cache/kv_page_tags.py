@@ -1140,14 +1140,17 @@ def direct_kv_checksum_from_loc(
     ptrs: List[int] = []
     strides: List[int] = []
     nbytes: List[int] = []
+    elem_sizes: List[int] = []
+    meta_offsets: List[int] = []
+    meta_ndims: List[int] = []
+    inner_sizes: List[int] = []
+    inner_strides: List[int] = []
     total_bytes = 0
     for buf in buffers:
         if not isinstance(buf, torch.Tensor) or not buf.is_cuda:
             return _unsupported("a KV buffer is not a CUDA tensor")
         if buf.device != device:
             return _unsupported("KV buffer / kv_loc device mismatch")
-        if not buf.is_contiguous():
-            return _unsupported("a KV buffer is not contiguous")
         if buf.dim() < 1 or buf.shape[0] == 0:
             return _unsupported("degenerate KV buffer shape")
         itemsize = buf.element_size()
@@ -1155,17 +1158,19 @@ def direct_kv_checksum_from_loc(
         for s in buf.shape[1:]:
             per_row_elems *= int(s)
         row_b = per_row_elems * itemsize
-        if row_b == 0 or row_b % 8 != 0:
-            return _unsupported("per-buffer row bytes not a positive multiple of 8")
+        if row_b == 0:
+            return _unsupported("per-buffer row bytes are zero")
         stride0_b = int(buf.stride(0)) * itemsize
-        if stride0_b % 8 != 0:
-            return _unsupported("per-buffer dim-0 stride not a multiple of 8")
         base = int(buf.data_ptr())
-        if base % 8 != 0:
-            return _unsupported("KV buffer base pointer not 8-byte aligned")
         ptrs.append(base)
         strides.append(stride0_b)
         nbytes.append(row_b)
+        elem_sizes.append(itemsize)
+        meta_offsets.append(len(inner_sizes))
+        meta_ndims.append(max(0, buf.dim() - 1))
+        for dim in range(1, buf.dim()):
+            inner_sizes.append(int(buf.shape[dim]))
+            inner_strides.append(int(buf.stride(dim)) * itemsize)
         total_bytes += row_b
 
     num_lanes = select_checksum_byte_count(
@@ -1207,6 +1212,193 @@ def direct_kv_checksum_from_loc(
     total = _mix_scalar(_CKSUM_SEED, combined)
     total = _mix_scalar(total, int(sel_loc.numel()))
     return total
+
+
+def batched_direct_kv_checksums_from_req_to_token(
+    kv_pool: object,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    num_tokens: Sequence[int],
+    bootstrap_rooms: Sequence[int],
+    *,
+    mode: ChecksumMode,
+    config: KVProtectionConfig,
+) -> Optional[List[int]]:
+    """Compute direct-KV transfer checksums for multiple requests in one launch.
+
+    This is the SGLang-side batched form of ``direct_kv_checksum_from_loc``.  It
+    reads physical token slots from the global ``req_to_token`` matrix using
+    ``req_pool_indices`` and per-request selected logical token indices, so the
+    caller does not need to build ``kv_loc[indices]`` for each request.
+
+    Returns a Python ``List[int]`` of final checksum bit-patterns on success, or
+    ``None`` in ``auto`` mode to let the caller fall back to the existing
+    per-request direct/Torch path.  ``strict`` mode raises on unsupported layouts
+    or missing CUDA op, matching ``direct_kv_checksum_from_loc``.
+    """
+    setting = str(getattr(config, "checksum_direct_kernel", "auto")).lower()
+    if setting == "off":
+        return None
+    strict = setting == "strict"
+
+    def _unsupported(reason: str) -> None:
+        if strict:
+            raise RuntimeError(
+                "SGLANG_KV_CHECKSUM_DIRECT_KERNEL=strict but the batched direct "
+                f"KV checksum kernel cannot run: {reason}. Set the gate to "
+                "'auto' to fall back, 'off' to disable, or run a supported "
+                "(contiguous MHA/MLA, 8-byte-aligned) KV layout."
+            )
+        logger.debug("Batched direct KV checksum fallback: %s", reason)
+        return None
+
+    if not isinstance(req_to_token, torch.Tensor) or not req_to_token.is_cuda:
+        return _unsupported("req_to_token is not a CUDA tensor")
+    if req_to_token.dim() != 2:
+        return _unsupported("req_to_token is not a 2D tensor")
+    if req_to_token.dtype not in (torch.int32, torch.int64):
+        return _unsupported("req_to_token dtype is not int32/int64")
+    if not req_to_token.is_contiguous():
+        return _unsupported("req_to_token is not contiguous")
+    if not (hasattr(kv_pool, "get_key_buffer") and hasattr(kv_pool, "layer_num")):
+        return _unsupported(
+            f"pool {type(kv_pool).__name__!r} lacks per-layer KV accessors"
+        )
+
+    num_reqs = int(req_pool_indices.numel())
+    if len(num_tokens) != num_reqs or len(bootstrap_rooms) != num_reqs:
+        return _unsupported("request metadata length mismatch")
+    if num_reqs == 0:
+        return []
+
+    try:
+        _op = torch.ops.sgl_kernel.kv_checksum_direct_batched.default
+    except Exception as e:  # pragma: no cover - depends on CUDA build
+        return _unsupported(f"sgl_kernel kv_checksum_direct_batched unavailable ({e})")
+
+    buffers: List[torch.Tensor] = []
+    for layer_id in range(int(kv_pool.layer_num)):
+        buffers.append(kv_pool.get_key_buffer(layer_id))
+        try:
+            buffers.append(kv_pool.get_value_buffer(layer_id))
+        except (NotImplementedError, AttributeError):
+            pass
+    if not buffers:
+        return _unsupported("no KV buffers exposed")
+
+    device = req_to_token.device
+    ptrs: List[int] = []
+    strides: List[int] = []
+    nbytes: List[int] = []
+    elem_sizes: List[int] = []
+    meta_offsets: List[int] = []
+    meta_ndims: List[int] = []
+    inner_sizes: List[int] = []
+    inner_strides: List[int] = []
+    total_bytes = 0
+    for buf in buffers:
+        if not isinstance(buf, torch.Tensor) or not buf.is_cuda:
+            return _unsupported("a KV buffer is not a CUDA tensor")
+        if buf.device != device:
+            return _unsupported("KV buffer / req_to_token device mismatch")
+        if buf.dim() < 1 or buf.shape[0] == 0:
+            return _unsupported("degenerate KV buffer shape")
+        itemsize = buf.element_size()
+        expected_stride = 1
+        for dim in range(buf.dim() - 1, 0, -1):
+            if int(buf.stride(dim)) != expected_stride:
+                return _unsupported("a KV buffer row is not contiguous")
+            expected_stride *= int(buf.shape[dim])
+        per_row_elems = 1
+        for s in buf.shape[1:]:
+            per_row_elems *= int(s)
+        row_b = per_row_elems * itemsize
+        if row_b == 0 or row_b % 8 != 0:
+            return _unsupported("per-buffer row bytes not a positive multiple of 8")
+        stride0_b = int(buf.stride(0)) * itemsize
+        if stride0_b % 8 != 0:
+            return _unsupported("per-buffer dim-0 stride not a multiple of 8")
+        base = int(buf.data_ptr())
+        if base % 8 != 0:
+            return _unsupported("KV buffer base pointer not 8-byte aligned")
+        ptrs.append(base)
+        strides.append(stride0_b)
+        nbytes.append(row_b)
+        elem_sizes.append(itemsize)
+        meta_offsets.append(len(inner_sizes))
+        meta_ndims.append(max(0, buf.dim() - 1))
+        for dim in range(1, buf.dim()):
+            inner_sizes.append(int(buf.shape[dim]))
+            inner_strides.append(int(buf.stride(dim)) * itemsize)
+        total_bytes += row_b
+
+    num_lanes = select_checksum_byte_count(
+        total_bytes, mode, config.checksum_partial_byte_rate
+    )
+
+    selected_parts: List[torch.Tensor] = []
+    offsets: List[int] = []
+    lengths: List[int] = []
+    cursor = 0
+    for i in range(num_reqs):
+        offsets.append(cursor)
+        indices = select_checksum_token_indices(
+            int(num_tokens[i]),
+            int(bootstrap_rooms[i]),
+            mode,
+            config.checksum_sample_rate,
+        )
+        lengths.append(int(indices.numel()))
+        cursor += int(indices.numel())
+        if indices.numel() > 0:
+            selected_parts.append(indices)
+
+    selected_indices = (
+        torch.cat(selected_parts, dim=0).to(device=device, dtype=torch.long)
+        if selected_parts
+        else torch.empty(0, dtype=torch.long, device=device)
+    )
+    selected_offsets = torch.tensor(offsets, dtype=TAG_DTYPE, device=device)
+    selected_lengths = torch.tensor(lengths, dtype=TAG_DTYPE, device=device)
+    req_pool_indices = req_pool_indices.to(device=device, dtype=torch.long).contiguous()
+    buffer_ptrs = torch.tensor(ptrs, dtype=TAG_DTYPE, device=device)
+    row_strides = torch.tensor(strides, dtype=TAG_DTYPE, device=device)
+    row_nbytes = torch.tensor(nbytes, dtype=TAG_DTYPE, device=device)
+    elem_sizes_t = torch.tensor(elem_sizes, dtype=TAG_DTYPE, device=device)
+    meta_offsets_t = torch.tensor(meta_offsets, dtype=TAG_DTYPE, device=device)
+    meta_ndims_t = torch.tensor(meta_ndims, dtype=TAG_DTYPE, device=device)
+    inner_sizes_t = torch.tensor(inner_sizes, dtype=TAG_DTYPE, device=device)
+    inner_strides_t = torch.tensor(inner_strides, dtype=TAG_DTYPE, device=device)
+    out = torch.empty((num_reqs,), dtype=TAG_DTYPE, device=device)
+
+    try:
+        _op(
+            buffer_ptrs,
+            row_strides,
+            row_nbytes,
+            req_to_token,
+            req_pool_indices,
+            selected_offsets,
+            selected_lengths,
+            selected_indices,
+            elem_sizes_t,
+            meta_offsets_t,
+            meta_ndims_t,
+            inner_sizes_t,
+            inner_strides_t,
+            int(num_lanes),
+            out,
+        )
+    except Exception as e:  # pragma: no cover - depends on CUDA runtime
+        if strict:
+            raise RuntimeError(f"batched direct KV checksum kernel failed: {e}") from e
+        logger.warning(
+            "Batched direct KV checksum kernel failed (%s); falling back to per-request path.",
+            e,
+        )
+        return None
+
+    return [int(x) for x in out.cpu().tolist()]
 
 
 def compare_checksums(expected: ChecksumPlan, actual_checksum: int) -> bool:

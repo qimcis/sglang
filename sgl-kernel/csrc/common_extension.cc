@@ -345,6 +345,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "kv_checksum_direct(Tensor buffer_ptrs, Tensor row_strides, Tensor row_nbytes, Tensor sel_loc, "
       "Tensor? positions, int num_lanes, Tensor! out) -> ()");
   m.impl("kv_checksum_direct", torch::kCUDA, &kv_checksum_direct);
+  m.def(
+      "kv_checksum_direct_batched(Tensor buffer_ptrs, Tensor row_strides, Tensor row_nbytes, "
+      "Tensor req_to_token, Tensor req_pool_indices, Tensor selected_offsets, "
+      "Tensor selected_lengths, Tensor selected_indices, Tensor elem_sizes, Tensor meta_offsets, "
+      "Tensor meta_ndims, Tensor inner_sizes, Tensor inner_strides, int num_lanes, Tensor! out) -> ()");
+  m.impl("kv_checksum_direct_batched", torch::kCUDA, &kv_checksum_direct_batched);
 
   /*
    * From csrc/memory

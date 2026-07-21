@@ -56,6 +56,50 @@ def kv_checksum_direct(
     )
 
 
+def kv_checksum_direct_batched(
+    buffer_ptrs: torch.Tensor,
+    row_strides: torch.Tensor,
+    row_nbytes: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    selected_offsets: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    selected_indices: torch.Tensor,
+    elem_sizes: torch.Tensor,
+    meta_offsets: torch.Tensor,
+    meta_ndims: torch.Tensor,
+    inner_sizes: torch.Tensor,
+    inner_strides: torch.Tensor,
+    num_lanes: int,
+    out: torch.Tensor,
+) -> None:
+    """Batched direct-KV checksums from SGLang's req_to_token table (CUDA).
+
+    Computes final per-request checksums in one launch.  Physical KV slots are
+    read as ``req_to_token[req_pool_indices[r], selected_indices_flat[j]]``, so
+    callers do not need to materialize per-request ``kv_loc[indices]`` tensors.
+    The output ``out`` has shape ``[num_requests]`` and contains signed-int64
+    checksum bit patterns with the same final mixing as ``kv_page_tags``.
+    """
+    torch.ops.sgl_kernel.kv_checksum_direct_batched.default(
+        buffer_ptrs,
+        row_strides,
+        row_nbytes,
+        req_to_token,
+        req_pool_indices,
+        selected_offsets,
+        selected_lengths,
+        selected_indices,
+        elem_sizes,
+        meta_offsets,
+        meta_ndims,
+        inner_sizes,
+        inner_strides,
+        int(num_lanes),
+        out,
+    )
+
+
 def transfer_kv_per_layer(
     src_k: torch.Tensor,
     dst_k: torch.Tensor,

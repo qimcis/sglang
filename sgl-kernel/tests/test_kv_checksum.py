@@ -15,6 +15,7 @@ import torch
 from sglang.srt.mem_cache.kv_page_tags import (
     ChecksumMode,
     KVProtectionConfig,
+    batched_direct_kv_checksums_from_req_to_token,
     direct_kv_checksum_from_loc,
     gather_logical_kv_rows,
     hash_rows_with_positions,
@@ -30,6 +31,15 @@ pytestmark = pytest.mark.skipif(
 def _have_op() -> bool:
     try:
         from sgl_kernel.kvcacheio import kv_checksum_direct  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def _have_batched_op() -> bool:
+    try:
+        from sgl_kernel.kvcacheio import kv_checksum_direct_batched  # noqa: F401
 
         return True
     except Exception:
@@ -73,6 +83,21 @@ def _run(pool, kv_loc, num_tokens, mode, cfg, room=99):
     ref = _reference(pool, kv_loc, indices, mode, cfg)
     got = direct_kv_checksum_from_loc(pool, kv_loc, indices, mode=mode, config=cfg)
     return ref, got
+
+
+def _batched_reference(
+    pool, req_to_token, req_pool_indices, num_tokens, rooms, mode, cfg
+):
+    refs = []
+    for req_pool_idx, n_tok, room in zip(req_pool_indices.tolist(), num_tokens, rooms):
+        kv_loc = (
+            req_to_token[int(req_pool_idx), : int(n_tok)].to(torch.long).contiguous()
+        )
+        indices = select_checksum_token_indices(
+            int(n_tok), int(room), mode, cfg.checksum_sample_rate
+        )
+        refs.append(_reference(pool, kv_loc, indices, mode, cfg))
+    return refs
 
 
 @pytest.mark.skipif(not _have_op(), reason="sgl_kernel.kv_checksum_direct not built")
@@ -192,6 +217,89 @@ def test_empty_selection():
     assert got == _splitmix64_scalar(_CKSUM_SEED)
 
 
+@pytest.mark.skipif(
+    not _have_batched_op(), reason="sgl_kernel.kv_checksum_direct_batched not built"
+)
+@pytest.mark.parametrize(
+    "mode", [ChecksumMode.ALWAYS_FULL, ChecksumMode.SAMPLED_PARTIAL]
+)
+def test_batched_mha_req_to_token_parity(mode):
+    torch.manual_seed(4)
+    size, h, d, L, max_context = 512, 3, 16, 4, 64
+    cfg = KVProtectionConfig(checksum_mode=mode, checksum_direct_kernel="auto")
+    k = [torch.randn(size, h, d, dtype=torch.float16, device="cuda") for _ in range(L)]
+    v = [torch.randn(size, h, d, dtype=torch.float16, device="cuda") for _ in range(L)]
+    pool = _Pool(k, v)
+
+    req_to_token = torch.zeros((8, max_context), dtype=torch.int32, device="cuda")
+    req_pool_indices = torch.tensor([3, 1, 6, 2], dtype=torch.long, device="cuda")
+    num_tokens = [48, 17, 0, 63]
+    rooms = [101, 202, 303, 404]
+    used = torch.randperm(size, device="cuda")
+    cursor = 0
+    for req_pool_idx, n_tok in zip(req_pool_indices.tolist(), num_tokens):
+        if n_tok:
+            req_to_token[int(req_pool_idx), :n_tok] = used[cursor : cursor + n_tok].to(
+                torch.int32
+            )
+            cursor += n_tok
+
+    ref = _batched_reference(
+        pool, req_to_token, req_pool_indices, num_tokens, rooms, mode, cfg
+    )
+    got = batched_direct_kv_checksums_from_req_to_token(
+        pool,
+        req_to_token,
+        req_pool_indices,
+        num_tokens,
+        rooms,
+        mode=mode,
+        config=cfg,
+    )
+    assert got is not None
+    assert [x & ((1 << 64) - 1) for x in got] == [x & ((1 << 64) - 1) for x in ref]
+
+
+@pytest.mark.skipif(
+    not _have_batched_op(), reason="sgl_kernel.kv_checksum_direct_batched not built"
+)
+def test_batched_mla_k_only_req_to_token_parity():
+    torch.manual_seed(5)
+    size, lora, L, max_context = 256, 64, 3, 48
+    mode = ChecksumMode.SAMPLED_FULL
+    cfg = KVProtectionConfig(checksum_mode=mode, checksum_direct_kernel="auto")
+    k = [
+        torch.randn(size, 1, lora, dtype=torch.bfloat16, device="cuda")
+        for _ in range(L)
+    ]
+    pool = _Pool(k, v_buffers=None)
+
+    req_to_token = torch.zeros((5, max_context), dtype=torch.int64, device="cuda")
+    req_pool_indices = torch.tensor([4, 2, 1], dtype=torch.long, device="cuda")
+    num_tokens = [40, 11, 31]
+    rooms = [7, 11, 13]
+    used = torch.randperm(size, device="cuda")
+    cursor = 0
+    for req_pool_idx, n_tok in zip(req_pool_indices.tolist(), num_tokens):
+        req_to_token[int(req_pool_idx), :n_tok] = used[cursor : cursor + n_tok]
+        cursor += n_tok
+
+    ref = _batched_reference(
+        pool, req_to_token, req_pool_indices, num_tokens, rooms, mode, cfg
+    )
+    got = batched_direct_kv_checksums_from_req_to_token(
+        pool,
+        req_to_token,
+        req_pool_indices,
+        num_tokens,
+        rooms,
+        mode=mode,
+        config=cfg,
+    )
+    assert got is not None
+    assert [x & ((1 << 64) - 1) for x in got] == [x & ((1 << 64) - 1) for x in ref]
+
+
 def test_cpu_falls_back_and_strict_raises():
     """No CUDA op needed: auto -> None on CPU pool, strict -> RuntimeError."""
     k = [torch.randn(16, 2, 8, dtype=torch.float32)]
@@ -213,6 +321,41 @@ def test_cpu_falls_back_and_strict_raises():
     with pytest.raises(RuntimeError):
         direct_kv_checksum_from_loc(
             pool, kv_loc, idx, mode=strict.checksum_mode, config=strict
+        )
+
+
+def test_batched_cpu_falls_back_and_strict_raises():
+    k = [torch.randn(16, 2, 8, dtype=torch.float32)]
+    pool = _Pool(k, None)
+    req_to_token = torch.arange(16, dtype=torch.int32).reshape(1, 16)
+    req_pool_indices = torch.tensor([0], dtype=torch.long)
+    auto = KVProtectionConfig(
+        checksum_mode=ChecksumMode.ALWAYS_FULL, checksum_direct_kernel="auto"
+    )
+    assert (
+        batched_direct_kv_checksums_from_req_to_token(
+            pool,
+            req_to_token,
+            req_pool_indices,
+            [4],
+            [1],
+            mode=auto.checksum_mode,
+            config=auto,
+        )
+        is None
+    )
+    strict = KVProtectionConfig(
+        checksum_mode=ChecksumMode.ALWAYS_FULL, checksum_direct_kernel="strict"
+    )
+    with pytest.raises(RuntimeError):
+        batched_direct_kv_checksums_from_req_to_token(
+            pool,
+            req_to_token,
+            req_pool_indices,
+            [4],
+            [1],
+            mode=strict.checksum_mode,
+            config=strict,
         )
 
 

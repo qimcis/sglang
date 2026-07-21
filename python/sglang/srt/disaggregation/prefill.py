@@ -649,6 +649,10 @@ class SchedulerDisaggregationPrefillMixin:
                 idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
             }
 
+        self._maybe_compute_transfer_checksums_batched(
+            [req for req in batch.reqs if req.inflight_middle_chunks <= 0]
+        )
+
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
@@ -993,6 +997,8 @@ class SchedulerDisaggregationPrefillMixin:
         manager = getattr(self, "kv_protection_manager", None)
         if manager is None or not manager.config.checksum_enabled:
             return
+        if getattr(req, "kv_transfer_checksum", None) is not None:
+            return
         try:
             seq_len = min(req.fill_len, len(req.origin_input_ids))
             if seq_len <= 0 or req.req_pool_idx is None:
@@ -1011,6 +1017,66 @@ class SchedulerDisaggregationPrefillMixin:
                 "KV transfer checksum (source) failed for rid=%s: %s", req.rid, e
             )
             req.kv_transfer_checksum = None
+
+    def _maybe_compute_transfer_checksums_batched(
+        self: Scheduler, reqs: List[Req]
+    ) -> None:
+        manager = getattr(self, "kv_protection_manager", None)
+        if manager is None or not manager.config.checksum_enabled or not reqs:
+            return
+
+        eligible = []
+        num_tokens = []
+        bootstrap_rooms = []
+        req_pool_indices = []
+        for req in reqs:
+            if getattr(req, "kv_transfer_checksum", None) is not None:
+                continue
+            seq_len = min(req.fill_len, len(req.origin_input_ids))
+            if seq_len <= 0 or req.req_pool_idx is None:
+                continue
+            eligible.append(req)
+            num_tokens.append(seq_len)
+            bootstrap_rooms.append(req.bootstrap_room or 0)
+            req_pool_indices.append(int(req.req_pool_idx))
+
+        if not eligible:
+            return
+
+        try:
+            from sglang.srt.mem_cache.kv_page_tags import (
+                ChecksumPlan,
+                batched_direct_kv_checksums_from_req_to_token,
+            )
+
+            req_to_token = self.req_to_token_pool.req_to_token
+            req_pool_indices_t = torch.tensor(
+                req_pool_indices, dtype=torch.long, device=req_to_token.device
+            )
+            kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+            mode = manager.config.checksum_mode
+            checksums = batched_direct_kv_checksums_from_req_to_token(
+                kv_pool,
+                req_to_token,
+                req_pool_indices_t,
+                num_tokens,
+                bootstrap_rooms,
+                mode=mode,
+                config=manager.config,
+            )
+            if checksums is None:
+                return
+            for req, n_tok, checksum in zip(eligible, num_tokens, checksums):
+                req.kv_transfer_checksum = ChecksumPlan(
+                    bootstrap_room=req.bootstrap_room or 0,
+                    num_tokens=n_tok,
+                    mode=mode,
+                    num_lanes=None,
+                    checksum=int(checksum),
+                )
+        except Exception as e:
+            # Fall back to the existing per-request path in send_kv_chunk.
+            logger.error("Batched KV transfer checksum (source) failed: %s", e)
 
     def send_kv_chunk(
         self: Scheduler,

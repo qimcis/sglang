@@ -650,6 +650,26 @@ void kv_checksum_direct(
     int64_t num_lanes,
     at::Tensor& out);
 
+// Batched direct-KV checksum from SGLang's req_to_token matrix. Writes final
+// per-request checksums to `out` ([R] int64), avoiding both logical row
+// materialization and per-request kernel launches.
+void kv_checksum_direct_batched(
+    const at::Tensor& buffer_ptrs,
+    const at::Tensor& row_strides,
+    const at::Tensor& row_nbytes,
+    const at::Tensor& req_to_token,
+    const at::Tensor& req_pool_indices,
+    const at::Tensor& selected_offsets,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& selected_indices,
+    const at::Tensor& elem_sizes,
+    const at::Tensor& meta_offsets,
+    const at::Tensor& meta_ndims,
+    const at::Tensor& inner_sizes,
+    const at::Tensor& inner_strides,
+    int64_t num_lanes,
+    at::Tensor& out);
+
 /*
  * From csrc/memory
  */
