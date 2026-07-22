@@ -1,0 +1,25 @@
+test/registered/unit/disaggregation/test_decode_queue_cleanup.py
+  s_5f73f26aee7f01::t_0bf255ede10b48 13
+test/registered/unit/disaggregation/test_nixl_backend_basic.py
+  s_5f73f26aee7f01::t_094fc5a5acdd2f 15
+test/registered/unit/disaggregation/test_nixl_sender_failure_cleanup.py
+  s_5f73f26aee7f01::t_68473fc0e4ad07 12
+test/registered/unit/mem_cache/test_mamba_unittest.py
+  s_5f73f26aee7f01::t_a9a88609a7825b 32
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "67cc92ca9740bc8a1ddfda6d0ead7ff2b3262600",
+  "prompts": {},
+  "sessions": {
+    "s_5f73f26aee7f01": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_099a8b759ffeqnA7QziBATTLQD",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
