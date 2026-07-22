@@ -370,6 +370,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         ), "sliding_window_size must be set for SWARadixCache"
         return True
 
+    def supports_kv_page_protection(self) -> bool:
+        return True
+
     def reset(self) -> None:
         self.root_node = TreeNode()
         self.root_node.key = []
@@ -486,6 +489,11 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
+        from sglang.srt.mem_cache.kv_page_tags import (
+            defer_kv_frees_until_mapping_refresh,
+            refresh_request_expected_mappings,
+        )
+
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : req.extend_range.end
@@ -498,7 +506,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         token_ids = req.get_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
-        ]
+        ].to(dtype=torch.int64, copy=True)
 
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
@@ -508,28 +516,37 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
-        result = self.insert(
-            InsertParams(
-                key=radix_key,
-                value=values,
-                prev_prefix_len=old_prefix_len,
+        with defer_kv_frees_until_mapping_refresh(self.token_to_kv_pool_allocator):
+            result = self.insert(
+                InsertParams(
+                    key=radix_key,
+                    value=values,
+                    prev_prefix_len=old_prefix_len,
+                )
             )
-        )
-        new_prefix_len = result.prefix_len
+            new_prefix_len = result.prefix_len
 
-        # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
-        new_indices, new_last_node = (
-            match_result.device_indices,
-            match_result.last_device_node,
-        )
+            match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+            new_indices, new_last_node = (
+                match_result.device_indices,
+                match_result.last_device_node,
+            )
 
-        assert old_prefix_len <= len(new_indices), f"{old_prefix_len=}, {new_indices=}"
-        assert new_prefix_len <= len(new_indices), f"{new_prefix_len=}, {new_indices=}"
-        self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(old_prefix_len, len(new_indices))),
-            new_indices[old_prefix_len:],
-        )
+            assert old_prefix_len <= len(
+                new_indices
+            ), f"{old_prefix_len=}, {new_indices=}"
+            assert new_prefix_len <= len(
+                new_indices
+            ), f"{new_prefix_len=}, {new_indices=}"
+            self.req_to_token_pool.write(
+                (req.req_pool_idx, slice(old_prefix_len, len(new_indices))),
+                new_indices[old_prefix_len:],
+            )
+            refresh_request_expected_mappings(
+                req,
+                self.req_to_token_pool.req_to_token,
+                self.token_to_kv_pool_allocator,
+            )
 
         req.cache_protected_len = len(new_indices)
 

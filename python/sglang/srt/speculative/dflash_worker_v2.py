@@ -1655,6 +1655,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
 
+        protection_check = target_out.fused_kv_page_protection_check
+        if protection_check is not None:
+            commit_lens = protection_check.mask_failed_rows(
+                commit_lens, torch.zeros_like(commit_lens)
+            )
+            bonus = protection_check.mask_failed_rows(bonus, torch.zeros_like(bonus))
+
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
@@ -1665,6 +1672,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+        elif protection_check is not None:
+            new_seq_lens = protection_check.mask_failed_rows(new_seq_lens, prefix_lens)
         if on_publish is not None:
             on_publish(new_seq_lens)
 
@@ -1702,4 +1711,5 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The non-overlap (sync) scheduler path advances batch.seq_lens
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
+            fused_kv_page_protection_check=protection_check,
         )

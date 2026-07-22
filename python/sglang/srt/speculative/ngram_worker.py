@@ -435,6 +435,14 @@ class NGRAMWorker(BaseSpecWorker):
                 accept_index,
             ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
             new_seq_lens = batch.seq_lens + accept_lens
+            protection_check = batch_result.fused_kv_page_protection_check
+            if protection_check is not None:
+                accept_lens = protection_check.mask_failed_rows(
+                    accept_lens, torch.ones_like(accept_lens)
+                )
+                new_seq_lens = protection_check.mask_failed_rows(
+                    new_seq_lens, batch.seq_lens
+                )
             commit_mamba_states_after_verify(
                 self.target_worker,
                 batch,
@@ -466,9 +474,6 @@ class NGRAMWorker(BaseSpecWorker):
                     self.draft_token_num - 1,
                 )
 
-            if on_publish is not None:
-                on_publish(new_seq_lens)
-
             self._update_ngram_corpus(batch)
             # Erase match state of requests that left the decode batch.
             # req.finished() is unusable here: under overlap it flips at result
@@ -497,15 +502,27 @@ class NGRAMWorker(BaseSpecWorker):
             accept_tokens = accept_tokens.flatten()
             next_token_ids = predict
 
-            if on_publish is not None:
-                on_publish(new_seq_lens)
+        protection_check = batch_result.fused_kv_page_protection_check
+        next_accept_lens = accept_lens
+        if protection_check is not None:
+            accept_lens = protection_check.mask_failed_rows(
+                accept_lens, torch.ones_like(accept_lens)
+            )
+            new_seq_lens = protection_check.mask_failed_rows(
+                new_seq_lens, batch.seq_lens
+            )
+            next_accept_lens = protection_check.mask_failed_rows(
+                accept_lens, torch.zeros_like(accept_lens)
+            )
+        if on_publish is not None:
+            on_publish(new_seq_lens)
 
         # Construct the next draft input
         next_draft_input = NgramVerifyInput(
             draft_token_num=self.draft_token_num,
             new_seq_lens=new_seq_lens,
             accept_tokens=accept_tokens,
-            accept_lens=accept_lens,
+            accept_lens=next_accept_lens,
         )
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -518,4 +535,5 @@ class NGRAMWorker(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+            fused_kv_page_protection_check=protection_check,
         )

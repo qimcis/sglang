@@ -9,16 +9,17 @@ Two independent (but related) mechanisms live here:
 
 1. Attention tags
    A sidecar GPU buffer of ``uint64`` tags, one per physical KV page, stored
-   separately from the KV tensors themselves.  A tag identifies the expected
-   request/page owner of whatever attention is about to read:
+   separately from the KV tensors themselves. A tag identifies one allocation
+   generation of a physical page and remains stable while RadixCache shares it:
 
-       tag = hash(physical_page_id, page_position, bootstrap_room, generation)
+       tag = hash(physical_page_id, generation)
 
    where ``generation`` is a per-physical-page allocation generation that is
-   bumped every time the page is (re)allocated.  At the decode pre-attention
-   boundary we compare the expected tags for each request's logical pages
-   against the sidecar buffer.  A mismatch means the page ownership changed
-   since transfer commit -> we fail *only* the affected request with
+   bumped every time the page is (re)allocated. At the decode pre-attention
+   boundary an independent request/logical-page sidecar first validates the
+   active physical mapping, then compares its expected identity and generation
+   against the physical sidecar. A mismatch means the mapping or allocation
+   changed since transfer commit -> we fail *only* the affected request with
    :class:`KVAttentionTagMismatch`.
 
 2. Transfer checksums
@@ -51,6 +52,7 @@ import struct
 import time
 import uuid
 from bisect import bisect_right
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -79,9 +81,20 @@ _I32_SIGN = 1 << 31
 
 # Transfer page tags are conceptually uint32; torch stores the bit pattern in int32.
 TRANSFER_PAGE_TAG_DTYPE = torch.int32
-KV_ATTENTION_TAG_BYTES_PER_PAGE = 48
+KV_ATTENTION_TAG_BYTES_PER_PAGE = 20
+KV_EXPECTED_MAPPING_BYTES_PER_PAGE = 24
+KV_REQUEST_PROTECTION_BYTES_PER_SLOT = 16
+TRANSFER_PAGE_TAG_SKIP = 0
+KV_EXPECTED_MAPPING_FULL = 0
+KV_EXPECTED_MAPPING_SWA = 1
+KV_EXPECTED_MAPPING_NAMESPACE_COUNT = 2
 KV_CHECKSUM_MAX_WORKSPACE_BYTES = 512 * 1024 * 1024
 KV_PAGE_INVALID_MAPPING = 1 << 0
+KV_PAGE_OWNER_MISMATCH = 1 << 1
+KV_PAGE_POSITION_MISMATCH = 1 << 2
+KV_PAGE_ATTENTION_TAG_MISMATCH = 1 << 3
+KV_PAGE_GENERATION_MISMATCH = 1 << 4
+KV_PAGE_TRANSFER_TAG_MISMATCH = 1 << 5
 KV_PAGE_VALIDATION_INCOMPLETE = 1 << 30
 KV_PAGE_VALIDATION_REMOTE_FAILURE = 1 << 29
 
@@ -458,10 +471,10 @@ SUPPORTED_ALLOCATOR_CLASSES = (
 )
 
 # Transfer backends for which the transfer-checksum manifest exchange is wired.
-SUPPORTED_CHECKSUM_BACKENDS = ("mooncake",)
+SUPPORTED_CHECKSUM_BACKENDS = ("mooncake", "nixl")
 # Fake accepts tag metadata for no-transfer scheduler coverage; Mooncake is the
 # only production backend that transports and commits it.
-SUPPORTED_ATTENTION_TAG_BACKENDS = ("mooncake", "fake")
+SUPPORTED_ATTENTION_TAG_BACKENDS = ("mooncake", "nixl", "fake")
 
 
 def assert_protection_supported(
@@ -470,11 +483,14 @@ def assert_protection_supported(
     allocator: object = None,
     transfer_backend: Optional[str] = None,
     is_spec_decode: bool = False,
+    supports_spec_target_verify: bool = False,
     pp_size: int = 1,
     enable_dp_attention: bool = False,
     radix_cache_enabled: bool = False,
     is_cuda_device: Optional[bool] = None,
     device_capability_major: Optional[int] = None,
+    device_capability_minor: Optional[int] = None,
+    prefix_cache: object = None,
 ) -> None:
     """Fail-fast when protection is enabled on an unsupported configuration.
 
@@ -484,6 +500,16 @@ def assert_protection_supported(
     """
     if not config.enabled:
         return
+
+    if (
+        config.enable_attention_tags
+        and prefix_cache is not None
+        and not prefix_cache.supports_kv_page_protection()
+    ):
+        raise RuntimeError(
+            "KV page protection requires a prefix cache with protected mapping "
+            f"lifecycle support; {type(prefix_cache).__name__} is unsupported"
+        )
 
     if allocator is not None:
         name = type(allocator).__name__
@@ -496,11 +522,15 @@ def assert_protection_supported(
                 "or run a supported layout (plain paged/token or SWA)."
             )
 
-    if is_spec_decode and config.enable_attention_tags:
+    if (
+        is_spec_decode
+        and config.enable_attention_tags
+        and not supports_spec_target_verify
+    ):
         raise RuntimeError(
-            "KV attention-tag protection does not yet support speculative decoding "
-            "(multiple tokens/pages committed per step). Disable "
-            "SGLANG_KV_PAGE_PROTECTION or speculative decoding."
+            "KV attention-tag protection requires a speculative target backend "
+            "with both pre-indexer and protected top-k validation. Disable "
+            "SGLANG_KV_PAGE_PROTECTION or use audited DSA target verification."
         )
 
     if config.enable_attention_tags and pp_size > 1:
@@ -513,13 +543,6 @@ def assert_protection_supported(
         raise RuntimeError(
             "KV attention-tag protection does not yet support DP attention. "
             "Disable --enable-dp-attention or SGLANG_KV_PAGE_PROTECTION."
-        )
-
-    if config.enable_attention_tags and radix_cache_enabled:
-        raise RuntimeError(
-            "KV attention-tag protection does not yet support shared radix-prefix "
-            "pages. Set --disable-radix-cache or disable "
-            "SGLANG_KV_PAGE_PROTECTION."
         )
 
     if config.enable_attention_tags and transfer_backend is not None:
@@ -538,13 +561,23 @@ def assert_protection_supported(
         fused_validation_enabled = (
             not envs.SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION.get()
         )
+        capability = (
+            (device_capability_major, device_capability_minor)
+            if device_capability_major is not None
+            and device_capability_minor is not None
+            else (
+                (device_capability_major, -1)
+                if device_capability_major is not None
+                else None
+            )
+        )
         if fused_validation_enabled and (
             is_cuda_device is False
-            or (device_capability_major is not None and device_capability_major != 9)
+            or (capability is not None and capability not in ((9, 0), (10, 0), (10, 3)))
         ):
             raise RuntimeError(
-                "Producer-fused DSA KV page protection requires an NVIDIA "
-                "Hopper SM90 GPU. Set "
+                "Fused KV page protection requires an NVIDIA Hopper SM90 or "
+                "Blackwell SM100/SM103 GPU. Set "
                 "SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION=1 to use scheduler "
                 "validation, or disable SGLANG_KV_PAGE_PROTECTION."
             )
@@ -672,11 +705,10 @@ def compute_attention_tag_scalar(
 
     This intentionally does not hash token ids or KV bytes.  Transfer checksums
     prove byte equality; attention tags prove that the physical page attention is
-    about to read is still the page generation assigned to this logical owner.
+    about to read is still the expected allocation generation.
     """
+    del page_position, bootstrap_room
     acc = _TAG_SEED
-    acc = _mix_scalar(acc, bootstrap_room)
-    acc = _mix_scalar(acc, page_position)
     acc = _mix_scalar(acc, physical_page_id)
     acc = _mix_scalar(acc, generation)
     return acc
@@ -715,8 +747,7 @@ def compute_attention_tags_tensor(
         dtype=TAG_DTYPE,
         device=physical_page_ids.device,
     )
-    acc = _mix_tensor(acc, bootstrap_rooms.to(TAG_DTYPE))
-    acc = _mix_tensor(acc, page_positions.to(TAG_DTYPE))
+    del page_positions, bootstrap_rooms
     acc = _mix_tensor(acc, physical_page_ids.to(TAG_DTYPE))
     acc = _mix_tensor(acc, generations.to(TAG_DTYPE))
     return acc
@@ -800,6 +831,7 @@ class AttentionTagManifest:
     page_positions_t: torch.Tensor
     generations_t: torch.Tensor
     expected_tags_t: torch.Tensor
+    mapping_namespace: int = KV_EXPECTED_MAPPING_FULL
     revision: int = 0
     max_num_pages: Optional[int] = None
     _replacement_heap: List[Tuple[int, int]] = field(
@@ -826,6 +858,7 @@ class AttentionTagManifest:
         generations: Sequence[int],
         page_positions: Optional[Sequence[int]] = None,
         max_num_pages: Optional[int] = None,
+        mapping_namespace: int = KV_EXPECTED_MAPPING_FULL,
     ) -> AttentionTagManifest:
         phys = list(physical_page_ids)
         gens = list(generations)
@@ -860,6 +893,7 @@ class AttentionTagManifest:
             page_positions_t=page_positions_t,
             generations_t=generations_t,
             expected_tags_t=expected_tags_t,
+            mapping_namespace=mapping_namespace,
             max_num_pages=max_num_pages,
         )
 
@@ -872,6 +906,7 @@ class AttentionTagManifest:
         generations: torch.Tensor,
         page_positions: Optional[Sequence[int] | torch.Tensor] = None,
         max_num_pages: Optional[int] = None,
+        mapping_namespace: int = KV_EXPECTED_MAPPING_FULL,
     ) -> AttentionTagManifest:
         pages_t = physical_page_ids.reshape(-1).to(dtype=torch.long)
         generations_t = generations.reshape(-1).to(
@@ -922,6 +957,7 @@ class AttentionTagManifest:
             page_positions_t=positions_t,
             generations_t=generations_t,
             expected_tags_t=expected_tags_t,
+            mapping_namespace=mapping_namespace,
             max_num_pages=max_num_pages,
         )
 
@@ -1040,6 +1076,30 @@ class AttentionTagManifest:
         self.revision += 1
         return tag_page_id, expected_t
 
+    def replace_pages(
+        self, physical_page_ids: torch.Tensor, generations: torch.Tensor
+    ) -> None:
+        """Replace this request's logical mapping after a radix dedup/remap."""
+        pages = physical_page_ids.reshape(-1).to(
+            device=self.physical_page_ids_t.device, dtype=torch.long
+        )
+        generations = generations.reshape(-1).to(device=pages.device, dtype=TAG_DTYPE)
+        if pages.numel() != self.num_pages or generations.numel() != self.num_pages:
+            raise RuntimeError("attention tag remap length mismatch")
+        self.physical_page_ids_t.copy_(pages)
+        self.generations_t.copy_(generations)
+        self.expected_tags_t.copy_(
+            compute_attention_tags_tensor(
+                pages,
+                self.page_positions_t.to(pages.device),
+                torch.full_like(self.page_positions_t, self.bootstrap_room).to(
+                    pages.device
+                ),
+                generations,
+            )
+        )
+        self.revision += 1
+
 
 @dataclass
 class AttentionTagManifestGroup:
@@ -1079,6 +1139,7 @@ class TransferPageTagManifest:
     page_positions_t: torch.Tensor
     generations_t: torch.Tensor
     expected_tags_t: torch.Tensor
+    mapping_namespace: int = KV_EXPECTED_MAPPING_FULL
     revision: int = 0
     max_num_pages: Optional[int] = None
     _replacement_heap: List[Tuple[int, int]] = field(
@@ -1105,6 +1166,7 @@ class TransferPageTagManifest:
         generations: Sequence[int],
         page_positions: Optional[Sequence[int]] = None,
         max_num_pages: Optional[int] = None,
+        mapping_namespace: int = KV_EXPECTED_MAPPING_FULL,
     ) -> TransferPageTagManifest:
         phys = list(physical_page_ids)
         gens = list(generations)
@@ -1137,6 +1199,7 @@ class TransferPageTagManifest:
             page_positions_t=torch.tensor(positions, dtype=TAG_DTYPE),
             generations_t=torch.tensor(gens, dtype=TAG_DTYPE),
             expected_tags_t=transfer_page_tags_to_tensor(expected),
+            mapping_namespace=mapping_namespace,
             max_num_pages=max_num_pages,
         )
 
@@ -1149,6 +1212,7 @@ class TransferPageTagManifest:
         generations: torch.Tensor,
         page_positions: Optional[Sequence[int] | torch.Tensor] = None,
         max_num_pages: Optional[int] = None,
+        mapping_namespace: int = KV_EXPECTED_MAPPING_FULL,
     ) -> TransferPageTagManifest:
         pages_t = physical_page_ids.reshape(-1).to(dtype=torch.long)
         generations_t = generations.reshape(-1).to(
@@ -1199,6 +1263,7 @@ class TransferPageTagManifest:
             page_positions_t=positions_t,
             generations_t=generations_t,
             expected_tags_t=expected_tags_t,
+            mapping_namespace=mapping_namespace,
             max_num_pages=max_num_pages,
         )
 
@@ -1312,6 +1377,27 @@ class TransferPageTagManifest:
 
         self.revision += 1
         return tag_page_id, expected_t
+
+    def replace_pages(
+        self,
+        physical_page_ids: torch.Tensor,
+        generations: torch.Tensor,
+        *,
+        skip_changed: bool,
+    ) -> None:
+        """Replace remapped pages and skip transfer checks for shared pages."""
+        pages = physical_page_ids.reshape(-1).to(
+            device=self.physical_page_ids_t.device, dtype=torch.long
+        )
+        generations = generations.reshape(-1).to(device=pages.device, dtype=TAG_DTYPE)
+        if pages.numel() != self.num_pages or generations.numel() != self.num_pages:
+            raise RuntimeError("transfer tag remap length mismatch")
+        changed = pages.ne(self.physical_page_ids_t)
+        self.physical_page_ids_t.copy_(pages)
+        self.generations_t.copy_(generations)
+        if skip_changed:
+            self.expected_tags_t.masked_fill_(changed, TRANSFER_PAGE_TAG_SKIP)
+        self.revision += 1
 
 
 @dataclass
@@ -1512,33 +1598,44 @@ class KVAttentionTagTable:
         device: str = "cpu",
         *,
         num_request_slots: int = 2,
+        num_logical_pages: Optional[int] = None,
         enable_history: bool = False,
     ):
         # +1 so physical page ids (which are 1-based in the paged allocator) fit.
         self._size = num_pages + 1
         self.device = device
+        self.num_logical_pages = int(num_logical_pages or num_pages)
+        if self.num_logical_pages <= 0:
+            raise ValueError("num_logical_pages must be positive")
         self.tags = torch.zeros(self._size, dtype=TAG_DTYPE, device=device)
         self.generations = torch.zeros(self._size, dtype=TAG_DTYPE, device=device)
         self.transfer_page_tags = torch.zeros(
             self._size, dtype=TRANSFER_PAGE_TAG_DTYPE, device=device
         )
-        self.owner_request_indices = torch.full(
-            (self._size,), -1, dtype=torch.int32, device=device
+        self.expected_mapping_namespace_stride = self.num_logical_pages
+        self.expected_mapping_stride = (
+            KV_EXPECTED_MAPPING_NAMESPACE_COUNT * self.num_logical_pages
         )
-        self.owner_page_positions = torch.full(
-            (self._size,), -1, dtype=torch.int32, device=device
+        expected_size = num_request_slots * self.expected_mapping_stride
+        self.expected_physical_pages = torch.zeros(
+            expected_size, dtype=torch.int32, device=device
         )
-        self.expected_tags = torch.zeros(self._size, dtype=TAG_DTYPE, device=device)
+        self.expected_tags = torch.zeros(expected_size, dtype=TAG_DTYPE, device=device)
         self.expected_generations = torch.zeros(
-            self._size, dtype=TAG_DTYPE, device=device
+            expected_size, dtype=TAG_DTYPE, device=device
         )
         self.expected_transfer_page_tags = torch.zeros(
-            self._size, dtype=TRANSFER_PAGE_TAG_DTYPE, device=device
+            expected_size, dtype=TRANSFER_PAGE_TAG_DTYPE, device=device
         )
         self.request_epochs = torch.zeros(
             num_request_slots, dtype=torch.int32, device=device
         )
         self.validated_epochs = torch.full(
+            (num_request_slots,), -1, dtype=torch.int32, device=device
+        )
+        # DSA validates its full per-forward page table before the indexer, then
+        # independently publishes selected-slot validation from fused top-k.
+        self.pre_indexer_validated_epochs = torch.full(
             (num_request_slots,), -1, dtype=torch.int32, device=device
         )
         self.validation_status = torch.zeros(
@@ -1590,6 +1687,17 @@ class KVAttentionTagTable:
         self.generations.index_add_(
             0, page_ids, torch.ones_like(page_ids, dtype=TAG_DTYPE)
         )
+        generations = self.generations.index_select(0, page_ids)
+        self.tags.index_copy_(
+            0,
+            page_ids,
+            compute_attention_tags_tensor(
+                page_ids,
+                torch.zeros_like(page_ids),
+                torch.zeros_like(page_ids),
+                generations,
+            ),
+        )
         history_pages = torch.unique(page_ids)
         self._record_history(
             history_pages,
@@ -1619,37 +1727,45 @@ class KVAttentionTagTable:
         generations: torch.Tensor,
         attention_tags: Optional[torch.Tensor] = None,
         transfer_page_tags: Optional[torch.Tensor] = None,
+        mapping_namespace: int = KV_EXPECTED_MAPPING_FULL,
     ) -> None:
-        """Publish the immutable owner record consumed by protected DSA top-k."""
+        """Publish request-logical expectations consumed by fused kernels."""
         if page_ids.numel() == 0:
             return
         if request_pool_idx <= 0 or request_pool_idx >= self.request_epochs.numel():
             raise RuntimeError("protected DSA request-pool index is out of bounds")
         page_ids = page_ids.to(
-            self.owner_request_indices.device, dtype=torch.long
+            self.expected_physical_pages.device, dtype=torch.long
         ).reshape(-1)
         count = page_ids.numel()
         positions = page_positions.to(
-            self.owner_page_positions.device, dtype=torch.int32
+            self.expected_physical_pages.device, dtype=torch.long
         ).reshape(-1)
         expected_generations = generations.to(
             self.expected_generations.device, dtype=TAG_DTYPE
         ).reshape(-1)
         if positions.numel() != count or expected_generations.numel() != count:
             raise RuntimeError("protected DSA owner metadata length mismatch")
-        owners = torch.full(
-            (count,),
-            int(request_pool_idx),
-            dtype=torch.int32,
-            device=self.owner_request_indices.device,
+        if not 0 <= mapping_namespace < KV_EXPECTED_MAPPING_NAMESPACE_COUNT:
+            raise RuntimeError("protected mapping namespace is out of bounds")
+        if not positions.is_cuda and (
+            bool((positions < 0).any().item())
+            or bool((positions >= self.num_logical_pages).any().item())
+        ):
+            raise RuntimeError("protected logical page position is out of bounds")
+        logical_indices = (
+            request_pool_idx * self.expected_mapping_stride
+            + mapping_namespace * self.expected_mapping_namespace_stride
+            + positions
         )
-        self.owner_request_indices.index_copy_(0, page_ids, owners)
-        self.owner_page_positions.index_copy_(0, page_ids, positions)
-        self.expected_generations.index_copy_(0, page_ids, expected_generations)
+        self.expected_physical_pages.index_copy_(
+            0, logical_indices, page_ids.to(torch.int32)
+        )
+        self.expected_generations.index_copy_(0, logical_indices, expected_generations)
         if attention_tags is not None:
             self.expected_tags.index_copy_(
                 0,
-                page_ids,
+                logical_indices,
                 attention_tags.to(self.expected_tags.device, dtype=TAG_DTYPE).reshape(
                     -1
                 ),
@@ -1657,12 +1773,114 @@ class KVAttentionTagTable:
         if transfer_page_tags is not None:
             self.expected_transfer_page_tags.index_copy_(
                 0,
-                page_ids,
+                logical_indices,
                 transfer_page_tags.to(
                     self.expected_transfer_page_tags.device,
                     dtype=TRANSFER_PAGE_TAG_DTYPE,
                 ).reshape(-1),
             )
+
+    def clear_request_slot(self, request_pool_idx: int) -> None:
+        """Invalidate one graph-stable request row before its slot is reused."""
+        if request_pool_idx <= 0 or request_pool_idx >= self.request_epochs.numel():
+            return
+        start = int(request_pool_idx) * self.expected_mapping_stride
+        end = start + self.expected_mapping_stride
+        self.expected_physical_pages[start:end].zero_()
+        self.expected_tags[start:end].zero_()
+        self.expected_generations[start:end].zero_()
+        self.expected_transfer_page_tags[start:end].zero_()
+        self.validation_status[request_pool_idx] = 0
+        self.request_epochs[request_pool_idx] += 1
+        self.validated_epochs[request_pool_idx] = -1
+        self.pre_indexer_validated_epochs[request_pool_idx] = -1
+
+    def clear_expected_owner_positions(
+        self,
+        request_pool_idx: int,
+        page_positions: torch.Tensor,
+        mapping_namespace: int,
+    ) -> None:
+        """Invalidate selected logical positions that left an SWA live window."""
+        if page_positions.numel() == 0:
+            return
+        positions = page_positions.to(
+            self.expected_physical_pages.device, dtype=torch.long
+        ).reshape(-1)
+        indices = (
+            request_pool_idx * self.expected_mapping_stride
+            + mapping_namespace * self.expected_mapping_namespace_stride
+            + positions
+        )
+        self.expected_physical_pages.index_fill_(0, indices, 0)
+        self.expected_tags.index_fill_(0, indices, 0)
+        self.expected_generations.index_fill_(0, indices, 0)
+        self.expected_transfer_page_tags.index_fill_(0, indices, 0)
+        self.validated_epochs[request_pool_idx] = -1
+        self.pre_indexer_validated_epochs[request_pool_idx] = -1
+
+    def expected_mapping_status(
+        self,
+        request_pool_idx: int,
+        logical_page_positions: torch.Tensor,
+        active_physical_pages: torch.Tensor,
+        mapping_namespace: int = KV_EXPECTED_MAPPING_FULL,
+    ) -> torch.Tensor:
+        """CPU/reference implementation of the fused request-logical ABI."""
+        positions = logical_page_positions.to(self.device, dtype=torch.long).reshape(-1)
+        pages = active_physical_pages.to(self.device, dtype=torch.long).reshape(-1)
+        if positions.numel() != pages.numel():
+            raise RuntimeError("protected mapping metadata length mismatch")
+        status = torch.zeros_like(pages, dtype=torch.int32)
+        valid_request = (
+            0 < request_pool_idx < self.request_epochs.numel()
+            and 0 <= mapping_namespace < KV_EXPECTED_MAPPING_NAMESPACE_COUNT
+        )
+        if not valid_request:
+            status.fill_(KV_PAGE_INVALID_MAPPING)
+            return status
+        valid = (
+            positions.ge(0)
+            & positions.lt(self.num_logical_pages)
+            & pages.gt(0)
+            & pages.lt(self.size)
+        )
+        status |= (~valid).to(torch.int32) * KV_PAGE_INVALID_MAPPING
+        if not bool(valid.any().item()):
+            return status
+        safe_positions = torch.where(valid, positions, 0)
+        safe_pages = torch.where(valid, pages, 0)
+        expected_indices = (
+            request_pool_idx * self.expected_mapping_stride
+            + mapping_namespace * self.expected_mapping_namespace_stride
+            + safe_positions
+        )
+        expected_pages = self.expected_physical_pages.index_select(0, expected_indices)
+        expected_tags = self.expected_tags.index_select(0, expected_indices)
+        expected_generations = self.expected_generations.index_select(
+            0, expected_indices
+        )
+        expected_transfer = self.expected_transfer_page_tags.index_select(
+            0, expected_indices
+        )
+        actual_tags = self.tags.index_select(0, safe_pages)
+        actual_generations = self.generations.index_select(0, safe_pages)
+        actual_transfer = self.transfer_page_tags.index_select(0, safe_pages)
+        status |= (valid & expected_pages.to(torch.long).ne(pages)).to(
+            torch.int32
+        ) * KV_PAGE_OWNER_MISMATCH
+        status |= (valid & actual_tags.ne(expected_tags)).to(
+            torch.int32
+        ) * KV_PAGE_ATTENTION_TAG_MISMATCH
+        status |= (valid & actual_generations.ne(expected_generations)).to(
+            torch.int32
+        ) * KV_PAGE_GENERATION_MISMATCH
+        status |= (
+            valid
+            & expected_transfer.ne(TRANSFER_PAGE_TAG_SKIP)
+            & actual_transfer.ne(expected_transfer)
+        ).to(torch.int32) * KV_PAGE_TRANSFER_TAG_MISMATCH
+        return status
 
     def begin_fused_forward(self, request_pool_indices: torch.Tensor) -> None:
         if request_pool_indices.numel() == 0:
@@ -1727,6 +1945,7 @@ class KVAttentionTagTable:
         page_table_2_page_offset: int = 0,
         page_table_2_window_size: int = 0,
         validate_full_mapping: bool = False,
+        pre_indexer_cache_by_request: bool = True,
     ) -> Dict[str, object]:
         return {
             "request_indices": request_indices,
@@ -1738,16 +1957,21 @@ class KVAttentionTagTable:
             "page_table_2_window_size": int(page_table_2_window_size),
             "page_size": int(page_size),
             "validate_full_mapping": bool(validate_full_mapping),
+            "pre_indexer_cache_by_request": bool(pre_indexer_cache_by_request),
             "actual_tags": self.tags,
             "actual_generations": self.generations,
             "actual_transfer_tags": self.transfer_page_tags,
-            "owner_request_indices": self.owner_request_indices,
-            "owner_page_positions": self.owner_page_positions,
+            "expected_physical_pages": self.expected_physical_pages,
+            "expected_mapping_stride": self.expected_mapping_stride,
+            "expected_mapping_namespace_stride": self.expected_mapping_namespace_stride,
+            "page_table_expected_mapping_offset": 0,
+            "page_table_2_expected_mapping_offset": self.expected_mapping_namespace_stride,
             "expected_tags": self.expected_tags,
             "expected_generations": self.expected_generations,
             "expected_transfer_tags": self.expected_transfer_page_tags,
             "request_epochs": self.request_epochs,
             "validated_epochs": self.validated_epochs,
+            "pre_indexer_validated_epochs": self.pre_indexer_validated_epochs,
             "status": self.validation_status,
         }
 
@@ -1781,7 +2005,8 @@ class KVAttentionTagTable:
         ).reshape(-1)
         if page_ids_t.numel() == 0:
             return
-        self.owner_request_indices.index_fill_(0, page_ids_t, -1)
+        self.tags.index_fill_(0, page_ids_t, 0)
+        self.transfer_page_tags.index_fill_(0, page_ids_t, TRANSFER_PAGE_TAG_SKIP)
         self._record_history(
             page_ids_t,
             KVPageHistory.FREE_DEFERRED if deferred else KVPageHistory.FREE,
@@ -1845,13 +2070,14 @@ def _transfer_page_tag_mismatch_mask(
         return torch.zeros(0, dtype=torch.bool, device=table.device)
     actual = table.read_transfer_page_tags(page_ids)
     expected = expected_tags.to(table.device, dtype=TRANSFER_PAGE_TAG_DTYPE).reshape(-1)
-    mismatch = actual != expected
+    validate = expected != TRANSFER_PAGE_TAG_SKIP
+    mismatch = validate & (actual != expected)
     if expected_generations is not None:
         actual_generations = table.generation_of(page_ids)
         expected_generations = expected_generations.to(
             table.device, dtype=TAG_DTYPE
         ).reshape(-1)
-        mismatch |= actual_generations != expected_generations
+        mismatch |= validate & (actual_generations != expected_generations)
     return mismatch
 
 
@@ -2667,6 +2893,137 @@ def _to_int_list(values: Sequence[int] | torch.Tensor) -> List[int]:
     return [int(x) for x in values]
 
 
+@contextmanager
+def defer_kv_frees_until_mapping_refresh(allocator):
+    """Delay page invalidation/reuse until an active request row is refreshed."""
+    if getattr(allocator, "attention_tag_table", None) is None:
+        yield
+        return
+    if not hasattr(allocator, "free_group_begin") or not hasattr(
+        allocator, "free_group_end"
+    ):
+        raise RuntimeError(
+            "KV page protection requires allocator free-group support for radix dedup"
+        )
+    already_grouped = not getattr(allocator, "is_not_in_free_group", True)
+    if not already_grouped:
+        allocator.free_group_begin()
+    free_group_start = len(allocator.free_group)
+    operation_group = getattr(allocator, "_free_group_ops", None)
+    operation_group_start = len(operation_group) if operation_group is not None else 0
+    try:
+        yield
+    except Exception:
+        # A bookkeeping failure must leak rather than release pages still named
+        # by a graph-visible request row.
+        del allocator.free_group[free_group_start:]
+        if operation_group is not None:
+            del operation_group[operation_group_start:]
+        if not already_grouped:
+            allocator.is_not_in_free_group = True
+        raise
+    else:
+        if not already_grouped:
+            allocator.free_group_end()
+
+
+def _retain_live_manifest_entries(manifest, live: torch.Tensor) -> None:
+    """Drop manifest entries that no longer have a live physical mapping."""
+    live = live.to(device=manifest.physical_page_ids_t.device, dtype=torch.bool)
+    if bool(live.all().item()):
+        return
+    indices = torch.nonzero(live, as_tuple=False).reshape(-1)
+    manifest.physical_page_ids_t = manifest.physical_page_ids_t.index_select(0, indices)
+    manifest.page_positions_t = manifest.page_positions_t.index_select(0, indices)
+    manifest.generations_t = manifest.generations_t.index_select(0, indices)
+    manifest.expected_tags_t = manifest.expected_tags_t.index_select(0, indices)
+    manifest.page_positions = [
+        int(position) for position in manifest.page_positions_t.detach().cpu().tolist()
+    ]
+    if manifest.max_num_pages is not None:
+        manifest._replacement_heap = [
+            (position, index) for index, position in enumerate(manifest.page_positions)
+        ]
+        heapq.heapify(manifest._replacement_heap)
+    manifest.revision += 1
+
+
+def refresh_request_expected_mappings(
+    req,
+    req_to_token: torch.Tensor,
+    allocator,
+    *,
+    max_sequence_len: Optional[int] = None,
+) -> None:
+    """Refresh request rows after RadixCache changes physical pages."""
+    table = getattr(allocator, "attention_tag_table", None)
+    request_pool_idx = getattr(req, "req_pool_idx", None)
+    if table is None or request_pool_idx is None:
+        return
+
+    attention_manifests = _iter_attention_manifests(
+        getattr(req, "kv_attention_tag_manifest", None)
+    )
+    transfer_manifests = _iter_transfer_page_tag_manifests(
+        getattr(req, "kv_transfer_page_tag_manifest", None)
+    )
+
+    if max_sequence_len is not None:
+        for manifest in (*attention_manifests, *transfer_manifests):
+            live = manifest.page_positions_t * manifest.page_size < max_sequence_len
+            _retain_live_manifest_entries(manifest, live)
+
+    def remapped_pages(manifest) -> torch.Tensor:
+        positions = manifest.page_positions_t.to(req_to_token.device, dtype=torch.long)
+        token_locs = req_to_token[request_pool_idx, positions * manifest.page_size]
+        if manifest.mapping_namespace == KV_EXPECTED_MAPPING_SWA:
+            if not hasattr(allocator, "translate_loc_from_full_to_swa") or not hasattr(
+                allocator, "attention_tag_swa_page_ids"
+            ):
+                raise RuntimeError("SWA protected mapping requires an SWA allocator")
+            token_locs = allocator.translate_loc_from_full_to_swa(token_locs)
+            live = token_locs > 0
+            table.clear_expected_owner_positions(
+                request_pool_idx,
+                manifest.page_positions_t.to(live.device)[~live],
+                manifest.mapping_namespace,
+            )
+            _retain_live_manifest_entries(manifest, live)
+            token_locs = token_locs[live]
+            pages = allocator.attention_tag_swa_page_ids(
+                token_locs // manifest.page_size
+            )
+        else:
+            pages = token_locs // manifest.page_size
+        return pages.to(table.device, dtype=torch.long)
+
+    for manifest in attention_manifests:
+        pages = remapped_pages(manifest)
+        generations = table.generation_of(pages)
+        manifest.replace_pages(pages, generations)
+        table.write_expected_owner(
+            pages,
+            request_pool_idx=request_pool_idx,
+            page_positions=manifest.page_positions_t,
+            generations=manifest.generations_t,
+            attention_tags=manifest.expected_tags_t,
+            mapping_namespace=manifest.mapping_namespace,
+        )
+
+    for manifest in transfer_manifests:
+        pages = remapped_pages(manifest)
+        generations = table.generation_of(pages)
+        manifest.replace_pages(pages, generations, skip_changed=True)
+        table.write_expected_owner(
+            pages,
+            request_pool_idx=request_pool_idx,
+            page_positions=manifest.page_positions_t,
+            generations=manifest.generations_t,
+            transfer_page_tags=manifest.expected_tags_t,
+            mapping_namespace=manifest.mapping_namespace,
+        )
+
+
 @dataclass
 class _FlattenedTagBatch:
     key: tuple
@@ -2699,10 +3056,12 @@ class KVPageProtectionManager:
         num_pages: int,
         page_size: int,
         num_request_slots: int = 2,
+        num_logical_pages: Optional[int] = None,
         device: str = "cpu",
         metrics_collector: object = None,
         transfer_backend: Optional[str] = None,
         is_spec_decode: bool = False,
+        supports_spec_target_verify: bool = False,
         is_cuda_device: Optional[bool] = None,
     ):
         assert_protection_supported(
@@ -2710,6 +3069,7 @@ class KVPageProtectionManager:
             allocator=allocator,
             transfer_backend=transfer_backend,
             is_spec_decode=is_spec_decode,
+            supports_spec_target_verify=supports_spec_target_verify,
             is_cuda_device=is_cuda_device,
         )
         self.config = config
@@ -2738,6 +3098,10 @@ class KVPageProtectionManager:
                     )
                 if attached_table.request_epochs.numel() != num_request_slots:
                     raise RuntimeError("preallocated KV request-slot count mismatch")
+                if num_logical_pages is not None and (
+                    attached_table.num_logical_pages != int(num_logical_pages)
+                ):
+                    raise RuntimeError("preallocated KV logical-page count mismatch")
                 if config.enable_page_history and attached_table.history is None:
                     raise RuntimeError("preallocated KV page history is missing")
                 self.table = attached_table
@@ -2746,6 +3110,7 @@ class KVPageProtectionManager:
                     num_pages,
                     device=device,
                     num_request_slots=num_request_slots,
+                    num_logical_pages=num_logical_pages,
                     enable_history=config.enable_page_history,
                 )
                 if allocator is not None and hasattr(
@@ -2755,6 +3120,10 @@ class KVPageProtectionManager:
 
     # -- attention ownership tags ------------------------------------------
 
+    def clear_request_slot(self, request_pool_idx: int) -> None:
+        if self.table is not None:
+            self.table.clear_request_slot(request_pool_idx)
+
     def register_attention_tags(
         self,
         *,
@@ -2763,6 +3132,7 @@ class KVPageProtectionManager:
         bootstrap_room: int,
         page_positions: Optional[Sequence[int]] = None,
         max_num_pages: Optional[int] = None,
+        mapping_namespace: int = KV_EXPECTED_MAPPING_FULL,
     ) -> Optional[AttentionTagManifest]:
         """Write attention ownership tags for a freshly transferred request.
 
@@ -2783,10 +3153,7 @@ class KVPageProtectionManager:
             generations_t,
             page_positions=page_positions,
             max_num_pages=max_num_pages,
-        )
-        self.table.write_tags(
-            manifest.physical_page_ids_t,
-            manifest.expected_tags_t,
+            mapping_namespace=mapping_namespace,
         )
         self.table.write_expected_owner(
             manifest.physical_page_ids_t,
@@ -2794,6 +3161,7 @@ class KVPageProtectionManager:
             page_positions=manifest.page_positions_t,
             generations=manifest.generations_t,
             attention_tags=manifest.expected_tags_t,
+            mapping_namespace=manifest.mapping_namespace,
         )
         self.table._record_history(
             manifest.physical_page_ids_t,
@@ -2897,19 +3265,19 @@ class KVPageProtectionManager:
             return
         manifests = _iter_attention_manifests(manifest)
         if len(manifests) != 1:
-            if manifests:
-                self.refresh_tail_page(
-                    manifests[0],
-                    logical_pos=logical_pos,
-                    request_pool_idx=request_pool_idx,
-                    physical_page_id=physical_page_id,
+            for sub_manifest in manifests:
+                sub_page_id = (
+                    swa_physical_page_id
+                    if sub_manifest.mapping_namespace == KV_EXPECTED_MAPPING_SWA
+                    else physical_page_id
                 )
-            if len(manifests) > 1 and swa_physical_page_id is not None:
+                if sub_page_id is None:
+                    continue
                 self.refresh_tail_page(
-                    manifests[1],
+                    sub_manifest,
                     logical_pos=logical_pos,
                     request_pool_idx=request_pool_idx,
-                    physical_page_id=swa_physical_page_id,
+                    physical_page_id=sub_page_id,
                 )
             return
         manifest = manifests[0]
@@ -2933,6 +3301,7 @@ class KVPageProtectionManager:
             page_positions=manifest.page_positions_t[entry_index : entry_index + 1],
             generations=manifest.generations_t[entry_index : entry_index + 1],
             attention_tags=expected_t,
+            mapping_namespace=manifest.mapping_namespace,
         )
         self.table._record_history(
             page_id_t,
@@ -2955,6 +3324,7 @@ class KVPageProtectionManager:
         page_positions: Optional[Sequence[int]] = None,
         write_actual: bool = False,
         max_num_pages: Optional[int] = None,
+        mapping_namespace: int = KV_EXPECTED_MAPPING_FULL,
     ) -> Optional[TransferPageTagManifest]:
         """Create expected transfer page tags for decode-owned pages.
 
@@ -2975,6 +3345,7 @@ class KVPageProtectionManager:
             generations_t,
             page_positions=page_positions,
             max_num_pages=max_num_pages,
+            mapping_namespace=mapping_namespace,
         )
         if write_actual:
             self.table.write_transfer_page_tags(
@@ -2987,6 +3358,7 @@ class KVPageProtectionManager:
             page_positions=manifest.page_positions_t,
             generations=manifest.generations_t,
             transfer_page_tags=manifest.expected_tags_t,
+            mapping_namespace=manifest.mapping_namespace,
         )
         self.table._record_history(
             manifest.physical_page_ids_t,
@@ -3069,19 +3441,19 @@ class KVPageProtectionManager:
             return
         manifests = _iter_transfer_page_tag_manifests(manifest)
         if len(manifests) != 1:
-            if manifests:
-                self.refresh_transfer_page_tag_tail_page(
-                    manifests[0],
-                    logical_pos=logical_pos,
-                    request_pool_idx=request_pool_idx,
-                    physical_page_id=physical_page_id,
+            for sub_manifest in manifests:
+                sub_page_id = (
+                    swa_physical_page_id
+                    if sub_manifest.mapping_namespace == KV_EXPECTED_MAPPING_SWA
+                    else physical_page_id
                 )
-            if len(manifests) > 1 and swa_physical_page_id is not None:
+                if sub_page_id is None:
+                    continue
                 self.refresh_transfer_page_tag_tail_page(
-                    manifests[1],
+                    sub_manifest,
                     logical_pos=logical_pos,
                     request_pool_idx=request_pool_idx,
-                    physical_page_id=swa_physical_page_id,
+                    physical_page_id=sub_page_id,
                 )
             return
         manifest = manifests[0]
@@ -3094,17 +3466,19 @@ class KVPageProtectionManager:
             physical_page_id=physical_page_id,
             generation=generation,
         )
-        self.table.write_transfer_page_tags(page_id_t, expected_t)
         page_position = int(logical_pos) // manifest.page_size
         entry_index = manifest._entry_index_for_page_position(page_position)
         if entry_index is None:
             raise RuntimeError("transfer tag tail page is missing from its manifest")
+        expected_t.fill_(TRANSFER_PAGE_TAG_SKIP)
+        manifest.expected_tags_t[entry_index] = TRANSFER_PAGE_TAG_SKIP
         self.table.write_expected_owner(
             page_id_t,
             request_pool_idx=request_pool_idx,
             page_positions=manifest.page_positions_t[entry_index : entry_index + 1],
             generations=manifest.generations_t[entry_index : entry_index + 1],
             transfer_page_tags=expected_t,
+            mapping_namespace=manifest.mapping_namespace,
         )
         self.table._record_history(
             page_id_t,

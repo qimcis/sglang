@@ -12,12 +12,17 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
+import torch.distributed as dist
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.common.staging_handler import StagingTransferInfo
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
+    KV_PROTECTION_FEATURE_ALL,
+    KV_PROTECTION_FEATURE_CHECKSUM,
+    KV_PROTECTION_FEATURE_PAGE_TAGS,
+    KV_PROTECTION_PROTOCOL_VERSION,
     CommonKVBootstrapServer,
     CommonKVManager,
     CommonKVReceiver,
@@ -33,7 +38,12 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import (
+    get_attention_cp_group,
+    get_attention_tp_group,
+)
 from sglang.srt.server_args import ServerArgs
 
 try:
@@ -137,6 +147,33 @@ class _KVXferPreparedSegment:
     dst_num_slots: int
 
 
+PROTECTED_NOTIF_PREFIX = "nixlp1"
+COMPLETION_HEADER = b"NIXL_COMPLETION_V1"
+TRANSFER_PAGE_TAG_HEADER = b"NIXL_TRANSFER_PAGE_TAG_V1"
+ABORT_HEADER = b"NIXL_ABORT_V1"
+ABORT_ACK_HEADER = b"NIXL_ABORT_ACK_V1"
+CHECKSUM_MANIFEST_KIND = b"checksum"
+NONCE_ONLY_KIND = b"nonce"
+
+_nonce_lock = threading.Lock()
+_last_transfer_nonce = 0
+
+
+def _new_transfer_nonce() -> int:
+    global _last_transfer_nonce
+    with _nonce_lock:
+        _last_transfer_nonce = max(_last_transfer_nonce + 1, time.time_ns())
+        nonce = _last_transfer_nonce
+    if not (dist.is_available() and dist.is_initialized()):
+        return nonce
+    # Receiver construction is collective across one decode DP shard. Chaining
+    # the orthogonal TP, CP, and PP broadcasts gives every producer-facing
+    # record for the room the same monotonic generation nonce.
+    for group in (get_attention_tp_group(), get_attention_cp_group(), get_pp_group()):
+        nonce = group.broadcast_object(nonce, src=0)
+    return int(nonce) or 1
+
+
 @dataclasses.dataclass
 class TransferInfo:
     """Contains indices for a transfer, sent by KVReceiver. Received by prefill bootstrap thread."""
@@ -150,11 +187,22 @@ class TransferInfo:
     required_dst_info_num: int
     dst_state_indices: List[List[int]]
     decode_prefix_len: Optional[int] = None  # for decode radix cache
+    dst_transfer_page_tag_ids: Optional[npt.NDArray[np.int32]] = None
+    dst_transfer_page_tags: Optional[npt.NDArray[np.int32]] = None
+    transfer_nonce: int = 0
+    protection_protocol_version: int = 0
+    protection_feature_bitmap: int = 0
+    is_dummy_transfer: Optional[bool] = None
+    sent_transfer_page_tag_ids: Set[int] = dataclasses.field(
+        default_factory=set, repr=False
+    )
     # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
     # end so positional construction in from_zmq() continues to work.
     staging: Optional[StagingTransferInfo] = None
 
     def is_dummy(self):
+        if self.is_dummy_transfer is not None:
+            return self.is_dummy_transfer
         # A transfer is "dummy" only for CP non-authoritative ranks.
         # When dst_kv_indices is empty due to a decode-side radix cache
         # full hit (decode_prefix_len > 0), the transfer is NOT dummy --
@@ -163,13 +211,85 @@ class TransferInfo:
             return False
         return self.dst_kv_indices.size == 0
 
+    @property
+    def is_protected(self) -> bool:
+        return bool(
+            self.transfer_nonce
+            or self.protection_protocol_version
+            or self.protection_feature_bitmap
+        )
+
+    def validate(self) -> None:
+        ids = np.asarray(
+            (
+                self.dst_transfer_page_tag_ids
+                if self.dst_transfer_page_tag_ids is not None
+                else []
+            ),
+            dtype=np.int32,
+        ).reshape(-1)
+        tags = np.asarray(
+            (
+                self.dst_transfer_page_tags
+                if self.dst_transfer_page_tags is not None
+                else []
+            ),
+            dtype=np.int32,
+        ).reshape(-1)
+        if len(ids) != len(tags):
+            raise ValueError("NIXL transfer page id/tag length mismatch")
+        seen = {}
+        for page_id, tag in zip(ids, tags, strict=True):
+            page_id, tag = int(page_id), int(tag)
+            if page_id in seen and seen[page_id] != tag:
+                raise ValueError("conflicting duplicate NIXL transfer page id")
+            seen[page_id] = tag
+        if not self.is_protected:
+            if len(ids):
+                raise ValueError("legacy NIXL metadata cannot carry transfer page tags")
+            return
+        if not self.transfer_nonce:
+            raise ValueError("protected NIXL metadata requires a nonzero nonce")
+        if self.is_dummy_transfer is None:
+            raise ValueError("protected NIXL metadata requires an explicit dummy flag")
+        if self.is_dummy_transfer and self.dst_kv_indices.size:
+            raise ValueError("dummy NIXL metadata cannot carry KV destinations")
+        if self.is_dummy_transfer and len(ids):
+            raise ValueError("dummy NIXL metadata cannot carry transfer page tags")
+        if self.protection_protocol_version != KV_PROTECTION_PROTOCOL_VERSION:
+            raise ValueError("unsupported NIXL protection protocol version")
+        if (
+            not self.protection_feature_bitmap
+            or self.protection_feature_bitmap & ~KV_PROTECTION_FEATURE_ALL
+        ):
+            raise ValueError("invalid NIXL protection feature bitmap")
+        if len(ids) and not (
+            self.protection_feature_bitmap & KV_PROTECTION_FEATURE_PAGE_TAGS
+        ):
+            raise ValueError("NIXL page-tag payload lacks negotiated capability")
+
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        if len(msg) < 7:
+            raise ValueError(f"NIXL transfer metadata has {len(msg)} fields")
+        if len(msg) > 9 and len(msg) not in (14, 15):
+            raise ValueError("NIXL transfer metadata must have exactly 14 or 15 fields")
+        for index in (4, 9, 10):
+            if len(msg) > index and len(msg[index]) % np.dtype(np.int32).itemsize:
+                raise ValueError(
+                    f"NIXL transfer metadata field {index} is not int32-aligned"
+                )
         dst_state_indices = (
             unpack_int_lists(msg[7], "i") if len(msg) > 7 and msg[7] != b"" else []
         )
+        is_dummy_transfer = None
+        if len(msg) > 14:
+            dummy_value = int(msg[14].decode("ascii"))
+            if dummy_value not in (0, 1):
+                raise ValueError("NIXL dummy flag must be 0 or 1")
+            is_dummy_transfer = bool(dummy_value)
 
-        return cls(
+        info = cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
@@ -181,7 +301,29 @@ class TransferInfo:
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
             ),  # hacky just add it into the message that will be sent
+            dst_transfer_page_tag_ids=(
+                np.frombuffer(msg[9], dtype=np.int32)
+                if len(msg) > 9 and msg[9]
+                else np.array([], dtype=np.int32)
+            ),
+            dst_transfer_page_tags=(
+                np.frombuffer(msg[10], dtype=np.int32)
+                if len(msg) > 10 and msg[10]
+                else np.array([], dtype=np.int32)
+            ),
+            transfer_nonce=(
+                int(msg[11].decode("ascii")) if len(msg) > 11 and msg[11] else 0
+            ),
+            protection_protocol_version=(
+                int(msg[12].decode("ascii")) if len(msg) > 12 and msg[12] else 0
+            ),
+            protection_feature_bitmap=(
+                int(msg[13].decode("ascii")) if len(msg) > 13 and msg[13] else 0
+            ),
+            is_dummy_transfer=is_dummy_transfer,
         )
+        info.validate()
+        return info
 
 
 @dataclasses.dataclass
@@ -324,8 +466,49 @@ class TransferStatus:
     # (pp_rank, chunk_id); normal homogeneous transfers bypass this.
     received_kv_parts_per_pp: Optional[Dict[Tuple[int, int], Set[int]]] = None
     expected_kv_parts_per_pp: Optional[Dict[Tuple[int, int], int]] = None
+    protected: bool = False
+    transfer_nonce: int = 0
+    protection_feature_bitmap: int = 0
+    expected_producers: Set[int] = dataclasses.field(default_factory=set)
+    completed_producers: Set[int] = dataclasses.field(default_factory=set)
+    quiesced_producers: Set[int] = dataclasses.field(default_factory=set)
+    received_aux_producers: Set[int] = dataclasses.field(default_factory=set)
+    received_state_producers: Set[int] = dataclasses.field(default_factory=set)
+    received_kvs_per_producer: Dict[int, Set[int]] = dataclasses.field(
+        default_factory=lambda: defaultdict(set)
+    )
+    expected_kvs_per_producer: Dict[int, int] = dataclasses.field(default_factory=dict)
+    checksum_manifests: Dict[int, object] = dataclasses.field(default_factory=dict)
+    failed: bool = False
+
+    def protected_data_done(self) -> bool:
+        if not self.expected_producers:
+            return False
+        for producer in self.expected_producers:
+            if producer not in self.received_aux_producers:
+                return False
+            expected = self.expected_kvs_per_producer.get(producer)
+            if expected is None or self.received_kvs_per_producer[producer] != set(
+                range(expected)
+            ):
+                return False
+            if self.expects_state and producer not in self.received_state_producers:
+                return False
+        return True
 
     def is_done(self):
+        if self.protected:
+            return (
+                not self.failed
+                and self.protected_data_done()
+                and self.completed_producers == self.expected_producers
+                and (
+                    not (
+                        self.protection_feature_bitmap & KV_PROTECTION_FEATURE_CHECKSUM
+                    )
+                    or set(self.checksum_manifests) == self.expected_producers
+                )
+            )
         if self.num_pp_ranks_expected is None or not self.received_aux:
             return False
         # If state data is expected, check all PP ranks have sent it
@@ -425,6 +608,16 @@ class NixlKVManager(CommonKVManager):
         self._num_slots_src: int = 0
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.active_transfer_nonce_by_room: Dict[int, int] = {}
+            self.active_transfer_features_by_room: Dict[int, int] = {}
+            self.retired_transfer_nonces: Dict[int, int] = {}
+            self.pending_abort_nonce_by_room: Dict[int, int] = {}
+            self.abort_ack_targets: Dict[int, Tuple[int, str, int]] = {}
+            self.active_transfer_workers: Dict[int, int] = defaultdict(int)
+            self.quiescence_failed_rooms: Set[int] = set()
+            self.quarantined_xfer_handles: Dict[int, List[Any]] = defaultdict(list)
+            self.quiesced_transfer_nonce_by_room: Dict[int, int] = {}
+            self.failure_completion_sent_rooms: Set[int] = set()
             self._num_slots_src = (
                 self.kv_args.kv_data_lens[0] // self.kv_args.kv_item_lens[0]
             )
@@ -455,16 +648,270 @@ class NixlKVManager(CommonKVManager):
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
             )
+            self.checksum_nonce_table: Dict[int, int] = {}
+            self.expected_producer_table: Dict[int, Set[int]] = {}
+            self.transfer_page_tag_expected_table: Dict[int, Dict[int, int]] = {}
+            self.transfer_page_tag_seen_table: Dict[int, Dict[int, Set[int]]] = {}
+            self.transfer_page_tag_event_table: Dict[int, List[object]] = defaultdict(
+                list
+            )
+            self.retired_decode_nonces: Dict[int, int] = {}
+            self.abort_ack_deadline_by_room: Dict[int, float] = {}
             if self.enable_staging:
                 self._init_staging_decode_ctx()
                 self._staging_handler = None
                 self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
-                self._start_decode_staging_thread()
+            self._start_decode_control_thread()
             self._start_heartbeat_checker_thread()
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    def _producer_id(self) -> int:
+        return (
+            self.pp_rank * self.attn_cp_size + self.attn_cp_rank
+        ) * self.attn_tp_size + self.attn_tp_rank
+
+    def _release_xfer_handles(self, handles: List[Any]) -> None:
+        for handle in handles:
+            if handle is None:
+                continue
+            for method_name in ("release_xfer_handle", "release_xfer"):
+                method = getattr(self.agent, method_name, None)
+                if method is not None:
+                    try:
+                        method(handle)
+                    except Exception:
+                        logger.debug(
+                            "Failed to release NIXL transfer handle", exc_info=True
+                        )
+                    break
+
+    def _cancel_and_drain_xfer_handles(self, room: int, handles: List[Any]) -> bool:
+        pending = [handle for handle in handles if handle is not None]
+        for handle in pending:
+            for method_name in ("cancel_xfer", "cancel_xfer_handle"):
+                method = getattr(self.agent, method_name, None)
+                if method is not None:
+                    try:
+                        method(handle)
+                    except Exception:
+                        logger.debug(
+                            "Failed to cancel NIXL transfer handle", exc_info=True
+                        )
+                    break
+        deadline = time.monotonic() + max(
+            float(getattr(self, "bootstrap_timeout", 300)), 0.001
+        )
+        terminal_states = {"DONE", "ERR", "CANCELED", "CANCELLED"}
+        while pending and time.monotonic() < deadline:
+            still_pending = []
+            for handle in pending:
+                try:
+                    state = self.agent.check_xfer_state(handle)
+                except Exception:
+                    state = None
+                if state in terminal_states:
+                    self._release_xfer_handles([handle])
+                else:
+                    still_pending.append(handle)
+            pending = still_pending
+            if pending:
+                time.sleep(0)
+        if pending:
+            with self.request_status_lock:
+                self.quiescence_failed_rooms.add(room)
+                self.quarantined_xfer_handles[room].extend(pending)
+            return False
+        return True
+
+    def _reap_quarantined_xfer_handles_once(self) -> None:
+        with self.request_status_lock:
+            quarantined = {
+                room: tuple(handles)
+                for room, handles in self.quarantined_xfer_handles.items()
+            }
+
+        terminal_states = {"DONE", "ERR", "CANCELED", "CANCELLED"}
+        for room, handles in quarantined.items():
+            terminal = []
+            for handle in handles:
+                try:
+                    if self.agent.check_xfer_state(handle) in terminal_states:
+                        terminal.append(handle)
+                except Exception:
+                    continue
+            if terminal:
+                self._release_xfer_handles(terminal)
+
+            with self.request_status_lock:
+                terminal_ids = {id(handle) for handle in terminal}
+                remaining = [
+                    handle
+                    for handle in self.quarantined_xfer_handles.get(room, ())
+                    if id(handle) not in terminal_ids
+                ]
+                self.quarantined_xfer_handles[room] = remaining
+                if remaining or self.active_transfer_workers.get(room, 0):
+                    continue
+
+                target = self.abort_ack_targets.get(room)
+                if target is not None:
+                    nonce, endpoint, port = target
+                    if not self._send_or_defer_quiescence_ack_locked(
+                        room, nonce, endpoint, port
+                    ):
+                        continue
+                self.quarantined_xfer_handles.pop(room, None)
+                self.quiescence_failed_rooms.discard(room)
+                self._cleanup_quiesced_prefill_room_locked(room)
+                self.request_status.pop(room, None)
+
+    def _wait_for_xfer_handles(self, room: int, handles: List[Any]) -> None:
+        deadline = time.monotonic() + max(
+            float(getattr(self, "bootstrap_timeout", 300)), 0.001
+        )
+        cancel = False
+        try:
+            while handles:
+                if self.check_status(room) == KVPoll.Failed:
+                    cancel = True
+                    raise RuntimeError(
+                        f"NIXL transfer cancelled after room failure room={room}"
+                    )
+                if time.monotonic() >= deadline:
+                    cancel = True
+                    raise TimeoutError(f"NIXL transfer handle timed out room={room}")
+                states = [self.agent.check_xfer_state(h) for h in handles]
+                if any(state == "ERR" for state in states):
+                    cancel = True
+                    raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
+                if all(state == "DONE" for state in states):
+                    return
+                time.sleep(0)
+        finally:
+            if cancel:
+                self._cancel_and_drain_xfer_handles(room, handles)
+            else:
+                self._release_xfer_handles(handles)
+            handles.clear()
+
+    def _send_quiescence_ack_locked(
+        self, room: int, nonce: int, endpoint: str, port: int
+    ) -> None:
+        from sglang.srt.utils.network import NetworkAddress
+
+        na = NetworkAddress(endpoint, port)
+        self._send_multipart(
+            na.to_tcp(),
+            [
+                ABORT_ACK_HEADER,
+                str(room).encode("ascii"),
+                str(nonce).encode("ascii"),
+                str(self._producer_id()).encode("ascii"),
+            ],
+            is_ipv6=na.is_ipv6,
+        )
+
+    def _send_or_defer_quiescence_ack_locked(
+        self, room: int, nonce: int, endpoint: str, port: int
+    ) -> bool:
+        try:
+            self._send_quiescence_ack_locked(room, nonce, endpoint, port)
+            return True
+        except Exception:
+            logger.warning(
+                "Failed to send NIXL quiescence ACK room=%s",
+                room,
+                exc_info=True,
+            )
+            self.abort_ack_targets[room] = (nonce, endpoint, port)
+            self.quiescence_failed_rooms.add(room)
+            self.quarantined_xfer_handles.setdefault(room, [])
+            return False
+
+    def _cleanup_quiesced_prefill_room_locked(self, room: int) -> None:
+        nonce = self.active_transfer_nonce_by_room.get(room, 0)
+        if not nonce:
+            nonce = max(
+                (
+                    info.transfer_nonce
+                    for info in self.transfer_infos.get(room, {}).values()
+                ),
+                default=0,
+            )
+        if nonce:
+            self.quiesced_transfer_nonce_by_room[room] = max(
+                self.quiesced_transfer_nonce_by_room.get(room, 0), nonce
+            )
+        self.retire_transfer_room(room)
+        self.transfer_infos.pop(room, None)
+        self.req_to_decode_prefix_len.pop(room, None)
+        self.abort_ack_targets.pop(room, None)
+        self.failure_completion_sent_rooms.discard(room)
+        if self.enable_staging and getattr(self, "_staging_ctx", None) is not None:
+            self._staging_ctx.prefetched_rooms.discard(room)
+            self._staging_ctx.prefetch_requested = {
+                key for key in self._staging_ctx.prefetch_requested if key[0] != room
+            }
+
+    def _finish_prefill_worker(self, room: int) -> None:
+        with self.request_status_lock:
+            count = self.active_transfer_workers.get(room, 0) - 1
+            if count > 0:
+                self.active_transfer_workers[room] = count
+                return
+            self.active_transfer_workers.pop(room, None)
+            if room in self.quiescence_failed_rooms:
+                return
+            target = self.abort_ack_targets.get(room)
+            if target is not None:
+                nonce, endpoint, port = target
+                if not self._send_or_defer_quiescence_ack_locked(
+                    room, nonce, endpoint, port
+                ):
+                    return
+                self._cleanup_quiesced_prefill_room_locked(room)
+                self.request_status.pop(room, None)
+            elif self.request_status.get(room) == KVPoll.Failed:
+                self._cleanup_quiesced_prefill_room_locked(room)
+                self.request_status.pop(room, None)
+
+    @staticmethod
+    def _retire_nonce(table: Dict[int, int], room: int, nonce: int) -> None:
+        if not nonce:
+            return
+        table[room] = max(table.get(room, 0), nonce)
+
+    @staticmethod
+    def _is_stale_nonce(
+        table: Dict[int, int], room: int, nonce: int, active_nonce: int = 0
+    ) -> bool:
+        return nonce <= table.get(room, 0) or bool(
+            active_nonce and nonce < active_nonce
+        )
+
+    def retire_transfer_room(self, room: int) -> None:
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return
+        with self.request_status_lock:
+            nonce = self.active_transfer_nonce_by_room.pop(room, 0)
+            self._retire_nonce(self.retired_transfer_nonces, room, nonce)
+            self.active_transfer_features_by_room.pop(room, None)
+            for info in self.transfer_infos.get(room, {}).values():
+                self._retire_nonce(
+                    self.retired_transfer_nonces, room, info.transfer_nonce
+                )
+            self.pending_abort_nonce_by_room.pop(room, None)
+
+    def _fail_room(self, room: int, reason: str) -> None:
+        with self.request_status_lock:
+            status = getattr(self, "transfer_statuses", {}).get(room)
+            if status is not None:
+                status.failed = True
+            self.record_failure(room, reason)
+            self.update_status(room, KVPoll.Failed)
 
     def _init_staging_prefill_ctx(self):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -538,21 +985,59 @@ class NixlKVManager(CommonKVManager):
 
         return is_watermark_ready(self._staging_ctx, agent_name, alloc_round, alloc_end)
 
-    def _start_decode_staging_thread(self):
-        """Start a thread on the decode side to recv STAGING_REQ from prefill via ZMQ."""
+    def _start_decode_control_thread(self):
+        """Receive protected completion/tag traffic and optional staging requests."""
 
-        def decode_staging_thread():
+        def decode_control_thread():
             while True:
                 msg = self.server_socket.recv_multipart()
-                if msg[0] == b"STAGING_REQ":
-                    self._handle_staging_req(msg)
-                    continue
-                logger.warning(
-                    "decode_staging_thread: unexpected message tag %s",
-                    msg[0][:20],
-                )
+                self._process_decode_control_message(msg)
 
-        threading.Thread(target=decode_staging_thread, daemon=True).start()
+        threading.Thread(target=decode_control_thread, daemon=True).start()
+
+    def _process_decode_control_message(self, msg: List[bytes]) -> None:
+        try:
+            if msg[0] == b"STAGING_REQ":
+                if not self.enable_staging:
+                    raise ValueError("staging request received while disabled")
+                self._handle_staging_req(msg)
+            elif msg[0] == COMPLETION_HEADER:
+                self._handle_protected_completion(msg)
+            elif msg[0] == TRANSFER_PAGE_TAG_HEADER:
+                self._handle_transfer_page_tags(msg)
+            elif msg[0] == ABORT_ACK_HEADER:
+                self._handle_abort_ack(msg)
+            else:
+                logger.warning(
+                    "NIXL decode control thread: unexpected message tag %s",
+                    msg[0][:32],
+                )
+        except Exception as e:
+            logger.warning("Malformed NIXL decode control message: %s", e)
+            generation = self._message_room_nonce(msg)
+            if generation is None:
+                return
+            room, nonce = generation
+            with self.request_status_lock:
+                status = self._active_decode_generation(
+                    room, nonce, "NIXL control message"
+                )
+                if status is not None:
+                    self._fail_room(room, f"Invalid NIXL control message: {e}")
+
+    @staticmethod
+    def _message_room(msg: List[bytes]) -> Optional[int]:
+        try:
+            return int(msg[1].decode("ascii"))
+        except (IndexError, UnicodeDecodeError, ValueError):
+            return None
+
+    @staticmethod
+    def _message_room_nonce(msg: List[bytes]) -> Optional[Tuple[int, int]]:
+        try:
+            return int(msg[1].decode("ascii")), int(msg[2].decode("ascii"))
+        except (IndexError, UnicodeDecodeError, ValueError):
+            return None
 
     def _handle_staging_req(self, msg):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -629,7 +1114,8 @@ class NixlKVManager(CommonKVManager):
         self._staging_ctx.prefetched_rooms.add(room)
 
     def check_status(self, bootstrap_room: int):
-        return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
+        with self.request_status_lock:
+            return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
     def _prep_equal_tp_dlist(
         self,
@@ -994,6 +1480,102 @@ class NixlKVManager(CommonKVManager):
                 dst_mem_kind=dst_mem_kind,
             )
 
+    def _notification(self, req: TransferInfo, kind: str, *fields: object) -> str:
+        if not getattr(req, "is_protected", False):
+            suffix = "_".join(str(field) for field in fields)
+            return f"{req.room}_{kind}" + (f"_{suffix}" if suffix else "")
+        return "|".join(
+            [
+                PROTECTED_NOTIF_PREFIX,
+                str(req.room),
+                str(req.transfer_nonce),
+                str(self._producer_id()),
+                kind,
+                *(str(field) for field in fields),
+            ]
+        )
+
+    def _send_control_frames(self, req: TransferInfo, frames: List[bytes]) -> None:
+        from sglang.srt.utils.network import NetworkAddress
+
+        na = NetworkAddress(req.endpoint, req.dst_port)
+        self._send_multipart(na.to_tcp(), frames, is_ipv6=na.is_ipv6)
+
+    def _sync_transfer_page_tags(
+        self, req: TransferInfo, index_slice: slice, *, extra: bool = False
+    ) -> None:
+        ids = req.dst_transfer_page_tag_ids
+        tags = req.dst_transfer_page_tags
+        if ids is None or tags is None or len(ids) == 0:
+            return
+        boundary = min(len(req.dst_kv_indices), len(ids))
+        if extra:
+            page_ids, page_tags = ids[boundary:], tags[boundary:]
+        else:
+            page_ids, page_tags = (
+                ids[:boundary][index_slice],
+                tags[:boundary][index_slice],
+            )
+        if len(page_ids) == 0:
+            return
+        keep = []
+        for index, page_id in enumerate(page_ids):
+            page_id = int(page_id)
+            if page_id not in req.sent_transfer_page_tag_ids:
+                req.sent_transfer_page_tag_ids.add(page_id)
+                keep.append(index)
+        if not keep:
+            return
+        page_ids = page_ids[keep]
+        page_tags = page_tags[keep]
+        self._send_control_frames(
+            req,
+            [
+                TRANSFER_PAGE_TAG_HEADER,
+                str(req.room).encode("ascii"),
+                str(req.transfer_nonce).encode("ascii"),
+                str(self._producer_id()).encode("ascii"),
+                np.asarray(page_ids, dtype=np.int32).tobytes(),
+                np.asarray(page_tags, dtype=np.int32).tobytes(),
+            ],
+        )
+
+    def _sync_completion(
+        self, req: TransferInfo, status: KVPoll, checksum_plan=None
+    ) -> None:
+        kind = NONCE_ONLY_KIND
+        payload = str(req.transfer_nonce).encode("ascii")
+        if status == KVPoll.Success and checksum_plan is not None:
+            kind = CHECKSUM_MANIFEST_KIND
+            payload = checksum_plan.to_wire_bytes(transfer_nonce=req.transfer_nonce)
+        self._send_control_frames(
+            req,
+            [
+                COMPLETION_HEADER,
+                str(req.room).encode("ascii"),
+                str(req.transfer_nonce).encode("ascii"),
+                str(self._producer_id()).encode("ascii"),
+                str(int(status)).encode("ascii"),
+                kind,
+                payload,
+            ],
+        )
+
+    def _finalize_failed_prefill_room(self, room: int) -> None:
+        with self.request_status_lock:
+            if room in self.failure_completion_sent_rooms:
+                return
+            for req in list(self.transfer_infos.get(room, {}).values()):
+                if req.is_protected and not req.is_dummy():
+                    try:
+                        self._sync_completion(req, KVPoll.Failed)
+                    except Exception:
+                        logger.debug(
+                            "Failed to send protected NIXL failure completion",
+                            exc_info=True,
+                        )
+            self.failure_completion_sent_rooms.add(room)
+
     def transfer_worker(self, queue: FastQueue, staging_buffer=None):
         # Per-worker staging strategy: lazy-created on first chunk so we
         # see kv_buffer_tensors (set by ModelRunner after engine init).
@@ -1004,8 +1586,20 @@ class NixlKVManager(CommonKVManager):
             kv_chunk: TransferKVChunk = queue.get()
             room = kv_chunk.room
             handles: List[Any] = []
+            cancel_handles = False
+            with self.request_status_lock:
+                self.active_transfer_workers[room] += 1
             try:
                 if self.check_status(room) == KVPoll.Failed:
+                    self._finalize_failed_prefill_room(room)
+                    continue
+                active_nonce = self.active_transfer_nonce_by_room.get(room, 0)
+                if active_nonce and kv_chunk.transfer_nonce != active_nonce:
+                    logger.debug(
+                        "Ignoring stale NIXL chunk room=%s nonce=%s",
+                        room,
+                        kv_chunk.transfer_nonce,
+                    )
                     continue
 
                 assert room in self.transfer_infos
@@ -1022,6 +1616,8 @@ class NixlKVManager(CommonKVManager):
                 self.update_status(room, KVPoll.Transferring)
 
                 reqs_to_be_processed = list(self.transfer_infos[room].values())
+                protected_reqs: List[TransferInfo] = []
+                pending_tag_slices: List[Tuple[TransferInfo, slice, bool]] = []
 
                 # Set when staging allocation/watermark is not yet ready and
                 # the chunk has been re-enqueued. We then break out of the
@@ -1037,6 +1633,12 @@ class NixlKVManager(CommonKVManager):
                     assert req.agent_name in self.decode_kv_args_table
                     dst_info = self.decode_kv_args_table[req.agent_name]
                     decode_tp_size = dst_info.decode_tp_size
+                    req_uses_staging = (
+                        self.enable_staging
+                        and not self.is_mla_backend
+                        and decode_tp_size != self.attn_tp_size
+                        and dst_info.staging is not None
+                    )
 
                     # Skip KV RDMA transfer when there are no pages to send
                     # (e.g., decode-side radix cache matched the entire prefix).
@@ -1058,9 +1660,12 @@ class NixlKVManager(CommonKVManager):
 
                         src_prefill_kv_indices = kv_chunk.prefill_kv_indices
 
-                        notif = (
-                            f"{req.room}_kv_{kv_chunk.chunk_id}"
-                            f"_{int(kv_chunk.is_last_chunk)}_{self.kv_args.engine_rank}"
+                        notif = self._notification(
+                            req,
+                            "kv",
+                            kv_chunk.chunk_id,
+                            int(kv_chunk.is_last_chunk),
+                            self.kv_args.engine_rank,
                         )
 
                         # Decide which kv send path to use:
@@ -1069,15 +1674,10 @@ class NixlKVManager(CommonKVManager):
                         #   2. send_kvcache (MLA or homogeneous TP)
                         #   3. send_kvcache_slice (heterogeneous TP fallback,
                         #      or staging hard-failed for this chunk)
-                        use_staging = (
-                            self.enable_staging
-                            and staging_strategy is not None
-                            and not self.is_mla_backend
-                            and decode_tp_size != self.attn_tp_size
-                            and dst_info.staging is not None
-                        )
+                        use_staging = req_uses_staging and staging_strategy is not None
 
                         kv_xfer_handle = None
+                        kv_landed_on_decode = False
                         if use_staging:
                             kv_xfer_handle, deferred = self._do_staging_transfer(
                                 staging_strategy,
@@ -1134,9 +1734,18 @@ class NixlKVManager(CommonKVManager):
                                     chunked_dst_kv_indice,
                                     notif,
                                 )
+                            kv_landed_on_decode = True
 
                         if kv_xfer_handle is not None:
                             handles.append(kv_xfer_handle)
+                        if (
+                            req.is_protected
+                            and kv_landed_on_decode
+                            and not req_uses_staging
+                        ):
+                            pending_tag_slices.append(
+                                (req, kv_chunk.index_slice, False)
+                            )
 
                     if kv_chunk.is_last_chunk:
                         dst_info = self.decode_kv_args_table[req.agent_name]
@@ -1147,7 +1756,9 @@ class NixlKVManager(CommonKVManager):
                                 dst_info.dst_state_data_ptrs,
                                 req.dst_state_indices,
                                 dst_info.gpu_id,
-                                f"{req.room}_state_{self.kv_args.engine_rank}",
+                                self._notification(
+                                    req, "state", self.kv_args.engine_rank
+                                ),
                                 decode_tp_size,
                                 decode_tp_rank=dst_info.decode_tp_rank,
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
@@ -1156,6 +1767,14 @@ class NixlKVManager(CommonKVManager):
                             handles.extend(
                                 h for h in state_xfer_handles if h is not None
                             )
+                            if (
+                                req.is_protected
+                                and state_xfer_handles
+                                and not req_uses_staging
+                            ):
+                                pending_tag_slices.append(
+                                    (req, kv_chunk.index_slice, True)
+                                )
 
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
@@ -1163,11 +1782,14 @@ class NixlKVManager(CommonKVManager):
                         # encode pp_rank in aux notif so receiver can mark
                         # expected_kvs_per_pp[pp_rank] = 0.
                         if len(kv_chunk.prefill_kv_indices) == 0:
-                            aux_notif = (
-                                f"{req.room}_aux_nokv_{self.kv_args.engine_rank}"
+                            aux_notif = self._notification(
+                                req,
+                                "aux",
+                                "nokv",
+                                self.kv_args.engine_rank,
                             )
                         else:
-                            aux_notif = f"{req.room}_aux"
+                            aux_notif = self._notification(req, "aux")
                         aux_xfer_handle = self.send_aux(
                             req.agent_name,
                             kv_chunk.prefill_aux_index,
@@ -1176,41 +1798,51 @@ class NixlKVManager(CommonKVManager):
                             aux_notif,
                         )
                         handles.append(aux_xfer_handle)
+                        if req.is_protected:
+                            protected_reqs.append(req)
 
                 if staging_deferred:
                     # Chunk has been re-enqueued; do not advance status.
+                    if handles:
+                        cancel_handles = True
+                        raise RuntimeError(
+                            f"NIXL staging deferred after partial fan-out room={room}"
+                        )
                     continue
 
-                while handles:
-                    all_done = True
-                    for handle in handles:
-                        state = self.agent.check_xfer_state(handle)
-                        if state == "ERR":
-                            raise RuntimeError(
-                                f"NIXL transfer encountered ERR room={room}"
-                            )
-                        if state != "DONE":
-                            all_done = False
-                    if all_done:
-                        break
-                    time.sleep(0)
+                self._wait_for_xfer_handles(room, handles)
+
+                if self.check_status(room) == KVPoll.Failed:
+                    cancel_handles = True
+                    raise RuntimeError(
+                        f"NIXL room failed before transfer completion room={room}"
+                    )
+
+                for req, tag_slice, extra in pending_tag_slices:
+                    self._sync_transfer_page_tags(req, tag_slice, extra=extra)
 
                 if kv_chunk.is_last_chunk:
-                    self.update_status(room, KVPoll.Success)
-                    # Drop per-room state on Success (parity with mooncake
-                    # transfer_worker; staging prefetch sets are NIXL-only).
-                    self.transfer_infos.pop(room, None)
-                    self.req_to_decode_prefix_len.pop(room, None)
-                    if self.enable_staging and self._staging_ctx is not None:
-                        self._staging_ctx.prefetched_rooms.discard(room)
-                        self._staging_ctx.prefetch_requested = {
-                            k
-                            for k in self._staging_ctx.prefetch_requested
-                            if k[0] != room
-                        }
+                    for req in protected_reqs:
+                        self._sync_completion(
+                            req, KVPoll.Success, checksum_plan=kv_chunk.checksum_plan
+                        )
+
+                if kv_chunk.is_last_chunk:
+                    with self.request_status_lock:
+                        if (
+                            self.request_status.get(room) == KVPoll.Failed
+                            or room in self.abort_ack_targets
+                        ):
+                            cancel_handles = True
+                            raise RuntimeError(
+                                f"NIXL room aborted during finalization room={room}"
+                            )
+                        self.update_status(room, KVPoll.Success)
+                        self._cleanup_quiesced_prefill_room_locked(room)
                 else:
                     self.update_status(room, KVPoll.Transferring)
             except Exception as e:
+                cancel_handles = True
                 # Catch all exceptions to prevent silently killing this
                 # worker thread, but still propagate via failure_exception().
                 if isinstance(e, _NIXL_TRANSPORT_ERRORS):
@@ -1222,6 +1854,15 @@ class NixlKVManager(CommonKVManager):
                 self.exceptions[room] = e
                 self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
+                self._finalize_failed_prefill_room(room)
+            finally:
+                if handles:
+                    if cancel_handles:
+                        self._cancel_and_drain_xfer_handles(room, handles)
+                    else:
+                        self._release_xfer_handles(handles)
+                    handles.clear()
+                self._finish_prefill_worker(room)
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -1744,10 +2385,16 @@ class NixlKVManager(CommonKVManager):
             queue.put(kv_chunk)
             return (None, True)
 
-        notif_tag = (
-            f"{req.room}_stg_{kv_chunk.chunk_id}_{int(kv_chunk.is_last_chunk)}"
-            f"_{self.kv_args.engine_rank}_{chunk_idx}"
-            f"_{page_start}_{num_pages}_{req.agent_name}"
+        notif_tag = self._notification(
+            req,
+            "stg",
+            kv_chunk.chunk_id,
+            int(kv_chunk.is_last_chunk),
+            self.kv_args.engine_rank,
+            chunk_idx,
+            page_start,
+            num_pages,
+            req.agent_name,
         )
         handle = self.send_kvcache_staged(
             req.agent_name,
@@ -2098,6 +2745,7 @@ class NixlKVManager(CommonKVManager):
         chunk_id: int,
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
+        checksum_plan=None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2116,6 +2764,7 @@ class NixlKVManager(CommonKVManager):
         # which is required for the staging ring's offset/watermark
         # state machine to advance correctly.
         shard_idx = bootstrap_room % len(self.transfer_queues)
+        transfer_nonce = self.active_transfer_nonce_by_room.get(bootstrap_room, 0)
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
@@ -2125,6 +2774,8 @@ class NixlKVManager(CommonKVManager):
                 chunk_id=chunk_id,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                checksum_plan=checksum_plan,
+                transfer_nonce=transfer_nonce,
             )
         )
         return None
@@ -2134,6 +2785,10 @@ class NixlKVManager(CommonKVManager):
         notif_map = self.agent.get_new_notifs()
         for peer_name, messages in notif_map.items():
             for msg in messages:
+                decoded = msg.decode("ascii")
+                if decoded.startswith(PROTECTED_NOTIF_PREFIX + "|"):
+                    self._handle_protected_notification(decoded)
+                    continue
                 # Notification tag layouts (underscore-separated):
                 #   kv:    {room}_kv_{chunk_id}_{is_last}_{pp_rank}             -> 5 fields
                 #   kvpart:{room}_kv_{chunk_id}_{is_last}_{pp_rank}_part_{i}_{n}-> 8 fields
@@ -2144,8 +2799,13 @@ class NixlKVManager(CommonKVManager):
                 # maxsplit=8 keeps everything past the 8th underscore in the
                 # last component, so agent_name (which may itself contain
                 # underscores) lands intact in components[8] for the stg path.
-                components = msg.decode("ascii").split("_", 8)
+                components = decoded.split("_", 8)
                 room = int(components[0])
+                if self.transfer_statuses.get(room, TransferStatus()).protected:
+                    self._fail_room(
+                        room, "Protected NIXL room received a legacy notification"
+                    )
+                    continue
                 tag = components[1]
                 if tag == "kv":
                     chunk_id = int(components[2])
@@ -2171,6 +2831,128 @@ class NixlKVManager(CommonKVManager):
                 elif tag == "state":
                     pp_rank = int(components[2]) if len(components) > 2 else 0
                     self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
+
+    def _handle_protected_notification(self, decoded: str) -> None:
+        with self.request_status_lock:
+            self._handle_protected_notification_locked(decoded)
+
+    @staticmethod
+    def _record_protected_chunk(
+        status: TransferStatus,
+        producer: int,
+        chunk_id: int,
+        is_last: int,
+        notification_kind: str,
+    ) -> None:
+        if chunk_id < 0:
+            raise ValueError("negative chunk id")
+        if is_last not in (0, 1):
+            raise ValueError("is_last must be 0 or 1")
+        received = status.received_kvs_per_producer[producer]
+        if chunk_id in received:
+            raise ValueError(f"duplicate {notification_kind} chunk notification")
+        expected = status.expected_kvs_per_producer.get(producer)
+        if expected is not None:
+            if chunk_id >= expected:
+                raise ValueError("chunk arrived beyond immutable final declaration")
+            if is_last and expected != chunk_id + 1:
+                raise ValueError("conflicting final chunk declaration")
+        received.add(chunk_id)
+        if is_last:
+            status.expected_kvs_per_producer[producer] = chunk_id + 1
+
+    def _active_decode_generation(
+        self, room: int, nonce: int, message_kind: str
+    ) -> Optional[TransferStatus]:
+        status = self.transfer_statuses.get(room)
+        if status is None or room not in self.request_status:
+            return None
+        if nonce != status.transfer_nonce:
+            if self._is_stale_nonce(
+                self.retired_decode_nonces, room, nonce, status.transfer_nonce
+            ):
+                return None
+            self._fail_room(room, f"{message_kind} nonce mismatch")
+            return None
+        return status
+
+    def _handle_protected_notification_locked(self, decoded: str) -> None:
+        fields = decoded.split("|")
+        try:
+            room = int(fields[1])
+            nonce = int(fields[2])
+        except (IndexError, ValueError):
+            return
+        status = self._active_decode_generation(
+            room, nonce, "Protected NIXL notification"
+        )
+        if status is None:
+            return
+        try:
+            if len(fields) < 5 or fields[0] != PROTECTED_NOTIF_PREFIX:
+                raise ValueError("invalid protected notification framing")
+            producer = int(fields[3])
+            kind = fields[4]
+        except Exception as e:
+            self._fail_room(room, f"Malformed protected NIXL notification: {e}")
+            return
+        if not status.protected or producer not in status.expected_producers:
+            self._fail_room(room, "Unexpected protected NIXL producer")
+            return
+        try:
+            if kind == "kv":
+                if len(fields) != 8:
+                    raise ValueError("KV notification must have exactly 8 fields")
+                chunk_id = int(fields[5])
+                is_last = int(fields[6])
+                int(fields[7])
+                self._record_protected_chunk(status, producer, chunk_id, is_last, "KV")
+            elif kind == "stg":
+                if len(fields) != 12:
+                    raise ValueError("staging notification must have exactly 12 fields")
+                chunk_id = int(fields[5])
+                is_last = int(fields[6])
+                int(fields[7])
+                chunk_idx = int(fields[8])
+                page_start = int(fields[9])
+                num_pages = int(fields[10])
+                if chunk_idx < 0 or page_start < 0 or num_pages <= 0 or not fields[11]:
+                    raise ValueError("invalid staging notification range")
+                self._record_protected_chunk(
+                    status, producer, chunk_id, is_last, "staging"
+                )
+                self._handle_staging_chunk_arrived(
+                    room,
+                    chunk_idx,
+                    page_start,
+                    num_pages,
+                    fields[11],
+                )
+            elif kind == "aux":
+                if len(fields) not in (5, 7) or (
+                    len(fields) == 7 and fields[5] != "nokv"
+                ):
+                    raise ValueError("invalid aux notification framing")
+                if len(fields) == 7:
+                    int(fields[6])
+                if producer in status.received_aux_producers:
+                    raise ValueError("duplicate aux notification")
+                status.received_aux_producers.add(producer)
+                if len(fields) == 7:
+                    status.expected_kvs_per_producer[producer] = 0
+                if self.enable_staging:
+                    self._maybe_submit_last_scatter(room)
+            elif kind == "state":
+                if len(fields) != 6:
+                    raise ValueError("state notification must have exactly 6 fields")
+                int(fields[5])
+                if producer in status.received_state_producers:
+                    raise ValueError("duplicate state notification")
+                status.received_state_producers.add(producer)
+            else:
+                raise ValueError(f"unknown notification kind {kind!r}")
+        except Exception as e:
+            self._fail_room(room, f"Invalid protected NIXL notification: {e}")
 
     def _handle_stg_notification(self, components, room: int):
         """Handle a staging RDMA notification tag.
@@ -2297,6 +3079,14 @@ class NixlKVManager(CommonKVManager):
         status = self.transfer_statuses.get(room)
         if status is None:
             return
+        if status.protected:
+            if not status.protected_data_done():
+                return
+            handler = self._staging_handler
+            if handler is not None and handler.is_staging_room(room):
+                handler.submit_last_scatter_async(room)
+                self._chunk_writer_counts.pop(room, None)
+            return
         if not status.received_aux:
             return
         if status.num_pp_ranks_expected is None:
@@ -2311,15 +3101,192 @@ class NixlKVManager(CommonKVManager):
             handler.submit_last_scatter_async(room)
             self._chunk_writer_counts.pop(room, None)
 
+    def _handle_protected_completion(self, msg: List[bytes]) -> None:
+        with self.request_status_lock:
+            self._handle_protected_completion_locked(msg)
+
+    def _handle_protected_completion_locked(self, msg: List[bytes]) -> None:
+        if len(msg) != 7:
+            raise ValueError(f"NIXL completion has {len(msg)} frames")
+        room = int(msg[1].decode("ascii"))
+        nonce = int(msg[2].decode("ascii"))
+        producer = int(msg[3].decode("ascii"))
+        completion_status = int(msg[4].decode("ascii"))
+        kind = msg[5]
+        status = self._active_decode_generation(room, nonce, "NIXL completion")
+        if status is None:
+            return
+        if not status.protected or producer not in status.expected_producers:
+            self._fail_room(room, "Unexpected NIXL completion producer")
+            return
+        if self.request_status.get(room) == KVPoll.Failed or status.failed:
+            return
+        if completion_status == KVPoll.Failed:
+            self._fail_room(room, "Prefill reported protected NIXL transfer failure")
+            return
+        if completion_status != KVPoll.Success:
+            self._fail_room(room, "Invalid protected NIXL completion status")
+            return
+        if producer in status.completed_producers:
+            self._fail_room(room, "Duplicate protected NIXL producer completion")
+            return
+        checksum_required = bool(
+            status.protection_feature_bitmap & KV_PROTECTION_FEATURE_CHECKSUM
+        )
+        try:
+            if checksum_required:
+                if kind != CHECKSUM_MANIFEST_KIND:
+                    raise ValueError("missing NIXL checksum manifest")
+                from sglang.srt.mem_cache.kv_page_tags import ChecksumPlan
+
+                plan = ChecksumPlan.from_wire_bytes(
+                    msg[6],
+                    expected_transfer_nonce=nonce,
+                    expected_bootstrap_room=room,
+                )
+                status.checksum_manifests[producer] = plan
+            else:
+                if kind != NONCE_ONLY_KIND or int(msg[6].decode("ascii")) != nonce:
+                    raise ValueError("invalid nonce-only NIXL completion")
+        except Exception as e:
+            self._fail_room(room, f"Invalid protected NIXL completion: {e}")
+            return
+        status.completed_producers.add(producer)
+
+    def _handle_abort_ack(self, msg: List[bytes]) -> None:
+        if len(msg) != 4:
+            raise ValueError(f"NIXL abort ACK has {len(msg)} frames")
+        room = int(msg[1].decode("ascii"))
+        nonce = int(msg[2].decode("ascii"))
+        producer = int(msg[3].decode("ascii"))
+        with self.request_status_lock:
+            status = self._active_decode_generation(room, nonce, "NIXL abort ACK")
+            if status is None:
+                return
+            if (
+                self.request_status.get(room) != KVPoll.Failed
+                or room not in self.abort_ack_deadline_by_room
+            ):
+                logger.warning(
+                    "Ignoring NIXL abort ACK before abort room=%s nonce=%s",
+                    room,
+                    nonce,
+                )
+                return
+            if not status.protected or producer not in status.expected_producers:
+                self._fail_room(room, "Unexpected NIXL abort ACK producer")
+                return
+            status.quiesced_producers.add(producer)
+
+    def _handle_transfer_page_tags(self, msg: List[bytes]) -> None:
+        with self.request_status_lock:
+            self._handle_transfer_page_tags_locked(msg)
+
+    def _handle_transfer_page_tags_locked(self, msg: List[bytes]) -> None:
+        if len(msg) != 6:
+            raise ValueError(f"NIXL transfer page tag message has {len(msg)} frames")
+        room = int(msg[1].decode("ascii"))
+        nonce = int(msg[2].decode("ascii"))
+        producer = int(msg[3].decode("ascii"))
+        if len(msg[4]) % 4 or len(msg[5]) % 4:
+            raise ValueError("NIXL transfer page tag payload is not int32-aligned")
+        page_ids = np.frombuffer(msg[4], dtype=np.int32)
+        tags = np.frombuffer(msg[5], dtype=np.int32)
+        if len(page_ids) != len(tags) or not len(page_ids):
+            raise ValueError("NIXL transfer page tag payload length mismatch")
+        status = self._active_decode_generation(room, nonce, "NIXL transfer page tag")
+        if status is None:
+            return
+        if self.request_status.get(room) == KVPoll.Failed or status.failed:
+            return
+        if (
+            not status.protected
+            or producer not in status.expected_producers
+            or not (status.protection_feature_bitmap & KV_PROTECTION_FEATURE_PAGE_TAGS)
+        ):
+            self._fail_room(room, "Unexpected NIXL transfer page tag producer")
+            return
+        expected = self.transfer_page_tag_expected_table.get(room)
+        if expected is None:
+            self._fail_room(room, "Missing expected NIXL transfer page tags")
+            return
+        payload = {
+            int(page_id): int(tag) for page_id, tag in zip(page_ids, tags, strict=True)
+        }
+        seen = self.transfer_page_tag_seen_table.setdefault(room, {}).setdefault(
+            producer, set()
+        )
+        if len(payload) != len(page_ids) or seen.intersection(payload):
+            self._fail_room(room, "Duplicate NIXL transfer page tag")
+            return
+        if any(expected.get(page_id) != tag for page_id, tag in payload.items()):
+            self._fail_room(room, "Conflicting NIXL transfer page tag")
+            return
+        manager = getattr(self.kv_args, "transfer_page_tag_manager", None)
+        if manager is None:
+            self._fail_room(room, "NIXL transfer page tag manager is unavailable")
+            return
+        try:
+            if (
+                self._active_decode_generation(room, nonce, "NIXL transfer page tag")
+                is not status
+            ):
+                return
+            event = manager.write_transfer_page_tags(
+                page_physical_ids=page_ids,
+                transfer_page_tags=tags,
+                bootstrap_room=room,
+            )
+        except Exception as e:
+            self._fail_room(room, f"Failed to write NIXL transfer page tags: {e}")
+            return
+        seen.update(payload)
+        if event is not None:
+            self.transfer_page_tag_event_table[room].append(event)
+
     def check_transfer_done(self, room: int):
+        with self.request_status_lock:
+            return self._check_transfer_done_locked(room)
+
+    def _check_transfer_done_locked(self, room: int):
         if room not in self.transfer_statuses:
             return False
-        return self.transfer_statuses[room].is_done()
+        status = self.transfer_statuses[room]
+        if not status.is_done():
+            return False
+        if status.protected and (
+            status.protection_feature_bitmap & KV_PROTECTION_FEATURE_PAGE_TAGS
+        ):
+            handler = self._staging_handler if self.enable_staging else None
+            is_staging_room = bool(
+                handler is not None and handler.is_staging_room(room)
+            )
+            if not is_staging_room:
+                expected_ids = set(self.transfer_page_tag_expected_table.get(room, {}))
+                seen_by_producer = self.transfer_page_tag_seen_table.get(room, {})
+                if any(
+                    seen_by_producer.get(producer, set()) != expected_ids
+                    for producer in status.expected_producers
+                ):
+                    return False
+                try:
+                    for event in self.transfer_page_tag_event_table.get(room, ()):
+                        event.synchronize()
+                except Exception as e:
+                    self._fail_room(
+                        room, f"NIXL transfer page tag synchronization failed: {e}"
+                    )
+                    return False
+                self.transfer_page_tag_event_table[room].clear()
+        return True
 
     def _start_bootstrap_thread(self):
         def bootstrap_thread():
             """This thread recvs transfer info from the decode engine"""
             while True:
+                self._reap_quarantined_xfer_handles_once()
+                if not self.server_socket.poll(timeout=100):
+                    continue
                 waiting_req_bytes = self.server_socket.recv_multipart()
                 logger.debug(
                     f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
@@ -2344,43 +3311,158 @@ class NixlKVManager(CommonKVManager):
 
                         handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
                     continue
-
-                assert (
-                    waiting_req_bytes[0] == GUARD
-                ), f"First message should be {GUARD}. Foreign traffic?"
-                waiting_req_bytes = waiting_req_bytes[1:]
-                room = waiting_req_bytes[0].decode("ascii")
-                agent_name = waiting_req_bytes[3].decode("ascii")
-                if room == "None":
-                    # Register new peer and save KV base pointers.
-                    self._add_remote_peer(
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    )
-                    logger.debug(f"Register KVArgs from {agent_name} successfully")
-                    continue
-                room = int(room)
-                if room not in self.transfer_infos:
-                    self.transfer_infos[room] = {}
-                self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
-                    waiting_req_bytes
-                )
-                required_dst_info_num = self.transfer_infos[room][
-                    agent_name
-                ].required_dst_info_num
-                logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
-                if len(self.transfer_infos[room]) == required_dst_info_num:
-                    self.req_to_decode_prefix_len[room] = next(
-                        (
-                            info.decode_prefix_len
-                            for info in self.transfer_infos[room].values()
-                            if info.decode_prefix_len is not None
-                        ),
-                        0,
-                    )
-                    logger.debug(f"{room=} is bootstrapped")
-                    self.update_status(room, KVPoll.WaitingForInput)
+                self._process_prefill_bootstrap_message(waiting_req_bytes)
 
         threading.Thread(target=bootstrap_thread).start()
+
+    def _process_prefill_bootstrap_message(self, msg: List[bytes]) -> None:
+        try:
+            self._handle_prefill_bootstrap_message(msg)
+        except Exception as e:
+            logger.warning("Malformed NIXL bootstrap message: %s", e)
+            generation = self._prefill_message_room_nonce(msg)
+            if generation is None:
+                return
+            room, nonce = generation
+            with self.request_status_lock:
+                active = self.active_transfer_nonce_by_room.get(room, 0)
+                if active and not self._is_stale_nonce(
+                    self.retired_transfer_nonces, room, nonce, active
+                ):
+                    self._fail_room(room, f"Invalid NIXL bootstrap metadata: {e}")
+
+    @staticmethod
+    def _prefill_message_room_nonce(msg: List[bytes]) -> Optional[Tuple[int, int]]:
+        try:
+            if msg[0] == ABORT_HEADER:
+                return int(msg[1].decode("ascii")), int(msg[2].decode("ascii"))
+            if msg[0] == GUARD and len(msg) > 12:
+                return int(msg[1].decode("ascii")), int(msg[12].decode("ascii"))
+        except (IndexError, UnicodeDecodeError, ValueError):
+            return None
+        return None
+
+    def _handle_prefill_bootstrap_message(self, msg: List[bytes]) -> None:
+        with self.request_status_lock:
+            self._handle_prefill_bootstrap_message_locked(msg)
+
+    def _handle_prefill_bootstrap_message_locked(self, msg: List[bytes]) -> None:
+        if msg and msg[0] == ABORT_HEADER:
+            if len(msg) != 5:
+                raise ValueError("malformed protected NIXL abort")
+            room = int(msg[1].decode("ascii"))
+            nonce = int(msg[2].decode("ascii"))
+            endpoint = msg[3].decode("ascii")
+            port = int(msg[4].decode("ascii"))
+            active = self.active_transfer_nonce_by_room.get(room, 0)
+            partial = {
+                info.transfer_nonce
+                for info in self.transfer_infos.get(room, {}).values()
+                if info.transfer_nonce
+            }
+            expected = active or (next(iter(partial)) if len(partial) == 1 else 0)
+            quiesced_nonce = self.quiesced_transfer_nonce_by_room.get(room, 0)
+            if nonce <= quiesced_nonce:
+                self._send_or_defer_quiescence_ack_locked(room, nonce, endpoint, port)
+                return
+            if expected and nonce == expected:
+                self.abort_ack_targets[room] = (nonce, endpoint, port)
+                self._fail_room(room, "Decode aborted protected NIXL transfer")
+                if (
+                    not self.active_transfer_workers.get(room, 0)
+                    and room not in self.quiescence_failed_rooms
+                ):
+                    if not self._send_or_defer_quiescence_ack_locked(
+                        room, nonce, endpoint, port
+                    ):
+                        return
+                    self._cleanup_quiesced_prefill_room_locked(room)
+                    self.request_status.pop(room, None)
+            elif not expected and nonce:
+                if self.active_transfer_workers.get(room, 0):
+                    self.abort_ack_targets[room] = (nonce, endpoint, port)
+                    self._fail_room(room, "Decode aborted protected NIXL transfer")
+                else:
+                    self.quiesced_transfer_nonce_by_room[room] = max(
+                        quiesced_nonce, nonce
+                    )
+                    self._retire_nonce(self.retired_transfer_nonces, room, nonce)
+                    self._send_or_defer_quiescence_ack_locked(
+                        room, nonce, endpoint, port
+                    )
+            return
+        if not msg or msg[0] != GUARD:
+            raise ValueError(f"first NIXL bootstrap frame must be {GUARD!r}")
+        fields = msg[1:]
+        if not fields:
+            raise ValueError("empty NIXL bootstrap payload")
+        room_text = fields[0].decode("ascii")
+        if room_text == "None":
+            info = KVArgsRegisterInfo.from_zmq(fields)
+            self._add_remote_peer(info)
+            logger.debug("Registered NIXL KVArgs from %s", info.agent_name)
+            return
+
+        room = int(room_text)
+        info = TransferInfo.from_zmq(fields)
+        manager = getattr(self.kv_args, "transfer_page_tag_manager", None)
+        local_features = 0
+        if manager is not None and manager.config.enabled:
+            if manager.config.checksum_enabled:
+                local_features |= KV_PROTECTION_FEATURE_CHECKSUM
+            if manager.config.enable_attention_tags:
+                local_features |= KV_PROTECTION_FEATURE_PAGE_TAGS
+        if local_features and not info.is_protected:
+            self._fail_room(room, "Protected NIXL room received legacy metadata")
+            return
+        if info.is_protected and info.protection_feature_bitmap != local_features:
+            self._fail_room(room, "NIXL protection feature negotiation mismatch")
+            return
+        if self._is_stale_nonce(
+            self.retired_transfer_nonces,
+            room,
+            info.transfer_nonce,
+            self.active_transfer_nonce_by_room.get(room, 0),
+        ):
+            return
+        active_nonce = self.active_transfer_nonce_by_room.get(room, 0)
+        if active_nonce and info.transfer_nonce != active_nonce:
+            self._fail_room(room, "NIXL room metadata nonce mismatch")
+            return
+        records = self.transfer_infos.setdefault(room, {})
+        if info.agent_name in records:
+            self._fail_room(room, "Duplicate NIXL room metadata producer")
+            return
+        if records:
+            first = next(iter(records.values()))
+            if (
+                first.transfer_nonce != info.transfer_nonce
+                or first.protection_feature_bitmap != info.protection_feature_bitmap
+                or first.protection_protocol_version != info.protection_protocol_version
+                or first.required_dst_info_num != info.required_dst_info_num
+            ):
+                self._fail_room(room, "NIXL room metadata records disagree")
+                return
+        records[info.agent_name] = info
+        if self.pending_abort_nonce_by_room.get(room) == info.transfer_nonce:
+            self.pending_abort_nonce_by_room.pop(room, None)
+            self._fail_room(room, "Decode aborted protected NIXL transfer")
+            return
+        if len(records) > info.required_dst_info_num:
+            self._fail_room(room, "Too many NIXL room metadata records")
+            return
+        if len(records) == info.required_dst_info_num:
+            self.active_transfer_nonce_by_room[room] = info.transfer_nonce
+            self.active_transfer_features_by_room[room] = info.protection_feature_bitmap
+            self.req_to_decode_prefix_len[room] = next(
+                (
+                    record.decode_prefix_len
+                    for record in records.values()
+                    if record.decode_prefix_len is not None
+                ),
+                0,
+            )
+            self.update_status(room, KVPoll.WaitingForInput)
 
 
 class NixlKVSender(CommonKVSender):
@@ -2398,6 +3480,7 @@ class NixlKVSender(CommonKVSender):
         self._send_failed = False
         self._send_error: Optional[Exception] = None
         self._transfer_start_time: Optional[float] = None
+        self.init_time = time.time()
 
     def send(
         self,
@@ -2426,6 +3509,7 @@ class NixlKVSender(CommonKVSender):
             self.chunk_id,
             self.aux_index,
             state_indices,
+            checksum_plan=self.checksum_plan if is_last_chunk else None,
         )
         self._record_transfer_indices(kv_indices, state_indices)
         self.chunk_id += 1
@@ -2435,7 +3519,17 @@ class NixlKVSender(CommonKVSender):
     def poll(self) -> KVPoll:
         if self._send_failed:
             return KVPoll.Failed  # type: ignore
+        if self.conclude_state is not None:
+            return self.conclude_state
         status = self.kv_mgr.check_status(self.bootstrap_room)
+        if status == KVPoll.Bootstrapping:
+            timeout = self._check_bootstrap_timeout()
+            if timeout is not None:
+                self.conclude_state = KVPoll.Failed
+                self.kv_mgr.retire_transfer_room(self.bootstrap_room)
+                return timeout
+        if status in (KVPoll.Success, KVPoll.Failed):
+            self.conclude_state = status
         if (
             status == KVPoll.Success
             and self._transfer_start_time is not None
@@ -2447,7 +3541,18 @@ class NixlKVSender(CommonKVSender):
         return status
 
     def clear(self) -> None:
-        super().clear()
+        lock = getattr(self.kv_mgr, "request_status_lock", threading.RLock())
+        with lock:
+            if getattr(self.kv_mgr, "active_transfer_workers", {}).get(
+                self.bootstrap_room, 0
+            ) or self.bootstrap_room in getattr(
+                self.kv_mgr, "quiescence_failed_rooms", set()
+            ):
+                return
+            retire = getattr(self.kv_mgr, "retire_transfer_room", None)
+            if retire is not None:
+                retire(self.bootstrap_room)
+            super().clear()
         if (
             getattr(self.kv_mgr, "enable_staging", False)
             and getattr(self.kv_mgr, "_staging_ctx", None) is not None
@@ -2489,8 +3594,79 @@ class NixlKVReceiver(CommonKVReceiver):
         bootstrap_room: Optional[int] = None,
     ):
         self.started_transfer = False
+        self.awaiting_quiescence = False
+        self.quiescence_deadline: Optional[float] = None
+        self.quiescence_proven = False
+        self.page_quarantine_required = False
+        self.abort_notified = False
+        self.abort_pending_producers: Set[int] = set()
+        manager = getattr(mgr.kv_args, "transfer_page_tag_manager", None)
+        self.protection_feature_bitmap = 0
+        if manager is not None and manager.config.enabled:
+            if manager.config.checksum_enabled:
+                self.protection_feature_bitmap |= KV_PROTECTION_FEATURE_CHECKSUM
+            if manager.config.enable_attention_tags:
+                self.protection_feature_bitmap |= KV_PROTECTION_FEATURE_PAGE_TAGS
+        self.transfer_nonce = (
+            _new_transfer_nonce() if self.protection_feature_bitmap else 0
+        )
+        self.notified_producers: Set[int] = set()
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time = None
+
+    def init(self, prefill_dp_rank: int):
+        super().init(prefill_dp_rank)
+        if self.conclude_state == KVPoll.Failed:
+            return
+        if self.protection_feature_bitmap:
+            if (
+                self.prefill_info.protection_protocol_version
+                != KV_PROTECTION_PROTOCOL_VERSION
+                or self.prefill_info.protection_feature_bitmap
+                != self.protection_feature_bitmap
+            ):
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    "NIXL prefill lacks the required KV protection capability",
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.conclude_state = KVPoll.Failed
+                return
+            expected_producers = {
+                int(info["producer_id"])
+                for info in self.bootstrap_infos
+                if not info.get("is_dummy", False)
+            }
+            if not expected_producers:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room, "Protected NIXL room has no producers"
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.conclude_state = KVPoll.Failed
+                return
+            if (
+                self.protection_feature_bitmap & KV_PROTECTION_FEATURE_CHECKSUM
+                and len(expected_producers) != 1
+            ):
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    "NIXL checksums require exactly one producer completion per decode rank",
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.conclude_state = KVPoll.Failed
+                return
+            with self.kv_mgr.request_status_lock:
+                status = self.kv_mgr.transfer_statuses[self.bootstrap_room]
+                status.protected = True
+                status.transfer_nonce = self.transfer_nonce
+                status.protection_feature_bitmap = self.protection_feature_bitmap
+                status.expected_producers = expected_producers
+                self.kv_mgr.checksum_nonce_table[self.bootstrap_room] = (
+                    self.transfer_nonce
+                )
+                self.kv_mgr.expected_producer_table[self.bootstrap_room] = (
+                    expected_producers
+                )
 
     def send_metadata(
         self,
@@ -2498,6 +3674,8 @@ class NixlKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        transfer_page_tag_ids: Optional[npt.NDArray[np.int32]] = None,
+        transfer_page_tags: Optional[npt.NDArray[np.int32]] = None,
     ):
         if self.bootstrap_infos is None:
             logger.error(
@@ -2505,6 +3683,42 @@ class NixlKVReceiver(CommonKVReceiver):
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
+
+        tag_ids = np.asarray(
+            transfer_page_tag_ids if transfer_page_tag_ids is not None else [],
+            dtype=np.int32,
+        ).reshape(-1)
+        tag_values = np.asarray(
+            transfer_page_tags if transfer_page_tags is not None else [],
+            dtype=np.int32,
+        ).reshape(-1)
+        if len(tag_ids) != len(tag_values):
+            self.kv_mgr.record_failure(
+                self.bootstrap_room, "NIXL transfer page id/tag length mismatch"
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return
+        expected_tags: Dict[int, int] = {}
+        for page_id, tag in zip(tag_ids, tag_values, strict=True):
+            page_id, tag = int(page_id), int(tag)
+            if page_id in expected_tags and expected_tags[page_id] != tag:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room, "Conflicting NIXL expected transfer page tag"
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return
+            expected_tags[page_id] = tag
+        if self.protection_feature_bitmap & KV_PROTECTION_FEATURE_PAGE_TAGS:
+            with self.kv_mgr.request_status_lock:
+                self.kv_mgr.transfer_page_tag_expected_table[self.bootstrap_room] = (
+                    expected_tags
+                )
+                self.kv_mgr.transfer_page_tag_seen_table[self.bootstrap_room] = {
+                    producer: set()
+                    for producer in self.kv_mgr.expected_producer_table[
+                        self.bootstrap_room
+                    ]
+                }
 
         # Register staging room bootstrap info for staging handler
         if (
@@ -2516,37 +3730,77 @@ class NixlKVReceiver(CommonKVReceiver):
                 self.bootstrap_room, self.bootstrap_infos, self
             )
 
-        for bootstrap_info in self.bootstrap_infos:
-            logger.debug(
-                f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
-            )
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-            is_dummy = bootstrap_info["is_dummy"]
-            logger.debug(
-                f"Sending to prefill server with bootstrap room {self.bootstrap_room} {is_dummy=}"
-            )
-            packed_state_indices = (
-                pack_int_lists(
-                    [(idx if idx is not None else []) for idx in state_indices], "i"
+        self.notified_producers = set()
+        self.started_transfer = bool(self.transfer_nonce)
+        self.init_time = time.time()
+        try:
+            for bootstrap_info in self.bootstrap_infos:
+                logger.debug(
+                    f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
                 )
-                if not is_dummy and state_indices is not None
-                else b""
-            )
-            with lock:
-                sock.send_multipart(
-                    [
-                        GUARD,
-                        str(self.bootstrap_room).encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.kv_mgr.agent.name.encode("ascii"),
-                        kv_indices.tobytes() if not is_dummy else b"",
-                        str(aux_index).encode("ascii"),
-                        str(self.required_dst_info_num).encode("ascii"),
-                        packed_state_indices,
-                        str(decode_prefix_len or 0).encode("ascii"),
-                    ]
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                is_dummy = bootstrap_info["is_dummy"]
+                logger.debug(
+                    f"Sending to prefill server with bootstrap room {self.bootstrap_room} {is_dummy=}"
                 )
+                packed_state_indices = (
+                    pack_int_lists(
+                        [(idx if idx is not None else []) for idx in state_indices], "i"
+                    )
+                    if not is_dummy and state_indices is not None
+                    else b""
+                )
+                with lock:
+                    sock.send_multipart(
+                        [
+                            GUARD,
+                            str(self.bootstrap_room).encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.kv_mgr.agent.name.encode("ascii"),
+                            kv_indices.tobytes() if not is_dummy else b"",
+                            str(aux_index).encode("ascii"),
+                            str(self.required_dst_info_num).encode("ascii"),
+                            packed_state_indices,
+                            str(decode_prefix_len or 0).encode("ascii"),
+                            tag_ids.tobytes() if not is_dummy else b"",
+                            tag_values.tobytes() if not is_dummy else b"",
+                            str(self.transfer_nonce).encode("ascii"),
+                            (
+                                str(KV_PROTECTION_PROTOCOL_VERSION).encode("ascii")
+                                if self.protection_feature_bitmap
+                                else b""
+                            ),
+                            str(self.protection_feature_bitmap).encode("ascii"),
+                            str(int(is_dummy)).encode("ascii"),
+                        ]
+                    )
+                if not is_dummy:
+                    self.notified_producers.add(int(bootstrap_info["producer_id"]))
+        except Exception as error:
+            if not self.transfer_nonce:
+                raise
+            with self.kv_mgr.request_status_lock:
+                status = self.kv_mgr.transfer_statuses[self.bootstrap_room]
+                status.expected_producers = set(self.notified_producers)
+                self.kv_mgr.expected_producer_table[self.bootstrap_room] = set(
+                    self.notified_producers
+                )
+                self.kv_mgr.transfer_page_tag_seen_table[self.bootstrap_room] = {
+                    producer: set() for producer in self.notified_producers
+                }
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                f"NIXL protected metadata fan-out failed: {error}",
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.started_transfer = bool(self.notified_producers)
+            if self.notified_producers:
+                self._begin_abort_quiescence()
+            else:
+                self.quiescence_proven = True
+                self.conclude_state = KVPoll.Failed
+            return
 
         # Mark that we expect state data if state_indices was provided.
         # Match the prefill-side truthy check: an empty list means the
@@ -2556,12 +3810,15 @@ class NixlKVReceiver(CommonKVReceiver):
             self.kv_mgr.transfer_statuses[self.bootstrap_room].expects_state = True
 
         self.started_transfer = True
-        self.init_time = time.time()
 
     def poll(self) -> KVPoll:
-        if self.conclude_state is not None:
+        if self.conclude_state is not None and not getattr(
+            self, "awaiting_quiescence", False
+        ):
             return self.conclude_state
         status = self.kv_mgr.check_status(self.bootstrap_room)
+        if status == KVPoll.Failed and self.started_transfer and self.transfer_nonce:
+            return self._poll_abort_quiescence()
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
             return status
@@ -2570,6 +3827,9 @@ class NixlKVReceiver(CommonKVReceiver):
 
         timeout_result = self._check_waiting_timeout()
         if timeout_result is not None:
+            if getattr(self, "transfer_nonce", 0):
+                return self._poll_abort_quiescence()
+            self.conclude_state = KVPoll.Failed
             return timeout_result
 
         self.kv_mgr.update_transfer_status()
@@ -2578,9 +3838,183 @@ class NixlKVReceiver(CommonKVReceiver):
                 self.bootstrap_room
             )
             self.conclude_state = KVPoll.Success
-            del self.kv_mgr.transfer_statuses[self.bootstrap_room]
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+            transfer_status = self.kv_mgr.transfer_statuses.get(self.bootstrap_room)
+            if transfer_status is not None and not transfer_status.protected:
+                self.kv_mgr.transfer_statuses.pop(self.bootstrap_room, None)
             return self.conclude_state  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore
+
+    def _begin_abort_quiescence(self) -> None:
+        if getattr(self, "awaiting_quiescence", False):
+            if not self.abort_notified:
+                self._send_abort_notification()
+            return
+        self.awaiting_quiescence = True
+        self.conclude_state = None
+        self.quiescence_deadline = time.monotonic() + max(
+            float(self.kv_mgr.waiting_timeout), 0.001
+        )
+        self.kv_mgr.abort_ack_deadline_by_room[self.bootstrap_room] = (
+            self.quiescence_deadline
+        )
+        notified = getattr(self, "notified_producers", None)
+        self.abort_pending_producers = (
+            set(notified)
+            if notified is not None
+            else {
+                int(info["producer_id"])
+                for info in self.bootstrap_infos
+                if not info.get("is_dummy", False)
+            }
+        )
+        if not self.abort_notified:
+            self._send_abort_notification()
+
+    def _poll_abort_quiescence(self) -> KVPoll:
+        self._begin_abort_quiescence()
+        with self.kv_mgr.request_status_lock:
+            transfer_status = self.kv_mgr.transfer_statuses.get(self.bootstrap_room)
+            expected = (
+                transfer_status.expected_producers
+                if transfer_status is not None
+                else set()
+            )
+            quiesced = (
+                transfer_status.quiesced_producers
+                if transfer_status is not None
+                else set()
+            )
+            if expected and quiesced == expected:
+                self.awaiting_quiescence = False
+                self.quiescence_proven = True
+                self.conclude_state = KVPoll.Failed
+                self.kv_mgr.abort_ack_deadline_by_room.pop(self.bootstrap_room, None)
+                return KVPoll.Failed
+        if time.monotonic() >= self.quiescence_deadline:
+            self.awaiting_quiescence = False
+            self.page_quarantine_required = True
+            self.conclude_state = KVPoll.Failed
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                "NIXL abort quiescence ACK timeout; destination pages quarantined",
+            )
+            return KVPoll.Failed
+        return KVPoll.Transferring
+
+    def abort(self):
+        if not self.started_transfer or not self.transfer_nonce:
+            return super().abort()
+        self.kv_mgr.record_failure(self.bootstrap_room, "Aborted by AbortReq.")
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        self._begin_abort_quiescence()
+
+    def requires_page_quarantine(self) -> bool:
+        return getattr(self, "page_quarantine_required", False) or getattr(
+            self, "awaiting_quiescence", False
+        )
+
+    def try_release_page_quarantine(self) -> bool:
+        if not self.requires_page_quarantine():
+            return True
+        with self.kv_mgr.request_status_lock:
+            transfer_status = self.kv_mgr.transfer_statuses.get(self.bootstrap_room)
+            if transfer_status is None:
+                return False
+            expected = transfer_status.expected_producers
+            if not expected or transfer_status.quiesced_producers != expected:
+                return False
+            self.awaiting_quiescence = False
+            self.page_quarantine_required = False
+            self.quiescence_proven = True
+            self.conclude_state = KVPoll.Failed
+            self.kv_mgr.abort_ack_deadline_by_room.pop(self.bootstrap_room, None)
+            return True
+
+    def get_checksum_plan(self):
+        status = self.kv_mgr.transfer_statuses.get(self.bootstrap_room)
+        if status is None or not status.protected:
+            return None
+        plans = status.checksum_manifests
+        if len(plans) != 1:
+            return None
+        return next(iter(plans.values()))
+
+    @staticmethod
+    def uses_legacy_checksum_completion() -> bool:
+        return False
+
+    def clear(self) -> None:
+        if getattr(self, "page_quarantine_required", False) or getattr(
+            self, "awaiting_quiescence", False
+        ):
+            return
+        sync_error = None
+        with self.kv_mgr.request_status_lock:
+            for event in self.kv_mgr.transfer_page_tag_event_table.get(
+                self.bootstrap_room, ()
+            ):
+                try:
+                    event.synchronize()
+                except Exception as error:
+                    sync_error = error
+                    break
+            self.kv_mgr._retire_nonce(
+                self.kv_mgr.retired_decode_nonces,
+                self.bootstrap_room,
+                self.transfer_nonce,
+            )
+            super().clear()
+            self.kv_mgr.transfer_statuses.pop(self.bootstrap_room, None)
+            self.kv_mgr.checksum_nonce_table.pop(self.bootstrap_room, None)
+            self.kv_mgr.expected_producer_table.pop(self.bootstrap_room, None)
+            self.kv_mgr.transfer_page_tag_expected_table.pop(self.bootstrap_room, None)
+            self.kv_mgr.transfer_page_tag_seen_table.pop(self.bootstrap_room, None)
+            self.kv_mgr.transfer_page_tag_event_table.pop(self.bootstrap_room, None)
+            getattr(self.kv_mgr, "abort_ack_deadline_by_room", {}).pop(
+                self.bootstrap_room, None
+            )
+            handler = getattr(self.kv_mgr, "_staging_handler", None)
+            if handler is not None:
+                handler.unregister_decode_req(self.bootstrap_room)
+            staging_ctx = getattr(self.kv_mgr, "_staging_ctx", None)
+            if staging_ctx is not None:
+                staging_ctx.room_bootstrap.pop(self.bootstrap_room, None)
+                staging_ctx.room_receivers.pop(self.bootstrap_room, None)
+            getattr(self.kv_mgr, "_chunk_writer_counts", {}).pop(
+                self.bootstrap_room, None
+            )
+        if sync_error is not None:
+            raise sync_error
+
+    def _send_abort_notification(self):
+        if not self.transfer_nonce:
+            return super()._send_abort_notification()
+        for bootstrap_info in self.bootstrap_infos:
+            if bootstrap_info.get("is_dummy", False):
+                continue
+            producer = int(bootstrap_info["producer_id"])
+            pending = getattr(self, "abort_pending_producers", None)
+            if pending is not None and producer not in pending:
+                continue
+            try:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            ABORT_HEADER,
+                            str(self.bootstrap_room).encode("ascii"),
+                            str(self.transfer_nonce).encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                        ]
+                    )
+                if pending is not None:
+                    pending.discard(producer)
+            except Exception:
+                logger.debug("Failed to send protected NIXL abort", exc_info=True)
+        pending = getattr(self, "abort_pending_producers", None)
+        self.abort_notified = pending is not None and not pending
 
     def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:
@@ -2651,8 +4085,23 @@ class NixlKVReceiver(CommonKVReceiver):
                 )
 
     def failure_exception(self):
+        if self.conclude_state is None:
+            self.conclude_state = KVPoll.Failed
+        if (
+            self.started_transfer
+            and self.transfer_nonce
+            and not getattr(self, "quiescence_proven", False)
+            and not getattr(self, "page_quarantine_required", False)
+        ):
+            if not getattr(self, "awaiting_quiescence", False):
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self._begin_abort_quiescence()
+            self.awaiting_quiescence = False
+            self.page_quarantine_required = True
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        if not getattr(self, "page_quarantine_required", False):
+            self.clear()
         is_propagated = failure_reason is None
         if is_propagated:
             failure_reason = "NIXL KVReceiver Exception"

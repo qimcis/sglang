@@ -1,4 +1,5 @@
 import dataclasses
+import functools
 from typing import Optional, Tuple
 
 import torch
@@ -13,6 +14,107 @@ else:
 _IMPORT_ERROR = ImportError(
     "Failed to load sgl_kernel.flashmla_ops extension. Ensure CUDA Driver >= 12.4"
 )
+
+
+def flashmla_blackwell_supported() -> bool:
+    """Whether this extension contains a FlashMLA image for the active Blackwell GPU."""
+    if _flashmla_import_error is not None:
+        return False
+    return bool(torch.ops.sgl_kernel.flashmla_blackwell_supported())
+
+
+_PROTECTED_CONSUMER_OPS = {
+    "flashmla_kv": ("get_mla_decoding_metadata", "fwd_kvcache_mla"),
+    "flashmla_sparse": ("sparse_prefill_fwd",),
+}
+
+
+@functools.lru_cache(maxsize=None)
+def _flashmla_protected_consumer_available(
+    consumer: str, device: int, num_q_heads: int
+) -> bool:
+    if _flashmla_import_error is not None or consumer not in _PROTECTED_CONSUMER_OPS:
+        return False
+    try:
+        with torch.cuda.device(device):
+            cuda_device = torch.device("cuda", device)
+            if not torch.ops.sgl_kernel.flashmla_protected_consumer_image_available(
+                consumer
+            ):
+                return False
+            if not all(
+                torch._C._dispatch_has_kernel_for_dispatch_key(
+                    f"sgl_kernel::{operation}", "CUDA"
+                )
+                for operation in _PROTECTED_CONSUMER_OPS[consumer]
+            ):
+                return False
+
+            if consumer == "flashmla_sparse":
+                q = torch.zeros(
+                    (2, num_q_heads, 576),
+                    dtype=torch.bfloat16,
+                    device=cuda_device,
+                )
+                kv = torch.zeros(
+                    (128, 1, 576), dtype=torch.bfloat16, device=cuda_device
+                )
+                indices = torch.zeros(
+                    (2, 1, 128), dtype=torch.int32, device=cuda_device
+                )
+                flash_mla_sparse_fwd(q, kv, indices, 576**-0.5)
+            else:
+                q = torch.zeros(
+                    (1, 1, num_q_heads, 576),
+                    dtype=torch.bfloat16,
+                    device=cuda_device,
+                )
+                kv = torch.zeros(
+                    (1, 64, 1, 656),
+                    dtype=torch.float8_e4m3fn,
+                    device=cuda_device,
+                )
+                kv[..., 512:528].view(torch.float32).fill_(1)
+                cache_seqlens = torch.ones(1, dtype=torch.int32, device=cuda_device)
+                indices = torch.zeros((1, 1, 64), dtype=torch.int32, device=cuda_device)
+                metadata, num_splits = get_mla_metadata(
+                    cache_seqlens,
+                    num_q_heads,
+                    1,
+                    num_q_heads,
+                    True,
+                    indices.shape[-1],
+                )
+                flash_mla_with_kvcache(
+                    q=q,
+                    k_cache=kv,
+                    block_table=torch.empty(
+                        (1, 0), dtype=torch.int32, device=cuda_device
+                    ),
+                    cache_seqlens=cache_seqlens,
+                    head_dim_v=512,
+                    tile_scheduler_metadata=metadata,
+                    num_splits=num_splits,
+                    is_fp8_kvcache=True,
+                    indices=indices,
+                )
+            torch.cuda.synchronize(device)
+            return True
+    except (AttributeError, RuntimeError, AssertionError, ValueError):
+        return False
+
+
+def flashmla_protected_consumer_available(
+    consumer: str, num_q_heads: int = 128, device: Optional[torch.device] = None
+) -> bool:
+    """Smoke-test the exact selected consumer and active-device image once."""
+    if _flashmla_import_error is not None or not torch.cuda.is_available():
+        return False
+    if num_q_heads not in (64, 128):
+        return False
+    device = torch.device(device) if device is not None else torch.device("cuda")
+    device_index = torch.cuda.current_device() if device.index is None else device.index
+    return _flashmla_protected_consumer_available(consumer, device_index, num_q_heads)
 
 
 @dataclasses.dataclass

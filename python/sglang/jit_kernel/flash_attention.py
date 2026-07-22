@@ -172,8 +172,6 @@ def flash_attn_with_kvcache(
             kv_page_protection=kv_page_protection,
         )
     elif ver == 4:
-        if kv_page_protection is not None:
-            raise RuntimeError("KV page protection is supported only by FA3")
         from .flash_attention_v4 import (
             flash_attn_with_kvcache as fa4_flash_attn_with_kvcache,
         )
@@ -207,6 +205,7 @@ def flash_attn_with_kvcache(
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             return_softmax_lse=return_softmax_lse,
+            kv_page_protection=kv_page_protection,
         )
     else:
         raise RuntimeError(f"Unknown flash attention version {ver}")

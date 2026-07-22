@@ -62,11 +62,13 @@ struct KVTopKProtectionParams {
   int32_t page_offset;
   int32_t num_physical_pages;
   int32_t num_request_slots;
+  int32_t expected_mapping_stride;
+  int32_t expected_mapping_namespace_stride;
+  int32_t expected_mapping_offset;
   const int64_t* __restrict__ actual_tags;
   const int64_t* __restrict__ actual_generations;
   const int32_t* __restrict__ actual_transfer_tags;
-  const int32_t* __restrict__ owner_request_indices;
-  const int32_t* __restrict__ owner_page_positions;
+  const int32_t* __restrict__ expected_physical_pages;
   const int64_t* __restrict__ expected_tags;
   const int64_t* __restrict__ expected_generations;
   const int32_t* __restrict__ expected_transfer_tags;
@@ -151,20 +153,23 @@ __device__ __forceinline__ int32_t validate_selected_token_slot(
     return kKVPageInvalidMapping;
   }
 
+  if (logical_page < 0 || logical_page >= protection.expected_mapping_namespace_stride) {
+    return kKVPagePositionMismatch;
+  }
   const auto page = static_cast<int32_t>(sidecar_page);
-  if (protection.owner_request_indices[page] != request_idx) {
+  const int64_t expected_index = static_cast<int64_t>(request_idx) * protection.expected_mapping_stride +
+                                 protection.expected_mapping_offset + logical_page;
+  if (protection.expected_physical_pages[expected_index] != page) {
     validation_status |= kKVPageOwnerMismatch;
   }
-  if (protection.owner_page_positions[page] != logical_page) {
-    validation_status |= kKVPagePositionMismatch;
-  }
-  if (protection.actual_tags[page] != protection.expected_tags[page]) {
+  if (protection.actual_tags[page] != protection.expected_tags[expected_index]) {
     validation_status |= kKVPageAttentionTagMismatch;
   }
-  if (protection.actual_generations[page] != protection.expected_generations[page]) {
+  if (protection.actual_generations[page] != protection.expected_generations[expected_index]) {
     validation_status |= kKVPageGenerationMismatch;
   }
-  if (protection.actual_transfer_tags[page] != protection.expected_transfer_tags[page]) {
+  const int32_t expected_transfer_tag = protection.expected_transfer_tags[expected_index];
+  if (expected_transfer_tag != 0 && protection.actual_transfer_tags[page] != expected_transfer_tag) {
     validation_status |= kKVPageTransferTagMismatch;
   }
   return validation_status;
@@ -444,8 +449,8 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // protected decode
   const bool graph_padding = request_idx == 0;
 
   __shared__ int32_t s_validation_status;
-  const bool row_shape_valid =
-      request_idx_valid && !graph_padding && length >= 0 && length <= src_num_cols && length <= score_num_cols;
+  const bool row_shape_valid = request_idx_valid && !graph_padding && length >= 0 && length <= src_num_cols &&
+                               length <= score_num_cols && protection.status[request_idx] == 0;
   if (tid == 0) {
     s_validation_status = (graph_padding || row_shape_valid) ? 0 : kKVPageInvalidMapping;
   }
@@ -658,6 +663,22 @@ void check_request_sidecar_tensor(
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 
+bool fast_topk_kv_page_protection_supported() {
+#ifdef USE_ROCM
+  return false;
+#else
+  // Probe the exact protected kernels on the active device. This catches an
+  // extension built without a loadable cubin/PTX image for SM100 or SM103.
+  const auto generic = cudaFuncSetAttribute(
+      topk_transform_decode_protected_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+  const auto page64 = cudaFuncSetAttribute(
+      topk_transform_decode_protected_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+  if (generic == cudaSuccess && page64 == cudaSuccess) return true;
+  cudaGetLastError();
+  return false;
+#endif
+}
+
 void kv_page_protection_begin_forward(
     const at::Tensor& request_indices, at::Tensor& request_epochs, at::Tensor& status) {
   check_request_sidecar_tensor(request_indices, request_indices, at::kLong, "request_indices");
@@ -754,8 +775,10 @@ void fast_topk_transform_interface(
     std::optional<at::Tensor> protection_actual_tags_opt,
     std::optional<at::Tensor> protection_actual_generations_opt,
     std::optional<at::Tensor> protection_actual_transfer_tags_opt,
-    std::optional<at::Tensor> protection_owner_request_indices_opt,
-    std::optional<at::Tensor> protection_owner_page_positions_opt,
+    std::optional<at::Tensor> protection_expected_physical_pages_opt,
+    int64_t protection_expected_mapping_stride,
+    int64_t protection_expected_mapping_namespace_stride,
+    int64_t protection_expected_mapping_offset,
     std::optional<at::Tensor> protection_expected_tags_opt,
     std::optional<at::Tensor> protection_expected_generations_opt,
     std::optional<at::Tensor> protection_expected_transfer_tags_opt,
@@ -808,15 +831,17 @@ void fast_topk_transform_interface(
   const bool any_protection =
       protection_request_indices_opt.has_value() || protection_page_size != 0 || protection_page_offset != 0 ||
       protection_actual_tags_opt.has_value() || protection_actual_generations_opt.has_value() ||
-      protection_actual_transfer_tags_opt.has_value() || protection_owner_request_indices_opt.has_value() ||
-      protection_owner_page_positions_opt.has_value() || protection_expected_tags_opt.has_value() ||
+      protection_actual_transfer_tags_opt.has_value() || protection_expected_physical_pages_opt.has_value() ||
+      protection_expected_mapping_stride != 0 || protection_expected_mapping_namespace_stride != 0 ||
+      protection_expected_mapping_offset != 0 || protection_expected_tags_opt.has_value() ||
       protection_expected_generations_opt.has_value() || protection_expected_transfer_tags_opt.has_value() ||
       protection_request_epochs_opt.has_value() || protection_validated_epochs_opt.has_value() ||
       protection_status_opt.has_value();
   const bool complete_protection =
       protection_request_indices_opt.has_value() && protection_actual_tags_opt.has_value() &&
       protection_actual_generations_opt.has_value() && protection_actual_transfer_tags_opt.has_value() &&
-      protection_owner_request_indices_opt.has_value() && protection_owner_page_positions_opt.has_value() &&
+      protection_expected_physical_pages_opt.has_value() && protection_expected_mapping_stride > 0 &&
+      protection_expected_mapping_namespace_stride > 0 && protection_expected_mapping_offset >= 0 &&
       protection_expected_tags_opt.has_value() && protection_expected_generations_opt.has_value() &&
       protection_expected_transfer_tags_opt.has_value() && protection_request_epochs_opt.has_value() &&
       protection_validated_epochs_opt.has_value() && protection_status_opt.has_value();
@@ -831,6 +856,15 @@ void fast_topk_transform_interface(
         protection_page_offset >= 0 && protection_page_offset <= std::numeric_limits<int32_t>::max(),
         "topk KV protection page offset is out of range");
     TORCH_CHECK(
+        protection_expected_mapping_stride > 0 &&
+            protection_expected_mapping_stride <= std::numeric_limits<int32_t>::max(),
+        "topk KV protection expected mapping stride is out of range");
+    TORCH_CHECK(
+        protection_expected_mapping_namespace_stride > 0 && protection_expected_mapping_offset >= 0 &&
+            protection_expected_mapping_offset + protection_expected_mapping_namespace_stride <=
+                protection_expected_mapping_stride,
+        "topk KV protection expected mapping namespace is out of range");
+    TORCH_CHECK(
         src_page_table.size(1) <= std::numeric_limits<int32_t>::max() &&
             score.size(1) <= std::numeric_limits<int32_t>::max(),
         "topk KV protection input is too wide");
@@ -839,8 +873,7 @@ void fast_topk_transform_interface(
     const auto& actual_tags = protection_actual_tags_opt.value();
     const auto& actual_generations = protection_actual_generations_opt.value();
     const auto& actual_transfer_tags = protection_actual_transfer_tags_opt.value();
-    const auto& owner_request_indices = protection_owner_request_indices_opt.value();
-    const auto& owner_page_positions = protection_owner_page_positions_opt.value();
+    const auto& expected_physical_pages = protection_expected_physical_pages_opt.value();
     const auto& expected_tags = protection_expected_tags_opt.value();
     const auto& expected_generations = protection_expected_generations_opt.value();
     const auto& expected_transfer_tags = protection_expected_transfer_tags_opt.value();
@@ -852,8 +885,7 @@ void fast_topk_transform_interface(
     check_protection_tensor(actual_tags, score, at::kLong, "protection_actual_tags");
     check_protection_tensor(actual_generations, score, at::kLong, "protection_actual_generations");
     check_protection_tensor(actual_transfer_tags, score, at::kInt, "protection_actual_transfer_tags");
-    check_protection_tensor(owner_request_indices, score, at::kInt, "protection_owner_request_indices");
-    check_protection_tensor(owner_page_positions, score, at::kInt, "protection_owner_page_positions");
+    check_protection_tensor(expected_physical_pages, score, at::kInt, "protection_expected_physical_pages");
     check_protection_tensor(expected_tags, score, at::kLong, "protection_expected_tags");
     check_protection_tensor(expected_generations, score, at::kLong, "protection_expected_generations");
     check_protection_tensor(expected_transfer_tags, score, at::kInt, "protection_expected_transfer_tags");
@@ -867,10 +899,7 @@ void fast_topk_transform_interface(
         num_physical_pages > 0 && num_physical_pages <= std::numeric_limits<int32_t>::max(),
         "topk KV protection physical sidecar size is out of range");
     TORCH_CHECK(
-        actual_generations.size(0) == num_physical_pages && actual_transfer_tags.size(0) == num_physical_pages &&
-            owner_request_indices.size(0) == num_physical_pages && owner_page_positions.size(0) == num_physical_pages &&
-            expected_tags.size(0) == num_physical_pages && expected_generations.size(0) == num_physical_pages &&
-            expected_transfer_tags.size(0) == num_physical_pages,
+        actual_generations.size(0) == num_physical_pages && actual_transfer_tags.size(0) == num_physical_pages,
         "topk KV protection physical sidecar length mismatch");
     const auto num_request_slots = request_epochs.size(0);
     TORCH_CHECK(
@@ -879,6 +908,12 @@ void fast_topk_transform_interface(
     TORCH_CHECK(
         validated_epochs.size(0) == num_request_slots && status.size(0) == num_request_slots,
         "topk KV protection request sidecar length mismatch");
+    const auto num_expected_mappings = num_request_slots * protection_expected_mapping_stride;
+    TORCH_CHECK(
+        expected_physical_pages.size(0) == num_expected_mappings && expected_tags.size(0) == num_expected_mappings &&
+            expected_generations.size(0) == num_expected_mappings &&
+            expected_transfer_tags.size(0) == num_expected_mappings,
+        "topk KV protection expected mapping sidecar length mismatch");
 
     const KVTopKProtectionParams protection{
         .request_indices = request_indices.data_ptr<int64_t>(),
@@ -886,11 +921,13 @@ void fast_topk_transform_interface(
         .page_offset = static_cast<int32_t>(protection_page_offset),
         .num_physical_pages = static_cast<int32_t>(num_physical_pages),
         .num_request_slots = static_cast<int32_t>(num_request_slots),
+        .expected_mapping_stride = static_cast<int32_t>(protection_expected_mapping_stride),
+        .expected_mapping_namespace_stride = static_cast<int32_t>(protection_expected_mapping_namespace_stride),
+        .expected_mapping_offset = static_cast<int32_t>(protection_expected_mapping_offset),
         .actual_tags = actual_tags.data_ptr<int64_t>(),
         .actual_generations = actual_generations.data_ptr<int64_t>(),
         .actual_transfer_tags = actual_transfer_tags.data_ptr<int32_t>(),
-        .owner_request_indices = owner_request_indices.data_ptr<int32_t>(),
-        .owner_page_positions = owner_page_positions.data_ptr<int32_t>(),
+        .expected_physical_pages = expected_physical_pages.data_ptr<int32_t>(),
         .expected_tags = expected_tags.data_ptr<int64_t>(),
         .expected_generations = expected_generations.data_ptr<int64_t>(),
         .expected_transfer_tags = expected_transfer_tags.data_ptr<int32_t>(),

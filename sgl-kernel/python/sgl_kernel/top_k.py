@@ -3,6 +3,11 @@ from typing import Optional
 import torch
 
 
+def fast_topk_kv_page_protection_supported() -> bool:
+    """Whether the installed extension has protected top-k for this GPU."""
+    return bool(torch.ops.sgl_kernel.fast_topk_kv_page_protection_supported())
+
+
 def fast_topk(values, topk, dim):
     if topk == 1:
         # Use max along the specified dimension to get both value and index
@@ -78,7 +83,7 @@ def fast_topk_transform_fused(
     src_page_table = page_table_size_1
     dst_page_table = score.new_empty((score.shape[0], topk), dtype=torch.int32)
     protection_args = (
-        (None, 0, 0) + (None,) * 11
+        (None, 0, 0) + (None,) * 4 + (0, 0, 0) + (None,) * 6
         if kv_page_protection is None
         else (
             kv_page_protection["request_indices"],
@@ -87,8 +92,10 @@ def fast_topk_transform_fused(
             kv_page_protection["actual_tags"],
             kv_page_protection["actual_generations"],
             kv_page_protection["actual_transfer_tags"],
-            kv_page_protection["owner_request_indices"],
-            kv_page_protection["owner_page_positions"],
+            kv_page_protection["expected_physical_pages"],
+            kv_page_protection["expected_mapping_stride"],
+            kv_page_protection["expected_mapping_namespace_stride"],
+            kv_page_protection["page_table_expected_mapping_offset"],
             kv_page_protection["expected_tags"],
             kv_page_protection["expected_generations"],
             kv_page_protection["expected_transfer_tags"],

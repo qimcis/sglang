@@ -35,7 +35,11 @@ from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVManager,
+    CommonKVReceiver,
+    send_metadata_with_staging_registration,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -92,6 +96,7 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -372,6 +377,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             num_pages=num_pages,
             page_size=page_size,
             num_request_slots=self.scheduler.req_to_token_pool.req_to_token.shape[0],
+            num_logical_pages=(
+                self.scheduler.req_to_token_pool.req_to_token.shape[1] + page_size - 1
+            )
+            // page_size,
             device=allocator.device,
             metrics_collector=metrics_collector,
             transfer_backend=(
@@ -380,6 +389,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 else str(self.transfer_backend)
             ),
             is_spec_decode=not self.scheduler.spec_algorithm.is_none(),
+            supports_spec_target_verify=getattr(
+                self.scheduler.tp_worker.model_runner,
+                "kv_requires_pre_indexer_page_validation",
+                False,
+            )
+            and getattr(
+                self.scheduler.tp_worker.model_runner,
+                "kv_fused_page_protection_enabled",
+                False,
+            ),
             is_cuda_device=is_cuda(),
         )
         self.scheduler.kv_protection_manager = manager
@@ -431,10 +450,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         seq_len: int,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Create expected transfer tags retained locally and sent to prefill."""
+        manager = getattr(self.scheduler, "kv_protection_manager", None)
+        if manager is not None and manager.config.enable_attention_tags:
+            manager.clear_request_slot(req.req_pool_idx)
         if _is_fake_transfer(req, self.scheduler.server_args):
             req.kv_transfer_page_tag_manifest = None
             return None, None
-        manager = getattr(self.scheduler, "kv_protection_manager", None)
         if (
             manager is None
             or not manager.config.enable_attention_tags
@@ -444,7 +465,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return None, None
 
         try:
-            from sglang.srt.mem_cache.kv_page_tags import TransferPageTagManifestGroup
+            from sglang.srt.mem_cache.kv_page_tags import (
+                KV_EXPECTED_MAPPING_SWA,
+                TransferPageTagManifestGroup,
+            )
 
             manifests = []
 
@@ -508,6 +532,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                             page_positions=positions.tolist(),
                             bootstrap_room=req.bootstrap_room or 0,
                             max_num_pages=max_num_pages,
+                            mapping_namespace=(
+                                KV_EXPECTED_MAPPING_SWA if st == StateType.SWA else 0
+                            ),
                         )
                     )
 
@@ -1332,20 +1359,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if transfer_page_tag_ids is not None and transfer_page_tags is not None:
                 metadata_kwargs["transfer_page_tag_ids"] = transfer_page_tag_ids
                 metadata_kwargs["transfer_page_tags"] = transfer_page_tags
-            decode_req.kv_receiver.send_metadata(
-                page_indices,
-                decode_req.metadata_buffer_index,
-                state_indices,
-                **metadata_kwargs,
-            )
-            if (
+            register_staging = (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")
                 and decode_req.kv_receiver.require_staging
-            ):
-                self.transfer_queue.staging_handler.register_decode_req(
-                    decode_req.req.bootstrap_room, decode_req
-                )
+            )
+            send_metadata_with_staging_registration(
+                decode_req.kv_receiver,
+                (
+                    page_indices,
+                    decode_req.metadata_buffer_index,
+                    state_indices,
+                ),
+                metadata_kwargs,
+                staging_handler=(
+                    self.transfer_queue.staging_handler if register_staging else None
+                ),
+                room=decode_req.req.bootstrap_room,
+                decode_req=decode_req,
+            )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
@@ -1737,6 +1769,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.transfer_page_pin_manager = KVTransferPagePinManager(
             scheduler.token_to_kv_pool_allocator
         )
+        self.quarantined_transfer_reqs: Dict[int, DecodeRequest] = {}
         scheduler.token_to_kv_pool_allocator.attach_transfer_page_pin_manager(
             self.transfer_page_pin_manager
         )
@@ -1789,6 +1822,40 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.kv_receiver = None
         self._release_transfer_pins(decode_req)
 
+    def _release_metadata_buffer(self, decode_req: DecodeRequest) -> None:
+        if self.enable_staging and self.staging_handler.is_staging_room(
+            decode_req.req.bootstrap_room
+        ):
+            self.staging_handler.unregister_decode_req(decode_req.req.bootstrap_room)
+        idx = decode_req.metadata_buffer_index
+        assert idx != -1
+        self.metadata_buffers.bootstrap_room[idx] = 0
+        self.req_to_metadata_buffer_idx_allocator.free(idx)
+        decode_req.metadata_buffer_index = -1
+
+    def _reap_quarantined_transfers(self) -> None:
+        quarantined = getattr(self, "quarantined_transfer_reqs", {})
+        for room, decode_req in list(quarantined.items()):
+            receiver = decode_req.kv_receiver
+            if not getattr(decode_req, "quarantine_receiver_cleared", False):
+                if (
+                    receiver is None
+                    or not getattr(
+                        receiver, "try_release_page_quarantine", lambda: False
+                    )()
+                ):
+                    continue
+                receiver.clear()
+                decode_req.kv_receiver = None
+                decode_req.quarantine_receiver_cleared = True
+            if not getattr(decode_req, "quarantine_kv_released", False):
+                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                decode_req.quarantine_kv_released = True
+            self._release_transfer_pins(decode_req)
+            if decode_req.metadata_buffer_index != -1:
+                self._release_metadata_buffer(decode_req)
+            quarantined.pop(room, None)
+
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
         (
@@ -1803,6 +1870,21 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_hidden_states,
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
+
+        # Keep transfer-produced output metadata private until all integrity and
+        # bookkeeping gates accept the request. Failed requests are streamed by
+        # pop_transferred(), so mutating Req any earlier can publish corrupt data.
+        staged_output_id = output_id[0].item()
+        staged_cached_tokens = tuple(cached_tokens[i].item() for i in range(7))
+        staged_logprobs = None
+        if decode_req.req.return_logprob:
+            top_logprobs_num = decode_req.req.logprob.top_logprobs_num
+            staged_logprobs = (
+                output_token_logprobs_val[0].item(),
+                output_token_logprobs_idx[0].item(),
+                output_top_logprobs_val[:top_logprobs_num].tolist(),
+                output_top_logprobs_idx[:top_logprobs_num].tolist(),
+            )
 
         # Validate bootstrap_room to detect context corruption
         actual_room = output_bootstrap_room[0].item()
@@ -1850,48 +1932,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self._clear_receiver(decode_req)
             return
 
+        if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+            self._clear_receiver(decode_req)
+            return
+
         self._commit_hicache_local_restore_to_req(decode_req)
-
-        # Case 3: Success - commit the transfer
-        decode_req.req.output_ids.append(output_id[0].item())
-        decode_req.req.cached_tokens = cached_tokens[0].item()
-        # The prefill node already reported its prefix-cache hit in
-        # cached_tokens[0]. Seed already_computed with it so that
-        # prepare_for_prebuilt's `cached_tokens += pre_len - already_computed`
-        # only adds decode-side reuse *beyond* what prefill counted, instead of
-        # double-counting the shared prompt prefix (which would make
-        # cached_tokens exceed prompt_tokens when decode radix cache is on).
-        decode_req.req.already_computed = decode_req.req.cached_tokens
-        decode_req.req.cached_tokens_device = cached_tokens[1].item()
-        decode_req.req.cached_tokens_host = cached_tokens[2].item()
-        decode_req.req.cached_tokens_storage = cached_tokens[3].item()
-        # Multimodal prompt token counts packed into cached_tokens slots 4-6
-        # by the prefill node (see MetadataBuffers.set_buf).
-        decode_req.req.mm_image_tokens = cached_tokens[4].item()
-        decode_req.req.mm_audio_tokens = cached_tokens[5].item()
-        decode_req.req.mm_video_tokens = cached_tokens[6].item()
-        if not self.spec_algorithm.is_none():
-            decode_req.req.output_topk_p = output_topk_p
-            decode_req.req.output_topk_index = output_topk_index
-            decode_req.req.hidden_states_tensor = output_hidden_states
-
-        if decode_req.req.return_logprob:
-            decode_req.req.logprob.output_token_logprobs_val.append(
-                output_token_logprobs_val[0].item()
-            )
-            decode_req.req.logprob.output_token_logprobs_idx.append(
-                output_token_logprobs_idx[0].item()
-            )
-            decode_req.req.logprob.output_top_logprobs_val.append(
-                output_top_logprobs_val[
-                    : decode_req.req.logprob.top_logprobs_num
-                ].tolist()
-            )
-            decode_req.req.logprob.output_top_logprobs_idx.append(
-                output_top_logprobs_idx[
-                    : decode_req.req.logprob.top_logprobs_num
-                ].tolist()
-            )
 
         # Verify the KV transfer checksum (gated). Compares decode-side
         # destination KV bytes against the prefill-side source checksum that was
@@ -1914,6 +1959,31 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if self._register_kv_attention_tags(decode_req.req):
             self._clear_receiver(decode_req)
             return
+
+        # Case 3: Success - publish the staged transfer metadata atomically with
+        # respect to all expected validation failures.
+        req = decode_req.req
+        req.output_ids.append(staged_output_id)
+        req.cached_tokens = staged_cached_tokens[0]
+        # The prefill node already reported its prefix-cache hit. Seed
+        # already_computed so prepare_for_prebuilt only adds decode-side reuse.
+        req.already_computed = req.cached_tokens
+        req.cached_tokens_device = staged_cached_tokens[1]
+        req.cached_tokens_host = staged_cached_tokens[2]
+        req.cached_tokens_storage = staged_cached_tokens[3]
+        req.mm_image_tokens = staged_cached_tokens[4]
+        req.mm_audio_tokens = staged_cached_tokens[5]
+        req.mm_video_tokens = staged_cached_tokens[6]
+        if not self.spec_algorithm.is_none():
+            req.output_topk_p = output_topk_p
+            req.output_topk_index = output_topk_index
+            req.hidden_states_tensor = output_hidden_states
+
+        if staged_logprobs is not None:
+            req.logprob.output_token_logprobs_val.append(staged_logprobs[0])
+            req.logprob.output_token_logprobs_idx.append(staged_logprobs[1])
+            req.logprob.output_top_logprobs_val.append(staged_logprobs[2])
+            req.logprob.output_top_logprobs_idx.append(staged_logprobs[3])
 
         self._clear_receiver(decode_req)
         decode_req.req.time_stats.set_wait_queue_entry_time()
@@ -2156,7 +2226,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if manager is None or not manager.config.enable_attention_tags:
             return False
         try:
-            from sglang.srt.mem_cache.kv_page_tags import AttentionTagManifestGroup
+            from sglang.srt.mem_cache.kv_page_tags import (
+                KV_EXPECTED_MAPPING_SWA,
+                AttentionTagManifestGroup,
+            )
 
             page_size = manager.page_size
             seq_len = len(req.origin_input_ids)
@@ -2199,6 +2272,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     page_positions=swa_page_positions,
                     bootstrap_room=req.bootstrap_room or 0,
                     max_num_pages=((window_size + page_size - 1) // page_size + 1),
+                    mapping_namespace=KV_EXPECTED_MAPPING_SWA,
                 )
                 if swa_manifest is not None and swa_manifest.num_pages > 0:
                     manifests.append(swa_manifest)
@@ -2315,6 +2389,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         kv_manager._staging_handler = self.staging_handler
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
+        self._reap_quarantined_transfers()
         if not self.queue:
             return []
 
@@ -2375,6 +2450,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         transferred_reqs = []
         indices_to_remove = set()
+        quarantined_indices = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -2389,12 +2465,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 )
                 is_propagated = False
+                receiver = decode_req.kv_receiver
                 if poll == KVPoll.Failed:
                     try:
-                        decode_req.kv_receiver.failure_exception()
+                        receiver.failure_exception()
                     except Exception as e:
                         error_message += f" with exception {e}"
                         is_propagated = getattr(e, "is_from_another_rank", False)
+                quarantine = bool(
+                    receiver is not None
+                    and getattr(receiver, "requires_page_quarantine", lambda: False)()
+                )
                 self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
@@ -2412,9 +2493,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-                # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
-                self._clear_receiver(decode_req)
+                if quarantine:
+                    room = decode_req.req.bootstrap_room
+                    self.quarantined_transfer_reqs[room] = decode_req
+                    quarantined_indices.add(i)
+                else:
+                    # Release failed pre-allocation only after producer quiescence.
+                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                    self._clear_receiver(decode_req)
                 indices_to_remove.add(i)
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
@@ -2462,18 +2548,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 raise ValueError(f"Unexpected poll case: {poll}")
 
         for i in indices_to_remove:
-            if self.enable_staging and self.staging_handler.is_staging_room(
-                self.queue[i].req.bootstrap_room
-            ):
-                self.staging_handler.unregister_decode_req(
-                    self.queue[i].req.bootstrap_room
-                )
-            idx = self.queue[i].metadata_buffer_index
-            assert idx != -1
-            # Reset so the next owner sees actual_room == 0 ("not yet written")
-            # instead of the stale value, avoiding a false-positive mismatch.
-            self.metadata_buffers.bootstrap_room[idx] = 0
-            self.req_to_metadata_buffer_idx_allocator.free(idx)
+            if i in quarantined_indices:
+                continue
+            self._release_metadata_buffer(self.queue[i])
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -2483,6 +2560,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
+        if getattr(self, "quarantined_transfer_reqs", {}):
+            raise RuntimeError(
+                "Cannot release GPU memory while protected NIXL pages are quarantined"
+            )
         for decode_req in self.queue:
             self._release_transfer_pins(decode_req)
         self.queue.clear()
@@ -2688,6 +2769,8 @@ class SchedulerDisaggregationDecodeMixin:
 
         if self.server_args.disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
+
+        self.disagg_decode_transfer_queue._reap_quarantined_transfers()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()

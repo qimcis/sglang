@@ -181,7 +181,7 @@ if(SGL_KERNEL_ENABLE_FA3)
     set(SGL_ATTN_KV_PAGE_PROTECTION_PATCH
         "${CMAKE_CURRENT_SOURCE_DIR}/sgl-attn-kv-page-protection.patch")
     set(SGL_ATTN_KV_PAGE_PROTECTION_PATCH_SHA256
-        "9439c9f6502e5ed9df2c4ed244bb0ea267278c60c8d7b6aad49cc66ffabf5e28")
+        "ddba08d45a8ea4154c459cd3314eb9f8f1a2dbfcad710fbebe8e424c6f84a172")
     file(SHA256 "${SGL_ATTN_KV_PAGE_PROTECTION_PATCH}" _sgl_attn_patch_sha256)
     if(NOT _sgl_attn_patch_sha256 STREQUAL SGL_ATTN_KV_PAGE_PROTECTION_PATCH_SHA256)
         message(FATAL_ERROR "sgl-attn KV page protection patch hash mismatch")
@@ -291,6 +291,7 @@ endif()
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
+    "csrc/attention/kv_page_protection.cu"
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/vertical_slash_index.cu"
     "csrc/common_extension.cc"

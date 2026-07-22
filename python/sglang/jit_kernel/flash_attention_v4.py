@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Callable, Optional, Tuple, Union
+from functools import lru_cache
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import torch
 
@@ -17,6 +18,65 @@ else:
 
 def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+@lru_cache(maxsize=None)
+def _preflight_supported_on_device(device_index: int) -> bool:
+    from sgl_kernel import kv_page_protection_preflight_supported
+
+    with torch.cuda.device(device_index):
+        return kv_page_protection_preflight_supported()
+
+
+def fa4_kv_page_protection_supported(device: torch.device) -> bool:
+    device = torch.device(device)
+    if device.type != "cuda":
+        return False
+    capability = torch.cuda.get_device_capability(device)
+    if capability not in ((10, 0), (10, 3)):
+        return False
+    device_index = torch.cuda.current_device() if device.index is None else device.index
+    return _preflight_supported_on_device(device_index)
+
+
+def _preflight_kv_page_protection(
+    protection: Optional[Dict[str, Any]],
+    page_table: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
+    cache_page_size: Optional[int],
+) -> None:
+    if protection is None:
+        return
+    if page_table is None or seqused_k is None:
+        raise RuntimeError(
+            "FA4 KV page protection requires paged KV and sequence lengths"
+        )
+    if protection.get("validate_full_mapping", False):
+        raise RuntimeError("FA4 KV protection requires an active page-table mapping")
+    if seqused_k is not protection.get("seqlens"):
+        raise RuntimeError(
+            "FA4 KV protection sequence lengths must be consumed by attention"
+        )
+    if page_table is not protection.get(
+        "page_table"
+    ) and page_table is not protection.get("page_table_2"):
+        raise RuntimeError(
+            "FA4 KV protection must validate the page table consumed by attention"
+        )
+    if cache_page_size is None or protection.get("page_size") != cache_page_size:
+        raise RuntimeError("FA4 KV protection page size must match the KV cache")
+    from sgl_kernel import kv_page_protection_preflight
+
+    if page_table.is_cuda and not fa4_kv_page_protection_supported(page_table.device):
+        capability = torch.cuda.get_device_capability(page_table.device)
+        raise RuntimeError(
+            "FA4 KV protection requires a loadable sgl-kernel preflight image "
+            f"for SM100 or SM103; got SM{capability[0]}{capability[1]}"
+        )
+
+    # This same-stream launch is intentionally retained on every layer. The
+    # device kernel exits after epoch/status loads once a request was validated.
+    kv_page_protection_preflight(protection)
 
 
 @debug_kernel_api
@@ -42,6 +102,7 @@ def flash_attn_varlen_func(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_softmax_lse: bool = False,
+    kv_page_protection: Optional[Dict[str, Any]] = None,
 ):
     if _flash_attn_varlen_func is None:  # pragma: no cover
         raise ImportError(
@@ -62,6 +123,10 @@ def flash_attn_varlen_func(
     if window_size == (-1, -1):
         window_size = (None, None)
 
+    cache_page_size = k.shape[1] if page_table is not None and k.dim() == 4 else None
+    _preflight_kv_page_protection(
+        kv_page_protection, page_table, seqused_k, cache_page_size
+    )
     result = _flash_attn_varlen_func(
         q=q,
         k=k,
@@ -127,6 +192,7 @@ def flash_attn_with_kvcache(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_softmax_lse: bool = False,
+    kv_page_protection: Optional[Dict[str, Any]] = None,
     **_: object,
 ):
     if k is not None or v is not None or qv is not None:
@@ -163,6 +229,7 @@ def flash_attn_with_kvcache(
         score_mod=score_mod,
         aux_tensors=aux_tensors,
         return_softmax_lse=True,
+        kv_page_protection=kv_page_protection,
     )
 
     if return_softmax_lse:

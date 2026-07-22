@@ -2,7 +2,7 @@ diff --git a/hopper/flash.h b/hopper/flash.h
 index 72920b9..3e4cd3f 100644
 --- a/hopper/flash.h
 +++ b/hopper/flash.h
-@@ -34,6 +34,38 @@ struct Qkv_params {
+@@ -34,6 +34,41 @@ struct Qkv_params {
 
  ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -14,20 +14,23 @@ index 72920b9..3e4cd3f 100644
 +    int page_table_num_rows;
 +    int page_table_num_cols;
 +    int page_table_page_offset;
++    int page_table_expected_mapping_offset;
 +    int const* __restrict__ page_table_2;
 +    int64_t page_table_2_batch_stride;
 +    int page_table_2_num_rows;
 +    int page_table_2_num_cols;
 +    int page_table_2_page_offset;
++    int page_table_2_expected_mapping_offset;
 +    int page_table_2_window_size;
 +    int page_size;
 +    int num_sidecar_pages;
 +    int num_request_slots;
++    int expected_mapping_stride;
++    int expected_mapping_namespace_stride;
 +    int64_t const* __restrict__ actual_tags;
 +    int64_t const* __restrict__ actual_generations;
 +    int const* __restrict__ actual_transfer_tags;
-+    int const* __restrict__ owner_request_indices;
-+    int const* __restrict__ owner_page_positions;
++    int const* __restrict__ expected_physical_pages;
 +    int64_t const* __restrict__ expected_tags;
 +    int64_t const* __restrict__ expected_generations;
 +    int const* __restrict__ expected_transfer_tags;
@@ -41,7 +44,7 @@ index 72920b9..3e4cd3f 100644
  struct Flash_fwd_params : public Qkv_params {
      using index_t = int64_t;
 
-@@ -180,6 +212,8 @@ struct Flash_fwd_params : public Qkv_params {
+@@ -180,6 +215,8 @@ struct Flash_fwd_params : public Qkv_params {
      int sparse_mask_fine_q_stride;
 
      bool use_sparse_mask;
@@ -63,7 +66,7 @@ index 1b650d7..4ca1beb 100644
  #include <cutlass/numeric_types.h>
 
  #include "flash.h"
-@@ -689,10 +691,30 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
+@@ -689,10 +691,33 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
          int64_t num_splits,
          std::optional<bool> pack_gqa_,
          int64_t sm_margin,
@@ -80,14 +83,17 @@ index 1b650d7..4ca1beb 100644
 +         std::optional<at::Tensor> protection_page_table_2_,
 +         int64_t protection_page_table_page_offset,
 +         int64_t protection_page_table_2_page_offset,
++         int64_t protection_page_table_expected_mapping_offset,
++         int64_t protection_page_table_2_expected_mapping_offset,
 +         int64_t protection_page_table_2_window_size,
 +         int64_t protection_page_size,
 +         bool protection_validate_full_mapping,
 +         std::optional<at::Tensor> protection_actual_tags_,
 +         std::optional<at::Tensor> protection_actual_generations_,
 +         std::optional<at::Tensor> protection_actual_transfer_tags_,
-+         std::optional<at::Tensor> protection_owner_request_indices_,
-+         std::optional<at::Tensor> protection_owner_page_positions_,
++         std::optional<at::Tensor> protection_expected_physical_pages_,
++         int64_t protection_expected_mapping_stride,
++         int64_t protection_expected_mapping_namespace_stride,
 +         std::optional<at::Tensor> protection_expected_tags_,
 +         std::optional<at::Tensor> protection_expected_generations_,
 +         std::optional<at::Tensor> protection_expected_transfer_tags_,
@@ -98,7 +104,7 @@ index 1b650d7..4ca1beb 100644
 
      auto dprops = at::cuda::getCurrentDeviceProperties();
      bool is_sm8x = dprops->major >= 8;
-@@ -972,6 +994,192 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
+@@ -972,6 +997,214 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
      params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
      params.only_qv = only_qv;
 
@@ -109,14 +115,17 @@ index 1b650d7..4ca1beb 100644
 +        || protection_page_table_2_.has_value()
 +        || protection_page_table_page_offset != 0
 +        || protection_page_table_2_page_offset != 0
++        || protection_page_table_expected_mapping_offset != 0
++        || protection_page_table_2_expected_mapping_offset != 0
 +        || protection_page_table_2_window_size != 0
 +        || protection_page_size != 0
 +        || protection_validate_full_mapping
 +        || protection_actual_tags_.has_value()
 +        || protection_actual_generations_.has_value()
 +        || protection_actual_transfer_tags_.has_value()
-+        || protection_owner_request_indices_.has_value()
-+        || protection_owner_page_positions_.has_value()
++        || protection_expected_physical_pages_.has_value()
++        || protection_expected_mapping_stride != 0
++        || protection_expected_mapping_namespace_stride != 0
 +        || protection_expected_tags_.has_value()
 +        || protection_expected_generations_.has_value()
 +        || protection_expected_transfer_tags_.has_value()
@@ -135,8 +144,9 @@ index 1b650d7..4ca1beb 100644
 +                    "KV page protection requires sequence lengths and a page table");
 +        TORCH_CHECK(protection_actual_tags_.has_value() && protection_actual_generations_.has_value()
 +                    && protection_actual_transfer_tags_.has_value()
-+                    && protection_owner_request_indices_.has_value()
-+                    && protection_owner_page_positions_.has_value()
++                    && protection_expected_physical_pages_.has_value()
++                    && protection_expected_mapping_stride > 0
++                    && protection_expected_mapping_namespace_stride > 0
 +                    && protection_expected_tags_.has_value()
 +                    && protection_expected_generations_.has_value()
 +                    && protection_expected_transfer_tags_.has_value()
@@ -146,16 +156,28 @@ index 1b650d7..4ca1beb 100644
 +                    "KV page protection metadata is incomplete");
 +        TORCH_CHECK(protection_page_table_2_.has_value()
 +                    || (protection_page_table_2_page_offset == 0
++                        && protection_page_table_2_expected_mapping_offset == 0
 +                        && protection_page_table_2_window_size == 0),
 +                    "secondary KV protection arguments require protection_page_table_2");
 +        TORCH_CHECK(protection_page_size > 0, "KV protection page size must be positive");
 +        TORCH_CHECK(protection_page_table_page_offset >= 0
-+                    && protection_page_table_2_page_offset >= 0,
++                    && protection_page_table_2_page_offset >= 0
++                    && protection_page_table_expected_mapping_offset >= 0
++                    && protection_page_table_2_expected_mapping_offset >= 0,
 +                    "KV protection page offsets must be non-negative");
++        TORCH_CHECK(protection_page_table_expected_mapping_offset
++                        + protection_expected_mapping_namespace_stride
++                        <= protection_expected_mapping_stride
++                    && (!protection_page_table_2_.has_value()
++                        || protection_page_table_2_expected_mapping_offset
++                            + protection_expected_mapping_namespace_stride
++                            <= protection_expected_mapping_stride),
++                    "KV protection expected mapping namespace is out of range");
 +        TORCH_CHECK(protection_page_size <= std::numeric_limits<int>::max()
 +                    && protection_page_table_page_offset <= std::numeric_limits<int>::max()
 +                    && protection_page_table_2_page_offset <= std::numeric_limits<int>::max()
-+                    && protection_page_table_2_window_size <= std::numeric_limits<int>::max(),
++                    && protection_page_table_2_window_size <= std::numeric_limits<int>::max()
++                    && protection_expected_mapping_stride <= std::numeric_limits<int>::max(),
 +                    "KV protection integer argument exceeds int32 range");
 +
 +        auto request_indices = protection_request_indices_.value();
@@ -196,8 +218,7 @@ index 1b650d7..4ca1beb 100644
 +        auto actual_tags = protection_actual_tags_.value();
 +        auto actual_generations = protection_actual_generations_.value();
 +        auto actual_transfer_tags = protection_actual_transfer_tags_.value();
-+        auto owner_request_indices = protection_owner_request_indices_.value();
-+        auto owner_page_positions = protection_owner_page_positions_.value();
++        auto expected_physical_pages = protection_expected_physical_pages_.value();
 +        auto expected_tags = protection_expected_tags_.value();
 +        auto expected_generations = protection_expected_generations_.value();
 +        auto expected_transfer_tags = protection_expected_transfer_tags_.value();
@@ -205,7 +226,7 @@ index 1b650d7..4ca1beb 100644
 +        auto validated_epochs = protection_validated_epochs_.value();
 +        auto status = protection_status_.value();
 +        for (auto const& tensor : {actual_tags, actual_generations, actual_transfer_tags,
-+                                  owner_request_indices, owner_page_positions, expected_tags,
++                                  expected_physical_pages, expected_tags,
 +                                  expected_generations, expected_transfer_tags, request_epochs,
 +                                  validated_epochs, status}) {
 +            CHECK_DEVICE(tensor); CHECK_CONTIGUOUS(tensor);
@@ -219,13 +240,12 @@ index 1b650d7..4ca1beb 100644
 +                    && expected_generations.scalar_type() == torch::kInt64,
 +                    "KV page protection tag/generation sidecars must have dtype int64");
 +        TORCH_CHECK(actual_transfer_tags.scalar_type() == torch::kInt32
-+                    && owner_request_indices.scalar_type() == torch::kInt32
-+                    && owner_page_positions.scalar_type() == torch::kInt32
++                    && expected_physical_pages.scalar_type() == torch::kInt32
 +                    && expected_transfer_tags.scalar_type() == torch::kInt32
 +                    && request_epochs.scalar_type() == torch::kInt32
 +                    && validated_epochs.scalar_type() == torch::kInt32
 +                    && status.scalar_type() == torch::kInt32,
-+                    "KV page protection owner/epoch/status sidecars must have dtype int32");
++                    "KV page protection mapping/epoch/status sidecars must have dtype int32");
 +        int64_t const num_sidecar_pages = actual_tags.numel();
 +        TORCH_CHECK(num_sidecar_pages <= std::numeric_limits<int>::max()
 +                    && request_epochs.numel() <= std::numeric_limits<int>::max()
@@ -233,16 +253,18 @@ index 1b650d7..4ca1beb 100644
 +                    && protection_page_table.size(1) <= std::numeric_limits<int>::max(),
 +                    "KV protection tensor size exceeds int32 range");
 +        TORCH_CHECK(actual_generations.numel() == num_sidecar_pages
-+                    && actual_transfer_tags.numel() == num_sidecar_pages
-+                    && owner_request_indices.numel() == num_sidecar_pages
-+                    && owner_page_positions.numel() == num_sidecar_pages
-+                    && expected_tags.numel() == num_sidecar_pages
-+                    && expected_generations.numel() == num_sidecar_pages
-+                    && expected_transfer_tags.numel() == num_sidecar_pages,
++                    && actual_transfer_tags.numel() == num_sidecar_pages,
 +                    "KV page protection physical sidecar size mismatch");
 +        TORCH_CHECK(request_epochs.numel() == validated_epochs.numel()
 +                    && request_epochs.numel() == status.numel(),
 +                    "KV page protection request sidecar size mismatch");
++        int64_t const num_expected_mappings =
++            request_epochs.numel() * protection_expected_mapping_stride;
++        TORCH_CHECK(expected_physical_pages.numel() == num_expected_mappings
++                    && expected_tags.numel() == num_expected_mappings
++                    && expected_generations.numel() == num_expected_mappings
++                    && expected_transfer_tags.numel() == num_expected_mappings,
++                    "KV page protection expected mapping sidecar size mismatch");
 +
 +        params.kv_page_protection.request_indices = request_indices.data_ptr<int64_t>();
 +        params.kv_page_protection.seqlens = protection_seqlens.data_ptr<int>();
@@ -251,6 +273,8 @@ index 1b650d7..4ca1beb 100644
 +        params.kv_page_protection.page_table_num_rows = protection_page_table.size(0);
 +        params.kv_page_protection.page_table_num_cols = protection_page_table.size(1);
 +        params.kv_page_protection.page_table_page_offset = protection_page_table_page_offset;
++        params.kv_page_protection.page_table_expected_mapping_offset =
++            protection_page_table_expected_mapping_offset;
 +        if (protection_page_table_2_.has_value()) {
 +            auto protection_page_table_2 = protection_page_table_2_.value();
 +            CHECK_DEVICE(protection_page_table_2);
@@ -270,16 +294,20 @@ index 1b650d7..4ca1beb 100644
 +            params.kv_page_protection.page_table_2_num_rows = protection_page_table_2.size(0);
 +            params.kv_page_protection.page_table_2_num_cols = protection_page_table_2.size(1);
 +            params.kv_page_protection.page_table_2_page_offset = protection_page_table_2_page_offset;
++            params.kv_page_protection.page_table_2_expected_mapping_offset =
++                protection_page_table_2_expected_mapping_offset;
 +            params.kv_page_protection.page_table_2_window_size = protection_page_table_2_window_size;
 +        }
 +        params.kv_page_protection.page_size = protection_page_size;
 +        params.kv_page_protection.num_sidecar_pages = num_sidecar_pages;
 +        params.kv_page_protection.num_request_slots = request_epochs.numel();
++        params.kv_page_protection.expected_mapping_stride = protection_expected_mapping_stride;
++        params.kv_page_protection.expected_mapping_namespace_stride =
++            protection_expected_mapping_namespace_stride;
 +        params.kv_page_protection.actual_tags = actual_tags.data_ptr<int64_t>();
 +        params.kv_page_protection.actual_generations = actual_generations.data_ptr<int64_t>();
 +        params.kv_page_protection.actual_transfer_tags = actual_transfer_tags.data_ptr<int>();
-+        params.kv_page_protection.owner_request_indices = owner_request_indices.data_ptr<int>();
-+        params.kv_page_protection.owner_page_positions = owner_page_positions.data_ptr<int>();
++        params.kv_page_protection.expected_physical_pages = expected_physical_pages.data_ptr<int>();
 +        params.kv_page_protection.expected_tags = expected_tags.data_ptr<int64_t>();
 +        params.kv_page_protection.expected_generations = expected_generations.data_ptr<int64_t>();
 +        params.kv_page_protection.expected_transfer_tags = expected_transfer_tags.data_ptr<int>();
@@ -435,7 +463,7 @@ new file mode 100644
 index 0000000..fd5648c
 --- /dev/null
 +++ b/hopper/kv_page_protection.cuh
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,144 @@
 +#pragma once
 +
 +#include <cuda.h>
@@ -465,6 +493,7 @@ index 0000000..fd5648c
 +        int page_table_num_rows,
 +        int page_table_num_cols,
 +        int page_offset,
++        int expected_mapping_offset,
 +        int first_page) {
 +    int lane_status = 0;
 +    if (batch < 0 || batch >= page_table_num_rows || seqlen < 0 || params.page_size <= 0) {
@@ -485,19 +514,24 @@ index 0000000..fd5648c
 +                    lane_status |= KV_PAGE_INVALID_MAPPING;
 +                    continue;
 +                }
-+                if (params.owner_request_indices[page] != request_idx) {
++                if (page_position < 0 || page_position >= params.expected_mapping_namespace_stride) {
++                    lane_status |= KV_PAGE_POSITION_MISMATCH;
++                    continue;
++                }
++                int64_t const expected_index =
++                    static_cast<int64_t>(request_idx) * params.expected_mapping_stride
++                    + expected_mapping_offset + page_position;
++                if (params.expected_physical_pages[expected_index] != page) {
 +                    lane_status |= KV_PAGE_OWNER_MISMATCH;
 +                }
-+                if (params.owner_page_positions[page] != static_cast<int>(page_position)) {
-+                    lane_status |= KV_PAGE_POSITION_MISMATCH;
-+                }
-+                if (params.actual_tags[page] != params.expected_tags[page]) {
++                if (params.actual_tags[page] != params.expected_tags[expected_index]) {
 +                    lane_status |= KV_PAGE_ATTENTION_TAG_MISMATCH;
 +                }
-+                if (params.actual_generations[page] != params.expected_generations[page]) {
++                if (params.actual_generations[page] != params.expected_generations[expected_index]) {
 +                    lane_status |= KV_PAGE_GENERATION_MISMATCH;
 +                }
-+                if (params.actual_transfer_tags[page] != params.expected_transfer_tags[page]) {
++                int const expected_transfer_tag = params.expected_transfer_tags[expected_index];
++                if (expected_transfer_tag != 0 && params.actual_transfer_tags[page] != expected_transfer_tag) {
 +                    lane_status |= KV_PAGE_TRANSFER_TAG_MISMATCH;
 +                }
 +            }
@@ -538,6 +572,7 @@ index 0000000..fd5648c
 +        params.page_table_num_rows,
 +        params.page_table_num_cols,
 +        params.page_table_page_offset,
++        params.page_table_expected_mapping_offset,
 +        0);
 +    if (params.page_table_2 != nullptr) {
 +        int const first_page = params.page_table_2_window_size > 0
@@ -553,6 +588,7 @@ index 0000000..fd5648c
 +            params.page_table_2_num_rows,
 +            params.page_table_2_num_cols,
 +            params.page_table_2_page_offset,
++            params.page_table_2_expected_mapping_offset,
 +            first_page);
 +    }
 +

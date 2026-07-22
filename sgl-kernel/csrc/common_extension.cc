@@ -104,13 +104,25 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "kv_page_protection_failure_status(Tensor request_indices, Tensor request_epochs, Tensor validated_epochs, "
       "Tensor status, Tensor(a!) failure_status, Tensor(b!) failed) -> ()");
   m.impl("kv_page_protection_failure_status", torch::kCUDA, &kv_page_protection_failure_status);
+  m.def("fast_topk_kv_page_protection_supported", &fast_topk_kv_page_protection_supported);
+  m.def("kv_page_protection_preflight_supported", &kv_page_protection_preflight_supported);
+  m.def(
+      "kv_page_protection_preflight(Tensor request_indices, Tensor(a!) seqlens, Tensor(b!) page_table, Tensor(c!)? "
+      "page_table_2, int page_table_page_offset, int page_table_2_page_offset, int "
+      "page_table_expected_mapping_offset, int page_table_2_expected_mapping_offset, int page_table_2_window_size, "
+      "int page_size, bool cache_validated_epochs, Tensor actual_tags, Tensor actual_generations, Tensor "
+      "actual_transfer_tags, Tensor expected_physical_pages, int expected_mapping_stride, int "
+      "expected_mapping_namespace_stride, Tensor expected_tags, Tensor expected_generations, Tensor "
+      "expected_transfer_tags, Tensor request_epochs, Tensor(d!) validated_epochs, Tensor(e!) status) -> ()");
+  m.impl("kv_page_protection_preflight", torch::kCUDA, &kv_page_protection_preflight);
   m.def(
       "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor(a!) dst_page_table, Tensor src_page_table, "
       "Tensor "
       "cu_seqlens_q, Tensor? row_starts, Tensor? protection_request_indices=None, int protection_page_size=0, int "
       "protection_page_offset=0, Tensor? protection_actual_tags=None, Tensor? protection_actual_generations=None, "
-      "Tensor? protection_actual_transfer_tags=None, Tensor? protection_owner_request_indices=None, Tensor? "
-      "protection_owner_page_positions=None, Tensor? protection_expected_tags=None, Tensor? "
+      "Tensor? protection_actual_transfer_tags=None, Tensor? protection_expected_physical_pages=None, int "
+      "protection_expected_mapping_stride=0, int protection_expected_mapping_namespace_stride=0, int "
+      "protection_expected_mapping_offset=0, Tensor? protection_expected_tags=None, Tensor? "
       "protection_expected_generations=None, Tensor? protection_expected_transfer_tags=None, Tensor? "
       "protection_request_epochs=None, Tensor(b!)? protection_validated_epochs=None, Tensor(c!)? "
       "protection_status=None) -> "

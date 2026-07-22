@@ -1066,7 +1066,7 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
 
     import torch
 
-    major, _ = torch.cuda.get_device_capability()
+    major, minor = torch.cuda.get_device_capability()
 
     # If user specified a backend but didn't explicitly set kv_cache_dtype,
     # suggest them to be explicit about kv_cache_dtype to avoid surprises
@@ -1139,18 +1139,45 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         declared["dsa_prefill_backend"] = "tilelang"
         declared["dsa_decode_backend"] = "tilelang"
     elif kv_cache_dtype == "fp8_e4m3":
-        # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
-        default = "trtllm" if major >= 10 else "flashmla_kv"
+        from sglang.srt.environ import envs
+
+        prefer_protected_flashmla = (major, minor) == (
+            10,
+            3,
+        ) or envs.SGLANG_KV_PAGE_PROTECTION.get()
         if not user_set_prefill:
-            declared["dsa_prefill_backend"] = default
+            declared["dsa_prefill_backend"] = (
+                "flashmla_kv"
+                if major < 10 or prefer_protected_flashmla
+                else "trtllm"
+            )
         if not user_set_decode:
-            declared["dsa_decode_backend"] = default
+            if major >= 10:
+                declared["dsa_decode_backend"] = (
+                    "flashmla_kv" if prefer_protected_flashmla else "trtllm"
+                )
+            else:
+                declared["dsa_decode_backend"] = (
+                    "fa3"
+                    if envs.SGLANG_KV_PAGE_PROTECTION.get()
+                    else "flashmla_kv"
+                )
     else:
+        from sglang.srt.environ import envs
+
+        prefer_protected_flashmla = (major, minor) == (
+            10,
+            3,
+        ) or envs.SGLANG_KV_PAGE_PROTECTION.get()
         # Set prefill/decode backends based on hardware architecture.
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = "flashmla_sparse"
         if not user_set_decode:
-            declared["dsa_decode_backend"] = "trtllm" if major >= 10 else "fa3"
+            declared["dsa_decode_backend"] = (
+                "flashmla_sparse"
+                if major >= 10 and prefer_protected_flashmla
+                else "trtllm" if major >= 10 else "fa3"
+            )
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)

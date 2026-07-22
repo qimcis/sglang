@@ -92,6 +92,9 @@ class RadixCacheCpp(BasePrefixCache):
         else:
             return torch.cat(l)
 
+    def supports_kv_page_protection(self) -> bool:
+        return True
+
     def reset(self):
         if self.cache_controller is not None:
             # need to clear the acks before resetting the cache controller
@@ -209,6 +212,11 @@ class RadixCacheCpp(BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
+        from sglang.srt.mem_cache.kv_page_tags import (
+            defer_kv_frees_until_mapping_refresh,
+            refresh_request_expected_mappings,
+        )
+
         assert req.req_pool_idx is not None
         token_ids = req.get_fill_ids()
         prefill_len = len(token_ids)  # prefill only (maybe chunked)
@@ -219,29 +227,35 @@ class RadixCacheCpp(BasePrefixCache):
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
         old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
-        new_prefix_len = self._insert(RadixKey(token_ids, req.extra_key), kv_indices)
-
-        # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
-        assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
-
-        # TODO(dark): optimize the `insert` and `match` (e.g. merge into 1 function)
-        # The prefix indices need to updated to reuse the kv indices in the pool
-        new_indices_vec, _, new_last_node, _ = self.tree.match_prefix(
-            RadixKey(token_ids, req.extra_key).token_ids
-        )
-        new_indices = self._merge_tensor(new_indices_vec)
-        assert new_prefix_len <= len(new_indices)
-
-        # KVCache between old & new is newly generated, but already exists in the pool
-        # we need to free this newly generated kv indices and reuse the indices in the pool
-        if old_prefix_len < new_prefix_len:
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[old_prefix_len:new_prefix_len]
+        with defer_kv_frees_until_mapping_refresh(self.token_to_kv_pool_allocator):
+            new_prefix_len = self._insert(
+                RadixKey(token_ids, req.extra_key), kv_indices
             )
-            reused_indices = new_indices[old_prefix_len:new_prefix_len]
-            self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, old_prefix_len:new_prefix_len
-            ] = reused_indices
+
+            # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
+            assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
+
+            # TODO(dark): optimize the `insert` and `match` (e.g. merge into 1 function)
+            new_indices_vec, _, new_last_node, _ = self.tree.match_prefix(
+                RadixKey(token_ids, req.extra_key).token_ids
+            )
+            new_indices = self._merge_tensor(new_indices_vec)
+            assert new_prefix_len <= len(new_indices)
+
+            if old_prefix_len < new_prefix_len:
+                reused_indices = new_indices[old_prefix_len:new_prefix_len]
+                self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, old_prefix_len:new_prefix_len
+                ] = reused_indices
+            refresh_request_expected_mappings(
+                req,
+                self.req_to_token_pool.req_to_token,
+                self.token_to_kv_pool_allocator,
+            )
+            if old_prefix_len < new_prefix_len:
+                self.token_to_kv_pool_allocator.free(
+                    kv_indices[old_prefix_len:new_prefix_len]
+                )
 
         if req.last_node != new_last_node:
             self.dec_lock_ref(req.last_node)

@@ -54,6 +54,9 @@ class ChunkCache(BasePrefixCache):
     def is_chunk_cache(self) -> bool:
         return True
 
+    def supports_kv_page_protection(self) -> bool:
+        return True
+
     # NOTE (csy): this is to determine if a cache has prefix matching feature.
     # Chunk cache always return True to indicate no prefix matching.
     # TODO (csy): Using a prefix cache trait to replace this

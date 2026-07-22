@@ -355,6 +355,13 @@ class FusedKVPageProtectionCheck:
         self.statuses = self.statuses.to("cpu", non_blocking=True)
         self.failed = self.failed.to("cpu", non_blocking=True)
 
+    def mask_failed_rows(
+        self, values: torch.Tensor, fallback: torch.Tensor
+    ) -> torch.Tensor:
+        self.wait()
+        failed = self.failed.to(device=values.device, dtype=torch.bool)
+        return torch.where(failed, fallback.to(values.device), values)
+
     def materialize_error(self):
         self.wait()
         if not bool(self.failed.any().item()):
@@ -3065,11 +3072,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.forward_pass_id += 1
 
         table = getattr(self, "kv_attention_tag_table", None)
+        is_protected_decode = (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.spec_info is None
+        )
+        is_protected_dsa_verify = (
+            forward_batch.forward_mode.is_target_verify()
+            and getattr(self, "kv_requires_pre_indexer_page_validation", False)
+        )
         if (
             table is not None
             and getattr(self, "kv_fused_page_protection_enabled", False)
-            and forward_batch.forward_mode.is_decode_or_idle()
-            and forward_batch.spec_info is None
+            and (is_protected_decode or is_protected_dsa_verify)
         ):
             table.begin_fused_forward(
                 forward_batch.req_pool_indices[: forward_batch.batch_size]
@@ -3210,11 +3224,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _start_fused_kv_page_protection_check(
         self, forward_batch: ForwardBatch, table
     ) -> Optional[FusedKVPageProtectionCheck]:
+        is_protected_decode = (
+            forward_batch.forward_mode.is_decode() and forward_batch.spec_info is None
+        )
+        is_protected_dsa_verify = (
+            forward_batch.forward_mode.is_target_verify()
+            and getattr(self, "kv_requires_pre_indexer_page_validation", False)
+        )
         if (
             table is None
             or not getattr(self, "kv_fused_page_protection_enabled", False)
-            or not forward_batch.forward_mode.is_decode()
-            or forward_batch.spec_info is not None
+            or not (is_protected_decode or is_protected_dsa_verify)
             or forward_batch.batch_size == 0
         ):
             return None

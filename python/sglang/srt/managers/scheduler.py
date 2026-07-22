@@ -880,6 +880,11 @@ class Scheduler(
             config,
             allocator=allocator,
             is_spec_decode=not self.spec_algorithm.is_none(),
+            supports_spec_target_verify=(
+                self.server_args.dsa_decode_backend is not None
+                and self.server_args.dsa_topk_backend == "sgl-kernel"
+                and envs.SGLANG_DSA_FUSE_TOPK.get()
+            ),
             pp_size=self.ps.pp_size,
             enable_dp_attention=self.server_args.enable_dp_attention,
             radix_cache_enabled=not self.server_args.disable_radix_cache,
@@ -889,6 +894,12 @@ class Scheduler(
                 if is_cuda_device
                 else None
             ),
+            device_capability_minor=(
+                torch.cuda.get_device_capability(allocator.device)[1]
+                if is_cuda_device
+                else None
+            ),
+            prefix_cache=self.tree_cache,
         )
         page_size = allocator.page_size
         num_pages = (
@@ -902,6 +913,12 @@ class Scheduler(
             num_request_slots=self.tp_worker.model_runner.req_to_token_pool.req_to_token.shape[
                 0
             ],
+            num_logical_pages=(
+                self.tp_worker.model_runner.req_to_token_pool.req_to_token.shape[1]
+                + page_size
+                - 1
+            )
+            // page_size,
             enable_history=config.enable_page_history,
         )
         allocator.attach_attention_tag_table(table)
@@ -3920,6 +3937,11 @@ class Scheduler(
     ):
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
+        if batch.forward_mode.is_target_verify():
+            # Target verification can execute protected DSA consumers. Resolve
+            # the device/TP status before accepted or bonus tokens are published.
+            self._finalize_fused_kv_protection_result(batch, result)
+
         if batch.forward_mode.is_decode():
             self._finalize_fused_kv_protection_result(batch, result)
             self.batch_result_processor.process_batch_result_decode(batch, result)
@@ -4070,6 +4092,11 @@ class Scheduler(
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
+                idle &= not getattr(
+                    self.disagg_decode_transfer_queue,
+                    "quarantined_transfer_reqs",
+                    {},
+                )
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
 

@@ -48,6 +48,38 @@ from sglang.srt.utils.network import (
 
 logger = logging.getLogger(__name__)
 
+KV_PROTECTION_PROTOCOL_VERSION = 2
+KV_PROTECTION_FEATURE_CHECKSUM = 1 << 0
+KV_PROTECTION_FEATURE_PAGE_TAGS = 1 << 1
+KV_PROTECTION_FEATURE_ALL = (
+    KV_PROTECTION_FEATURE_CHECKSUM | KV_PROTECTION_FEATURE_PAGE_TAGS
+)
+
+
+def send_metadata_with_staging_registration(
+    receiver,
+    metadata_args,
+    metadata_kwargs,
+    staging_handler=None,
+    room=None,
+    decode_req=None,
+):
+    if staging_handler is not None:
+        staging_handler.register_decode_req(room, decode_req)
+    try:
+        receiver.send_metadata(*metadata_args, **metadata_kwargs)
+    except Exception:
+        if staging_handler is not None:
+            staging_handler.unregister_decode_req(room)
+        raise
+    manager = getattr(receiver, "kv_mgr", None)
+    if (
+        staging_handler is not None
+        and manager is not None
+        and manager.check_status(room) == KVPoll.Failed
+    ):
+        staging_handler.unregister_decode_req(room)
+
 
 class KVTransferError(Exception):
     def __init__(
@@ -75,6 +107,8 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
+    protection_protocol_version: int = 0
+    protection_feature_bitmap: int = 0
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -94,6 +128,8 @@ class PrefillServerInfo:
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
+        self.protection_protocol_version = int(self.protection_protocol_version)
+        self.protection_feature_bitmap = int(self.protection_feature_bitmap)
 
 
 @dataclasses.dataclass
@@ -443,6 +479,20 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
         }
+        if self.server_args.disaggregation_transfer_backend == "nixl":
+            protection_manager = getattr(
+                self.kv_args, "transfer_page_tag_manager", None
+            )
+            if protection_manager is not None and protection_manager.config.enabled:
+                features = 0
+                if protection_manager.config.checksum_enabled:
+                    features |= KV_PROTECTION_FEATURE_CHECKSUM
+                if protection_manager.config.enable_attention_tags:
+                    features |= KV_PROTECTION_FEATURE_PAGE_TAGS
+                payload.update(
+                    protection_protocol_version=KV_PROTECTION_PROTOCOL_VERSION,
+                    protection_feature_bitmap=features,
+                )
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
         for attempt in range(max_retries):
@@ -1062,6 +1112,10 @@ class CommonKVReceiver(BaseKVReceiver):
                             else:
                                 # For non-MLA: all target_tp_ranks are selected real ranks
                                 bootstrap_info["is_dummy"] = False
+                            bootstrap_info["producer_id"] = (
+                                target_pp_rank * self.prefill_info.attn_cp_size
+                                + target_cp_rank
+                            ) * self.prefill_info.attn_tp_size + target_tp_rank
                             logger.debug(
                                 f"Fetched bootstrap info: {bootstrap_info} for DP {self.prefill_dp_rank} CP {target_cp_rank} TP {target_tp_rank} PP {target_pp_rank}"
                             )
@@ -1270,6 +1324,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
+        self.protection_protocol_version: Optional[int] = None
+        self.protection_feature_bitmap: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1336,6 +1392,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        protection_protocol_version = int(data.get("protection_protocol_version", 0))
+        protection_feature_bitmap = int(data.get("protection_feature_bitmap", 0))
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1354,6 +1412,18 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
+
+        if self.protection_protocol_version is None:
+            self.protection_protocol_version = protection_protocol_version
+            self.protection_feature_bitmap = protection_feature_bitmap
+        elif (
+            self.protection_protocol_version != protection_protocol_version
+            or self.protection_feature_bitmap != protection_feature_bitmap
+        ):
+            return web.Response(
+                text="Prefill workers disagree on KV protection capabilities.",
+                status=400,
+            )
 
         if self.follow_bootstrap_room is None:
             load_balance_method = data.get(
@@ -1424,6 +1494,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
+                protection_protocol_version=self.protection_protocol_version or 0,
+                protection_feature_bitmap=self.protection_feature_bitmap or 0,
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 

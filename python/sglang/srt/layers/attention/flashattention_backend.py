@@ -322,13 +322,16 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
             self._get_scheduler_metadata = get_scheduler_metadata
+            self._fa4_kv_page_protection_supported = None
         elif self.fa_impl_ver == 4:
             from sglang.jit_kernel.flash_attention_v4 import (
+                fa4_kv_page_protection_supported,
                 flash_attn_varlen_func,
                 flash_attn_with_kvcache,
             )
 
             self._get_scheduler_metadata = None
+            self._fa4_kv_page_protection_supported = fa4_kv_page_protection_supported
         else:
             raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
 
@@ -387,11 +390,19 @@ class FlashAttentionBackend(AttentionBackend):
         self.kv_fused_page_protection_enabled = should_use_fused_kv_page_protection(
             self.kv_attention_tag_table,
             supported=(
-                self.fa_impl_ver == 3
+                self.fa_impl_ver in (3, 4)
                 and getattr(self, "attention_chunk_size", None) is None
             ),
         )
         if self.kv_fused_page_protection_enabled:
+            if self.fa_impl_ver == 4 and not self._fa4_kv_page_protection_supported(
+                self.device
+            ):
+                capability = torch.cuda.get_device_capability(self.device)
+                raise RuntimeError(
+                    "FA4 KV protection requires a loadable sgl-kernel preflight "
+                    f"image for SM100 or SM103; got SM{capability[0]}{capability[1]}"
+                )
             model_runner.kv_fused_page_protection_enabled = True
 
     def _set_kv_page_protection(
@@ -410,6 +421,17 @@ class FlashAttentionBackend(AttentionBackend):
         ):
             metadata.kv_page_protection = None
             return
+        persistent_storage = self.req_to_token.untyped_storage().data_ptr()
+        for name in ("page_table", "swa_page_table"):
+            page_table = getattr(metadata, name)
+            if (
+                page_table is not None
+                and page_table.untyped_storage().data_ptr() == persistent_storage
+            ):
+                raise RuntimeError(
+                    "KV page protection requires mutable per-forward page-table "
+                    f"snapshots; {name} aliases persistent req_to_token storage"
+                )
         metadata.kv_page_protection = table.fused_forward_args(
             request_indices=request_indices,
             seqlens=metadata.cache_seqlens_int32,
