@@ -1580,6 +1580,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,
+            fused_kv_page_protection_check=(
+                forward_batch_output.fused_kv_page_protection_check
+            ),
             extra_keep_alive_refs=[verify_forward_batch],
         )
 

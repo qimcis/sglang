@@ -282,8 +282,10 @@ class FlashAttentionBackend(AttentionBackend):
         table = self.kv_attention_tag_table
         if (
             not self.kv_fused_page_protection_enabled
-            or not forward_mode.is_decode_or_idle()
-            or spec_info is not None
+            or not (
+                (forward_mode.is_decode_or_idle() and spec_info is None)
+                or forward_mode.is_target_verify()
+            )
             or metadata.page_table is None
         ):
             metadata.kv_page_protection = None

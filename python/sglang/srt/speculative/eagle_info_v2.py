@@ -109,3 +109,6 @@ class EagleDraftInputV2Mixin:
             out_cache_loc,
             bs,
         )
+        batch.kv_reservation_locs = out_cache_loc
+        batch.kv_reservation_start_lens = cur_kv_lens
+        batch.kv_reservation_end_lens = nxt_kv_lens

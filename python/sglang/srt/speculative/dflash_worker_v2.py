@@ -1689,4 +1689,5 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The non-overlap (sync) scheduler path advances batch.seq_lens
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
+            fused_kv_page_protection_check=(target_out.fused_kv_page_protection_check),
         )

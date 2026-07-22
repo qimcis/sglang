@@ -2963,8 +2963,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if (
             table is not None
             and getattr(self, "kv_fused_page_protection_enabled", False)
-            and forward_batch.forward_mode.is_decode_or_idle()
-            and forward_batch.spec_info is None
+            and (
+                (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    and forward_batch.spec_info is None
+                )
+                or forward_batch.forward_mode.is_target_verify()
+            )
         ):
             table.begin_fused_forward(
                 forward_batch.req_pool_indices[: forward_batch.batch_size]
@@ -3057,8 +3062,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if (
             table is None
             or not getattr(self, "kv_fused_page_protection_enabled", False)
-            or not forward_batch.forward_mode.is_decode()
-            or forward_batch.spec_info is not None
+            or not (
+                (
+                    forward_batch.forward_mode.is_decode()
+                    and forward_batch.spec_info is None
+                )
+                or forward_batch.forward_mode.is_target_verify()
+            )
             or forward_batch.batch_size == 0
         ):
             return None

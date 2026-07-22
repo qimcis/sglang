@@ -11,6 +11,8 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -110,6 +112,90 @@ class TestFusedKVProtectionRetry(CustomTestCase):
         self.assertEqual(fa3_args["page_table_2_page_offset"], 7)
         self.assertEqual(fa3_args["page_table_2_window_size"], 4096)
         self.assertTrue(fa3_args["validate_full_mapping"])
+
+    def test_fa3_target_verify_sets_protection_metadata(self):
+        protection = object()
+        table = SimpleNamespace(fused_forward_args=MagicMock(return_value=protection))
+        backend = FlashAttentionBackend.__new__(FlashAttentionBackend)
+        backend.kv_attention_tag_table = table
+        backend.kv_fused_page_protection_enabled = True
+        backend.page_size = 4
+        backend.kv_page_protection_swa_offset = 32
+        backend.sliding_window_size = 4096
+        page_table = torch.arange(4, dtype=torch.int32).view(2, 2)
+        swa_page_table = page_table + 8
+        seqlens = torch.tensor([4, 8], dtype=torch.int32)
+        metadata = SimpleNamespace(
+            page_table=page_table,
+            swa_page_table=swa_page_table,
+            cache_seqlens_int32=seqlens,
+            kv_page_protection=None,
+        )
+        request_indices = torch.tensor([1, 2], dtype=torch.int64)
+        forward_mode = SimpleNamespace(
+            is_decode_or_idle=lambda: False,
+            is_target_verify=lambda: True,
+        )
+
+        backend._set_kv_page_protection(
+            metadata, request_indices, forward_mode, spec_info=object()
+        )
+
+        self.assertIs(metadata.kv_page_protection, protection)
+        table.fused_forward_args.assert_called_once_with(
+            request_indices=request_indices,
+            seqlens=seqlens,
+            page_table=page_table,
+            page_size=4,
+            page_table_2=swa_page_table,
+            page_table_2_page_offset=32,
+            page_table_2_window_size=4096,
+        )
+
+    def test_dsa_target_verify_repeats_indices_in_stable_buffer(self):
+        protection = object()
+        table = SimpleNamespace(fused_forward_args=MagicMock(return_value=protection))
+        backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        backend.kv_attention_tag_table = table
+        backend.kv_fused_page_protection_enabled = False
+        backend.speculative_num_draft_tokens = 3
+        backend.real_page_size = 64
+        backend.kv_page_protection_request_indices = {}
+        metadata = SimpleNamespace(kv_page_protection=object())
+        forward_mode = SimpleNamespace(
+            is_decode_or_idle=lambda: False,
+            is_target_verify=lambda: True,
+        )
+
+        backend._set_kv_page_protection(
+            metadata,
+            torch.tensor([1, 2]),
+            forward_mode,
+            spec_info=object(),
+        )
+        self.assertIsNone(metadata.kv_page_protection)
+        self.assertEqual(backend.kv_page_protection_request_indices, {})
+
+        backend.kv_fused_page_protection_enabled = True
+        backend._set_kv_page_protection(
+            metadata,
+            torch.tensor([1, 2]),
+            forward_mode,
+            spec_info=object(),
+        )
+        stable_indices = table.fused_forward_args.call_args.kwargs["request_indices"]
+        self.assertEqual(stable_indices.tolist(), [1, 1, 1, 2, 2, 2])
+        self.assertIs(metadata.kv_page_protection, protection)
+
+        backend._set_kv_page_protection(
+            metadata,
+            torch.tensor([3, 4]),
+            forward_mode,
+            spec_info=object(),
+        )
+        reused_indices = table.fused_forward_args.call_args.kwargs["request_indices"]
+        self.assertIs(reused_indices, stable_indices)
+        self.assertEqual(reused_indices.tolist(), [3, 3, 3, 4, 4, 4])
 
     def _scheduler(self):
         scheduler = Scheduler.__new__(Scheduler)
@@ -287,6 +373,209 @@ class TestFusedKVProtectionRetry(CustomTestCase):
         self.assertEqual(error.request_pool_indices, (2,))
         self.assertEqual(error.statuses, (KV_PAGE_VALIDATION_REMOTE_FAILURE,))
 
+    def test_target_verify_materializes_fused_protection_check(self):
+        runner = SimpleNamespace(
+            kv_fused_page_protection_enabled=True,
+            tp_size=1,
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_decode=lambda: False,
+                is_target_verify=lambda: True,
+            ),
+            spec_info=object(),
+            batch_size=2,
+            req_pool_indices=torch.tensor([3, 4], dtype=torch.int64),
+        )
+        statuses = torch.zeros(2, dtype=torch.int32)
+        failed = torch.zeros(2, dtype=torch.int32)
+        table = SimpleNamespace(
+            fused_failure_status=MagicMock(return_value=(statuses, failed))
+        )
+
+        check = ModelRunner._start_fused_kv_page_protection_check(
+            runner, forward_batch, table
+        )
+
+        self.assertIsNotNone(check)
+        torch.testing.assert_close(
+            check.request_pool_indices, forward_batch.req_pool_indices
+        )
+
+    def test_spec_reservation_registration_uses_allocator_locations(self):
+        req = _request("r", 1)
+        req.bootstrap_room = 7
+        req.kv_attention_tag_manifest = object()
+        req.kv_transfer_page_tag_manifest = object()
+        req_to_token = torch.zeros((2, 16), dtype=torch.int64)
+        req_to_token[1, 4:12] = torch.arange(8, 16)
+        batch = SimpleNamespace(
+            reqs=[req],
+            spec_algorithm=SimpleNamespace(is_none=lambda: False),
+            kv_reservation_locs=torch.arange(8, 16),
+            kv_reservation_start_lens=[4],
+            kv_reservation_end_lens=[12],
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            batch_size=lambda: 1,
+        )
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(page_size=4)
+        manager = SimpleNamespace(
+            page_size=4,
+            refresh_tail_page=MagicMock(),
+            refresh_transfer_page_tag_tail_page=MagicMock(),
+            verify_request_mappings=MagicMock(return_value=[]),
+        )
+
+        errors = scheduler._register_speculative_kv_reservations(batch, manager)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            [
+                call.kwargs["logical_pos"]
+                for call in manager.refresh_tail_page.call_args_list
+            ],
+            [4, 8],
+        )
+        self.assertEqual(
+            [
+                call.kwargs["physical_page_id"].item()
+                for call in manager.refresh_tail_page.call_args_list
+            ],
+            [2, 3],
+        )
+        self.assertIsNone(batch.kv_reservation_locs)
+        manager.verify_request_mappings.assert_called_once()
+
+    def test_spec_reservation_handles_partial_and_zero_length_rows(self):
+        first = _request("first", 1)
+        second = _request("second", 2)
+        for req in (first, second):
+            req.kv_attention_tag_manifest = object()
+        req_to_token = torch.zeros((3, 16), dtype=torch.int64)
+        req_to_token[1, 3:9] = torch.tensor([11, 20, 21, 22, 23, 28])
+        batch = SimpleNamespace(
+            reqs=[first, second],
+            spec_algorithm=SimpleNamespace(is_none=lambda: False),
+            kv_reservation_locs=torch.tensor([11, 20, 21, 22, 23, 28]),
+            kv_reservation_start_lens=[3, 8],
+            kv_reservation_end_lens=[9, 8],
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            batch_size=lambda: 2,
+        )
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(page_size=4)
+        manager = SimpleNamespace(
+            page_size=4,
+            refresh_tail_page=MagicMock(),
+            refresh_transfer_page_tag_tail_page=MagicMock(),
+            verify_request_mappings=MagicMock(return_value=[]),
+        )
+
+        errors = scheduler._register_speculative_kv_reservations(batch, manager)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            [
+                (call.kwargs["logical_pos"], call.kwargs["physical_page_id"].item())
+                for call in manager.refresh_tail_page.call_args_list
+            ],
+            [(4, 5), (8, 7)],
+        )
+        self.assertIsNone(batch.kv_reservation_locs)
+        self.assertIsNone(batch.kv_reservation_start_lens)
+        self.assertIsNone(batch.kv_reservation_end_lens)
+
+    def test_spec_reservation_handles_page_size_one_and_unequal_rows(self):
+        first = _request("first", 1)
+        second = _request("second", 2)
+        for req in (first, second):
+            req.kv_attention_tag_manifest = object()
+        batch = SimpleNamespace(
+            reqs=[first, second],
+            spec_algorithm=SimpleNamespace(is_none=lambda: False),
+            kv_reservation_locs=torch.tensor([10, 11, 20]),
+            kv_reservation_start_lens=[2, 5],
+            kv_reservation_end_lens=[4, 6],
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.zeros((3, 16), dtype=torch.int64)
+            ),
+            batch_size=lambda: 2,
+        )
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(page_size=1)
+        manager = SimpleNamespace(
+            page_size=1,
+            refresh_tail_page=MagicMock(),
+            refresh_transfer_page_tag_tail_page=MagicMock(),
+            verify_request_mappings=MagicMock(return_value=[]),
+        )
+
+        errors = scheduler._register_speculative_kv_reservations(batch, manager)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            [
+                (call.kwargs["logical_pos"], call.kwargs["physical_page_id"].item())
+                for call in manager.refresh_tail_page.call_args_list
+            ],
+            [(2, 10), (3, 11), (5, 20)],
+        )
+
+    def test_malformed_spec_reservation_is_cleared(self):
+        req = _request("r", 1)
+        batch = SimpleNamespace(
+            reqs=[req],
+            spec_algorithm=SimpleNamespace(is_none=lambda: False),
+            kv_reservation_locs=torch.tensor([10]),
+            kv_reservation_start_lens=[2],
+            kv_reservation_end_lens=[4],
+            batch_size=lambda: 1,
+        )
+        scheduler = Scheduler.__new__(Scheduler)
+        manager = SimpleNamespace(page_size=1)
+
+        with self.assertRaisesRegex(RuntimeError, "location count mismatch"):
+            scheduler._register_speculative_kv_reservations(batch, manager)
+
+        self.assertIsNone(batch.kv_reservation_locs)
+        self.assertIsNone(batch.kv_reservation_start_lens)
+        self.assertIsNone(batch.kv_reservation_end_lens)
+
+    def test_failed_spec_rows_do_not_update_acceptance_metrics(self):
+        good = _request("good", 1)
+        bad = _request("bad", 2)
+        bad.finished_reason = object()
+        for req in (good, bad):
+            req.grammar = None
+            req.kv_committed_len = 10
+            req.spec_verify_ct = 0
+            req.spec_num_correct_drafts = 0
+            req.update_spec_correct_drafts_histogram = MagicMock()
+
+        batch = SimpleNamespace(
+            reqs=[good, bad],
+            spec_algorithm=SimpleNamespace(is_dflash=lambda: False),
+        )
+        result = GenerationBatchResult(
+            next_token_ids=torch.tensor([1, 2, 3, 4, 5, 6]),
+            accept_lens=torch.tensor([3, 3]),
+            speculative_num_draft_tokens=3,
+            fused_kv_page_protection_failed_rids={"bad"},
+        )
+        processor = SimpleNamespace(model_worker=MagicMock())
+
+        tokens = SchedulerBatchResultProcessor._resolve_spec_v2_tokens(
+            processor, result, batch
+        )
+
+        self.assertEqual(tokens, [[1, 2, 3], [4, 5, 6]])
+        self.assertEqual(result.num_correct_drafts, 2)
+        self.assertEqual(result.num_correct_drafts_per_req_cpu, [2, 0])
+        processor.model_worker.on_verify_complete_cpu.assert_called_once_with(
+            [2], batch_size=1
+        )
+
     def test_sampling_defers_protection_materialization(self):
         events = []
         runner = SimpleNamespace(
@@ -420,6 +709,7 @@ class TestFusedKVProtectionRetry(CustomTestCase):
 
         self.assertEqual(req.output_ids, [])
         self.assertTrue(req.kv_fused_protection_deferred_release)
+        self.assertEqual(metrics_reporter.num_generated_tokens, 0)
         release_kv_cache.assert_not_called()
 
         drain_result = GenerationBatchResult(
@@ -430,6 +720,7 @@ class TestFusedKVProtectionRetry(CustomTestCase):
 
         self.assertEqual(req.output_ids, [])
         self.assertFalse(req.kv_fused_protection_deferred_release)
+        self.assertEqual(metrics_reporter.num_generated_tokens, 0)
         release_kv_cache.assert_called_once_with(
             req, processor.tree_cache, is_insert=False
         )

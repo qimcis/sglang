@@ -539,14 +539,23 @@ class SchedulerBatchResultProcessor:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
-        result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
+        failed_rids = result.fused_kv_page_protection_failed_rids or set()
+        valid_num_correct_drafts = [
+            accept_len - 1
+            for req, accept_len in zip(batch.reqs, accept_lens, strict=True)
+            if req.rid not in failed_rids
+        ]
+        result.num_correct_drafts = sum(valid_num_correct_drafts)
+        result.num_correct_drafts_per_req_cpu = [
+            0 if req.rid in failed_rids else accept_len - 1
+            for req, accept_len in zip(batch.reqs, accept_lens, strict=True)
+        ]
 
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
         self.model_worker.on_verify_complete_cpu(
-            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
+            valid_num_correct_drafts, batch_size=len(valid_num_correct_drafts)
         )
 
         predict_tokens = []
@@ -660,10 +669,15 @@ class SchedulerBatchResultProcessor:
             next_token_ids=next_token_ids,
         )
 
-        self.metrics_reporter.num_generated_tokens += len(batch.reqs)
+        failed_rids = result.fused_kv_page_protection_failed_rids or set()
+        valid_batch_size = sum(
+            req.rid not in failed_rids and not req.finished() and not req.is_retracted
+            for req in batch.reqs
+        )
+        self.metrics_reporter.num_generated_tokens += valid_batch_size
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
-                batch.batch_size(), result.num_correct_drafts
+                valid_batch_size, result.num_correct_drafts
             )
         if self.server_args.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
@@ -672,7 +686,6 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        failed_rids = result.fused_kv_page_protection_failed_rids or set()
         newly_deferred_rids = (
             result.fused_kv_page_protection_deferred_release_rids or set()
         )

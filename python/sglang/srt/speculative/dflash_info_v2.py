@@ -208,6 +208,7 @@ class DFlashDraftInputV2(SpecInput):
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
 
         caller_stream = None
+        out_cache_loc = None
         if plan_stream is not None:
             caller_stream = torch.get_device_module(batch.device).current_stream()
 
@@ -267,6 +268,10 @@ class DFlashDraftInputV2(SpecInput):
         # reclaim any DFLASH over-allocation if the request finishes later.
         for i, req in enumerate(batch.reqs):
             req.kv_allocated_len = max(req.kv_allocated_len, int(nxt_kv_lens_cpu_t[i]))
+
+        batch.kv_reservation_locs = out_cache_loc
+        batch.kv_reservation_start_lens = [int(cur_kv_lens_cpu_t[i]) for i in range(bs)]
+        batch.kv_reservation_end_lens = [int(nxt_kv_lens_cpu_t[i]) for i in range(bs)]
 
         # Preserve the lagging committed CPU view on the batch and carry the
         # tighter host-side planning bound separately from the full reserved

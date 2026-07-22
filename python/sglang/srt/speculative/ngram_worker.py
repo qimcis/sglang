@@ -343,7 +343,9 @@ class NGRAMWorker(BaseSpecWorker):
             draft_token_num=self.draft_token_num,
         )
 
-    def _update_ngram_corpus(self, batch: ScheduleBatch):
+    def _update_ngram_corpus(
+        self, batch: ScheduleBatch, failed_rows: Optional[List[bool]] = None
+    ):
         batch_tokens = []
         i, stride = 0, self.draft_token_num
         # Same splice condition as _prepare_draft_tokens: only overlap mode
@@ -365,9 +367,11 @@ class NGRAMWorker(BaseSpecWorker):
                 list(req.output_ids[-self.max_trie_depth :]) + prev_tokens,
                 self.max_trie_depth,
             )
-            batch_tokens.append(put_ids)
+            if failed_rows is None or not failed_rows[i]:
+                batch_tokens.append(put_ids)
             i += 1
-        self.ngram_corpus.batch_put(batch_tokens)
+        if batch_tokens:
+            self.ngram_corpus.batch_put(batch_tokens)
 
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None
@@ -469,7 +473,12 @@ class NGRAMWorker(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(new_seq_lens)
 
-            self._update_ngram_corpus(batch)
+            failed_rows = None
+            protection_check = batch_result.fused_kv_page_protection_check
+            if protection_check is not None:
+                protection_check.wait()
+                failed_rows = protection_check.failed.bool().cpu().tolist()
+            self._update_ngram_corpus(batch, failed_rows)
             # Erase match state of requests that left the decode batch.
             # req.finished() is unusable here: under overlap it flips at result
             # processing, one iteration after the request left the batch.
@@ -518,4 +527,7 @@ class NGRAMWorker(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+            fused_kv_page_protection_check=(
+                batch_result.fused_kv_page_protection_check
+            ),
         )

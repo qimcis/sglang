@@ -2,7 +2,7 @@
 
 Acceptance: the feature must be OFF for non-PD serving (no allocator overhead),
 configurable via env vars, and must fail-fast (not silently disable) on
-unsupported allocators/backends/speculative decoding.
+unsupported allocators/backends.
 """
 
 import unittest
@@ -139,13 +139,12 @@ class TestFailFast(CustomTestCase):
                 transfer_backend="nixl",
             )
 
-    def test_spec_decode_fails_fast_for_attention_tags(self):
-        with self.assertRaises(RuntimeError):
-            assert_protection_supported(
-                KVProtectionConfig(enable_attention_tags=True),
-                allocator=_FakePagedAllocator(),
-                is_spec_decode=True,
-            )
+    def test_spec_decode_supports_attention_tags(self):
+        assert_protection_supported(
+            KVProtectionConfig(enable_attention_tags=True),
+            allocator=_FakePagedAllocator(),
+            is_spec_decode=True,
+        )
 
     def test_pipeline_parallel_fails_fast_for_attention_tags(self):
         with self.assertRaisesRegex(RuntimeError, "pipeline parallelism"):

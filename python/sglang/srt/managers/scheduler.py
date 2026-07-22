@@ -3156,10 +3156,13 @@ class Scheduler(
         manager = self.kv_protection_manager
         if manager is None or not manager.config.enable_attention_tags:
             return
-        use_fused_verification = getattr(
-            self.tp_worker.model_runner,
-            "kv_fused_page_protection_enabled",
-            False,
+        use_fused_verification = (
+            getattr(
+                self.tp_worker.model_runner,
+                "kv_fused_page_protection_enabled",
+                False,
+            )
+            and batch.spec_algorithm.is_none()
         )
         try:
             page_size = manager.page_size
@@ -3167,6 +3170,7 @@ class Scheduler(
             transfer_items = []
             pending_refreshes = []
             refresh_candidates = []
+            mismatches = self._register_speculative_kv_reservations(batch, manager)
             for i, req in enumerate(batch.reqs):
                 attention_manifest = getattr(req, "kv_attention_tag_manifest", None)
                 transfer_manifest = getattr(req, "kv_transfer_page_tag_manifest", None)
@@ -3184,7 +3188,7 @@ class Scheduler(
                 # bootstrap room, and generation. Those inputs do not change
                 # while appending within the same logical page, so refresh only
                 # when the just-appended token opens a new page.
-                if logical_pos % page_size == 0:
+                if batch.spec_algorithm.is_none() and logical_pos % page_size == 0:
                     refresh_candidates.append(
                         (
                             i,
@@ -3234,11 +3238,10 @@ class Scheduler(
                             ),
                         )
                     )
-            mismatches = (
-                []
-                if use_fused_verification
-                else manager.verify_protection_batch(attention_items, transfer_items)
-            )
+            if not use_fused_verification:
+                mismatches.extend(
+                    manager.verify_protection_batch(attention_items, transfer_items)
+                )
         except Exception as e:  # fail closed without crashing the decode loop
             logger.exception("KV attention tag verification error")
             from sglang.srt.mem_cache.kv_page_tags import (
@@ -3329,14 +3332,22 @@ class Scheduler(
         ]
         prepared_out_cache_loc = batch.out_cache_loc
         keep_indices_device = None
-        if keep_indices:
+        if (
+            keep_indices
+            and prepared_out_cache_loc is not None
+            and batch.spec_algorithm.is_none()
+        ):
             keep_indices_device = torch.tensor(
                 keep_indices,
                 dtype=torch.int64,
                 device=prepared_out_cache_loc.device,
             )
         batch.filter_batch(keep_indices=keep_indices)
-        if not batch.is_empty() and prepared_out_cache_loc is not None:
+        if (
+            not batch.is_empty()
+            and prepared_out_cache_loc is not None
+            and batch.spec_algorithm.is_none()
+        ):
             batch.out_cache_loc = prepared_out_cache_loc.index_select(
                 0, keep_indices_device
             )
@@ -3370,6 +3381,140 @@ class Scheduler(
                         )
             except Exception as e:
                 logger.error("KV attention tag tail refresh error: %s", e)
+
+    def _register_speculative_kv_reservations(
+        self, batch: ScheduleBatch, manager
+    ) -> list:
+        """Publish speculative allocator reservations before target verification."""
+        if batch.spec_algorithm.is_none():
+            return []
+
+        starts = batch.kv_reservation_start_lens
+        ends = batch.kv_reservation_end_lens
+        reservation_locs = batch.kv_reservation_locs
+        try:
+            if starts is None or ends is None:
+                raise RuntimeError("speculative KV reservation metadata is missing")
+            if len(starts) != batch.batch_size() or len(ends) != batch.batch_size():
+                raise RuntimeError("speculative KV reservation batch size mismatch")
+
+            lengths = [int(end) - int(start) for start, end in zip(starts, ends)]
+            if any(length < 0 for length in lengths):
+                raise RuntimeError("speculative KV reservation length is negative")
+            expected_num_locs = sum(lengths)
+            actual_num_locs = (
+                0 if reservation_locs is None else int(reservation_locs.numel())
+            )
+            if actual_num_locs != expected_num_locs:
+                raise RuntimeError(
+                    "speculative KV reservation location count mismatch "
+                    f"(expected={expected_num_locs}, actual={actual_num_locs})"
+                )
+
+            allocator = self.token_to_kv_pool_allocator
+            page_size = manager.page_size
+            has_swa = hasattr(allocator, "translate_loc_from_full_to_swa") and hasattr(
+                allocator, "attention_tag_swa_page_ids"
+            )
+            errors = []
+            bad_rids = set()
+            offset = 0
+            for req, start, end, length in zip(
+                batch.reqs, starts, ends, lengths, strict=True
+            ):
+                start = int(start)
+                end = int(end)
+                req_locs = (
+                    None
+                    if reservation_locs is None
+                    else reservation_locs[offset : offset + length]
+                )
+                offset += length
+                first_new_page_pos = (start + page_size - 1) // page_size
+                last_page_pos = (end - 1) // page_size if end > start else -1
+                try:
+                    if first_new_page_pos <= last_page_pos:
+                        logical_positions = range(first_new_page_pos, last_page_pos + 1)
+                        first_loc_offset = first_new_page_pos * page_size - start
+                        page_locs = req_locs[first_loc_offset:length:page_size]
+                        full_page_ids = page_locs // page_size
+                        swa_page_ids = None
+                        if has_swa:
+                            swa_locs = allocator.translate_loc_from_full_to_swa(
+                                page_locs
+                            )
+                            swa_page_ids = allocator.attention_tag_swa_page_ids(
+                                swa_locs // page_size
+                            )
+
+                        for page_index, logical_page_pos in enumerate(
+                            logical_positions
+                        ):
+                            full_page_id = full_page_ids[page_index : page_index + 1]
+                            swa_page_id = (
+                                None
+                                if swa_page_ids is None
+                                else swa_page_ids[page_index : page_index + 1]
+                            )
+                            logical_pos = logical_page_pos * page_size
+                            attention_manifest = getattr(
+                                req, "kv_attention_tag_manifest", None
+                            )
+                            if attention_manifest is not None:
+                                manager.refresh_tail_page(
+                                    attention_manifest,
+                                    logical_pos=logical_pos,
+                                    request_pool_idx=req.req_pool_idx,
+                                    physical_page_id=full_page_id,
+                                    swa_physical_page_id=swa_page_id,
+                                )
+                            transfer_manifest = getattr(
+                                req, "kv_transfer_page_tag_manifest", None
+                            )
+                            if transfer_manifest is not None:
+                                manager.refresh_transfer_page_tag_tail_page(
+                                    transfer_manifest,
+                                    logical_pos=logical_pos,
+                                    request_pool_idx=req.req_pool_idx,
+                                    physical_page_id=full_page_id,
+                                    swa_physical_page_id=swa_page_id,
+                                )
+                except Exception as error:
+                    from sglang.srt.mem_cache.kv_page_tags import (
+                        KVProtectionBookkeepingError,
+                        attach_kv_protection_incident,
+                    )
+
+                    mismatch = KVProtectionBookkeepingError(
+                        rid=req.rid,
+                        bootstrap_room=req.bootstrap_room,
+                        cause="speculative_reservation_registration",
+                        detail=str(error),
+                    )
+                    attach_kv_protection_incident(
+                        mismatch, kind="attention_tag", phase="tag_registration"
+                    )
+                    errors.append(mismatch)
+                    bad_rids.add(req.rid)
+
+            mapping_items = [
+                (req.rid, req.req_pool_idx, req.kv_attention_tag_manifest)
+                for req in batch.reqs
+                if req.rid not in bad_rids
+                and getattr(req, "kv_attention_tag_manifest", None) is not None
+            ]
+            errors.extend(
+                manager.verify_request_mappings(
+                    mapping_items,
+                    batch.req_to_token_pool.req_to_token,
+                    allocator=allocator,
+                )
+            )
+            return errors
+        finally:
+            batch.kv_reservation_locs = None
+            batch.kv_reservation_start_lens = None
+            batch.kv_reservation_end_lens = None
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC

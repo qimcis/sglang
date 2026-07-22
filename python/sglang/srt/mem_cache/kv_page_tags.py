@@ -487,13 +487,6 @@ def assert_protection_supported(
                 "or run a supported layout (plain paged/token or SWA)."
             )
 
-    if is_spec_decode and config.enable_attention_tags:
-        raise RuntimeError(
-            "KV attention-tag protection does not yet support speculative decoding "
-            "(multiple tokens/pages committed per step). Disable "
-            "SGLANG_KV_PAGE_PROTECTION or speculative decoding."
-        )
-
     if config.enable_attention_tags and pp_size > 1:
         raise RuntimeError(
             "KV attention-tag protection does not yet support pipeline "
@@ -2960,6 +2953,127 @@ class KVPageProtectionManager:
     def clear_verification_cache(self) -> None:
         self._attention_verification_cache = None
         self._transfer_verification_cache = None
+
+    def verify_request_mappings(
+        self,
+        items: Sequence[Tuple[Optional[str], int, object]],
+        req_to_token: torch.Tensor,
+        *,
+        allocator: object = None,
+    ) -> List[KVProtectionBookkeepingError]:
+        """Verify logical-page mappings against captured ownership manifests."""
+        if not self.config.enable_attention_tags or self.table is None:
+            return []
+
+        entries = []
+        errors = []
+        num_rows, row_width = req_to_token.shape
+        for rid, request_pool_idx, manifest in items:
+            manifests = _iter_attention_manifests(manifest)
+            if not manifests:
+                continue
+            full_manifest = manifests[0]
+            if request_pool_idx < 0 or request_pool_idx >= num_rows:
+                errors.append(
+                    KVProtectionBookkeepingError(
+                        rid=rid,
+                        bootstrap_room=full_manifest.bootstrap_room,
+                        cause="speculative_mapping",
+                        detail="request-pool index is out of bounds",
+                    )
+                )
+                continue
+            for manifest_index, sub_manifest in enumerate(manifests):
+                if any(
+                    position < 0 or position * self.page_size >= row_width
+                    for position in sub_manifest.page_positions
+                ):
+                    errors.append(
+                        KVProtectionBookkeepingError(
+                            rid=rid,
+                            bootstrap_room=sub_manifest.bootstrap_room,
+                            cause="speculative_mapping",
+                            detail="logical page position is out of bounds",
+                        )
+                    )
+                    break
+                is_swa = manifest_index > 0
+                if is_swa and not (
+                    hasattr(allocator, "translate_loc_from_full_to_swa")
+                    and hasattr(allocator, "attention_tag_swa_page_ids")
+                ):
+                    errors.append(
+                        KVProtectionBookkeepingError(
+                            rid=rid,
+                            bootstrap_room=sub_manifest.bootstrap_room,
+                            cause="speculative_mapping",
+                            detail="SWA mapping verification is unavailable",
+                        )
+                    )
+                    break
+                if sub_manifest.num_pages:
+                    entries.append((rid, request_pool_idx, sub_manifest, is_swa))
+
+        if not entries:
+            for error in errors:
+                attach_kv_protection_incident(
+                    error, kind="attention_tag", phase="pre_attention"
+                )
+            return errors
+
+        expected_slots = []
+        actual_slots = []
+        owners = []
+        offsets = [0]
+        for rid, request_pool_idx, manifest, is_swa in entries:
+            positions = manifest.page_positions_tensor(self.device).to(torch.long)
+            pages = manifest.physical_pages_tensor(self.device)
+            logical_slots = positions * self.page_size
+            rows = torch.full_like(logical_slots, int(request_pool_idx))
+            expected_slots.append(pages * self.page_size)
+            mapped_slots = req_to_token[rows, logical_slots]
+            if is_swa:
+                swa_locs = allocator.translate_loc_from_full_to_swa(mapped_slots)
+                swa_page_ids = allocator.attention_tag_swa_page_ids(
+                    swa_locs // self.page_size
+                )
+                mapped_slots = swa_page_ids * self.page_size
+            actual_slots.append(mapped_slots)
+            owners.append((rid, manifest))
+            offsets.append(offsets[-1] + manifest.num_pages)
+
+        expected = (
+            expected_slots[0] if len(expected_slots) == 1 else torch.cat(expected_slots)
+        )
+        actual = actual_slots[0] if len(actual_slots) == 1 else torch.cat(actual_slots)
+        mismatch = actual.ne(expected)
+        if bool(mismatch.any().item()):
+            seen_rids = set()
+            for index in torch.nonzero(mismatch).reshape(-1).cpu().tolist():
+                owner_index = bisect_right(offsets, int(index)) - 1
+                rid, manifest = owners[owner_index]
+                if rid in seen_rids:
+                    continue
+                seen_rids.add(rid)
+                page_index = int(index) - offsets[owner_index]
+                errors.append(
+                    KVProtectionBookkeepingError(
+                        rid=rid,
+                        bootstrap_room=manifest.bootstrap_room,
+                        cause="speculative_mapping",
+                        detail=(
+                            f"logical_page={manifest.page_positions[page_index]}, "
+                            f"expected_slot={int(expected[index].item())}, "
+                            f"actual_slot={int(actual[index].item())}"
+                        ),
+                    )
+                )
+
+        for error in errors:
+            attach_kv_protection_incident(
+                error, kind="attention_tag", phase="pre_attention"
+            )
+        return errors
 
     def _transfer_mismatch_details(
         self, flattened: _FlattenedTagBatch, mismatch: torch.Tensor

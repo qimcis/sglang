@@ -6,7 +6,8 @@ byte-level correctness.
 """
 
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -423,6 +424,62 @@ class TestProtectionManager(CustomTestCase):
         self.assertEqual(manifest.physical_page_ids_t.tolist(), [3, 8])
         self.assertTrue(torch.equal(manifest.expected_tags_t[0], old_first_tag))
         self.assertIsNone(mgr.verify_request(manifest, rid="r"))
+
+    def test_request_mapping_matches_manifest_and_detects_corruption(self):
+        mgr = self._make_manager()
+        mgr.table.bump_generations(torch.tensor([2, 3]))
+        manifest = mgr.register_attention_tags(
+            page_physical_ids=[2, 3], bootstrap_room=7
+        )
+        req_to_token = torch.zeros((3, 12), dtype=torch.int64)
+        req_to_token[1, :8] = torch.arange(8, 16)
+
+        items = [("r", 1, manifest)]
+        self.assertEqual(mgr.verify_request_mappings(items, req_to_token), [])
+
+        req_to_token[1, 4] = 20
+        errors = mgr.verify_request_mappings(items, req_to_token)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0].rid, "r")
+        self.assertEqual(errors[0].cause, "speculative_mapping")
+        self.assertIn("logical_page=1", errors[0].detail)
+        self.assertIsNotNone(errors[0].incident)
+
+    def test_request_mapping_verifies_swa_manifest(self):
+        mgr = self._make_manager()
+        full = mgr.register_attention_tags(
+            page_physical_ids=[2, 3], page_positions=[0, 1], bootstrap_room=7
+        )
+        swa = mgr.register_attention_tags(
+            page_physical_ids=[51, 52], page_positions=[0, 1], bootstrap_room=7
+        )
+        group = AttentionTagManifestGroup((full, swa))
+        req_to_token = torch.zeros((2, 12), dtype=torch.int64)
+        req_to_token[1, :8] = torch.arange(8, 16)
+        corrupt = False
+
+        def translate_locs(locs):
+            translated = locs - 4
+            if corrupt:
+                translated = translated.clone()
+                translated[0] += 4
+            return translated
+
+        allocator = SimpleNamespace(
+            translate_loc_from_full_to_swa=MagicMock(side_effect=translate_locs),
+            attention_tag_swa_page_ids=MagicMock(side_effect=lambda pages: pages + 50),
+        )
+        items = [("r", 1, group)]
+
+        self.assertEqual(
+            mgr.verify_request_mappings(items, req_to_token, allocator=allocator), []
+        )
+        corrupt = True
+        errors = mgr.verify_request_mappings(items, req_to_token, allocator=allocator)
+
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0].rid, "r")
+        self.assertEqual(errors[0].cause, "speculative_mapping")
 
     def test_group_verifies_full_and_swa_manifests(self):
         mgr = self._make_manager()

@@ -1714,6 +1714,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # not read by ForwardBatch), stale in spec draft window
     req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
 
+    # Speculative decode reservation captured before req_to_token is updated.
+    # The scheduler consumes this once to extend KV protection manifests.
+    kv_reservation_locs: Optional[torch.Tensor] = None
+    kv_reservation_start_lens: Optional[List[int]] = None
+    kv_reservation_end_lens: Optional[List[int]] = None
+
     # Forward-pass metrics
     fpm_start_time: float = 0.0
 

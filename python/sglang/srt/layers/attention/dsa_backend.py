@@ -329,6 +329,7 @@ class DeepseekSparseAttnBackend(
         self.kv_attention_tag_table = getattr(
             model_runner, "kv_attention_tag_table", None
         )
+        self.kv_page_protection_request_indices = {}
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
@@ -634,15 +635,29 @@ class DeepseekSparseAttnBackend(
         spec_info: Optional[SpecInput],
     ) -> None:
         table = self.kv_attention_tag_table
-        protection = (
-            table.fused_forward_args(
-                request_indices=request_indices,
-                page_size=self.real_page_size,
+        if not self.kv_fused_page_protection_enabled or not (
+            (forward_mode.is_decode_or_idle() and spec_info is None)
+            or forward_mode.is_target_verify()
+        ):
+            object.__setattr__(metadata, "kv_page_protection", None)
+            return
+
+        if forward_mode.is_target_verify():
+            repeated_request_indices = request_indices.repeat_interleave(
+                self.speculative_num_draft_tokens
             )
-            if self.kv_fused_page_protection_enabled
-            and forward_mode.is_decode_or_idle()
-            and spec_info is None
-            else None
+            key = int(repeated_request_indices.numel())
+            protected_request_indices = self.kv_page_protection_request_indices.get(key)
+            if protected_request_indices is None:
+                protected_request_indices = torch.empty_like(repeated_request_indices)
+                self.kv_page_protection_request_indices[key] = protected_request_indices
+            # CUDA graph kernels retain this buffer's capture-time pointer.
+            protected_request_indices.copy_(repeated_request_indices)
+        else:
+            protected_request_indices = request_indices
+        protection = table.fused_forward_args(
+            request_indices=protected_request_indices,
+            page_size=self.real_page_size,
         )
         object.__setattr__(metadata, "kv_page_protection", protection)
 
