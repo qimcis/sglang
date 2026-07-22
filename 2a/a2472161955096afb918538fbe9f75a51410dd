@@ -1,0 +1,107 @@
+python/sglang/srt/mem_cache/mamba_radix_cache.py
+  s_9cc109cde7aa66::t_a271bd244dd227 457-459,628-630,633-646,748-757
+python/sglang/srt/mem_cache/base_prefix_cache.py
+  s_414cd192908149::t_bb74a8386377aa 249-252
+python/sglang/srt/server_args.py
+  s_940a9a6e244286::t_7ace1888928c2f 3417-3419,3432-3436,3443-3445,3447-3449,3451-3452,3456-3458,3465-3467,3630,3632
+sgl-kernel/python/sgl_kernel/flash_mla.py
+  s_5f73f26aee7f01::t_82dcc37e34e528 2,19-119
+sgl-kernel/python/sgl_kernel/__init__.py
+  s_414cd192908149::t_86c6cf589207b4 75-78,131
+python/sglang/srt/layers/attention/dsa/dsa_indexer.py
+  s_b980e68e0d0a1c::t_a292328f7dc710 601-605
+python/sglang/srt/session/streaming_session.py
+  s_5f73f26aee7f01::t_8ab162b0735c5b 58-63,82-85,112-113,122-123,280-294,401-403
+python/sglang/srt/disaggregation/common/conn.py
+  s_9cc109cde7aa66::t_006aec2e017b47 50-81,109-110,130-131,480-493,1101-1104,1310-1311,1378-1379,1399-1410,1480-1481
+sgl-kernel/csrc/elementwise/topk.cu
+  s_940a9a6e244286::t_d65ed5c40490b4 65-67,71,156-158,160-162,165,168,171-172,452-453,666-681,778-781,834-836,843-844,858-866,876,888,902,911-916,924-926,930
+python/sglang/srt/mem_cache/chunk_cache.py
+  s_0b85e03ce1a38d::t_d4efbe7fbf32db 57-59
+sgl-kernel/CMakeLists.txt
+  s_414cd192908149::t_42666178542d26 184,294
+sgl-kernel/csrc/attention/kv_page_protection.cu
+  s_0b85e03ce1a38d::t_97964d418a466f 1-348
+python/sglang/srt/layers/attention/flashattention_backend.py
+  s_0b85e03ce1a38d::t_b6faf9a1e1ffd2 202,205,211,271,276-283,302-312
+sgl-kernel/csrc/common_extension.cc
+  s_414cd192908149::t_3f041a13f28577 98-108,114-116
+python/sglang/srt/speculative/dflash_worker_v2.py
+  s_5f73f26aee7f01::t_291a3c72be5eb5 1641-1647,1658-1659,1701
+python/sglang/jit_kernel/flash_attention_v4.py
+  s_414cd192908149::t_175e6520534425 3-4,23-81,105,126-129,195,232
+sgl-kernel/include/sgl_kernel_ops.h
+  s_414cd192908149::t_a18f1fee07483e 155-180,194-197
+python/sglang/srt/mem_cache/swa_radix_cache.py
+  s_9cc109cde7aa66::t_34aab11df30a29 373-375,492-496,509,519-525,527,529-533,535-549
+python/sglang/srt/mem_cache/radix_cache_cpp.py
+  s_9cc109cde7aa66::t_92c4612bf8f87a 95-97,215-219,230-233,235-236,238-243,245-253,255-258
+sgl-kernel/python/sgl_kernel/kv_page_protection.py
+  s_414cd192908149::t_9cc77c784ea2a2 1-52
+python/sglang/srt/mem_cache/unified_radix_cache.py
+  s_9cc109cde7aa66::t_c012dbfa90d8fc 380-382,784,788-802,841-850,886-895
+python/sglang/srt/mem_cache/common.py
+  s_414cd192908149::t_acc8627fb025e9 643-648
+python/sglang/srt/mem_cache/radix_cache.py
+  s_414cd192908149::t_b2dbb3c4fcce7d 315-317,496,528-543
+python/sglang/srt/layers/attention/attention_registry.py
+  s_414cd192908149::t_cdab8bd917dd68 215-219
+python/sglang/srt/layers/attention/dsa/dsa_topk_backend.py
+  s_414cd192908149::t_eea3aec491eeb7 3,17-120
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2aa2472161955096afb918538fbe9f75a51410dd",
+  "prompts": {},
+  "sessions": {
+    "s_0b85e03ce1a38d": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_07528b1b5ffeF9teOxxZYEpaLQ",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    },
+    "s_414cd192908149": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_092e40640ffew2SWf2GjqC7eiw",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    },
+    "s_5f73f26aee7f01": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_099a8b759ffeqnA7QziBATTLQD",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    },
+    "s_940a9a6e244286": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_074a76d95ffenD2fO3hBARIqCX",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    },
+    "s_9cc109cde7aa66": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0754e57d5ffeyxE7hIg6cqd50B",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    },
+    "s_b980e68e0d0a1c": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_18abcf2b5ffegv5x5kigiEqjDG",
+        "model": "gpt-5.5"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
