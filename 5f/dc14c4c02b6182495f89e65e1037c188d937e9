@@ -1,0 +1,59 @@
+python/sglang/srt/layers/attention/dsa_backend.py
+  s_b980e68e0d0a1c::t_3a716138bf0cbd 332,640-649,651-662
+python/sglang/srt/layers/attention/flashattention_backend.py
+  s_414cd192908149::t_08249f979c6bd2 285-288
+python/sglang/srt/managers/schedule_batch.py
+  s_414cd192908149::t_bc15646b91283a 1717-1722
+python/sglang/srt/managers/scheduler.py
+  s_b980e68e0d0a1c::t_904392ff4742cc 3159-3165,3178,3196,3402-3406,3413-3417,3422-3555
+python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+  s_b980e68e0d0a1c::t_1f5ccd5a8ec7bf 542-552,558,672-677,680
+python/sglang/srt/mem_cache/kv_page_tags.py
+  s_5f73f26aee7f01::t_f494845e5e04f5 3175-3295
+python/sglang/srt/model_executor/model_runner.py
+  s_414cd192908149::t_77f4dc74d466cb 2966-2972,3065-3071
+python/sglang/srt/speculative/dflash_info_v2.py
+  s_5f73f26aee7f01::t_b7c05a389c40ae 211,272-275
+python/sglang/srt/speculative/dflash_worker_v2.py
+  s_414cd192908149::t_89b12580219bdf 1692
+python/sglang/srt/speculative/eagle_info_v2.py
+  s_414cd192908149::t_bc37530550fda8 112-114
+python/sglang/srt/speculative/eagle_worker_v2.py
+  s_414cd192908149::t_9a8a34d50dcd98 1583-1585
+python/sglang/srt/speculative/multi_layer_eagle_worker_v2.py
+  s_b980e68e0d0a1c::t_3d7dc9edbe15a9 850-851,902-904
+python/sglang/srt/speculative/ngram_worker.py
+  s_414cd192908149::t_861cd72f3c392a 346-348,370-371,373-374,476-481,530-532
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5fdc14c4c02b6182495f89e65e1037c188d937e9",
+  "prompts": {},
+  "sessions": {
+    "s_414cd192908149": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_092e40640ffew2SWf2GjqC7eiw",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    },
+    "s_5f73f26aee7f01": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_099a8b759ffeqnA7QziBATTLQD",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    },
+    "s_b980e68e0d0a1c": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_18abcf2b5ffegv5x5kigiEqjDG",
+        "model": "gpt-5.5"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
