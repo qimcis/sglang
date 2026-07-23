@@ -169,11 +169,42 @@ class DecodeStagingHandler:
 
         ok = self._scatter_region(staging_offset, page_start, num_pages, decode_req)
         if ok:
-            event = torch.cuda.Event()
-            event.record(self.staging_allocator._scatter_stream)
-            if not hasattr(decode_req, "_chunk_events"):
-                decode_req._chunk_events = []
-            decode_req._chunk_events.append((event, alloc_id))
+            try:
+                event = torch.cuda.Event()
+                event.record(self.staging_allocator._scatter_stream)
+            except Exception:
+                try:
+                    self.staging_allocator._scatter_stream.synchronize()
+                except Exception:
+                    self._record_staging_failure(
+                        decode_req,
+                        f"Failed to track or synchronize staging scatter chunk={chunk_idx}",
+                    )
+                    logger.exception(
+                        "Failed to track or synchronize staging scatter room=%s chunk=%s",
+                        room,
+                        chunk_idx,
+                    )
+                    return False
+                chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
+                try:
+                    self.staging_allocator.free(alloc_id)
+                except Exception:
+                    self._record_staging_failure(
+                        decode_req,
+                        f"Failed to free synchronized staging scatter chunk={chunk_idx}",
+                    )
+                    logger.exception(
+                        "Failed to free synchronized staging scatter room=%s chunk=%s",
+                        room,
+                        chunk_idx,
+                    )
+                    return False
+                decode_req._staging_watermark_pending = True
+            else:
+                if not hasattr(decode_req, "_chunk_events"):
+                    decode_req._chunk_events = []
+                decode_req._chunk_events.append((event, alloc_id))
             chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
         else:
             logger.warning(
@@ -203,7 +234,6 @@ class DecodeStagingHandler:
         once all writers for this chunk have reported in. Returns True if scatter
         was submitted.
         """
-        chunk_writer_counts[room][chunk_idx].append((page_start, num_pages, writer_id))
         decode_req = self._room_to_decode_req.get(room)
         if decode_req is None:
             logger.warning(
@@ -212,12 +242,36 @@ class DecodeStagingHandler:
                 chunk_idx,
             )
             return False
+        protected = bool(getattr(decode_req.kv_receiver, "transfer_nonce", 0))
+        arrivals = chunk_writer_counts[room][chunk_idx]
+        if protected:
+            if any(existing_writer == writer_id for _, _, existing_writer in arrivals):
+                raise RuntimeError(
+                    f"Duplicate staging writer room={room} chunk={chunk_idx} writer={writer_id}"
+                )
+            if arrivals and any(
+                existing_start != page_start or existing_pages != num_pages
+                for existing_start, existing_pages, _ in arrivals
+            ):
+                raise RuntimeError(
+                    f"Conflicting staging geometry room={room} chunk={chunk_idx}"
+                )
+        arrivals.append((page_start, num_pages, writer_id))
         writers_arrived = len(chunk_writer_counts[room][chunk_idx])
         num_writers = self.num_writers_for(decode_req)
         if writers_arrived >= num_writers:
-            self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
+            submitted = self.submit_chunk_scatter(
+                room, chunk_idx, page_start, num_pages
+            )
+            if not submitted and (
+                protected
+                or getattr(decode_req, "_staging_scatter_tracking_failed", False)
+            ):
+                raise RuntimeError(
+                    f"Failed to submit staging scatter room={room} chunk={chunk_idx}"
+                )
             del chunk_writer_counts[room][chunk_idx]
-            return True
+            return submitted
         return False
 
     def submit_last_scatter_async(self, room: int) -> bool:
@@ -238,11 +292,47 @@ class DecodeStagingHandler:
             return False
         alloc_id = self._submit_last_scatter(decode_req)
         if alloc_id >= 0:
-            event = torch.cuda.Event()
-            event.record(self.staging_allocator._scatter_stream)
-            decode_req._scatter_event = event
-            decode_req._scatter_alloc_id = alloc_id
-            decode_req._staging_last_scatter_submitted = True
+            try:
+                event = torch.cuda.Event()
+                event.record(self.staging_allocator._scatter_stream)
+            except Exception:
+                try:
+                    self.staging_allocator._scatter_stream.synchronize()
+                except Exception:
+                    self._record_staging_failure(
+                        decode_req,
+                        "Failed to track or synchronize final staging scatter",
+                    )
+                    logger.exception(
+                        "Failed to track or synchronize final staging scatter room=%s",
+                        room,
+                    )
+                    return False
+                chunk_infos = getattr(decode_req.kv_receiver, "chunk_staging_infos", [])
+                if chunk_infos:
+                    chunk_infos[-1] = (-1, -1, 0, -1, 0)
+                try:
+                    self.staging_allocator.free(alloc_id)
+                except Exception:
+                    self._record_staging_failure(
+                        decode_req, "Failed to free synchronized final staging scatter"
+                    )
+                    logger.exception(
+                        "Failed to free synchronized final staging scatter room=%s",
+                        room,
+                    )
+                    return False
+                decode_req._staging_watermark_pending = True
+                decode_req._staging_scatter_done = True
+            else:
+                decode_req._scatter_event = event
+                decode_req._scatter_alloc_id = alloc_id
+                decode_req._staging_last_scatter_submitted = True
+            chunk_infos = getattr(decode_req.kv_receiver, "chunk_staging_infos", [])
+            if chunk_infos:
+                chunk_infos[-1] = (-1, -1, 0, -1, 0)
+        elif alloc_id == -2:
+            return False
         else:
             decode_req._staging_scatter_done = True
         return True
@@ -253,9 +343,36 @@ class DecodeStagingHandler:
 
     def is_done(self, decode_req: DecodeRequest) -> bool:
         """Return True if staging scatter is complete for this request."""
+        if getattr(decode_req, "_staging_scatter_tracking_failed", False):
+            return False
         if not getattr(decode_req, "_staging_scatter_done", False):
             return False
         return not getattr(decode_req, "_chunk_events", None)
+
+    def pending_scatter_writes_done(self, room: int) -> bool:
+        """Advance and report only already-submitted scatter writes for a room."""
+        decode_req = self._room_to_decode_req.get(room)
+        if decode_req is None:
+            return True
+        if getattr(decode_req, "_staging_scatter_tracking_failed", False):
+            return False
+        self.advance_scatter(decode_req)
+        return (
+            not getattr(decode_req, "_chunk_events", None)
+            and getattr(decode_req, "_scatter_event", None) is None
+        )
+
+    def reclaim_unsubmitted_allocations(self, room: int) -> None:
+        """Reclaim staging regions that were never submitted after an abort."""
+        decode_req = self._room_to_decode_req.get(room)
+        if decode_req is None:
+            return
+        chunk_infos = getattr(decode_req.kv_receiver, "chunk_staging_infos", [])
+        for index, (alloc_id, _offset, _round, _end, _pages) in enumerate(chunk_infos):
+            if alloc_id < 0:
+                continue
+            self._free_and_send_watermark(alloc_id, decode_req)
+            chunk_infos[index] = (-1, -1, 0, -1, 0)
 
     def advance_scatter(self, decode_req: DecodeRequest) -> None:
         """Check CUDA events and free completed staging allocations.
@@ -264,6 +381,10 @@ class DecodeStagingHandler:
         (via submit_chunk_scatter / submit_last_scatter_async).  This
         method only polls the recorded events and releases staging memory.
         """
+        if getattr(decode_req, "_staging_watermark_pending", False):
+            self._send_watermark(decode_req)
+            decode_req._staging_watermark_pending = False
+
         room = decode_req.req.bootstrap_room
         chunk_events = getattr(decode_req, "_chunk_events", None)
         if chunk_events:
@@ -286,6 +407,18 @@ class DecodeStagingHandler:
     # ------------------------------------------------------------------
     # Internal methods
     # ------------------------------------------------------------------
+
+    def _record_staging_failure(self, decode_req: DecodeRequest, message: str) -> None:
+        decode_req._staging_scatter_tracking_failed = True
+        room = decode_req.req.bootstrap_room
+        fail_room = getattr(self.kv_manager, "_fail_room", None)
+        if fail_room is not None:
+            fail_room(room, message)
+            return
+        from sglang.srt.disaggregation.common.conn import KVPoll
+
+        self.kv_manager.record_failure(room, message)
+        self.kv_manager.update_status(room, KVPoll.Failed)
 
     def _scatter_region(
         self,
@@ -359,8 +492,34 @@ class DecodeStagingHandler:
         expected_generations = getattr(
             decode_req, "transfer_pinned_page_generations", ()
         )
-        if table is None or not expected_pages or not expected_generations:
-            return True
+        page_count = len(expected_pages) if expected_pages is not None else 0
+        generation_count = (
+            len(expected_generations) if expected_generations is not None else 0
+        )
+        metadata_complete = (
+            table is not None and page_count > 0 and page_count == generation_count
+        )
+        if not metadata_complete:
+            receiver = decode_req.kv_receiver
+            if not getattr(receiver, "transfer_nonce", 0):
+                return True
+            message = (
+                "Protected KV staging destination metadata is missing or incomplete "
+                f"(rid={decode_req.req.rid}, bootstrap_room={decode_req.req.bootstrap_room})"
+            )
+            logger.error(message)
+            try:
+                fail_room = getattr(receiver.kv_mgr, "_fail_room", None)
+                if fail_room is not None:
+                    fail_room(receiver.bootstrap_room, message)
+                else:
+                    receiver.abort()
+                    receiver.kv_mgr.record_failure(receiver.bootstrap_room, message)
+            except Exception:
+                logger.exception(
+                    "Failed to abort receiver after missing staging metadata"
+                )
+            return False
 
         expected_by_page = {
             int(page): int(generation)
@@ -386,11 +545,13 @@ class DecodeStagingHandler:
             )
             logger.error(message)
             try:
-                decode_req.kv_receiver.abort()
-                decode_req.kv_receiver.kv_mgr.record_failure(
-                    decode_req.kv_receiver.bootstrap_room,
-                    message,
-                )
+                receiver = decode_req.kv_receiver
+                fail_room = getattr(receiver.kv_mgr, "_fail_room", None)
+                if fail_room is not None:
+                    fail_room(receiver.bootstrap_room, message)
+                else:
+                    receiver.abort()
+                    receiver.kv_mgr.record_failure(receiver.bootstrap_room, message)
             except Exception:
                 logger.exception("Failed to abort receiver after stale staging page")
             return False
@@ -416,15 +577,18 @@ class DecodeStagingHandler:
         ok = self._scatter_region(
             staging_offset, page_start, last_num_pages, decode_req
         )
-        return alloc_id if ok else -1
+        return alloc_id if ok else -2
 
     def _free_and_send_watermark(
         self, alloc_id: int, decode_req: DecodeRequest
     ) -> None:
         """Free a staging allocation and broadcast watermark to all prefills."""
         self.staging_allocator.free(alloc_id)
+        self._send_watermark(decode_req)
+
+    def _send_watermark(self, decode_req: DecodeRequest) -> None:
+        """Broadcast the current staging watermark to all prefills."""
         post_wm = self.staging_allocator.get_watermark()
-        room = decode_req.req.bootstrap_room
         wm_round, wm_tail = post_wm
         wm_round_b = str(wm_round).encode("ascii")
         wm_tail_b = str(wm_tail).encode("ascii")

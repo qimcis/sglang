@@ -1066,7 +1066,7 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
 
     import torch
 
-    major, minor = torch.cuda.get_device_capability()
+    major, _ = torch.cuda.get_device_capability()
 
     # If user specified a backend but didn't explicitly set kv_cache_dtype,
     # suggest them to be explicit about kv_cache_dtype to avoid surprises
@@ -1113,7 +1113,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     import torch
 
-    major, _ = torch.cuda.get_device_capability()
+    major, minor = torch.cuda.get_device_capability()
     kv_cache_dtype = view.kv_cache_dtype
     user_set_prefill = view.dsa_prefill_backend is not None
     user_set_decode = view.dsa_decode_backend is not None
@@ -1147,9 +1147,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         ) or envs.SGLANG_KV_PAGE_PROTECTION.get()
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = (
-                "flashmla_kv"
-                if major < 10 or prefer_protected_flashmla
-                else "trtllm"
+                "flashmla_kv" if major < 10 or prefer_protected_flashmla else "trtllm"
             )
         if not user_set_decode:
             if major >= 10:
@@ -1158,9 +1156,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
                 )
             else:
                 declared["dsa_decode_backend"] = (
-                    "fa3"
-                    if envs.SGLANG_KV_PAGE_PROTECTION.get()
-                    else "flashmla_kv"
+                    "fa3" if envs.SGLANG_KV_PAGE_PROTECTION.get() else "flashmla_kv"
                 )
     else:
         from sglang.srt.environ import envs

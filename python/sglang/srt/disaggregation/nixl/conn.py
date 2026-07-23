@@ -466,6 +466,15 @@ class TransferStatus:
     # (pp_rank, chunk_id); normal homogeneous transfers bypass this.
     received_kv_parts_per_pp: Optional[Dict[Tuple[int, int], Set[int]]] = None
     expected_kv_parts_per_pp: Optional[Dict[Tuple[int, int], int]] = None
+    received_kv_parts_per_producer: Dict[Tuple[int, int], Set[int]] = dataclasses.field(
+        default_factory=lambda: defaultdict(set)
+    )
+    expected_kv_parts_per_producer: Dict[Tuple[int, int], int] = dataclasses.field(
+        default_factory=dict
+    )
+    kv_part_metadata_per_producer: Dict[Tuple[int, int], Tuple[int, int]] = (
+        dataclasses.field(default_factory=dict)
+    )
     protected: bool = False
     transfer_nonce: int = 0
     protection_feature_bitmap: int = 0
@@ -474,6 +483,15 @@ class TransferStatus:
     quiesced_producers: Set[int] = dataclasses.field(default_factory=set)
     received_aux_producers: Set[int] = dataclasses.field(default_factory=set)
     received_state_producers: Set[int] = dataclasses.field(default_factory=set)
+    received_state_parts_per_producer: Dict[int, Set[int]] = dataclasses.field(
+        default_factory=lambda: defaultdict(set)
+    )
+    expected_state_parts_per_producer: Dict[int, int] = dataclasses.field(
+        default_factory=dict
+    )
+    staging_chunk_ids_per_producer: Dict[Tuple[int, int], int] = dataclasses.field(
+        default_factory=dict
+    )
     received_kvs_per_producer: Dict[int, Set[int]] = dataclasses.field(
         default_factory=lambda: defaultdict(set)
     )
@@ -482,7 +500,13 @@ class TransferStatus:
     failed: bool = False
 
     def protected_data_done(self) -> bool:
-        if not self.expected_producers:
+        if (
+            not self.expected_producers
+            or self.received_kv_parts_per_producer
+            or self.expected_kv_parts_per_producer
+            or self.received_state_parts_per_producer
+            or self.expected_state_parts_per_producer
+        ):
             return False
         for producer in self.expected_producers:
             if producer not in self.received_aux_producers:
@@ -613,6 +637,7 @@ class NixlKVManager(CommonKVManager):
             self.retired_transfer_nonces: Dict[int, int] = {}
             self.pending_abort_nonce_by_room: Dict[int, int] = {}
             self.abort_ack_targets: Dict[int, Tuple[int, str, int]] = {}
+            self.ack_only_abort_targets: Dict[Tuple[int, int], Tuple[str, int]] = {}
             self.active_transfer_workers: Dict[int, int] = defaultdict(int)
             self.quiescence_failed_rooms: Set[int] = set()
             self.quarantined_xfer_handles: Dict[int, List[Any]] = defaultdict(list)
@@ -688,6 +713,27 @@ class NixlKVManager(CommonKVManager):
                         )
                     break
 
+    def _post_xfer_handle(self, handle: Any, notif: str, error_message: str) -> None:
+        room = None
+        if notif.startswith(f"{PROTECTED_NOTIF_PREFIX}|"):
+            try:
+                room = int(notif.split("|", 2)[1])
+            except (IndexError, ValueError):
+                room = None
+        else:
+            try:
+                room = int(notif.split("_", 1)[0])
+            except (IndexError, ValueError):
+                room = None
+        try:
+            state = self.agent.transfer(handle)
+            if state == "ERR":
+                raise RuntimeError(error_message)
+        except Exception:
+            if room is not None:
+                self._cancel_and_drain_xfer_handles(room, [handle])
+            raise
+
     def _cancel_and_drain_xfer_handles(self, room: int, handles: List[Any]) -> bool:
         pending = [handle for handle in handles if handle is not None]
         for handle in pending:
@@ -732,6 +778,21 @@ class NixlKVManager(CommonKVManager):
                 room: tuple(handles)
                 for room, handles in self.quarantined_xfer_handles.items()
             }
+            ack_only_targets = dict(self.ack_only_abort_targets)
+
+        for (room, nonce), (endpoint, port) in ack_only_targets.items():
+            try:
+                self._send_quiescence_ack(room, nonce, endpoint, port)
+            except Exception:
+                logger.warning(
+                    "Failed to send stale NIXL quiescence ACK room=%s",
+                    room,
+                    exc_info=True,
+                )
+                continue
+            with self.request_status_lock:
+                if self.ack_only_abort_targets.get((room, nonce)) == (endpoint, port):
+                    self.ack_only_abort_targets.pop((room, nonce), None)
 
         terminal_states = {"DONE", "ERR", "CANCELED", "CANCELLED"}
         for room, handles in quarantined.items():
@@ -755,18 +816,14 @@ class NixlKVManager(CommonKVManager):
                 self.quarantined_xfer_handles[room] = remaining
                 if remaining or self.active_transfer_workers.get(room, 0):
                     continue
-
                 target = self.abort_ack_targets.get(room)
-                if target is not None:
-                    nonce, endpoint, port = target
-                    if not self._send_or_defer_quiescence_ack_locked(
-                        room, nonce, endpoint, port
-                    ):
-                        continue
-                self.quarantined_xfer_handles.pop(room, None)
-                self.quiescence_failed_rooms.discard(room)
-                self._cleanup_quiesced_prefill_room_locked(room)
-                self.request_status.pop(room, None)
+                if target is None:
+                    self.quarantined_xfer_handles.pop(room, None)
+                    self.quiescence_failed_rooms.discard(room)
+                    self._cleanup_quiesced_prefill_room_locked(room)
+                    self.request_status.pop(room, None)
+                    continue
+            self._try_send_pending_quiescence_ack(room)
 
     def _wait_for_xfer_handles(self, room: int, handles: List[Any]) -> None:
         deadline = time.monotonic() + max(
@@ -797,7 +854,7 @@ class NixlKVManager(CommonKVManager):
                 self._release_xfer_handles(handles)
             handles.clear()
 
-    def _send_quiescence_ack_locked(
+    def _send_quiescence_ack(
         self, room: int, nonce: int, endpoint: str, port: int
     ) -> None:
         from sglang.srt.utils.network import NetworkAddress
@@ -814,22 +871,53 @@ class NixlKVManager(CommonKVManager):
             is_ipv6=na.is_ipv6,
         )
 
-    def _send_or_defer_quiescence_ack_locked(
-        self, room: int, nonce: int, endpoint: str, port: int
-    ) -> bool:
+    def _defer_quiescence_ack_locked(
+        self,
+        room: int,
+        nonce: int,
+        endpoint: str,
+        port: int,
+        *,
+        cleanup_room: bool = True,
+    ) -> None:
+        if not cleanup_room:
+            self.ack_only_abort_targets[(room, nonce)] = (endpoint, port)
+            return
+        self.abort_ack_targets[room] = (nonce, endpoint, port)
+        self.quiescence_failed_rooms.add(room)
+        self.quarantined_xfer_handles.setdefault(room, [])
+
+    def _try_send_pending_quiescence_ack(self, room: int) -> bool:
+        with self.request_status_lock:
+            target = self.abort_ack_targets.get(room)
+            if (
+                target is None
+                or self.active_transfer_workers.get(room, 0)
+                or self.quarantined_xfer_handles.get(room)
+            ):
+                return False
+        nonce, endpoint, port = target
         try:
-            self._send_quiescence_ack_locked(room, nonce, endpoint, port)
-            return True
+            self._send_quiescence_ack(room, nonce, endpoint, port)
         except Exception:
             logger.warning(
                 "Failed to send NIXL quiescence ACK room=%s",
                 room,
                 exc_info=True,
             )
-            self.abort_ack_targets[room] = (nonce, endpoint, port)
-            self.quiescence_failed_rooms.add(room)
-            self.quarantined_xfer_handles.setdefault(room, [])
             return False
+        with self.request_status_lock:
+            if (
+                self.abort_ack_targets.get(room) != target
+                or self.active_transfer_workers.get(room, 0)
+                or self.quarantined_xfer_handles.get(room)
+            ):
+                return False
+            self.quarantined_xfer_handles.pop(room, None)
+            self.quiescence_failed_rooms.discard(room)
+            self._cleanup_quiesced_prefill_room_locked(room)
+            self.request_status.pop(room, None)
+        return True
 
     def _cleanup_quiesced_prefill_room_locked(self, room: int) -> None:
         nonce = self.active_transfer_nonce_by_room.get(room, 0)
@@ -867,13 +955,9 @@ class NixlKVManager(CommonKVManager):
                 return
             target = self.abort_ack_targets.get(room)
             if target is not None:
-                nonce, endpoint, port = target
-                if not self._send_or_defer_quiescence_ack_locked(
-                    room, nonce, endpoint, port
-                ):
-                    return
-                self._cleanup_quiesced_prefill_room_locked(room)
-                self.request_status.pop(room, None)
+                self.quiescence_failed_rooms.add(room)
+                self.quarantined_xfer_handles.setdefault(room, [])
+                return
             elif self.request_status.get(room) == KVPoll.Failed:
                 self._cleanup_quiesced_prefill_room_locked(room)
                 self.request_status.pop(room, None)
@@ -1675,6 +1759,11 @@ class NixlKVManager(CommonKVManager):
                         #   3. send_kvcache_slice (heterogeneous TP fallback,
                         #      or staging hard-failed for this chunk)
                         use_staging = req_uses_staging and staging_strategy is not None
+                        if req.is_protected and req_uses_staging and not use_staging:
+                            raise RuntimeError(
+                                "Protected NIXL staging strategy is unavailable "
+                                f"room={room}"
+                            )
 
                         kv_xfer_handle = None
                         kv_landed_on_decode = False
@@ -1693,6 +1782,11 @@ class NixlKVManager(CommonKVManager):
                                 # pick it up again on the next pop.
                                 staging_deferred = True
                                 break
+                            if kv_xfer_handle is None and req.is_protected:
+                                raise RuntimeError(
+                                    "Protected NIXL staging transfer cannot fall "
+                                    f"back to direct transfer room={room}"
+                                )
                             # kv_xfer_handle is None here means staging
                             # send_kvcache_staged() returned None (e.g.
                             # decode buffer too small) -- fall through to
@@ -1725,6 +1819,7 @@ class NixlKVManager(CommonKVManager):
                                             src_prefill_kv_indices,
                                             chunked_dst_kv_indice,
                                             notif,
+                                            room=req.room,
                                         )
                                     )
                             else:
@@ -1763,9 +1858,7 @@ class NixlKVManager(CommonKVManager):
                                 decode_tp_rank=dst_info.decode_tp_rank,
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
                                 dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
-                            )
-                            handles.extend(
-                                h for h in state_xfer_handles if h is not None
+                                output_handles=handles,
                             )
                             if (
                                 req.is_protected
@@ -1986,9 +2079,9 @@ class NixlKVManager(CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create prepped transfer")
-            state = self.agent.transfer(xfer_handle)
-            if state == "ERR":
-                raise Exception("KVSender failed to post prepped transfer")
+            self._post_xfer_handle(
+                xfer_handle, notif, "KVSender failed to post prepped transfer"
+            )
             return xfer_handle
 
         # Non-prepped path: used for state transfers (SWA/NSA) via maybe_send_extra.
@@ -2096,9 +2189,7 @@ class NixlKVManager(CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post transfer")
+        self._post_xfer_handle(xfer_handle, notif, "KVSender failed to post transfer")
         return xfer_handle
 
     def send_kvcache(
@@ -2131,6 +2222,8 @@ class NixlKVManager(CommonKVManager):
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_indices: npt.NDArray[np.int32],
         notif: str,
+        *,
+        room: int,
     ):
         info = self.decode_kv_args_table[peer_name]
         segments = info.kv_xfer_segments
@@ -2140,29 +2233,37 @@ class NixlKVManager(CommonKVManager):
 
         num_parts = len(segments)
         handles = []
-        for part_idx, seg in enumerate(segments):
-            num_layers = seg.end - seg.start
-            src_indices = repeat_indices_over_layers(
-                prefill_kv_indices, num_layers, self._num_slots_src
-            )
-            dst_indices = repeat_indices_over_layers(
-                dst_kv_indices, num_layers, seg.dst_num_slots
-            )
-            part_notif = f"{notif}_part_{part_idx}_{num_parts}"
-            xfer_handle = self.agent.make_prepped_xfer(
-                "WRITE",
-                seg.src_handle,
-                src_indices,
-                seg.dst_handle,
-                dst_indices,
-                part_notif.encode("ascii"),
-            )
-            if not xfer_handle:
-                raise Exception("KVSender failed to create mixed prepped transfer")
-            state = self.agent.transfer(xfer_handle)
-            if state == "ERR":
-                raise Exception("KVSender failed to post mixed prepped transfer")
-            handles.append(xfer_handle)
+        try:
+            for part_idx, seg in enumerate(segments):
+                num_layers = seg.end - seg.start
+                src_indices = repeat_indices_over_layers(
+                    prefill_kv_indices, num_layers, self._num_slots_src
+                )
+                dst_indices = repeat_indices_over_layers(
+                    dst_kv_indices, num_layers, seg.dst_num_slots
+                )
+                part_notif = (
+                    f"{notif}|{part_idx}|{num_parts}"
+                    if notif.startswith(f"{PROTECTED_NOTIF_PREFIX}|")
+                    else f"{notif}_part_{part_idx}_{num_parts}"
+                )
+                xfer_handle = self.agent.make_prepped_xfer(
+                    "WRITE",
+                    seg.src_handle,
+                    src_indices,
+                    seg.dst_handle,
+                    dst_indices,
+                    part_notif.encode("ascii"),
+                )
+                if not xfer_handle:
+                    raise Exception("KVSender failed to create mixed prepped transfer")
+                handles.append(xfer_handle)
+                state = self.agent.transfer(xfer_handle)
+                if state == "ERR":
+                    raise Exception("KVSender failed to post mixed prepped transfer")
+        except Exception:
+            self._cancel_and_drain_xfer_handles(room, handles)
+            raise
         return handles
 
     def send_kvcache_slice(
@@ -2206,9 +2307,9 @@ class NixlKVManager(CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create prepped slice transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post prepped slice transfer")
+        self._post_xfer_handle(
+            xfer_handle, notif, "KVSender failed to post prepped slice transfer"
+        )
         return xfer_handle
 
     def send_kvcache_staged(
@@ -2318,9 +2419,9 @@ class NixlKVManager(CommonKVManager):
                 f"(src=0x{staging_buffer.get_ptr():x}, dst=0x{dst_write_ptr:x}, "
                 f"size={per_rank_bytes})"
             )
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise RuntimeError("[Staging] NIXL bulk transfer failed to post")
+        self._post_xfer_handle(
+            xfer_handle, notif, "[Staging] NIXL bulk transfer failed to post"
+        )
         return xfer_handle
 
     def _try_create_staging_strategy(self, staging_buffer):
@@ -2443,9 +2544,7 @@ class NixlKVManager(CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post transfer")
+        self._post_xfer_handle(xfer_handle, notif, "KVSender failed to post transfer")
         return xfer_handle
 
     def _send_mamba_state(
@@ -2489,9 +2588,9 @@ class NixlKVManager(CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create Mamba state transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("Failed to post Mamba state transfer")
+        self._post_xfer_handle(
+            xfer_handle, notif, "Failed to post Mamba state transfer"
+        )
         return xfer_handle
 
     def _send_mamba_state_slice(
@@ -2592,9 +2691,9 @@ class NixlKVManager(CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create Mamba state slice transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("Failed to post Mamba state slice transfer")
+        self._post_xfer_handle(
+            xfer_handle, notif, "Failed to post Mamba state slice transfer"
+        )
         return xfer_handle
 
     def maybe_send_extra(
@@ -2609,6 +2708,7 @@ class NixlKVManager(CommonKVManager):
         decode_tp_rank: int = 0,
         dst_state_item_lens: List[List[int]] | None = None,
         dst_state_dim_per_tensor: List[List[int]] | None = None,
+        output_handles: Optional[List[Any]] = None,
     ):
         """Send state per hybrid component, dispatching by state_type[i]."""
         state_types = getattr(self.kv_args, "state_types", []) or []
@@ -2620,13 +2720,19 @@ class NixlKVManager(CommonKVManager):
         dst_state_item_lens = dst_state_item_lens or []
         dst_state_dim_per_tensor = dst_state_dim_per_tensor or []
 
+        active_components = [
+            i
+            for i in range(len(state_types))
+            if i < len(prefill_state_indices)
+            and prefill_state_indices[i] is not None
+            and len(prefill_state_indices[i]) > 0
+        ]
         handles = []
-        for i, st in enumerate(state_types):
+        for part_idx, i in enumerate(active_components):
+            st = state_types[i]
             src_indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
             )
-            if src_indices is None or len(src_indices) == 0:
-                continue
             src_ptrs = src_state_data_ptrs[i] if i < len(src_state_data_ptrs) else []
             src_lens = src_state_item_lens[i] if i < len(src_state_item_lens) else []
             src_dims = (
@@ -2638,7 +2744,14 @@ class NixlKVManager(CommonKVManager):
             dst_dims = (
                 dst_state_dim_per_tensor[i] if i < len(dst_state_dim_per_tensor) else []
             )
-            comp_notif = f"{notif}_{i}"
+            if notif.startswith(f"{PROTECTED_NOTIF_PREFIX}|"):
+                comp_notif = (
+                    notif
+                    if len(active_components) == 1
+                    else f"{notif}|{part_idx}|{len(active_components)}"
+                )
+            else:
+                comp_notif = f"{notif}_{i}"
 
             if st == StateType.MAMBA:
                 if self.attn_tp_size != decode_tp_size:
@@ -2734,6 +2847,8 @@ class NixlKVManager(CommonKVManager):
                 )
             if h is not None:
                 handles.append(h)
+                if output_handles is not None:
+                    output_handles.append(h)
         return handles
 
     def add_transfer_request(
@@ -2846,6 +2961,8 @@ class NixlKVManager(CommonKVManager):
     ) -> None:
         if chunk_id < 0:
             raise ValueError("negative chunk id")
+        if (producer, chunk_id) in status.expected_kv_parts_per_producer:
+            raise ValueError("cannot mix direct and multipart KV notifications")
         if is_last not in (0, 1):
             raise ValueError("is_last must be 0 or 1")
         received = status.received_kvs_per_producer[producer]
@@ -2861,11 +2978,47 @@ class NixlKVManager(CommonKVManager):
         if is_last:
             status.expected_kvs_per_producer[producer] = chunk_id + 1
 
+    @staticmethod
+    def _record_protected_chunk_part(
+        status: TransferStatus,
+        producer: int,
+        chunk_id: int,
+        is_last: int,
+        part_idx: int,
+        num_parts: int,
+    ) -> None:
+        if chunk_id in status.received_kvs_per_producer[producer]:
+            raise ValueError("duplicate completed KV chunk notification")
+        if num_parts <= 1 or part_idx < 0 or part_idx >= num_parts:
+            raise ValueError("invalid protected KV part metadata")
+        key = (producer, chunk_id)
+        metadata = (is_last, num_parts)
+        expected_metadata = status.kv_part_metadata_per_producer.setdefault(
+            key, metadata
+        )
+        if expected_metadata != metadata:
+            raise ValueError("conflicting protected KV part metadata")
+        expected = status.expected_kv_parts_per_producer.setdefault(key, num_parts)
+        if expected != num_parts:
+            raise ValueError("conflicting protected KV part count")
+        parts = status.received_kv_parts_per_producer[key]
+        if part_idx in parts:
+            raise ValueError("duplicate protected KV part notification")
+        parts.add(part_idx)
+        if len(parts) != num_parts:
+            return
+        status.received_kv_parts_per_producer.pop(key, None)
+        status.expected_kv_parts_per_producer.pop(key, None)
+        status.kv_part_metadata_per_producer.pop(key, None)
+        NixlKVManager._record_protected_chunk(status, producer, chunk_id, is_last, "KV")
+
     def _active_decode_generation(
         self, room: int, nonce: int, message_kind: str
     ) -> Optional[TransferStatus]:
         status = self.transfer_statuses.get(room)
         if status is None or room not in self.request_status:
+            return None
+        if status.failed or self.request_status.get(room) == KVPoll.Failed:
             return None
         if nonce != status.transfer_nonce:
             if self._is_stale_nonce(
@@ -2901,12 +3054,24 @@ class NixlKVManager(CommonKVManager):
             return
         try:
             if kind == "kv":
-                if len(fields) != 8:
-                    raise ValueError("KV notification must have exactly 8 fields")
+                if len(fields) not in (8, 10):
+                    raise ValueError("KV notification has invalid field count")
                 chunk_id = int(fields[5])
                 is_last = int(fields[6])
                 int(fields[7])
-                self._record_protected_chunk(status, producer, chunk_id, is_last, "KV")
+                if len(fields) == 10:
+                    self._record_protected_chunk_part(
+                        status,
+                        producer,
+                        chunk_id,
+                        is_last,
+                        int(fields[8]),
+                        int(fields[9]),
+                    )
+                else:
+                    self._record_protected_chunk(
+                        status, producer, chunk_id, is_last, "KV"
+                    )
             elif kind == "stg":
                 if len(fields) != 12:
                     raise ValueError("staging notification must have exactly 12 fields")
@@ -2918,6 +3083,14 @@ class NixlKVManager(CommonKVManager):
                 num_pages = int(fields[10])
                 if chunk_idx < 0 or page_start < 0 or num_pages <= 0 or not fields[11]:
                     raise ValueError("invalid staging notification range")
+                staging_key = (producer, chunk_idx)
+                prior_chunk_id = status.staging_chunk_ids_per_producer.setdefault(
+                    staging_key, chunk_id
+                )
+                if prior_chunk_id != chunk_id:
+                    raise ValueError(
+                        "protected staging chunk index changed protocol chunk id"
+                    )
                 self._record_protected_chunk(
                     status, producer, chunk_id, is_last, "staging"
                 )
@@ -2926,8 +3099,9 @@ class NixlKVManager(CommonKVManager):
                     chunk_idx,
                     page_start,
                     num_pages,
-                    fields[11],
+                    str(producer),
                 )
+                self._maybe_submit_last_scatter(room)
             elif kind == "aux":
                 if len(fields) not in (5, 7) or (
                     len(fields) == 7 and fields[5] != "nokv"
@@ -2943,12 +3117,36 @@ class NixlKVManager(CommonKVManager):
                 if self.enable_staging:
                     self._maybe_submit_last_scatter(room)
             elif kind == "state":
-                if len(fields) != 6:
-                    raise ValueError("state notification must have exactly 6 fields")
+                if len(fields) not in (6, 8):
+                    raise ValueError("state notification has invalid field count")
                 int(fields[5])
                 if producer in status.received_state_producers:
                     raise ValueError("duplicate state notification")
-                status.received_state_producers.add(producer)
+                if len(fields) == 6:
+                    if producer in status.expected_state_parts_per_producer:
+                        raise ValueError(
+                            "cannot mix direct and multipart state notifications"
+                        )
+                    status.received_state_producers.add(producer)
+                else:
+                    part_idx = int(fields[6])
+                    num_parts = int(fields[7])
+                    if num_parts <= 1 or part_idx < 0 or part_idx >= num_parts:
+                        raise ValueError("invalid protected state part metadata")
+                    expected = status.expected_state_parts_per_producer.setdefault(
+                        producer, num_parts
+                    )
+                    if expected != num_parts:
+                        raise ValueError("conflicting protected state part count")
+                    parts = status.received_state_parts_per_producer[producer]
+                    if part_idx in parts:
+                        raise ValueError("duplicate protected state part notification")
+                    parts.add(part_idx)
+                    if len(parts) == num_parts:
+                        status.received_state_parts_per_producer.pop(producer, None)
+                        status.expected_state_parts_per_producer.pop(producer, None)
+                        status.received_state_producers.add(producer)
+                self._maybe_submit_last_scatter(room)
             else:
                 raise ValueError(f"unknown notification kind {kind!r}")
         except Exception as e:
@@ -3084,7 +3282,10 @@ class NixlKVManager(CommonKVManager):
                 return
             handler = self._staging_handler
             if handler is not None and handler.is_staging_room(room):
-                handler.submit_last_scatter_async(room)
+                if not handler.submit_last_scatter_async(room):
+                    raise RuntimeError(
+                        f"Failed to submit final staging scatter room={room}"
+                    )
                 self._chunk_writer_counts.pop(room, None)
             return
         if not status.received_aux:
@@ -3160,8 +3361,15 @@ class NixlKVManager(CommonKVManager):
         nonce = int(msg[2].decode("ascii"))
         producer = int(msg[3].decode("ascii"))
         with self.request_status_lock:
-            status = self._active_decode_generation(room, nonce, "NIXL abort ACK")
-            if status is None:
+            status = self.transfer_statuses.get(room)
+            if status is None or room not in self.request_status:
+                return
+            if nonce != status.transfer_nonce:
+                if self._is_stale_nonce(
+                    self.retired_decode_nonces, room, nonce, status.transfer_nonce
+                ):
+                    return
+                self._fail_room(room, "NIXL abort ACK nonce mismatch")
                 return
             if (
                 self.request_status.get(room) != KVPoll.Failed
@@ -3363,7 +3571,9 @@ class NixlKVManager(CommonKVManager):
             expected = active or (next(iter(partial)) if len(partial) == 1 else 0)
             quiesced_nonce = self.quiesced_transfer_nonce_by_room.get(room, 0)
             if nonce <= quiesced_nonce:
-                self._send_or_defer_quiescence_ack_locked(room, nonce, endpoint, port)
+                self._defer_quiescence_ack_locked(
+                    room, nonce, endpoint, port, cleanup_room=False
+                )
                 return
             if expected and nonce == expected:
                 self.abort_ack_targets[room] = (nonce, endpoint, port)
@@ -3372,12 +3582,7 @@ class NixlKVManager(CommonKVManager):
                     not self.active_transfer_workers.get(room, 0)
                     and room not in self.quiescence_failed_rooms
                 ):
-                    if not self._send_or_defer_quiescence_ack_locked(
-                        room, nonce, endpoint, port
-                    ):
-                        return
-                    self._cleanup_quiesced_prefill_room_locked(room)
-                    self.request_status.pop(room, None)
+                    self._defer_quiescence_ack_locked(room, nonce, endpoint, port)
             elif not expected and nonce:
                 if self.active_transfer_workers.get(room, 0):
                     self.abort_ack_targets[room] = (nonce, endpoint, port)
@@ -3387,8 +3592,8 @@ class NixlKVManager(CommonKVManager):
                         quiesced_nonce, nonce
                     )
                     self._retire_nonce(self.retired_transfer_nonces, room, nonce)
-                    self._send_or_defer_quiescence_ack_locked(
-                        room, nonce, endpoint, port
+                    self._defer_quiescence_ack_locked(
+                        room, nonce, endpoint, port, cleanup_room=False
                     )
             return
         if not msg or msg[0] != GUARD:
@@ -3846,6 +4051,10 @@ class NixlKVReceiver(CommonKVReceiver):
         return KVPoll.WaitingForInput  # type: ignore
 
     def _begin_abort_quiescence(self) -> None:
+        with self.kv_mgr.request_status_lock:
+            transfer_status = self.kv_mgr.transfer_statuses.get(self.bootstrap_room)
+            if transfer_status is not None:
+                transfer_status.failed = True
         if getattr(self, "awaiting_quiescence", False):
             if not self.abort_notified:
                 self._send_abort_notification()
@@ -3887,6 +4096,9 @@ class NixlKVReceiver(CommonKVReceiver):
             )
             if expected and quiesced == expected:
                 self.awaiting_quiescence = False
+                # Route release through try_release_page_quarantine so staging
+                # writes are drained and never-submitted allocations reclaimed.
+                self.page_quarantine_required = True
                 self.quiescence_proven = True
                 self.conclude_state = KVPoll.Failed
                 self.kv_mgr.abort_ack_deadline_by_room.pop(self.bootstrap_room, None)
@@ -3914,9 +4126,29 @@ class NixlKVReceiver(CommonKVReceiver):
             self, "awaiting_quiescence", False
         )
 
+    def _staging_scatter_writes_done(self) -> bool:
+        handler = getattr(self.kv_mgr, "_staging_handler", None)
+        if handler is None or not handler.is_staging_room(self.bootstrap_room):
+            return True
+        return handler.pending_scatter_writes_done(self.bootstrap_room)
+
     def try_release_page_quarantine(self) -> bool:
         if not self.requires_page_quarantine():
             return True
+        if not self._staging_scatter_writes_done():
+            return False
+        with self.kv_mgr.request_status_lock:
+            transfer_status = self.kv_mgr.transfer_statuses.get(self.bootstrap_room)
+            if transfer_status is None:
+                return False
+            expected = transfer_status.expected_producers
+            if not expected or transfer_status.quiesced_producers != expected:
+                return False
+
+        handler = getattr(self.kv_mgr, "_staging_handler", None)
+        if handler is not None and handler.is_staging_room(self.bootstrap_room):
+            handler.reclaim_unsubmitted_allocations(self.bootstrap_room)
+
         with self.kv_mgr.request_status_lock:
             transfer_status = self.kv_mgr.transfer_statuses.get(self.bootstrap_room)
             if transfer_status is None:

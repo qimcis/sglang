@@ -1836,6 +1836,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def _reap_quarantined_transfers(self) -> None:
         quarantined = getattr(self, "quarantined_transfer_reqs", {})
         for room, decode_req in list(quarantined.items()):
+            if getattr(decode_req, "_staging_scatter_tracking_failed", False):
+                continue
             receiver = decode_req.kv_receiver
             if not getattr(decode_req, "quarantine_receiver_cleared", False):
                 if (
@@ -2475,7 +2477,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 quarantine = bool(
                     receiver is not None
                     and getattr(receiver, "requires_page_quarantine", lambda: False)()
-                )
+                ) or getattr(decode_req, "_staging_scatter_tracking_failed", False)
                 self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
