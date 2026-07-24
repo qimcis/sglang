@@ -264,7 +264,17 @@ ARG SGL_KERNEL_SOURCE_REVISION=unknown
 
 COPY sgl-kernel /build/sgl-kernel
 RUN --mount=type=cache,target=/root/.cache/pip \
-    mkdir -p /wheels \
+    case "${SGL_KERNEL_ARCH_PROFILE}" in \
+      hopper-sm90) \
+        test -f /build/sgl-kernel/sgl-attn-kv-page-protection.patch \
+        && grep -q "SGL_ATTN_KV_PAGE_PROTECTION_PATCH_SHA256" /build/sgl-kernel/CMakeLists.txt ;; \
+      blackwell-sm100|blackwell-sm103) \
+        test -f /build/sgl-kernel/csrc/flashmla_capability.cu \
+        && grep -q "flashmla_protected_consumer_image_available" /build/sgl-kernel/csrc/flashmla_capability.cu ;; \
+      auto) ;; \
+      *) echo "Unsupported SGL_KERNEL_ARCH_PROFILE: ${SGL_KERNEL_ARCH_PROFILE}" >&2; exit 1 ;; \
+    esac \
+    && mkdir -p /wheels \
     && python3 -m pip install scikit-build-core \
     && cd /build/sgl-kernel \
     && CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_AND_DOWNLOAD_PARALLEL} \
