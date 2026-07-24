@@ -17,11 +17,16 @@ from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
+    KV_PROTECTION_FEATURE_ALL,
+    KV_PROTECTION_FEATURE_CHECKSUM,
+    KV_PROTECTION_FEATURE_PAGE_TAGS,
+    KV_PROTECTION_PROTOCOL_VERSION,
     CommonKVBootstrapServer,
     CommonKVManager,
     CommonKVReceiver,
     CommonKVSender,
     KVTransferError,
+    kv_protection_feature_bitmap,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingContext,
@@ -80,11 +85,75 @@ class TransferInfo:
     dst_transfer_page_tag_ids: Optional[npt.NDArray[np.int32]] = None
     dst_transfer_page_tags: Optional[npt.NDArray[np.int32]] = None
     transfer_nonce: int = 0
-    # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
+    # Keep staging in its legacy positional slot.
     staging: Optional[StagingTransferInfo] = None
+    protection_protocol_version: int = 0
+    protection_feature_bitmap: int = 0
+
+    @property
+    def is_protected(self) -> bool:
+        return bool(
+            self.transfer_nonce
+            or self.protection_protocol_version
+            or self.protection_feature_bitmap
+        )
+
+    def validate(self) -> None:
+        ids = np.asarray(
+            (
+                self.dst_transfer_page_tag_ids
+                if self.dst_transfer_page_tag_ids is not None
+                else []
+            ),
+            dtype=np.int32,
+        ).reshape(-1)
+        tags = np.asarray(
+            (
+                self.dst_transfer_page_tags
+                if self.dst_transfer_page_tags is not None
+                else []
+            ),
+            dtype=np.int32,
+        ).reshape(-1)
+        if len(ids) != len(tags):
+            raise ValueError("Mooncake transfer page id/tag length mismatch")
+        seen = {}
+        for page_id, tag in zip(ids, tags, strict=True):
+            page_id, tag = int(page_id), int(tag)
+            if page_id in seen and seen[page_id] != tag:
+                raise ValueError("conflicting duplicate Mooncake transfer page id")
+            seen[page_id] = tag
+        if not self.is_protected:
+            if len(ids):
+                raise ValueError(
+                    "legacy Mooncake metadata cannot carry transfer page tags"
+                )
+            return
+        if not self.transfer_nonce:
+            raise ValueError("protected Mooncake metadata requires a nonzero nonce")
+        if self.protection_protocol_version != KV_PROTECTION_PROTOCOL_VERSION:
+            raise ValueError("unsupported Mooncake protection protocol version")
+        if (
+            not self.protection_feature_bitmap
+            or self.protection_feature_bitmap & ~KV_PROTECTION_FEATURE_ALL
+        ):
+            raise ValueError("invalid Mooncake protection feature bitmap")
+        if len(ids) and not (
+            self.protection_feature_bitmap & KV_PROTECTION_FEATURE_PAGE_TAGS
+        ):
+            raise ValueError("Mooncake page-tag payload lacks negotiated capability")
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        if len(msg) < 8 or len(msg) > 14 or len(msg) == 13:
+            raise ValueError(
+                "Mooncake transfer metadata must have 8-12 legacy or 14 protected fields"
+            )
+        for index in (4, 9, 10):
+            if len(msg) > index and len(msg[index]) % np.dtype(np.int32).itemsize:
+                raise ValueError(
+                    f"Mooncake transfer metadata field {index} is not int32-aligned"
+                )
         if msg[4] == b"" and msg[5] == b"":
             is_dummy = True
             dst_kv_indices = np.array([], dtype=np.int32)
@@ -107,7 +176,7 @@ class TransferInfo:
                 else np.array([], dtype=np.int32)
             )
             is_dummy = False
-        return cls(
+        info = cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
@@ -125,7 +194,15 @@ class TransferInfo:
             transfer_nonce=(
                 int(msg[11].decode("ascii")) if len(msg) > 11 and msg[11] else 0
             ),
+            protection_protocol_version=(
+                int(msg[12].decode("ascii")) if len(msg) > 12 and msg[12] else 0
+            ),
+            protection_feature_bitmap=(
+                int(msg[13].decode("ascii")) if len(msg) > 13 and msg[13] else 0
+            ),
         )
+        info.validate()
+        return info
 
 
 # decode
@@ -191,6 +268,10 @@ class MooncakeKVManager(CommonKVManager):
         self.enable_trace = server_args.enable_trace
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.active_transfer_nonce_by_room: dict[int, int] = {}
+            self.active_transfer_workers: dict[int, int] = defaultdict(int)
+            self.abort_ack_targets: dict[int, set[tuple[int, str, int]]] = defaultdict(
+                set
+            )
             self.retired_transfer_nonces: dict[int, list[int]] = defaultdict(list)
             self.pending_abort_nonce_by_room: dict[int, int] = {}
             self.session_failures = defaultdict(int)
@@ -259,7 +340,9 @@ class MooncakeKVManager(CommonKVManager):
                 dict
             )
             self.checksum_nonce_table: dict[int, int] = {}
-            self.legacy_checksum_rooms: set[int] = set()
+            self.abort_ack_producers_by_room: dict[int, set[int]] = defaultdict(set)
+            self.expected_abort_ack_producers_by_room: dict[int, set[int]] = {}
+            self.abort_pending_rooms: set[int] = set()
             self.transfer_page_tag_expected_table: dict[int, dict[int, int]] = {}
             self.transfer_page_tag_seen_table: dict[int, set[int]] = {}
             self.transfer_page_tag_event_table: dict[int, object] = {}
@@ -290,6 +373,56 @@ class MooncakeKVManager(CommonKVManager):
             and room in self.active_transfer_nonce_by_room
             and self.active_transfer_nonce_by_room[room] == transfer_nonce
         )
+
+    def _producer_id(self) -> int:
+        return (
+            self.pp_rank * self.attn_cp_size + self.attn_cp_rank
+        ) * self.attn_tp_size + self.attn_tp_rank
+
+    def _try_send_pending_quiescence_acks(self, room: int) -> None:
+        with self.request_status_lock:
+            if self.active_transfer_workers.get(room, 0):
+                return
+            targets = tuple(self.abort_ack_targets.get(room, ()))
+        sent = []
+        for nonce, endpoint, port in targets:
+            try:
+                na = NetworkAddress(endpoint, port)
+                self._send_multipart(
+                    na.to_tcp(),
+                    [
+                        b"ABORT_ACK",
+                        str(room).encode("ascii"),
+                        str(nonce).encode("ascii"),
+                        str(self._producer_id()).encode("ascii"),
+                    ],
+                    is_ipv6=na.is_ipv6,
+                )
+                sent.append((nonce, endpoint, port))
+            except Exception as e:
+                logger.debug(
+                    "Failed to send protected ABORT_ACK for room %s: %s", room, e
+                )
+        if sent:
+            with self.request_status_lock:
+                pending = self.abort_ack_targets.get(room)
+                if pending is not None:
+                    pending.difference_update(sent)
+                    if not pending:
+                        self.abort_ack_targets.pop(room, None)
+
+    def _finish_transfer_worker(self, room: int) -> None:
+        with self.request_status_lock:
+            active = self.active_transfer_workers.get(room, 0)
+            if active <= 1:
+                self.active_transfer_workers.pop(room, None)
+            else:
+                self.active_transfer_workers[room] = active - 1
+        self._try_send_pending_quiescence_acks(room)
+
+    def transfer_workers_quiescent(self, room: int) -> bool:
+        with self.request_status_lock:
+            return not self.active_transfer_workers.get(room, 0)
 
     def _update_active_transfer_status(
         self, room: int, transfer_nonce: int, status: KVPoll
@@ -449,23 +582,22 @@ class MooncakeKVManager(CommonKVManager):
 
     def _send_chunk_ready(self, req, chunk_idx, kv_chunk, prefill_unique_rank):
         """Notify decode that a non-last staging chunk RDMA is complete."""
-        try:
-            na = NetworkAddress(req.endpoint, req.dst_port)
-            self._send_multipart(
-                na.to_tcp(),
-                [
-                    b"CHUNK_READY",
-                    str(req.room).encode("ascii"),
-                    str(chunk_idx).encode("ascii"),
-                    str(kv_chunk.index_slice.start).encode("ascii"),
-                    str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
-                    req.mooncake_session_id.encode("ascii"),
-                    str(prefill_unique_rank).encode("ascii"),
-                ],
-                is_ipv6=na.is_ipv6,
-            )
-        except Exception:
-            pass
+        na = NetworkAddress(req.endpoint, req.dst_port)
+        frames = [
+            b"CHUNK_READY",
+            str(req.room).encode("ascii"),
+            str(chunk_idx).encode("ascii"),
+            str(
+                (req.decode_prefix_len or 0) // self.kv_args.page_size
+                + kv_chunk.index_slice.start
+            ).encode("ascii"),
+            str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
+            req.mooncake_session_id.encode("ascii"),
+            str(prefill_unique_rank).encode("ascii"),
+        ]
+        if req.transfer_nonce:
+            frames.append(str(req.transfer_nonce).encode("ascii"))
+        self._send_multipart(na.to_tcp(), frames, is_ipv6=na.is_ipv6)
 
     def _do_staging_transfer(
         self,
@@ -473,14 +605,12 @@ class MooncakeKVManager(CommonKVManager):
         kv_chunk,
         req,
         target_info,
-        chunked_dst_kv_indice,
-        executor,
         queue,
         prefill_unique_rank,
     ):
         """Execute staging transfer for one chunk. Returns (ret, deferred).
 
-        Handles readiness check, transfer, fallback, and CHUNK_READY notification.
+        Handles readiness checks, transfer, and CHUNK_READY notification.
         deferred=True means caller should re-enqueue and break. The third return
         value is true only when this call has written the chunk into decode KV
         pages; pure staging writes land in an intermediate buffer and are scattered
@@ -513,23 +643,23 @@ class MooncakeKVManager(CommonKVManager):
             target_info,
         )
         if ret == -1:
-            logger.warning(
-                f"[Staging][tp{_tp}] Falling back to per-token slice path "
-                f"(room={kv_chunk.room})"
+            logger.error(
+                "[Staging][tp%s] Staging transfer is unavailable; refusing a "
+                "direct-write fallback (room=%s)",
+                _tp,
+                kv_chunk.room,
             )
-            ret = self.send_kvcache_slice(
-                req.mooncake_session_id,
-                kv_chunk.prefill_kv_indices,
-                target_info.dst_kv_ptrs,
-                chunked_dst_kv_indice,
-                target_info.dst_tp_rank,
-                target_info.dst_attn_tp_size,
-                target_info.dst_kv_item_len,
-                executor,
-            )
-            landed_on_decode = ret == 0
+            return (-1, False, False)
         elif ret == 0 and not kv_chunk.is_last_chunk:
-            self._send_chunk_ready(req, chunk_idx, kv_chunk, prefill_unique_rank)
+            try:
+                self._send_chunk_ready(req, chunk_idx, kv_chunk, prefill_unique_rank)
+            except Exception as e:
+                logger.error(
+                    "Failed to send staging CHUNK_READY for room=%s: %s",
+                    kv_chunk.room,
+                    e,
+                )
+                return (-1, False, False)
         return (ret, False, landed_on_decode)
 
     def _prefetch_staging_reqs(self, room: int):
@@ -617,14 +747,14 @@ class MooncakeKVManager(CommonKVManager):
 
         if not staging_buffer.fits(per_rank_bytes):
             logger.warning(
-                f"Prefill staging too small for {per_rank_bytes} bytes, falling back"
+                f"Prefill staging too small for {per_rank_bytes} bytes; rejecting transfer"
             )
             return -1
         if dst_staging_size < total_staging_needed:
             logger.warning(
                 f"Decode staging too small: need {total_staging_needed} bytes "
                 f"({num_writers if self.attn_tp_size > dst_attn_tp_size else 1} writers "
-                f"x {per_rank_bytes} bytes/rank), have {dst_staging_size}, falling back"
+                f"x {per_rank_bytes} bytes/rank), have {dst_staging_size}; rejecting transfer"
             )
             return -1
 
@@ -759,22 +889,31 @@ class MooncakeKVManager(CommonKVManager):
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         if self.enable_custom_mem_pool:
-            futures = [
-                executor.submit(
-                    process_layer,
-                    src_ptr,
-                    dst_ptr,
-                    item_len,
-                )
-                for (src_ptr, dst_ptr, item_len) in layers_params
-            ]
+            futures = []
+            submission_error = None
+            for src_ptr, dst_ptr, item_len in layers_params:
+                try:
+                    futures.append(
+                        executor.submit(process_layer, src_ptr, dst_ptr, item_len)
+                    )
+                except Exception as e:
+                    submission_error = e
+                    break
+            first_status = 0
+            first_error = None
             for future in concurrent.futures.as_completed(futures):
-                status = future.result()
-                if status != 0:
-                    for f in futures:
-                        f.cancel()
-                    return status
-            return 0
+                try:
+                    status = future.result()
+                    if status != 0 and first_status == 0:
+                        first_status = status
+                except Exception as e:
+                    if first_error is None:
+                        first_error = e
+            if submission_error is not None:
+                raise submission_error
+            if first_error is not None:
+                raise first_error
+            return first_status
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads
@@ -903,23 +1042,44 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         futures = []
+        submission_error = None
         for i in range(layers_current_pp_stage):
-            futures.append(
-                executor.submit(process_layer_tp_aware, src_k_ptrs[i], dst_k_ptrs[i])
-            )
-        for i in range(layers_current_pp_stage):
-            futures.append(
-                executor.submit(process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
-            )
+            try:
+                futures.append(
+                    executor.submit(
+                        process_layer_tp_aware, src_k_ptrs[i], dst_k_ptrs[i]
+                    )
+                )
+            except Exception as e:
+                submission_error = e
+                break
+        if submission_error is None:
+            for i in range(layers_current_pp_stage):
+                try:
+                    futures.append(
+                        executor.submit(
+                            process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i]
+                        )
+                    )
+                except Exception as e:
+                    submission_error = e
+                    break
 
+        first_status = 0
+        first_error = None
         for future in concurrent.futures.as_completed(futures):
-            status = future.result()
-            if status != 0:
-                for f in futures:
-                    f.cancel()
-                return status
-
-        return 0
+            try:
+                status = future.result()
+                if status != 0 and first_status == 0:
+                    first_status = status
+            except Exception as e:
+                if first_error is None:
+                    first_error = e
+        if submission_error is not None:
+            raise submission_error
+        if first_error is not None:
+            raise first_error
+        return first_status
 
     def send_aux(
         self,
@@ -1485,6 +1645,7 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         while True:
+            worker_room = None
             try:
                 kv_chunk: TransferKVChunk = queue.get()
                 if self.enable_trace:
@@ -1501,6 +1662,9 @@ class MooncakeKVManager(CommonKVManager):
                     reqs_to_be_processed = tuple(
                         self.transfer_infos.get(kv_chunk.room, {}).values()
                     )
+                    if is_active:
+                        self.active_transfer_workers[kv_chunk.room] += 1
+                        worker_room = kv_chunk.room
                 if not is_active:
                     logger.debug(
                         f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
@@ -1521,12 +1685,9 @@ class MooncakeKVManager(CommonKVManager):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
                 polls = []
                 dst_ranks_infos = []
+                has_real_request = any(not req.is_dummy for req in reqs_to_be_processed)
                 # Unique id per prefill sender so decode's response set size matches expected_response_num.
-                prefill_unique_rank = (
-                    self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
-                    + self.pp_rank * self.attn_cp_size
-                    + self.attn_cp_rank
-                )
+                prefill_unique_rank = self._producer_id()
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
@@ -1599,17 +1760,15 @@ class MooncakeKVManager(CommonKVManager):
                                     kv_chunk,
                                     req,
                                     target_rank_registration_info,
-                                    chunked_dst_kv_indice,
-                                    executor,
                                     queue,
-                                    prefill_unique_rank,
+                                    self._producer_id(),
                                 )
                             )
                             if deferred:
                                 staging_deferred = True
                                 # Chunk re-enqueued; stop processing remaining reqs for this chunk
                                 break
-                        else:
+                        elif not self.enable_staging:
                             ret = self.send_kvcache_slice(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
@@ -1620,6 +1779,14 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
                             )
+                        else:
+                            logger.error(
+                                "Staging is required for heterogeneous TP but its "
+                                "strategy or destination registration is unavailable "
+                                "(room=%s)",
+                                kv_chunk.room,
+                            )
+                            ret = -1
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
@@ -1723,12 +1890,8 @@ class MooncakeKVManager(CommonKVManager):
                                             transfer_nonce=transfer_nonce,
                                         )
                     else:
-                        # Dummy request means the decode instance is not used, so its status can be marked as success directly
-                        # Dummy request does not need to sync status to decode endpoint
-                        if kv_chunk.is_last_chunk:
-                            self._update_active_transfer_status(
-                                req.room, kv_chunk.transfer_nonce, KVPoll.Success
-                            )
+                        # Dummy requests do not participate in destination completion.
+                        pass
 
                     if self.enable_trace:
                         mooncake_trace_slice(
@@ -1736,6 +1899,11 @@ class MooncakeKVManager(CommonKVManager):
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND_SESSION,
                             start_ts,
                         )
+
+                if kv_chunk.is_last_chunk and not has_real_request:
+                    self._update_active_transfer_status(
+                        kv_chunk.room, kv_chunk.transfer_nonce, KVPoll.Success
+                    )
 
                 if self.enable_trace:
                     kv_chunk.trace_ctx.trace_slice_end(
@@ -1745,6 +1913,8 @@ class MooncakeKVManager(CommonKVManager):
                     )
 
                 if staging_deferred:
+                    self._finish_transfer_worker(kv_chunk.room)
+                    worker_room = None
                     continue
 
                 with self.request_status_lock:
@@ -1764,7 +1934,12 @@ class MooncakeKVManager(CommonKVManager):
                         self._retire_transfer_nonce(kv_chunk.room, active_nonce)
                         self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
 
+                self._finish_transfer_worker(kv_chunk.room)
+                worker_room = None
+
             except Exception as e:
+                if worker_room is not None:
+                    self._finish_transfer_worker(worker_room)
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
@@ -1776,14 +1951,23 @@ class MooncakeKVManager(CommonKVManager):
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
-                room = waiting_req_bytes[0].decode("ascii")
+                try:
+                    room = waiting_req_bytes[0].decode("ascii")
+                except (IndexError, UnicodeDecodeError) as e:
+                    logger.warning(
+                        "Ignoring malformed Mooncake bootstrap message: %s", e
+                    )
+                    continue
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
                     from sglang.srt.disaggregation.common.staging_handler import (
                         handle_watermark_msg,
                     )
 
-                    handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
+                    try:
+                        handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
+                    except Exception as e:
+                        logger.warning("Ignoring malformed WATERMARK message: %s", e)
                     continue
                 # Staging: decode replies with allocated staging offset
                 if room == "STAGING_RSP":
@@ -1791,23 +1975,28 @@ class MooncakeKVManager(CommonKVManager):
                         handle_staging_rsp,
                     )
 
-                    with self.request_status_lock:
-                        handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                    try:
+                        with self.request_status_lock:
+                            handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                    except Exception as e:
+                        logger.warning("Ignoring malformed STAGING_RSP message: %s", e)
                     continue
                 # Decode-side abort notification: mark room as failed and ACK
                 if room == "ABORT":
-                    room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
-                    decode_ip = waiting_req_bytes[2].decode("ascii")
-                    decode_port = int(waiting_req_bytes[3].decode("ascii"))
-                    abort_nonce = (
-                        int(waiting_req_bytes[4].decode("ascii"))
-                        if len(waiting_req_bytes) > 4 and waiting_req_bytes[4]
-                        else 0
-                    )
-                    manager = getattr(self.kv_args, "transfer_page_tag_manager", None)
+                    try:
+                        room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
+                        decode_ip = waiting_req_bytes[2].decode("ascii")
+                        decode_port = int(waiting_req_bytes[3].decode("ascii"))
+                        abort_nonce = (
+                            int(waiting_req_bytes[4].decode("ascii"))
+                            if len(waiting_req_bytes) > 4 and waiting_req_bytes[4]
+                            else 0
+                        )
+                    except (IndexError, UnicodeDecodeError, ValueError) as e:
+                        logger.warning("Ignoring malformed ABORT message: %s", e)
+                        continue
                     protection_required = bool(
-                        getattr(self.kv_args, "kv_protection_enabled", False)
-                        or (manager is not None and manager.config.enabled)
+                        kv_protection_feature_bitmap(self.kv_args)
                     )
                     with self.request_status_lock:
                         active_nonce = self.active_transfer_nonce_by_room.get(
@@ -1865,6 +2054,20 @@ class MooncakeKVManager(CommonKVManager):
                             self.pending_abort_nonce_by_room[room_to_be_aborted] = (
                                 abort_nonce
                             )
+                        protected_ack = bool(
+                            abort_nonce
+                            and (
+                                retired_nonce
+                                or (
+                                    protection_required
+                                    and (nonce_matches or pending_abort)
+                                )
+                            )
+                        )
+                        if protected_ack:
+                            self.abort_ack_targets[room_to_be_aborted].add(
+                                (abort_nonce, decode_ip, decode_port)
+                            )
                     # No need to abort the room if it has already succeeded.
                     if should_abort:
                         logger.debug(
@@ -1881,32 +2084,40 @@ class MooncakeKVManager(CommonKVManager):
                             f"Received abort notification for room {room_to_be_aborted}, "
                             f"ignoring (already completed or unknown)"
                         )
-                    # Send ACK back to decode endpoint
+                    if protected_ack:
+                        self._try_send_pending_quiescence_acks(room_to_be_aborted)
+                    elif not abort_nonce:
+                        try:
+                            na = NetworkAddress(decode_ip, decode_port)
+                            self._send_multipart(
+                                na.to_tcp(),
+                                [
+                                    b"ABORT_ACK",
+                                    str(room_to_be_aborted).encode("ascii"),
+                                    b"0",
+                                ],
+                                is_ipv6=na.is_ipv6,
+                            )
+                        except Exception as e:
+                            logger.debug(
+                                "Failed to send legacy ABORT_ACK for room %s: %s",
+                                room_to_be_aborted,
+                                e,
+                            )
+                    continue
+                try:
+                    mooncake_session_id = waiting_req_bytes[3].decode("ascii")
+                except (IndexError, UnicodeDecodeError) as e:
+                    logger.warning("Ignoring malformed Mooncake metadata: %s", e)
+                    continue
+                if room == "None":
                     try:
-                        na = NetworkAddress(decode_ip, decode_port)
-                        self._send_multipart(
-                            na.to_tcp(),
-                            [
-                                b"ABORT_ACK",
-                                str(room_to_be_aborted).encode("ascii"),
-                                str(abort_nonce).encode("ascii"),
-                            ],
-                            is_ipv6=na.is_ipv6,
-                        )
-                        logger.debug(
-                            f"Sent ABORT_ACK for room {room_to_be_aborted} to "
-                            f"{decode_ip}:{decode_port}"
+                        self.decode_kv_args_table[mooncake_session_id] = (
+                            KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                         )
                     except Exception as e:
-                        logger.debug(
-                            f"Failed to send ABORT_ACK for room {room_to_be_aborted}: {e}"
-                        )
-                    continue
-                mooncake_session_id = waiting_req_bytes[3].decode("ascii")
-                if room == "None":
-                    self.decode_kv_args_table[mooncake_session_id] = (
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    )
+                        logger.warning("Ignoring malformed KVArgs registration: %s", e)
+                        continue
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
                             self.failed_sessions.remove(mooncake_session_id)
@@ -1917,10 +2128,52 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     continue
                 else:
-                    required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
-                    room = int(room)
-                    transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
+                    try:
+                        room = int(room)
+                        transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
+                    except Exception as e:
+                        if isinstance(room, int):
+                            self.record_failure(
+                                room, f"Invalid Mooncake bootstrap metadata: {e}"
+                            )
+                            self.update_status(room, KVPoll.Failed)
+                        logger.warning(
+                            "Rejecting invalid Mooncake bootstrap room=%s: %s", room, e
+                        )
+                        continue
+                    required_dst_info_num = transfer_info.required_dst_info_num
                     transfer_nonce = transfer_info.transfer_nonce
+                    local_features = kv_protection_feature_bitmap(self.kv_args)
+                    expected_protocol = (
+                        KV_PROTECTION_PROTOCOL_VERSION if local_features else 0
+                    )
+                    if (
+                        transfer_info.protection_protocol_version != expected_protocol
+                        or transfer_info.protection_feature_bitmap != local_features
+                    ):
+                        reason = "Mooncake protection feature negotiation mismatch"
+                        self.record_failure(room, reason)
+                        self.update_status(room, KVPoll.Failed)
+                        if transfer_nonce:
+                            with self.request_status_lock:
+                                self._retire_transfer_nonce(room, transfer_nonce)
+                        try:
+                            self.sync_status_to_decode_endpoint(
+                                transfer_info.endpoint,
+                                transfer_info.dst_port,
+                                room,
+                                KVPoll.Failed,
+                                self._producer_id(),
+                                transfer_nonce=transfer_nonce,
+                            )
+                        except Exception as e:
+                            logger.debug(
+                                "Failed to report Mooncake negotiation mismatch "
+                                "for room=%s: %s",
+                                room,
+                                e,
+                            )
+                        continue
                     with self.request_status_lock:
                         if self.request_status.get(room) == KVPoll.Failed:
                             logger.warning(
@@ -1960,12 +2213,22 @@ class MooncakeKVManager(CommonKVManager):
                         if room not in self.transfer_infos:
                             self.transfer_infos[room] = {}
 
-                        existing_nonces = {
-                            info.transfer_nonce
-                            for info in self.transfer_infos[room].values()
-                        }
-                        if existing_nonces and transfer_nonce not in existing_nonces:
-                            self.transfer_infos[room] = {}
+                        if self.transfer_infos[room]:
+                            first = next(iter(self.transfer_infos[room].values()))
+                            if (
+                                first.transfer_nonce != transfer_nonce
+                                or first.protection_protocol_version
+                                != transfer_info.protection_protocol_version
+                                or first.protection_feature_bitmap
+                                != transfer_info.protection_feature_bitmap
+                                or first.required_dst_info_num
+                                != transfer_info.required_dst_info_num
+                            ):
+                                self.record_failure(
+                                    room, "Mooncake bootstrap metadata records disagree"
+                                )
+                                self.update_status(room, KVPoll.Failed)
+                                continue
 
                         self.transfer_infos[room][mooncake_session_id] = transfer_info
                         # NOTE: after bootstrapping we can mark the req as waiting for input
@@ -1996,23 +2259,58 @@ class MooncakeKVManager(CommonKVManager):
 
         # Staging: prefill notifies a chunk written to staging buffer
         if msg[0] == b"CHUNK_READY":
-            room = int(msg[1].decode("ascii"))
-            chunk_idx = int(msg[2].decode("ascii"))
-            page_start = int(msg[3].decode("ascii"))
-            num_pages = int(msg[4].decode("ascii"))
-            session_id = msg[5].decode("ascii")
-            handler = self._staging_handler
-            assert (
-                handler is not None
-            ), "CHUNK_READY received before staging handler initialized"
-            handler.handle_chunk_arrived(
-                room,
-                chunk_idx,
-                page_start,
-                num_pages,
-                session_id,
-                self._chunk_writer_counts,
-            )
+            room = None
+            try:
+                if len(msg) not in (7, 8):
+                    raise ValueError(f"CHUNK_READY has {len(msg)} frames")
+                room = int(msg[1].decode("ascii"))
+                chunk_idx = int(msg[2].decode("ascii"))
+                page_start = int(msg[3].decode("ascii"))
+                num_pages = int(msg[4].decode("ascii"))
+                if not msg[5].decode("ascii"):
+                    raise ValueError("CHUNK_READY has an empty destination session")
+                producer_id = int(msg[6].decode("ascii"))
+                expected_nonce = self.checksum_nonce_table.get(room, 0)
+                if expected_nonce:
+                    if len(msg) != 8:
+                        raise ValueError("protected CHUNK_READY has no nonce")
+                    transfer_nonce = int(msg[7].decode("ascii"))
+                    if transfer_nonce != expected_nonce:
+                        logger.warning(
+                            "Ignoring stale CHUNK_READY room=%s nonce=%s",
+                            room,
+                            transfer_nonce,
+                        )
+                        return
+                    expected_producers = self.expected_abort_ack_producers_by_room.get(
+                        room, set()
+                    )
+                    if producer_id not in expected_producers:
+                        raise ValueError("CHUNK_READY came from an unexpected producer")
+                    writer_id = str(producer_id)
+                else:
+                    if len(msg) != 7:
+                        raise ValueError(
+                            "legacy CHUNK_READY cannot carry a protection nonce"
+                        )
+                    writer_id = str(producer_id)
+                handler = self._staging_handler
+                assert (
+                    handler is not None
+                ), "CHUNK_READY received before staging handler initialized"
+                handler.handle_chunk_arrived(
+                    room,
+                    chunk_idx,
+                    page_start,
+                    num_pages,
+                    writer_id,
+                    self._chunk_writer_counts,
+                )
+            except Exception as e:
+                if room is not None and self.checksum_nonce_table.get(room, 0):
+                    self.record_failure(room, f"Invalid protected CHUNK_READY: {e}")
+                    self.update_status(room, KVPoll.Failed)
+                raise
             return
 
         # Staging: prefill pre-requests staging allocation before forward
@@ -2022,9 +2320,27 @@ class MooncakeKVManager(CommonKVManager):
 
         # Prefill acknowledges abort notification
         if msg[0] == b"ABORT_ACK":
-            # TODO(shangming): use this info to implement the deferred release mechanism if needed
             ack_aborted_room = int(msg[1].decode("ascii"))
-            logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
+            if len(msg) == 4:
+                nonce = int(msg[2].decode("ascii"))
+                producer_id = int(msg[3].decode("ascii"))
+                with self.request_status_lock:
+                    expected_nonce = self.checksum_nonce_table.get(ack_aborted_room)
+                    expected_producers = self.expected_abort_ack_producers_by_room.get(
+                        ack_aborted_room
+                    )
+                    if (
+                        expected_nonce == nonce
+                        and expected_producers is not None
+                        and producer_id in expected_producers
+                        and ack_aborted_room in self.abort_pending_rooms
+                        and self.request_status.get(ack_aborted_room) == KVPoll.Failed
+                    ):
+                        self.abort_ack_producers_by_room[ack_aborted_room].add(
+                            producer_id
+                        )
+            else:
+                logger.debug("Received legacy ABORT_ACK for room %s", ack_aborted_room)
             return
 
         self._handle_decode_completion(msg)
@@ -2042,10 +2358,10 @@ class MooncakeKVManager(CommonKVManager):
                 return
             if self.request_status[bootstrap_room] == KVPoll.Failed:
                 return
-            manager = getattr(self.kv_args, "transfer_page_tag_manager", None)
-            protection_required = bool(manager is not None and manager.config.enabled)
+            protection_features = kv_protection_feature_bitmap(self.kv_args)
+            protection_required = bool(protection_features)
             checksum_required = bool(
-                manager is not None and manager.config.checksum_enabled
+                protection_features & KV_PROTECTION_FEATURE_CHECKSUM
             )
             plan = None
             if protection_required:
@@ -2078,6 +2394,23 @@ class MooncakeKVManager(CommonKVManager):
                         bootstrap_room,
                         transfer_nonce,
                     )
+                    return
+                expected_producers = self.expected_abort_ack_producers_by_room.get(
+                    bootstrap_room, set()
+                )
+                if prefill_rank not in expected_producers:
+                    self.record_failure(
+                        bootstrap_room,
+                        "Invalid KV protection completion: unexpected producer",
+                    )
+                    self.update_status(bootstrap_room, KVPoll.Failed)
+                    return
+                if prefill_rank in self.prefill_response_tracker[bootstrap_room]:
+                    self.record_failure(
+                        bootstrap_room,
+                        "Invalid KV protection completion: duplicate producer",
+                    )
+                    self.update_status(bootstrap_room, KVPoll.Failed)
                     return
 
                 try:
@@ -2159,7 +2492,26 @@ class MooncakeKVManager(CommonKVManager):
                                 return
                     if staging_handler is not None:
                         if is_staging_room:
-                            staging_handler.submit_last_scatter_async(bootstrap_room)
+                            if protection_required and not (
+                                staging_handler.intermediate_scatters_submitted(
+                                    bootstrap_room
+                                )
+                            ):
+                                self.record_failure(
+                                    bootstrap_room,
+                                    "Missing protected Mooncake staging chunk completion",
+                                )
+                                self.update_status(bootstrap_room, KVPoll.Failed)
+                                return
+                            if not staging_handler.submit_last_scatter_async(
+                                bootstrap_room
+                            ):
+                                self.record_failure(
+                                    bootstrap_room,
+                                    "Failed to submit final Mooncake staging scatter",
+                                )
+                                self.update_status(bootstrap_room, KVPoll.Failed)
+                                return
                         self._chunk_writer_counts.pop(bootstrap_room, None)
                     self.update_status(bootstrap_room, KVPoll.Success)
             elif status == KVPoll.Failed:
@@ -2372,6 +2724,9 @@ class MooncakeKVSender(CommonKVSender):
             self.kv_mgr.retire_transfer_room(self.bootstrap_room)
             super().clear()
 
+    def source_pages_quiescent(self) -> bool:
+        return self.kv_mgr.transfer_workers_quiescent(self.bootstrap_room)
+
     def _init_trace_ctx(self):
         if self.kv_mgr.enable_trace:
             self.trace_ctx = TraceReqContext(
@@ -2402,20 +2757,48 @@ class MooncakeKVReceiver(CommonKVReceiver):
     ):
         self.session_id = mgr.get_session_id()
         self.init_time = None
-        manager = getattr(mgr.kv_args, "transfer_page_tag_manager", None)
+        self.protection_feature_bitmap = kv_protection_feature_bitmap(mgr.kv_args)
         self.transfer_nonce = (
-            secrets.randbits(64) or 1
-            if manager is not None and manager.config.enabled
-            else 0
+            secrets.randbits(64) or 1 if self.protection_feature_bitmap else 0
         )
+        self.started_transfer = False
+        self.page_quarantine_required = False
+        self.quiescence_proven = False
+        self.expected_producers: set[int] = set()
+        self.notified_producers: set[int] = set()
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
     def init(self, prefill_dp_rank: int):
         super().init(prefill_dp_rank)
-        manager = getattr(self.kv_mgr.kv_args, "transfer_page_tag_manager", None)
-        if manager is not None and manager.config.enabled:
+        if self.conclude_state == KVPoll.Failed:
+            return
+        expected_protocol = (
+            KV_PROTECTION_PROTOCOL_VERSION if self.protection_feature_bitmap else 0
+        )
+        if (
+            self.prefill_info.protection_protocol_version != expected_protocol
+            or self.prefill_info.protection_feature_bitmap
+            != self.protection_feature_bitmap
+        ):
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                "Mooncake prefill KV protection capability mismatch",
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.conclude_state = KVPoll.Failed
+            return
+        if self.protection_feature_bitmap:
+            manager = getattr(self.kv_mgr.kv_args, "transfer_page_tag_manager", None)
+            if manager is None or not manager.config.enabled:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    "Mooncake decode protection manager is unavailable",
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.conclude_state = KVPoll.Failed
+                return
             if (
-                manager.config.checksum_enabled
+                self.protection_feature_bitmap & KV_PROTECTION_FEATURE_CHECKSUM
                 and getattr(self, "required_prefill_response_num", 1) != 1
             ):
                 self.kv_mgr.record_failure(
@@ -2425,10 +2808,18 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 self.conclude_state = KVPoll.Failed
                 return
+            self.expected_producers = {
+                int(info["producer_id"])
+                for info in self.bootstrap_infos
+                if not info.get("is_dummy", False)
+            }
             with self.kv_mgr.request_status_lock:
                 self.kv_mgr.checksum_nonce_table[self.bootstrap_room] = (
                     self.transfer_nonce
                 )
+                self.kv_mgr.expected_abort_ack_producers_by_room[
+                    self.bootstrap_room
+                ] = set(self.expected_producers)
 
     def _register_kv_args(self):
         packed_kv_data_ptrs = b"".join(
@@ -2507,6 +2898,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
             and self.kv_mgr._staging_ctx.allocator is not None
         ):
             self.chunk_staging_infos = []
+            self.expected_staging_chunks = set()
+            self.staging_total_pages = len(kv_indices)
+            self.staging_page_start = (
+                decode_prefix_len or 0
+            ) // self.kv_mgr.kv_args.page_size
             self.kv_mgr.register_staging_room_bootstrap(
                 self.bootstrap_room, self.bootstrap_infos, self
             )
@@ -2525,8 +2921,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
             if transfer_page_tags is not None
             else b""
         )
-        manager = getattr(self.kv_mgr.kv_args, "transfer_page_tag_manager", None)
-        if manager is not None and manager.config.enable_attention_tags:
+        if self.protection_feature_bitmap & KV_PROTECTION_FEATURE_PAGE_TAGS:
             tag_ids = np.asarray(
                 transfer_page_tag_ids if transfer_page_tag_ids is not None else [],
                 dtype=np.int32,
@@ -2561,26 +2956,57 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 )
                 self.kv_mgr.transfer_page_tag_seen_table[self.bootstrap_room] = set()
         for bootstrap_info in self.bootstrap_infos:
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-            is_dummy = bootstrap_info["is_dummy"]
+            try:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                is_dummy = bootstrap_info["is_dummy"]
 
-            with lock:
-                sock.send_multipart(
-                    [
-                        str(self.bootstrap_room).encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.session_id.encode("ascii"),
-                        kv_indices_bytes if not is_dummy else b"",
-                        str(aux_index).encode("ascii") if not is_dummy else b"",
-                        state_indices_bytes if not is_dummy else b"",
-                        str(self.required_dst_info_num).encode("ascii"),
-                        str(decode_prefix_len or 0).encode("ascii"),
-                        transfer_page_tag_ids_bytes if not is_dummy else b"",
-                        transfer_page_tags_bytes if not is_dummy else b"",
-                        str(self.transfer_nonce).encode("ascii"),
-                    ]
+                frames = [
+                    str(self.bootstrap_room).encode("ascii"),
+                    self.kv_mgr.local_ip.encode("ascii"),
+                    str(self.kv_mgr.rank_port).encode("ascii"),
+                    self.session_id.encode("ascii"),
+                    kv_indices_bytes if not is_dummy else b"",
+                    str(aux_index).encode("ascii") if not is_dummy else b"",
+                    state_indices_bytes if not is_dummy else b"",
+                    str(self.required_dst_info_num).encode("ascii"),
+                    str(decode_prefix_len or 0).encode("ascii"),
+                    transfer_page_tag_ids_bytes if not is_dummy else b"",
+                    transfer_page_tags_bytes if not is_dummy else b"",
+                    str(self.transfer_nonce).encode("ascii"),
+                ]
+                if self.protection_feature_bitmap:
+                    frames.extend(
+                        [
+                            str(KV_PROTECTION_PROTOCOL_VERSION).encode("ascii"),
+                            str(self.protection_feature_bitmap).encode("ascii"),
+                        ]
+                    )
+                with lock:
+                    sock.send_multipart(frames)
+                if self.protection_feature_bitmap and not is_dummy:
+                    self.notified_producers.add(int(bootstrap_info["producer_id"]))
+                    self.started_transfer = True
+            except Exception as e:
+                if not self.protection_feature_bitmap:
+                    raise
+                with self.kv_mgr.request_status_lock:
+                    self.kv_mgr.expected_abort_ack_producers_by_room[
+                        self.bootstrap_room
+                    ] = set(self.notified_producers)
+                self.page_quarantine_required = bool(self.notified_producers)
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    f"Failed to send protected Mooncake metadata: {e}",
                 )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self._send_abort_notification()
+                self.init_time = time.time()
+                return
+        if self.protection_feature_bitmap:
+            with self.kv_mgr.request_status_lock:
+                self.kv_mgr.expected_abort_ack_producers_by_room[
+                    self.bootstrap_room
+                ] = set(self.notified_producers)
         self.init_time = time.time()
 
     def get_checksum_plan(self):
@@ -2590,11 +3016,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 return None
             return next(iter(plans.values()))
 
-    def uses_legacy_checksum_completion(self) -> bool:
-        with self.kv_mgr.request_status_lock:
-            return self.bootstrap_room in self.kv_mgr.legacy_checksum_rooms
-
     def clear(self) -> None:
+        if self.requires_page_quarantine():
+            return
         with self.kv_mgr.request_status_lock:
             tag_event = self.kv_mgr.transfer_page_tag_event_table.get(
                 self.bootstrap_room
@@ -2604,13 +3028,33 @@ class MooncakeKVReceiver(CommonKVReceiver):
             super().clear()
             self.kv_mgr.checksum_manifest_table.pop(self.bootstrap_room, None)
             self.kv_mgr.checksum_nonce_table.pop(self.bootstrap_room, None)
-            self.kv_mgr.legacy_checksum_rooms.discard(self.bootstrap_room)
+            self.kv_mgr.abort_ack_producers_by_room.pop(self.bootstrap_room, None)
+            self.kv_mgr.expected_abort_ack_producers_by_room.pop(
+                self.bootstrap_room, None
+            )
+            self.kv_mgr.abort_pending_rooms.discard(self.bootstrap_room)
             self.kv_mgr.transfer_page_tag_expected_table.pop(self.bootstrap_room, None)
             self.kv_mgr.transfer_page_tag_seen_table.pop(self.bootstrap_room, None)
             self.kv_mgr.transfer_page_tag_event_table.pop(self.bootstrap_room, None)
 
     def _send_abort_notification(self):
+        if self.transfer_nonce:
+            with self.kv_mgr.request_status_lock:
+                self.kv_mgr.abort_pending_rooms.add(self.bootstrap_room)
         for bootstrap_info in self.bootstrap_infos:
+            producer_id = int(bootstrap_info.get("producer_id", -1))
+            if bootstrap_info.get("is_dummy", False):
+                continue
+            with self.kv_mgr.request_status_lock:
+                expected = self.kv_mgr.expected_abort_ack_producers_by_room.get(
+                    self.bootstrap_room, set()
+                )
+                if self.transfer_nonce and producer_id not in expected:
+                    continue
+                if producer_id in self.kv_mgr.abort_ack_producers_by_room.get(
+                    self.bootstrap_room, set()
+                ):
+                    continue
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
@@ -2630,6 +3074,40 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     e,
                 )
 
+    def requires_page_quarantine(self) -> bool:
+        return bool(self.page_quarantine_required and not self.quiescence_proven)
+
+    def try_release_page_quarantine(self) -> bool:
+        if not self.requires_page_quarantine():
+            return True
+        self._send_abort_notification()
+        with self.kv_mgr.request_status_lock:
+            received = self.kv_mgr.abort_ack_producers_by_room.get(
+                self.bootstrap_room, set()
+            )
+            expected = self.kv_mgr.expected_abort_ack_producers_by_room.get(
+                self.bootstrap_room, set()
+            )
+            if received != expected:
+                return False
+        handler = getattr(self.kv_mgr, "_staging_handler", None)
+        if handler is not None and handler.is_staging_room(self.bootstrap_room):
+            if not handler.pending_scatter_writes_done(self.bootstrap_room):
+                return False
+            handler.reclaim_unsubmitted_allocations(self.bootstrap_room)
+        with self.kv_mgr.request_status_lock:
+            received = self.kv_mgr.abort_ack_producers_by_room.get(
+                self.bootstrap_room, set()
+            )
+            expected = self.kv_mgr.expected_abort_ack_producers_by_room.get(
+                self.bootstrap_room, set()
+            )
+            if received != expected:
+                return False
+            self.page_quarantine_required = False
+            self.quiescence_proven = True
+        return True
+
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
@@ -2648,7 +3126,12 @@ class MooncakeKVReceiver(CommonKVReceiver):
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
 
-        self.clear()
+        if self.transfer_nonce and self.started_transfer and not self.quiescence_proven:
+            self.page_quarantine_required = True
+        if self.requires_page_quarantine():
+            self._send_abort_notification()
+        else:
+            self.clear()
 
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
@@ -2658,6 +3141,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
         raise KVTransferError(
             self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
         )
+
+    def abort(self):
+        super().abort()
+        if self.transfer_nonce and self.started_transfer and not self.quiescence_proven:
+            self.page_quarantine_required = True
+        if self.requires_page_quarantine():
+            self._send_abort_notification()
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):

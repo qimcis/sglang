@@ -161,7 +161,7 @@ class PrefillBootstrapQueue:
         )
 
         protocol_config = KVProtectionConfig.from_env(is_pd_decode=True)
-        self.kv_protection_enabled = protocol_config.enabled
+        self.kv_protection_config = protocol_config
         # Prefill only needs the transfer-checksum half; disable attention tags so we
         # do not attach a sidecar table / bump generations on the prefill side.
         config = dataclasses.replace(protocol_config, enable_attention_tags=False)
@@ -217,7 +217,7 @@ class PrefillBootstrapQueue:
             )
         kv_args.page_size = self.token_to_kv_pool.page_size
         kv_args.transfer_page_tag_manager = self.scheduler.kv_protection_manager
-        kv_args.kv_protection_enabled = self.kv_protection_enabled
+        kv_args.kv_protection_config = self.kv_protection_config
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
@@ -825,6 +825,18 @@ class SchedulerDisaggregationPrefillMixin:
         Poll the requests in the middle of transfer. If done, return the request.
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
+        quarantined = getattr(self, "_quarantined_prefill_source_reqs", {})
+        for room, req in list(quarantined.items()):
+            sender = req.disagg_kv_sender
+            if not getattr(sender, "source_pages_quiescent", lambda: True)():
+                continue
+            sender.clear()
+            if (
+                req.req_pool_idx is not None or self.tree_cache.supports_mamba()
+            ) and not req.kv_committed_freed:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+            quarantined.pop(room, None)
+
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
@@ -870,6 +882,11 @@ class SchedulerDisaggregationPrefillMixin:
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
+                if not getattr(
+                    req.disagg_kv_sender, "source_pages_quiescent", lambda: True
+                )():
+                    undone_reqs.append(req)
+                    continue
                 error_message = f"Prefill transfer failed for request rank={self.ps.tp_rank} {req.rid=} {req.bootstrap_room=}"
                 is_propagated = False
                 try:

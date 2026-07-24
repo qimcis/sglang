@@ -657,6 +657,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.transfer_page_tag_manager = getattr(
             self.scheduler, "kv_protection_manager", None
         )
+        manager = kv_args.transfer_page_tag_manager
+        kv_args.kv_protection_config = getattr(manager, "config", None)
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
@@ -2005,23 +2007,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             expected = getattr(req, "_kv_transfer_expected_checksum", None)
             if expected is None:
                 raise ValueError("missing checksum page manifest")
-            if getattr(req, "_kv_transfer_legacy_checksum", False):
-                if (
-                    meta_bootstrap_room.numel() < 4
-                    or int(meta_bootstrap_room[3].item()) != 1
-                ):
-                    raise ValueError("missing legacy checksum metadata")
-                legacy_num_tokens = int(meta_bootstrap_room[2].item())
-                if legacy_num_tokens != expected.num_tokens:
-                    raise ValueError("legacy checksum token count mismatch")
-                from sglang.srt.mem_cache.kv_page_tags import ChecksumPlan
-
-                expected = ChecksumPlan(
-                    bootstrap_room=expected.bootstrap_room,
-                    num_tokens=legacy_num_tokens,
-                    checksum=int(meta_bootstrap_room[1].item()),
-                )
-                req._kv_transfer_expected_checksum = expected
             num_tokens = expected.num_tokens
             if num_tokens <= 0 or req.req_pool_idx is None:
                 raise ValueError("checksum page manifest has invalid token count")
@@ -2128,7 +2113,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             return None, []
         from sglang.srt.mem_cache.kv_page_tags import (
             TRANSFER_CHECKSUM_DIGEST_PAGE_SIZE,
-            ChecksumPlan,
             swa_checksum_evicted_len,
         )
 
@@ -2159,18 +2143,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             except Exception as e:
                 req._kv_transfer_manifest_error = str(e)
                 continue
-            uses_legacy_checksum = getattr(
-                decode_req.kv_receiver,
-                "uses_legacy_checksum_completion",
-                lambda: False,
-            )()
-            if expected is None and uses_legacy_checksum:
-                expected = ChecksumPlan(
-                    bootstrap_room=int(req.bootstrap_room or 0),
-                    num_tokens=len(req.origin_input_ids),
-                    checksum=0,
-                )
-                req._kv_transfer_legacy_checksum = True
             if expected is None:
                 continue
             req._kv_transfer_expected_checksum = expected
@@ -2182,12 +2154,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 req_pool_idx = int(req.req_pool_idx)
                 if expected.bootstrap_room != expected_room:
                     raise ValueError("checksum page manifest bootstrap room mismatch")
-                if (
-                    not uses_legacy_checksum
-                    and expected.page_size != TRANSFER_CHECKSUM_DIGEST_PAGE_SIZE
-                ):
+                if expected.page_size != TRANSFER_CHECKSUM_DIGEST_PAGE_SIZE:
                     raise ValueError("checksum page manifest page size mismatch")
-                if not uses_legacy_checksum and expected.logical_start != 0:
+                if expected.logical_start != 0:
                     raise ValueError("checksum page manifest logical start mismatch")
                 if n != actual_tokens:
                     raise ValueError(
@@ -2521,8 +2490,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     delattr(decode_req.req, "_kv_transfer_expected_checksum")
                 if hasattr(decode_req.req, "_kv_transfer_manifest_error"):
                     delattr(decode_req.req, "_kv_transfer_manifest_error")
-                if hasattr(decode_req.req, "_kv_transfer_legacy_checksum"):
-                    delattr(decode_req.req, "_kv_transfer_legacy_checksum")
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
@@ -2564,7 +2531,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         """Clean up in-flight transfers before releasing GPU memory."""
         if getattr(self, "quarantined_transfer_reqs", {}):
             raise RuntimeError(
-                "Cannot release GPU memory while protected NIXL pages are quarantined"
+                "Cannot release GPU memory while protected transfer pages are quarantined"
             )
         for decode_req in self.queue:
             self._release_transfer_pins(decode_req)

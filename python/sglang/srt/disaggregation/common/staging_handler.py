@@ -91,6 +91,9 @@ class DecodeStagingHandler:
 
     def num_writers_for(self, decode_req) -> int:
         """Compute num_writers for a specific request based on its prefill TP."""
+        expected_producers = getattr(decode_req.kv_receiver, "expected_producers", None)
+        if expected_producers:
+            return len(expected_producers)
         prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
         if prefill_tp > self.decode_tp:
             return prefill_tp // max(1, self.decode_tp)
@@ -219,6 +222,49 @@ class DecodeStagingHandler:
         """Check if a room is registered for staging scatter."""
         return room in self._room_to_decode_req
 
+    def intermediate_scatters_submitted(self, room: int) -> bool:
+        """Return whether every non-final staging allocation was submitted."""
+        decode_req = self._room_to_decode_req.get(room)
+        if decode_req is None:
+            return False
+        receiver = decode_req.kv_receiver
+        chunk_infos = getattr(receiver, "chunk_staging_infos", [])
+        expected_chunks = getattr(receiver, "expected_staging_chunks", None)
+        total_pages = getattr(receiver, "staging_total_pages", None)
+        page_start = getattr(receiver, "staging_page_start", None)
+        if expected_chunks is None or total_pages is None or page_start is None:
+            return False
+        if not expected_chunks:
+            return not chunk_infos
+        final_chunk_idx = max(expected_chunks)
+        if expected_chunks != set(range(final_chunk_idx + 1)):
+            return False
+        if final_chunk_idx >= len(chunk_infos):
+            return False
+        submitted_geometry = getattr(decode_req, "_submitted_staging_geometry", {})
+        if getattr(receiver, "requires_final_staging_notification", False) and (
+            final_chunk_idx
+            not in getattr(decode_req, "_final_staging_writers_ready", set())
+        ):
+            return False
+        if any(
+            chunk_idx != final_chunk_idx and chunk_idx not in submitted_geometry
+            for chunk_idx in expected_chunks
+        ):
+            return False
+        alloc_id, offset, _, _, final_num_pages = chunk_infos[final_chunk_idx]
+        if alloc_id < 0 or offset < 0 or final_num_pages <= 0:
+            return False
+        intervals = list(submitted_geometry.values()) + [
+            (page_start + total_pages - final_num_pages, final_num_pages)
+        ]
+        cursor = page_start
+        for interval_start, interval_pages in sorted(intervals):
+            if interval_start != cursor or interval_pages <= 0:
+                return False
+            cursor += interval_pages
+        return cursor == page_start + total_pages
+
     def handle_chunk_arrived(
         self,
         room: int,
@@ -227,6 +273,7 @@ class DecodeStagingHandler:
         num_pages: int,
         writer_id: str,
         chunk_writer_counts: dict,
+        submit_scatter: bool = True,
     ) -> bool:
         """Process a staging chunk arrival from any transport (NIXL RDMA notif or ZMQ CHUNK_READY).
 
@@ -243,12 +290,47 @@ class DecodeStagingHandler:
             )
             return False
         protected = bool(getattr(decode_req.kv_receiver, "transfer_nonce", 0))
-        arrivals = chunk_writer_counts[room][chunk_idx]
         if protected:
-            if any(existing_writer == writer_id for _, _, existing_writer in arrivals):
+            receiver = decode_req.kv_receiver
+            expected_chunks = getattr(receiver, "expected_staging_chunks", set())
+            total_pages = getattr(receiver, "staging_total_pages", 0)
+            transfer_page_start = getattr(receiver, "staging_page_start", 0)
+            if (
+                chunk_idx not in expected_chunks
+                or page_start < transfer_page_start
+                or num_pages <= 0
+                or page_start + num_pages > transfer_page_start + total_pages
+            ):
+                raise RuntimeError(
+                    f"Unexpected staging geometry room={room} chunk={chunk_idx}: "
+                    f"start={page_start} pages={num_pages}"
+                )
+            chunk_infos = getattr(decode_req.kv_receiver, "chunk_staging_infos", [])
+            if chunk_idx >= len(chunk_infos):
+                raise RuntimeError(
+                    f"Missing staging allocation room={room} chunk={chunk_idx}"
+                )
+            alloc_id, offset, _, _, allocated_pages = chunk_infos[chunk_idx]
+            if alloc_id < 0 or offset < 0 or allocated_pages != num_pages:
+                raise RuntimeError(
+                    f"Invalid staging allocation room={room} chunk={chunk_idx}"
+                )
+        arrivals = chunk_writer_counts[room][chunk_idx]
+        prior_arrival = next(
+            (
+                (existing_start, existing_pages)
+                for existing_start, existing_pages, existing_writer in arrivals
+                if existing_writer == writer_id
+            ),
+            None,
+        )
+        if prior_arrival is not None:
+            if protected or prior_arrival != (page_start, num_pages):
                 raise RuntimeError(
                     f"Duplicate staging writer room={room} chunk={chunk_idx} writer={writer_id}"
                 )
+            return False
+        if protected:
             if arrivals and any(
                 existing_start != page_start or existing_pages != num_pages
                 for existing_start, existing_pages, _ in arrivals
@@ -260,9 +342,23 @@ class DecodeStagingHandler:
         writers_arrived = len(chunk_writer_counts[room][chunk_idx])
         num_writers = self.num_writers_for(decode_req)
         if writers_arrived >= num_writers:
+            if not submit_scatter:
+                ready = getattr(decode_req, "_final_staging_writers_ready", None)
+                if ready is None:
+                    ready = set()
+                    decode_req._final_staging_writers_ready = ready
+                ready.add(chunk_idx)
+                del chunk_writer_counts[room][chunk_idx]
+                return False
             submitted = self.submit_chunk_scatter(
                 room, chunk_idx, page_start, num_pages
             )
+            if submitted:
+                geometry = getattr(decode_req, "_submitted_staging_geometry", None)
+                if geometry is None:
+                    geometry = {}
+                    decode_req._submitted_staging_geometry = geometry
+                geometry[chunk_idx] = (page_start, num_pages)
             if not submitted and (
                 protected
                 or getattr(decode_req, "_staging_scatter_tracking_failed", False)
@@ -290,6 +386,10 @@ class DecodeStagingHandler:
                 room,
             )
             return False
+        if getattr(decode_req, "_staging_last_scatter_submitted", False) or getattr(
+            decode_req, "_staging_scatter_done", False
+        ):
+            return True
         alloc_id = self._submit_last_scatter(decode_req)
         if alloc_id >= 0:
             try:
@@ -347,7 +447,10 @@ class DecodeStagingHandler:
             return False
         if not getattr(decode_req, "_staging_scatter_done", False):
             return False
-        return not getattr(decode_req, "_chunk_events", None)
+        return (
+            not getattr(decode_req, "_chunk_events", None)
+            and getattr(decode_req, "_scatter_event", None) is None
+        )
 
     def pending_scatter_writes_done(self, room: int) -> bool:
         """Advance and report only already-submitted scatter writes for a room."""
@@ -487,6 +590,16 @@ class DecodeStagingHandler:
         self, decode_req: DecodeRequest, page_idx_tensor: torch.Tensor
     ) -> bool:
         manager = getattr(self.scheduler, "kv_protection_manager", None)
+        receiver = decode_req.kv_receiver
+        from sglang.srt.disaggregation.common.conn import (
+            KV_PROTECTION_FEATURE_PAGE_TAGS,
+        )
+
+        if not (
+            getattr(receiver, "protection_feature_bitmap", 0)
+            & KV_PROTECTION_FEATURE_PAGE_TAGS
+        ):
+            return True
         table = getattr(manager, "table", None)
         expected_pages = getattr(decode_req, "transfer_pinned_page_ids", ())
         expected_generations = getattr(
@@ -500,7 +613,6 @@ class DecodeStagingHandler:
             table is not None and page_count > 0 and page_count == generation_count
         )
         if not metadata_complete:
-            receiver = decode_req.kv_receiver
             if not getattr(receiver, "transfer_nonce", 0):
                 return True
             message = (
@@ -906,14 +1018,25 @@ def handle_staging_req(
             session_id,
         )
         return
+    if chunk_idx < 0 or chunk_num_pages <= 0:
+        raise ValueError("invalid staging request geometry")
+    expected_chunks = getattr(receiver, "expected_staging_chunks", None)
+    if expected_chunks is not None:
+        if chunk_idx >= getattr(receiver, "staging_total_pages", 0):
+            raise ValueError("staging chunk index exceeds transfer page count")
+        expected_chunks.add(chunk_idx)
     infos = getattr(receiver, "chunk_staging_infos", [])
 
     if chunk_idx < len(infos) and infos[chunk_idx][0] >= 0:
-        _, offset, rnd, end, _ = infos[chunk_idx]
+        _, offset, rnd, end, allocated_pages = infos[chunk_idx]
+        if allocated_pages != chunk_num_pages:
+            raise ValueError("conflicting staging request geometry")
     elif (
         chunk_idx < len(infos)
         and infos[chunk_idx][1] == StagingAllocator.ALLOC_OVERSIZED
     ):
+        if infos[chunk_idx][4] != chunk_num_pages:
+            raise ValueError("conflicting staging request geometry")
         offset, rnd, end = StagingAllocator.ALLOC_OVERSIZED, 0, -1
     else:
         from sglang.srt.disaggregation.common.staging_buffer import (

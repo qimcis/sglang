@@ -28,6 +28,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
     KVTransferError,
+    kv_protection_feature_bitmap,
 )
 from sglang.srt.disaggregation.common.staging_handler import StagingRegisterInfo
 from sglang.srt.disaggregation.common.utils import (
@@ -1108,13 +1109,6 @@ class NixlKVManager(CommonKVManager):
                 )
                 if status is not None:
                     self._fail_room(room, f"Invalid NIXL control message: {e}")
-
-    @staticmethod
-    def _message_room(msg: List[bytes]) -> Optional[int]:
-        try:
-            return int(msg[1].decode("ascii"))
-        except (IndexError, UnicodeDecodeError, ValueError):
-            return None
 
     @staticmethod
     def _message_room_nonce(msg: List[bytes]) -> Optional[Tuple[int, int]]:
@@ -2465,11 +2459,14 @@ class NixlKVManager(CommonKVManager):
             kv_buffer_tensors missing, etc.) -> return ``(None, False)``,
             signalling the caller to fall back to send_kvcache_slice.
         """
-        page_start = kv_chunk.index_slice.start
+        transfer_page_start = kv_chunk.index_slice.start
+        page_start = (
+            req.decode_prefix_len or 0
+        ) // self.kv_args.page_size + transfer_page_start
         num_pages = len(kv_chunk.prefill_kv_indices)
 
         ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
-            req, page_start, num_pages, session_id=req.agent_name
+            req, transfer_page_start, num_pages, session_id=req.agent_name
         )
         if not ready:
             from sglang.srt.disaggregation.common.staging_buffer import (
@@ -2900,52 +2897,68 @@ class NixlKVManager(CommonKVManager):
         notif_map = self.agent.get_new_notifs()
         for peer_name, messages in notif_map.items():
             for msg in messages:
-                decoded = msg.decode("ascii")
-                if decoded.startswith(PROTECTED_NOTIF_PREFIX + "|"):
-                    self._handle_protected_notification(decoded)
-                    continue
-                # Notification tag layouts (underscore-separated):
-                #   kv:    {room}_kv_{chunk_id}_{is_last}_{pp_rank}             -> 5 fields
-                #   kvpart:{room}_kv_{chunk_id}_{is_last}_{pp_rank}_part_{i}_{n}-> 8 fields
-                #   stg:   {room}_stg_{chunk_id}_{is_last}_{pp_rank}_{chunk_idx}
-                #          _{page_start}_{num_pages}_{agent_name}               -> 9 fields
-                #   aux:   {room}_aux                                           -> 2 fields
-                #   state: {room}_state_{pp_rank}                               -> 3 fields
-                # maxsplit=8 keeps everything past the 8th underscore in the
-                # last component, so agent_name (which may itself contain
-                # underscores) lands intact in components[8] for the stg path.
-                components = decoded.split("_", 8)
-                room = int(components[0])
-                if self.transfer_statuses.get(room, TransferStatus()).protected:
-                    self._fail_room(
-                        room, "Protected NIXL room received a legacy notification"
-                    )
-                    continue
-                tag = components[1]
-                if tag == "kv":
-                    chunk_id = int(components[2])
-                    is_last_chunk = bool(int(components[3]))
-                    pp_rank = int(components[4]) if len(components) > 4 else 0
-                    if len(components) > 7 and components[5] == "part":
-                        self._track_kv_part_arrival(
-                            room,
-                            chunk_id,
-                            is_last_chunk,
-                            pp_rank,
-                            int(components[6]),
-                            int(components[7]),
+                try:
+                    self._process_notification(msg)
+                except Exception as e:
+                    room = None
+                    try:
+                        decoded = msg.decode("ascii")
+                        separator = (
+                            "|" if decoded.startswith(PROTECTED_NOTIF_PREFIX) else "_"
                         )
-                    else:
-                        self._track_kv_arrival(room, chunk_id, is_last_chunk, pp_rank)
-                elif tag == "stg":
-                    self._handle_stg_notification(components, room)
-                elif tag == "aux":
-                    # main's "nokv" marker (decode-side radix cache hit):
-                    # mark expected_kvs_per_pp[pp_rank] = 0 for this rank.
-                    self._handle_aux_notification(room, components)
-                elif tag == "state":
-                    pp_rank = int(components[2]) if len(components) > 2 else 0
-                    self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
+                        room = int(
+                            decoded.split(separator, 2)[1 if separator == "|" else 0]
+                        )
+                    except Exception:
+                        pass
+                    if room is not None and room in self.request_status:
+                        self._fail_room(room, f"Malformed NIXL notification: {e}")
+                    logger.warning(
+                        "Ignoring malformed NIXL notification from %s: %s",
+                        peer_name,
+                        e,
+                    )
+
+    def _process_notification(self, msg: bytes) -> None:
+        decoded = msg.decode("ascii")
+        if decoded.startswith(PROTECTED_NOTIF_PREFIX + "|"):
+            self._handle_protected_notification(decoded)
+            return
+        # maxsplit=8 preserves underscores in a staging notification's agent name.
+        components = decoded.split("_", 8)
+        if len(components) < 2:
+            raise ValueError("truncated NIXL notification")
+        room = int(components[0])
+        if self.transfer_statuses.get(room, TransferStatus()).protected:
+            self._fail_room(room, "Protected NIXL room received a legacy notification")
+            return
+        tag = components[1]
+        if tag == "kv":
+            if len(components) < 4:
+                raise ValueError("truncated NIXL KV notification")
+            chunk_id = int(components[2])
+            is_last_chunk = bool(int(components[3]))
+            pp_rank = int(components[4]) if len(components) > 4 else 0
+            if len(components) > 7 and components[5] == "part":
+                self._track_kv_part_arrival(
+                    room,
+                    chunk_id,
+                    is_last_chunk,
+                    pp_rank,
+                    int(components[6]),
+                    int(components[7]),
+                )
+            else:
+                self._track_kv_arrival(room, chunk_id, is_last_chunk, pp_rank)
+        elif tag == "stg":
+            self._handle_stg_notification(components, room)
+        elif tag == "aux":
+            self._handle_aux_notification(room, components)
+        elif tag == "state":
+            pp_rank = int(components[2]) if len(components) > 2 else 0
+            self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
+        else:
+            raise ValueError(f"unknown NIXL notification tag {tag!r}")
 
     def _handle_protected_notification(self, decoded: str) -> None:
         with self.request_status_lock:
@@ -3094,13 +3107,23 @@ class NixlKVManager(CommonKVManager):
                 self._record_protected_chunk(
                     status, producer, chunk_id, is_last, "staging"
                 )
-                self._handle_staging_chunk_arrived(
-                    room,
-                    chunk_idx,
-                    page_start,
-                    num_pages,
-                    str(producer),
-                )
+                if not is_last:
+                    self._handle_staging_chunk_arrived(
+                        room,
+                        chunk_idx,
+                        page_start,
+                        num_pages,
+                        str(producer),
+                    )
+                else:
+                    self._handle_staging_chunk_arrived(
+                        room,
+                        chunk_idx,
+                        page_start,
+                        num_pages,
+                        str(producer),
+                        submit_scatter=False,
+                    )
                 self._maybe_submit_last_scatter(room)
             elif kind == "aux":
                 if len(fields) not in (5, 7) or (
@@ -3163,11 +3186,17 @@ class NixlKVManager(CommonKVManager):
         chunk_idx = int(components[5])
         page_start = int(components[6])
         num_pages = int(components[7])
-        agent_name = components[8] if len(components) > 8 else ""
-        self._track_kv_arrival(room, chunk_id, is_last_chunk, pp_rank)
+        if len(components) <= 8 or not components[8]:
+            raise ValueError("staging notification is missing its destination agent")
         self._handle_staging_chunk_arrived(
-            room, chunk_idx, page_start, num_pages, agent_name
+            room,
+            chunk_idx,
+            page_start,
+            num_pages,
+            str(pp_rank),
+            submit_scatter=not is_last_chunk,
         )
+        self._track_kv_arrival(room, chunk_id, is_last_chunk, pp_rank)
 
     def _handle_aux_notification(self, room: int, components: List[str]):
         """Handle an aux notification and trigger last scatter if staging is complete.
@@ -3258,6 +3287,7 @@ class NixlKVManager(CommonKVManager):
         page_start: int,
         num_pages: int,
         agent_name: str,
+        submit_scatter: bool = True,
     ):
         """Process a staging chunk arrival via RDMA notification."""
         handler = self._staging_handler
@@ -3270,6 +3300,7 @@ class NixlKVManager(CommonKVManager):
             num_pages,
             agent_name,
             self._chunk_writer_counts,
+            submit_scatter=submit_scatter,
         )
 
     def _maybe_submit_last_scatter(self, room: int):
@@ -3282,6 +3313,9 @@ class NixlKVManager(CommonKVManager):
                 return
             handler = self._staging_handler
             if handler is not None and handler.is_staging_room(room):
+                if not handler.intermediate_scatters_submitted(room):
+                    self._fail_room(room, "Missing protected NIXL staging chunk")
+                    return
                 if not handler.submit_last_scatter_async(room):
                     raise RuntimeError(
                         f"Failed to submit final staging scatter room={room}"
@@ -3610,17 +3644,12 @@ class NixlKVManager(CommonKVManager):
 
         room = int(room_text)
         info = TransferInfo.from_zmq(fields)
-        manager = getattr(self.kv_args, "transfer_page_tag_manager", None)
-        local_features = 0
-        if manager is not None and manager.config.enabled:
-            if manager.config.checksum_enabled:
-                local_features |= KV_PROTECTION_FEATURE_CHECKSUM
-            if manager.config.enable_attention_tags:
-                local_features |= KV_PROTECTION_FEATURE_PAGE_TAGS
-        if local_features and not info.is_protected:
-            self._fail_room(room, "Protected NIXL room received legacy metadata")
-            return
-        if info.is_protected and info.protection_feature_bitmap != local_features:
+        local_features = kv_protection_feature_bitmap(self.kv_args)
+        expected_protocol = KV_PROTECTION_PROTOCOL_VERSION if local_features else 0
+        if (
+            info.protection_protocol_version != expected_protocol
+            or info.protection_feature_bitmap != local_features
+        ):
             self._fail_room(room, "NIXL protection feature negotiation mismatch")
             return
         if self._is_stale_nonce(
@@ -3805,13 +3834,7 @@ class NixlKVReceiver(CommonKVReceiver):
         self.page_quarantine_required = False
         self.abort_notified = False
         self.abort_pending_producers: Set[int] = set()
-        manager = getattr(mgr.kv_args, "transfer_page_tag_manager", None)
-        self.protection_feature_bitmap = 0
-        if manager is not None and manager.config.enabled:
-            if manager.config.checksum_enabled:
-                self.protection_feature_bitmap |= KV_PROTECTION_FEATURE_CHECKSUM
-            if manager.config.enable_attention_tags:
-                self.protection_feature_bitmap |= KV_PROTECTION_FEATURE_PAGE_TAGS
+        self.protection_feature_bitmap = kv_protection_feature_bitmap(mgr.kv_args)
         self.transfer_nonce = (
             _new_transfer_nonce() if self.protection_feature_bitmap else 0
         )
@@ -3823,20 +3846,22 @@ class NixlKVReceiver(CommonKVReceiver):
         super().init(prefill_dp_rank)
         if self.conclude_state == KVPoll.Failed:
             return
+        expected_protocol = (
+            KV_PROTECTION_PROTOCOL_VERSION if self.protection_feature_bitmap else 0
+        )
+        if (
+            self.prefill_info.protection_protocol_version != expected_protocol
+            or self.prefill_info.protection_feature_bitmap
+            != self.protection_feature_bitmap
+        ):
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                "NIXL KV protection capability mismatch",
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.conclude_state = KVPoll.Failed
+            return
         if self.protection_feature_bitmap:
-            if (
-                self.prefill_info.protection_protocol_version
-                != KV_PROTECTION_PROTOCOL_VERSION
-                or self.prefill_info.protection_feature_bitmap
-                != self.protection_feature_bitmap
-            ):
-                self.kv_mgr.record_failure(
-                    self.bootstrap_room,
-                    "NIXL prefill lacks the required KV protection capability",
-                )
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                self.conclude_state = KVPoll.Failed
-                return
             expected_producers = {
                 int(info["producer_id"])
                 for info in self.bootstrap_infos
@@ -3931,6 +3956,12 @@ class NixlKVReceiver(CommonKVReceiver):
             and self.kv_mgr._staging_ctx.allocator is not None
         ):
             self.chunk_staging_infos = []
+            self.expected_staging_chunks = set()
+            self.requires_final_staging_notification = True
+            self.staging_total_pages = len(kv_indices)
+            self.staging_page_start = (
+                decode_prefix_len or 0
+            ) // self.kv_mgr.kv_args.page_size
             self.kv_mgr.register_staging_room_bootstrap(
                 self.bootstrap_room, self.bootstrap_infos, self
             )
@@ -4171,10 +4202,6 @@ class NixlKVReceiver(CommonKVReceiver):
         if len(plans) != 1:
             return None
         return next(iter(plans.values()))
-
-    @staticmethod
-    def uses_legacy_checksum_completion() -> bool:
-        return False
 
     def clear(self) -> None:
         if getattr(self, "page_quarantine_required", False) or getattr(

@@ -887,7 +887,6 @@ class Scheduler(
             ),
             pp_size=self.ps.pp_size,
             enable_dp_attention=self.server_args.enable_dp_attention,
-            radix_cache_enabled=not self.server_args.disable_radix_cache,
             is_cuda_device=is_cuda_device,
             device_capability_major=(
                 torch.cuda.get_device_capability(allocator.device)[0]
@@ -2601,8 +2600,12 @@ class Scheduler(
         prepare_abort(req, "Aborted")
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
+        source_pages_quiescent = True
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             req.disagg_kv_sender.abort()
+            source_pages_quiescent = getattr(
+                req.disagg_kv_sender, "source_pages_quiescent", lambda: True
+            )()
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
@@ -2612,7 +2615,14 @@ class Scheduler(
         if (
             req.req_pool_idx is not None or self.tree_cache.supports_mamba()
         ) and not req.kv_committed_freed:
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+            if source_pages_quiescent:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+            else:
+                quarantined = getattr(self, "_quarantined_prefill_source_reqs", None)
+                if quarantined is None:
+                    quarantined = {}
+                    self._quarantined_prefill_source_reqs = quarantined
+                quarantined[req.bootstrap_room] = req
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -4087,6 +4097,7 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                idle &= not getattr(self, "_quarantined_prefill_source_reqs", {})
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0

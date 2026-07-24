@@ -56,6 +56,21 @@ KV_PROTECTION_FEATURE_ALL = (
 )
 
 
+def kv_protection_feature_bitmap(kv_args: KVArgs) -> int:
+    config = getattr(kv_args, "kv_protection_config", None)
+    if config is None:
+        manager = getattr(kv_args, "transfer_page_tag_manager", None)
+        config = getattr(manager, "config", None)
+    if config is None or not config.enabled:
+        return 0
+    features = 0
+    if config.checksum_enabled:
+        features |= KV_PROTECTION_FEATURE_CHECKSUM
+    if config.enable_attention_tags:
+        features |= KV_PROTECTION_FEATURE_PAGE_TAGS
+    return features
+
+
 def send_metadata_with_staging_registration(
     receiver,
     metadata_args,
@@ -69,7 +84,10 @@ def send_metadata_with_staging_registration(
     try:
         receiver.send_metadata(*metadata_args, **metadata_kwargs)
     except Exception:
-        if staging_handler is not None:
+        if (
+            staging_handler is not None
+            and not getattr(receiver, "requires_page_quarantine", lambda: False)()
+        ):
             staging_handler.unregister_decode_req(room)
         raise
     manager = getattr(receiver, "kv_mgr", None)
@@ -77,6 +95,7 @@ def send_metadata_with_staging_registration(
         staging_handler is not None
         and manager is not None
         and manager.check_status(room) == KVPoll.Failed
+        and not getattr(receiver, "requires_page_quarantine", lambda: False)()
     ):
         staging_handler.unregister_decode_req(room)
 
@@ -392,6 +411,23 @@ class CommonKVManager(BaseKVManager):
             target_pp_ranks = list(range(info.pp_size))
             required_prefill_response_num *= info.pp_size // self.pp_size
 
+        if (
+            getattr(self, "enable_staging", False)
+            and not self.is_mla_backend
+            and self.attn_tp_size != info.attn_tp_size
+            and (
+                self.pp_size != info.pp_size
+                or (
+                    self.enable_all_cp_ranks_for_transfer
+                    and self.attn_cp_size != info.attn_cp_size
+                )
+            )
+        ):
+            raise RuntimeError(
+                "Heterogeneous-TP staging requires matching prefill/decode PP "
+                "layouts and does not support multi-rank CP fan-in"
+            )
+
         protection_manager = getattr(self.kv_args, "transfer_page_tag_manager", None)
         if (
             protection_manager is not None
@@ -479,16 +515,9 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
         }
-        if self.server_args.disaggregation_transfer_backend == "nixl":
-            protection_manager = getattr(
-                self.kv_args, "transfer_page_tag_manager", None
-            )
-            if protection_manager is not None and protection_manager.config.enabled:
-                features = 0
-                if protection_manager.config.checksum_enabled:
-                    features |= KV_PROTECTION_FEATURE_CHECKSUM
-                if protection_manager.config.enable_attention_tags:
-                    features |= KV_PROTECTION_FEATURE_PAGE_TAGS
+        if self.server_args.disaggregation_transfer_backend in ("mooncake", "nixl"):
+            features = kv_protection_feature_bitmap(self.kv_args)
+            if features:
                 payload.update(
                     protection_protocol_version=KV_PROTECTION_PROTOCOL_VERSION,
                     protection_feature_bitmap=features,

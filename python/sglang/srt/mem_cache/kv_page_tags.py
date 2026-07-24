@@ -396,7 +396,6 @@ class KVProtectionConfig:
     enable_attention_tags: bool = False
     enable_transfer_checksum: bool = False
     enable_page_history: bool = False
-    allow_legacy_completion: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -486,7 +485,6 @@ def assert_protection_supported(
     supports_spec_target_verify: bool = False,
     pp_size: int = 1,
     enable_dp_attention: bool = False,
-    radix_cache_enabled: bool = False,
     is_cuda_device: Optional[bool] = None,
     device_capability_major: Optional[int] = None,
     device_capability_minor: Optional[int] = None,
@@ -2633,7 +2631,6 @@ class AsyncChecksumBatch:
     num_tokens: List[int]
     packed_results_t: torch.Tensor
     page_counts: List[int]
-    max_num_pages: int
     page_size: int
     logical_starts: List[int]
     stream: Optional[torch.cuda.Stream]
@@ -3912,7 +3909,6 @@ class KVPageProtectionManager:
                 [],
                 torch.empty(0, dtype=TAG_DTYPE),
                 [],
-                0,
                 int(checksum_page_size),
                 [],
                 None,
@@ -4212,7 +4208,6 @@ class KVPageProtectionManager:
             num_tokens=num_tokens_list,
             packed_results_t=packed_results_t,
             page_counts=page_counts,
-            max_num_pages=max_num_pages,
             page_size=checksum_page_size,
             logical_starts=starts_list,
             stream=stream,
