@@ -101,6 +101,16 @@ def validate_dockerfile() -> None:
         "local builder does not build a wheel",
     )
     require(
+        "sgl-attn-kv-page-protection.patch" in builder
+        and "SGL_ATTN_KV_PAGE_PROTECTION_PATCH_SHA256" in builder,
+        "local builder does not reject a Hopper profile without its FA3 leaf",
+    )
+    require(
+        "csrc/flashmla_capability.cu" in builder
+        and "flashmla_protected_consumer_image_available" in builder,
+        "local builder does not reject a Blackwell profile without its FlashMLA leaf",
+    )
+    require(
         "COPY --from=local_kernel_builder /wheels" in final,
         "final stage does not copy the local wheel",
     )
