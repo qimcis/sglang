@@ -1,0 +1,25 @@
+python/sglang/srt/disaggregation/common/conn.py
+  s_5f73f26aee7f01::t_cfa1f32a82b76b 59-73,87-90,98,414-430,518-520
+python/sglang/srt/disaggregation/common/staging_handler.py
+  s_5f73f26aee7f01::t_5ceb7d4deebb32 94-96,225-267,276,294-328,332-333,345-352,356-361,389-392,450-453,593-602,1021-1027,1031-1033,1038-1039
+python/sglang/srt/disaggregation/decode.py
+  s_5f73f26aee7f01::t_1e6e4dff41e52e 660-661,2157,2159,2534
+python/sglang/srt/managers/scheduler.py
+  s_5f73f26aee7f01::t_51058c376c18b5 2603,2606-2608,2618-2625,4100
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "83109914c69d041d881f84668e4e52e3d4392759",
+  "prompts": {},
+  "sessions": {
+    "s_5f73f26aee7f01": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_099a8b759ffeqnA7QziBATTLQD",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
