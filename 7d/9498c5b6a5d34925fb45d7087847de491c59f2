@@ -1,0 +1,25 @@
+docker/Dockerfile
+  s_700c7ffe080221::t_b3da97d5432d5d 164-165,255-278,754-778
+docker/kv-protection-bake.hcl
+  s_700c7ffe080221::t_11cbfef9c0382d 1-50
+docker/validate-kv-protection-packaging.py
+  s_700c7ffe080221::t_a902a2cc4627ac 1-180
+sgl-kernel/CMakeLists.txt
+  s_700c7ffe080221::t_31690359b18497 31-42,44-47,195-206,221-223,225-226,230,233-241,243-244,246-257,261-266,268,271-277,365-368,370-378,380-383,385-393,411-416,419-432,437-442,564-578
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7d9498c5b6a5d34925fb45d7087847de491c59f2",
+  "prompts": {},
+  "sessions": {
+    "s_700c7ffe080221": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_069d953ecffeXK2AlwHoLVvct6",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
