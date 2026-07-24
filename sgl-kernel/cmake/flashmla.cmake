@@ -26,21 +26,31 @@ set(FLASHMLA_CUDA_FLAGS
 
 set(FLASHMLA_ENABLE_SM100 OFF)
 
-# The FlashMLA kernels only work on hopper and require CUDA 12.4 or later.
-# Only build FlashMLA kernels if we are building for something compatible with
-# sm90a
-if(${CUDA_VERSION} VERSION_GREATER 12.4)
-    list(APPEND FLASHMLA_CUDA_FLAGS
-        "-gencode=arch=compute_90a,code=sm_90a"
-    )
-endif()
-if(${CUDA_VERSION} VERSION_GREATER 12.8)
-    list(APPEND FLASHMLA_CUDA_FLAGS
-        "-gencode=arch=compute_100a,code=sm_100a"
-    )
+# Preserve the broad legacy matrix for auto; explicit profiles emit one image.
+if(SGL_KERNEL_ARCH_PROFILE STREQUAL "auto")
+    if(${CUDA_VERSION} VERSION_GREATER 12.4)
+        list(APPEND FLASHMLA_CUDA_FLAGS
+            "-gencode=arch=compute_90a,code=sm_90a"
+        )
+    endif()
+    if(${CUDA_VERSION} VERSION_GREATER 12.8)
+        list(APPEND FLASHMLA_CUDA_FLAGS
+            "-gencode=arch=compute_100a,code=sm_100a"
+        )
+        set(FLASHMLA_ENABLE_SM100 ON)
+    endif()
+elseif(SGL_KERNEL_ARCH_PROFILE STREQUAL "hopper-sm90")
+    list(APPEND FLASHMLA_CUDA_FLAGS "-gencode=arch=compute_90a,code=sm_90a")
+elseif(SGL_KERNEL_ARCH_PROFILE STREQUAL "blackwell-sm100")
+    list(APPEND FLASHMLA_CUDA_FLAGS "-gencode=arch=compute_100a,code=sm_100a")
+    set(FLASHMLA_ENABLE_SM100 ON)
+elseif(SGL_KERNEL_ARCH_PROFILE STREQUAL "blackwell-sm103")
+    list(APPEND FLASHMLA_CUDA_FLAGS "-gencode=arch=compute_103a,code=sm_103a")
     set(FLASHMLA_ENABLE_SM100 ON)
 endif()
-if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
+if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0" AND
+   (SGL_KERNEL_ARCH_PROFILE STREQUAL "auto" OR
+    SGL_KERNEL_ARCH_PROFILE STREQUAL "blackwell-sm103"))
     # Patch FlashMLA sources for SM103a support.
     # These patches are only needed (and only valid) with CUDA 13+.
 
@@ -90,9 +100,11 @@ if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
         message(STATUS "cutlass/arch/config.h already patched for SM103a")
     endif()
 
-    list(APPEND FLASHMLA_CUDA_FLAGS
-        "-gencode=arch=compute_103a,code=sm_103a"
-    )
+    if(SGL_KERNEL_ARCH_PROFILE STREQUAL "auto")
+        list(APPEND FLASHMLA_CUDA_FLAGS
+            "-gencode=arch=compute_103a,code=sm_103a"
+        )
+    endif()
 endif()
 
 
