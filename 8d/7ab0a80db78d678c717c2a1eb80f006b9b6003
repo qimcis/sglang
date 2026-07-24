@@ -1,0 +1,25 @@
+docker/Dockerfile
+  s_700c7ffe080221::t_09f61dff122ff4 164-165,255-278,754-778
+docker/kv-protection-bake.hcl
+  s_700c7ffe080221::t_af65e750aef79f 1-50
+docker/validate-kv-protection-packaging.py
+  s_700c7ffe080221::t_84a62c31298579 1-180
+sgl-kernel/cmake/flashmla.cmake
+  s_700c7ffe080221::t_366a313f158e43 29-48,51-53,103-107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8d7ab0a80db78d678c717c2a1eb80f006b9b6003",
+  "prompts": {},
+  "sessions": {
+    "s_700c7ffe080221": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_069d953ecffeXK2AlwHoLVvct6",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
