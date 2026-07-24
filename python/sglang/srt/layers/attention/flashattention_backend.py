@@ -323,13 +323,16 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
             self._get_scheduler_metadata = get_scheduler_metadata
+            self._fa4_kv_page_protection_supported = None
         elif self.fa_impl_ver == 4:
             from sglang.jit_kernel.flash_attention_v4 import (
+                fa4_kv_page_protection_supported,
                 flash_attn_varlen_func,
                 flash_attn_with_kvcache,
             )
 
             self._get_scheduler_metadata = None
+            self._fa4_kv_page_protection_supported = fa4_kv_page_protection_supported
         else:
             raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
 
@@ -389,7 +392,11 @@ class FlashAttentionBackend(AttentionBackend):
             self.kv_attention_tag_table is not None
             and not envs.SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION.get()
         )
-        leaf_supported, leaf_reason = self._protected_consumer_capability()
+        leaf_supported, leaf_reason = (
+            self._protected_consumer_capability()
+            if fused_protection_requested
+            else (False, "")
+        )
         fused_protection_supported = (
             leaf_supported and getattr(self, "attention_chunk_size", None) is None
         )
@@ -413,8 +420,17 @@ class FlashAttentionBackend(AttentionBackend):
             model_runner.kv_fused_page_protection_enabled = True
 
     def _protected_consumer_capability(self) -> tuple[bool, str]:
-        """Leaf hook for an attention kernel implementing the protection ABI."""
-        return False, "no architecture-specific protected attention leaf is installed"
+        """Install only the exact Blackwell FA4 protected consumer leaf."""
+        if self.fa_impl_ver != 4:
+            return False, "only the Blackwell FA4 protected attention leaf is installed"
+        if not self._fa4_kv_page_protection_supported(self.device):
+            capability = torch.cuda.get_device_capability(self.device)
+            return (
+                False,
+                "FA4 KV protection requires a loadable sgl-kernel preflight "
+                f"image for SM100 or SM103; got SM{capability[0]}{capability[1]}",
+            )
+        return True, ""
 
     def _set_kv_page_protection(
         self,

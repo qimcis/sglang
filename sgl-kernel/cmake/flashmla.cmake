@@ -25,16 +25,16 @@ set(FLASHMLA_CUDA_FLAGS
 )
 
 set(FLASHMLA_ENABLE_SM100 OFF)
+set(FLASHMLA_ENABLE_SM103 OFF)
 
-# The FlashMLA kernels only work on hopper and require CUDA 12.4 or later.
-# Only build FlashMLA kernels if we are building for something compatible with
-# sm90a
-if(${CUDA_VERSION} VERSION_GREATER 12.4)
+# FlashMLA requires CUDA 12.4; newer toolchains add architecture-specific
+# Blackwell images below.
+if(${CUDA_VERSION} VERSION_GREATER_EQUAL "12.4")
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
 endif()
-if(${CUDA_VERSION} VERSION_GREATER 12.8)
+if(${CUDA_VERSION} VERSION_GREATER_EQUAL "12.8")
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
     )
@@ -93,10 +93,12 @@ if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_103a,code=sm_103a"
     )
+    set(FLASHMLA_ENABLE_SM103 ON)
 endif()
 
 
 set(FlashMLA_SOURCES
+    "csrc/flashmla_capability.cu"
     "csrc/flashmla_extension.cc"
 
     # Compatibility shim for sgl-kernel torch.ops API.
@@ -155,7 +157,18 @@ target_compile_options(flashmla_ops PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:${FLASHMLA_CUDA_FLAGS}>
 )
 if(FLASHMLA_ENABLE_SM100)
-    target_compile_definitions(flashmla_ops PRIVATE FLASHMLA_ENABLE_SM100)
+    target_compile_definitions(flashmla_ops PRIVATE
+        FLASHMLA_ENABLE_SM100
+        FLASHMLA_PROTECTED_KV_SM100
+        FLASHMLA_PROTECTED_SPARSE_SM100
+    )
+endif()
+if(FLASHMLA_ENABLE_SM103)
+    target_compile_definitions(flashmla_ops PRIVATE
+        FLASHMLA_ENABLE_SM103
+        FLASHMLA_PROTECTED_KV_SM103
+        FLASHMLA_PROTECTED_SPARSE_SM103
+    )
 endif()
 
 # CUDA 13 moved cuda/std/* under cccl/cuda/std/*. The vendored cutlass routes

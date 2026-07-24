@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <ATen/cuda/CUDAContext.h>
 #include <torch/all.h>
 #include <torch/library.h>
 
@@ -20,6 +21,8 @@ limitations under the License.
 #include "api/sparse_decode.h"
 #include "api/sparse_fwd.h"
 #include "sgl_kernel_ops.h"
+
+bool flashmla_protected_consumer_image_available(const std::string& consumer);
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_sparse_decode_fwd(
     const at::Tensor& q,
@@ -71,10 +74,25 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       num_splits);
 }
 
+static bool flashmla_blackwell_supported() {
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+#ifdef FLASHMLA_ENABLE_SM103
+  if (properties->major == 10 && properties->minor == 3) return true;
+#endif
+#ifdef FLASHMLA_ENABLE_SM100
+  if (properties->major == 10 && properties->minor == 0) return true;
+#endif
+  return false;
+}
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From FlashMLA
    */
+  m.def("flashmla_blackwell_supported() -> bool", &flashmla_blackwell_supported);
+  m.def(
+      "flashmla_protected_consumer_image_available(str consumer) -> bool",
+      &flashmla_protected_consumer_image_available);
   m.def(
       "get_mla_decoding_metadata(Tensor seqlens_k, int num_q_tokens_per_head_k, int h_k, int? h_q, bool "
       "is_fp8_kvcache, int? topk) -> Tensor[]");

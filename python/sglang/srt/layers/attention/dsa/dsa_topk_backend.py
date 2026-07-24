@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum, IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -33,6 +34,80 @@ def repeat_request_indices_into(
         request_indices.reshape(-1, 1)
     )
     return repeated
+
+
+@dataclass(frozen=True)
+class ProtectedDSAConsumerCapability:
+    supported: bool
+    zero_is_valid: bool
+    requires_status_publication_barrier: bool
+    reason: str = ""
+
+
+def protected_dsa_consumer_capability(
+    impl: str,
+    device_capability: Tuple[int, int],
+    *,
+    flashmla_operation_available: bool = False,
+) -> ProtectedDSAConsumerCapability:
+    """Audited Blackwell consumers of protected physical-slot top-k output."""
+    sm = tuple(device_capability)
+    if impl in ("flashmla_kv", "flashmla_sparse"):
+        if sm not in ((10, 0), (10, 3)):
+            return ProtectedDSAConsumerCapability(
+                False,
+                True,
+                True,
+                f"{impl} protected DSA requires SM100 or SM103, got SM{sm[0]}{sm[1]}",
+            )
+        if not flashmla_operation_available:
+            return ProtectedDSAConsumerCapability(
+                False,
+                True,
+                True,
+                f"{impl} protected DSA requires its exact CUDA operation and image for SM{sm[0]}{sm[1]}",
+            )
+        # FlashMLA treats physical slot 0 as data. Failed rows therefore execute
+        # on reserved storage and are discarded by the post-forward status barrier.
+        return ProtectedDSAConsumerCapability(True, True, True)
+
+    if impl == "trtllm":
+        return ProtectedDSAConsumerCapability(
+            False,
+            False,
+            False,
+            "TRTLLM-GEN protected DSA is disabled because no exact op- and "
+            "architecture-specific binary capability probe is available; use "
+            "flashmla_kv or flashmla_sparse on Blackwell",
+        )
+
+    if impl == "fa3":
+        reason = "FA3 has no Blackwell protected-slot consumer contract"
+    elif impl == "tilelang":
+        reason = "TileLang has no audited protected-slot sentinel contract"
+    elif impl == "aiter":
+        reason = "AIter has no CUDA protected-slot consumer contract"
+    else:
+        reason = f"{impl} has no audited protected DSA consumer contract"
+    return ProtectedDSAConsumerCapability(False, False, False, reason)
+
+
+def protected_dsa_producer_capability(
+    device_capability: Tuple[int, int], *, compiled_kernel_available: bool
+) -> Tuple[bool, str]:
+    """Gate the protected producer by an exact Blackwell code image."""
+    sm = tuple(device_capability)
+    if sm not in ((10, 0), (10, 3)):
+        return (
+            False,
+            f"protected SGL top-k requires SM100 or SM103; got SM{sm[0]}{sm[1]}",
+        )
+    if not compiled_kernel_available:
+        return (
+            False,
+            f"sgl-kernel has no loadable protected top-k image for SM{sm[0]}{sm[1]}",
+        )
+    return True, ""
 
 
 class TopkTransformMethod(IntEnum):
