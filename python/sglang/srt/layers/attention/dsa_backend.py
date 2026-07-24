@@ -40,6 +40,8 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
+    protected_dsa_consumer_capability,
+    protected_dsa_producer_capability,
     repeat_request_indices_into,
 )
 from sglang.srt.layers.attention.dsa.utils import (
@@ -421,27 +423,42 @@ class DeepseekSparseAttnBackend(
             self.kv_attention_tag_table is not None
             and not envs.SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION.get()
         )
-        producer_supported = (
-            self.dsa_topk_backend.is_sgl_kernel()
+        consumer_capability = protected_dsa_consumer_capability(
+            self.dsa_decode_impl, self.device_capability
+        )
+        producer_supported, producer_reason = protected_dsa_producer_capability(
+            self.device_capability,
+            compiled_kernel_available=(
+                _protected_topk_binary_available()
+                if fused_protection_requested
+                else False
+            ),
+        )
+        fused_protection_supported = (
+            consumer_capability.supported
+            and producer_supported
+            and self.dsa_topk_backend.is_sgl_kernel()
             and envs.SGLANG_DSA_FUSE_TOPK.get()
             and self.hisparse_coordinator is None
-            and (not fused_protection_requested or _protected_topk_binary_available())
         )
-        consumer_supported, consumer_reason = self._protected_consumer_capability()
-        fused_protection_supported = producer_supported and consumer_supported
         if fused_protection_requested and not fused_protection_supported:
-            reason = (
-                consumer_reason
-                if not consumer_supported
-                else "the protected SGL top-k producer is unavailable"
-            )
+            if self.hisparse_coordinator is not None:
+                reason = "HiSparse changes physical ownership after SGL top-k"
+            elif not self.dsa_topk_backend.is_sgl_kernel():
+                reason = "the protected producer requires --dsa-topk-backend=sgl-kernel"
+            elif not envs.SGLANG_DSA_FUSE_TOPK.get():
+                reason = "the protected producer requires SGLANG_DSA_FUSE_TOPK=1"
+            elif not consumer_capability.supported:
+                reason = consumer_capability.reason
+            else:
+                reason = producer_reason
             raise RuntimeError(
                 "Fused DSA KV page protection is unavailable: "
-                f"{reason}. Install an architecture-specific protected consumer "
-                "leaf or set SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION=1 to use "
-                "scheduler validation explicitly."
+                f"{reason}. Hopper FA3 on SM90 is the only audited protected "
+                "consumer. Set SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION=1 to "
+                "use scheduler validation explicitly."
             )
-        self.kv_protected_consumer_supported = consumer_supported
+        self.kv_protected_consumer_capability = consumer_capability
         self.kv_fused_page_protection_enabled = should_use_fused_kv_page_protection(
             self.kv_attention_tag_table,
             supported=fused_protection_supported,
@@ -520,10 +537,6 @@ class DeepseekSparseAttnBackend(
             )
         else:
             self.workspace_buffer = None
-
-    def _protected_consumer_capability(self) -> Tuple[bool, str]:
-        """Leaf hook for an audited consumer of protected physical-slot top-k."""
-        return False, "no architecture-specific protected DSA consumer is installed"
 
     def _make_aiter_dsa_decode_metadata_buffer(
         self,
@@ -739,14 +752,20 @@ class DeepseekSparseAttnBackend(
             f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
         )
 
-    def _enforce_protected_consumer_boundary(self, metadata: DSAMetadata) -> None:
-        """Fail closed unless a leaf has installed an audited consumer boundary."""
+    def _enforce_protected_consumer_boundary(
+        self, metadata: DSAMetadata, consumer: str
+    ) -> None:
         protection = metadata.kv_page_protection
         if protection is None:
             return
-        if not self.kv_protected_consumer_supported:
+        capability = self.kv_protected_consumer_capability
+        if consumer != self.dsa_decode_impl or not capability.supported:
             raise RuntimeError(
-                "protected top-k reached a backend without an architecture-specific consumer"
+                f"protected top-k reached unaudited DSA consumer {consumer}"
+            )
+        if not capability.requires_status_publication_barrier:
+            raise RuntimeError(
+                f"protected DSA consumer {consumer} lacks a fail-closed publication barrier"
             )
         if protection["validated_epochs"] is protection["pre_indexer_validated_epochs"]:
             raise RuntimeError(
@@ -2296,8 +2315,6 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
-        self._enforce_protected_consumer_boundary(metadata)
-
         if self.dsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -2336,6 +2353,7 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif self.dsa_decode_impl == "fa3":
+            self._enforce_protected_consumer_boundary(metadata, "fa3")
             return self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
@@ -2385,6 +2403,8 @@ class DeepseekSparseAttnBackend(
         qk_rope_dim = k_rope_cache.shape[-1]
         k_rope_cache = k_rope_cache.view(-1, page_size, 1, qk_rope_dim)
         c_kv_cache = c_kv_cache.view(-1, page_size, 1, v_head_dim)
+        # Protected DSA mappings are validated and sanitized by top-k before
+        # this attention kernel consumes them.
         o = flash_attn_with_kvcache(
             q=q_rope,
             k_cache=k_rope_cache,

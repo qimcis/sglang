@@ -344,7 +344,15 @@ class FlashAttentionBackend(AttentionBackend):
 
     def _protected_consumer_capability(self) -> tuple[bool, str]:
         """Leaf hook for an attention kernel implementing the protection ABI."""
-        return False, "no architecture-specific protected attention leaf is installed"
+        capability = torch.cuda.get_device_capability(self.device)
+        if self.fa_impl_ver != 3:
+            return False, "only FA3 has a protected Hopper attention leaf"
+        if capability != (9, 0):
+            return (
+                False,
+                f"protected FA3 requires SM90, got SM{capability[0]}{capability[1]}",
+            )
+        return True, ""
 
     def _set_kv_page_protection(
         self,

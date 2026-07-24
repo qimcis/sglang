@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum, IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -11,6 +12,48 @@ _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
     "large": 2,
 }
+
+
+@dataclass(frozen=True)
+class ProtectedDSAConsumerCapability:
+    supported: bool
+    zero_is_valid: bool
+    requires_status_publication_barrier: bool
+    reason: str = ""
+
+
+def protected_dsa_consumer_capability(
+    impl: str, device_capability: Tuple[int, int]
+) -> ProtectedDSAConsumerCapability:
+    """Describe the Hopper FA3 protected physical-slot consumer contract."""
+    sm = tuple(device_capability)
+    if impl != "fa3":
+        return ProtectedDSAConsumerCapability(
+            False,
+            False,
+            False,
+            f"{impl} has no audited Hopper protected DSA consumer contract",
+        )
+    if sm != (9, 0):
+        return ProtectedDSAConsumerCapability(
+            False,
+            True,
+            True,
+            f"FA3 protected DSA requires SM90, got SM{sm[0]}{sm[1]}",
+        )
+    return ProtectedDSAConsumerCapability(True, True, True)
+
+
+def protected_dsa_producer_capability(
+    device_capability: Tuple[int, int], *, compiled_kernel_available: bool
+) -> Tuple[bool, str]:
+    """Gate the protected top-k producer on its exact Hopper code image."""
+    sm = tuple(device_capability)
+    if sm != (9, 0):
+        return False, f"protected SGL top-k requires SM90, got SM{sm[0]}{sm[1]}"
+    if not compiled_kernel_available:
+        return False, "sgl-kernel has no loadable protected top-k image for SM90"
+    return True, ""
 
 
 def repeat_request_indices_into(

@@ -1213,7 +1213,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     import torch
 
-    major, _ = torch.cuda.get_device_capability()
+    major, minor = torch.cuda.get_device_capability()
     kv_cache_dtype = view.kv_cache_dtype
     user_set_prefill = view.dsa_prefill_backend is not None
     user_set_decode = view.dsa_decode_backend is not None
@@ -1244,7 +1244,14 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = default
         if not user_set_decode:
-            declared["dsa_decode_backend"] = default
+            if (major, minor) == (9, 0):
+                from sglang.srt.environ import envs
+
+                declared["dsa_decode_backend"] = (
+                    "fa3" if envs.SGLANG_KV_PAGE_PROTECTION.get() else default
+                )
+            else:
+                declared["dsa_decode_backend"] = default
     else:
         # Set prefill/decode backends based on hardware architecture.
         if not user_set_prefill:
