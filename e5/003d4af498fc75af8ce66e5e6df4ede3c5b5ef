@@ -1,0 +1,19 @@
+docker/validate-kv-protection-packaging.py
+  s_700c7ffe080221::t_bdd94ad61bc7cb 1-180
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e5003d4af498fc75af8ce66e5e6df4ede3c5b5ef",
+  "prompts": {},
+  "sessions": {
+    "s_700c7ffe080221": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_069d953ecffeXK2AlwHoLVvct6",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
