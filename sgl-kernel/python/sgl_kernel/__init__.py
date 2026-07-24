@@ -75,7 +75,15 @@ else:
         infllmv2_attn_stage1,
         max_pooling_1d_varlen,
     )
+    from sgl_kernel.kv_page_protection import (
+        kv_page_protection_preflight,
+        kv_page_protection_preflight_supported,
+    )
     from sgl_kernel.kvcacheio import (
+        kv_checksum_direct_table_batched,
+        kv_checksum_direct_table_batched_with_pages,
+        kv_checksum_direct_table_batched_with_pages_compact,
+        kv_page_history_record,
         transfer_kv_all_layer,
         transfer_kv_all_layer_mla,
         transfer_kv_per_layer,
@@ -121,6 +129,7 @@ else:
     )
     from sgl_kernel.top_k import (
         fast_topk,
+        fast_topk_kv_page_protection_supported,
         fast_topk_transform_fused,
         fast_topk_transform_ragged_fused,
         fast_topk_v2,
@@ -200,6 +209,9 @@ else:
         "top_p_renorm_prob",
         "topk_sigmoid",
         "topk_softmax",
+        "kv_checksum_direct_table_batched",
+        "kv_checksum_direct_table_batched_with_pages",
+        "kv_checksum_direct_table_batched_with_pages_compact",
         "transfer_kv_all_layer",
         "transfer_kv_all_layer_mla",
         "transfer_kv_per_layer",

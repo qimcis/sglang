@@ -1306,6 +1306,65 @@ class ModelRunnerKVCacheMixin:
         configurator = create_memory_pool_configurator(self)
         config = configurator.calculate_pool_sizes(available_bytes, page_size)
 
+        from sglang.srt.mem_cache.kv_page_tags import (
+            KV_ATTENTION_TAG_BYTES_PER_PAGE,
+            KV_CHECKSUM_MAX_WORKSPACE_BYTES,
+            KV_EXPECTED_MAPPING_BYTES_PER_PAGE,
+            KV_EXPECTED_MAPPING_NAMESPACE_COUNT,
+            KV_REQUEST_PROTECTION_BYTES_PER_SLOT,
+            KVPageHistory,
+            KVProtectionConfig,
+        )
+
+        disaggregation_mode = self.server_args.disaggregation_mode
+        protection_config = KVProtectionConfig.from_env(
+            is_pd_decode=disaggregation_mode in ("prefill", "decode")
+        )
+        reserved_bytes = (
+            KV_CHECKSUM_MAX_WORKSPACE_BYTES if protection_config.checksum_enabled else 0
+        )
+        if disaggregation_mode == "decode" and protection_config.enable_attention_tags:
+            protected_tokens = (
+                config.full_max_total_num_tokens or config.max_total_num_tokens
+            ) + (config.swa_max_total_num_tokens or 0)
+            protected_pages = protected_tokens // page_size + 1
+            bytes_per_page = KV_ATTENTION_TAG_BYTES_PER_PAGE
+            if protection_config.enable_page_history:
+                bytes_per_page += KVPageHistory.BYTES_PER_PAGE
+            reserved_bytes += protected_pages * bytes_per_page
+            max_running_requests = self._resolve_max_num_reqs(
+                config.max_total_num_tokens
+            )
+            logical_pages_per_request = (
+                self.model_config.context_len
+                + get_req_to_token_extra_context_len(self.server_args)
+                + page_size
+                - 1
+            ) // page_size
+            reserved_bytes += (
+                (
+                    max_running_requests
+                    + self.server_args.disaggregation_decode_extra_slots
+                    + 1
+                )
+                * logical_pages_per_request
+                * KV_EXPECTED_MAPPING_BYTES_PER_PAGE
+                * KV_EXPECTED_MAPPING_NAMESPACE_COUNT
+            )
+            reserved_bytes += (
+                max_running_requests
+                + self.server_args.disaggregation_decode_extra_slots
+                + 1
+            ) * KV_REQUEST_PROTECTION_BYTES_PER_SLOT
+        if reserved_bytes:
+            if reserved_bytes >= available_bytes:
+                raise RuntimeError(
+                    "KV page-protection workspace exceeds available memory"
+                )
+            config = configurator.calculate_pool_sizes(
+                available_bytes - reserved_bytes, page_size
+            )
+
         # Apply external constraints (user cap, page alignment, PP sync)
         constrained = self._apply_token_constraints(config.max_total_num_tokens)
         if constrained != config.max_total_num_tokens:

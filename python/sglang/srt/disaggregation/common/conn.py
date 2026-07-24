@@ -48,6 +48,57 @@ from sglang.srt.utils.network import (
 
 logger = logging.getLogger(__name__)
 
+KV_PROTECTION_PROTOCOL_VERSION = 2
+KV_PROTECTION_FEATURE_CHECKSUM = 1 << 0
+KV_PROTECTION_FEATURE_PAGE_TAGS = 1 << 1
+KV_PROTECTION_FEATURE_ALL = (
+    KV_PROTECTION_FEATURE_CHECKSUM | KV_PROTECTION_FEATURE_PAGE_TAGS
+)
+
+
+def kv_protection_feature_bitmap(kv_args: KVArgs) -> int:
+    config = getattr(kv_args, "kv_protection_config", None)
+    if config is None:
+        manager = getattr(kv_args, "transfer_page_tag_manager", None)
+        config = getattr(manager, "config", None)
+    if config is None or not config.enabled:
+        return 0
+    features = 0
+    if config.checksum_enabled:
+        features |= KV_PROTECTION_FEATURE_CHECKSUM
+    if config.enable_attention_tags:
+        features |= KV_PROTECTION_FEATURE_PAGE_TAGS
+    return features
+
+
+def send_metadata_with_staging_registration(
+    receiver,
+    metadata_args,
+    metadata_kwargs,
+    staging_handler=None,
+    room=None,
+    decode_req=None,
+):
+    if staging_handler is not None:
+        staging_handler.register_decode_req(room, decode_req)
+    try:
+        receiver.send_metadata(*metadata_args, **metadata_kwargs)
+    except Exception:
+        if (
+            staging_handler is not None
+            and not getattr(receiver, "requires_page_quarantine", lambda: False)()
+        ):
+            staging_handler.unregister_decode_req(room)
+        raise
+    manager = getattr(receiver, "kv_mgr", None)
+    if (
+        staging_handler is not None
+        and manager is not None
+        and manager.check_status(room) == KVPoll.Failed
+        and not getattr(receiver, "requires_page_quarantine", lambda: False)()
+    ):
+        staging_handler.unregister_decode_req(room)
+
 
 class KVTransferError(Exception):
     def __init__(
@@ -75,6 +126,8 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
+    protection_protocol_version: int = 0
+    protection_feature_bitmap: int = 0
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -94,6 +147,8 @@ class PrefillServerInfo:
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
+        self.protection_protocol_version = int(self.protection_protocol_version)
+        self.protection_feature_bitmap = int(self.protection_feature_bitmap)
 
 
 @dataclasses.dataclass
@@ -151,9 +206,11 @@ class CommonKVManager(BaseKVManager):
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
+        self.request_status_lock = threading.RLock()
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_lock = threading.Lock()
+        self._socket_send_locks: Dict[str, threading.Lock] = {}
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
@@ -210,24 +267,28 @@ class CommonKVManager(BaseKVManager):
             )
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
-        return self.request_status[bootstrap_room]
+        with self.request_status_lock:
+            return self.request_status[bootstrap_room]
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
-        if bootstrap_room not in self.request_status:
-            # Do not resurrect a cleared entry with Failed: once clear() has
-            # popped the room from request_status, any late update_status(Failed)
-            # (e.g. from abort()) must be a no-op. Otherwise a Failed entry could
-            # pollute a future request that reuses the same bootstrap_room.
-            if status == KVPoll.Failed:
-                return
-            self.request_status[bootstrap_room] = status
-        else:
-            if status == KVPoll.Failed:
-                self.request_status[bootstrap_room] = KVPoll.Failed
+        with self.request_status_lock:
+            if bootstrap_room not in self.request_status:
+                # Do not resurrect a cleared entry with Failed: once clear() has
+                # popped the room from request_status, any late update_status(Failed)
+                # (e.g. from abort()) must be a no-op. Otherwise a Failed entry could
+                # pollute a future request that reuses the same bootstrap_room.
+                if status == KVPoll.Failed:
+                    return
+                self.request_status[bootstrap_room] = status
             else:
-                self.request_status[bootstrap_room] = max(
-                    self.request_status[bootstrap_room], status
-                )
+                if self.request_status[bootstrap_room] == KVPoll.Failed:
+                    return
+                if status == KVPoll.Failed:
+                    self.request_status[bootstrap_room] = KVPoll.Failed
+                else:
+                    self.request_status[bootstrap_room] = max(
+                        self.request_status[bootstrap_room], status
+                    )
 
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
@@ -350,6 +411,39 @@ class CommonKVManager(BaseKVManager):
             target_pp_ranks = list(range(info.pp_size))
             required_prefill_response_num *= info.pp_size // self.pp_size
 
+        if (
+            getattr(self, "enable_staging", False)
+            and not self.is_mla_backend
+            and self.attn_tp_size != info.attn_tp_size
+            and (
+                self.pp_size != info.pp_size
+                or (
+                    self.enable_all_cp_ranks_for_transfer
+                    and self.attn_cp_size != info.attn_cp_size
+                )
+            )
+        ):
+            raise RuntimeError(
+                "Heterogeneous-TP staging requires matching prefill/decode PP "
+                "layouts and does not support multi-rank CP fan-in"
+            )
+
+        protection_manager = getattr(self.kv_args, "transfer_page_tag_manager", None)
+        if (
+            protection_manager is not None
+            and protection_manager.config.checksum_enabled
+            and (
+                self.attn_tp_size != info.attn_tp_size
+                or self.attn_cp_size != info.attn_cp_size
+                or self.pp_size != info.pp_size
+                or required_prefill_response_num != 1
+            )
+        ):
+            raise RuntimeError(
+                "KV checksum page manifests require matching prefill/decode "
+                "TP, CP, and PP layouts with one prefill completion per decode rank"
+            )
+
         info.target_tp_rank = target_tp_rank
         info.target_tp_ranks = target_tp_ranks
         info.target_cp_ranks = target_cp_ranks
@@ -421,6 +515,13 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
         }
+        if self.server_args.disaggregation_transfer_backend in ("mooncake", "nixl"):
+            features = kv_protection_feature_bitmap(self.kv_args)
+            if features:
+                payload.update(
+                    protection_protocol_version=KV_PROTECTION_PROTOCOL_VERSION,
+                    protection_feature_bitmap=features,
+                )
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
         for attempt in range(max_retries):
@@ -488,6 +589,14 @@ class CommonKVManager(BaseKVManager):
                 zmq.EVENT_DISCONNECTED
             )
             return sock
+
+    def _send_multipart(
+        self, endpoint: str, frames: List[bytes], is_ipv6: bool = False
+    ) -> None:
+        with self._socket_lock:
+            send_lock = self._socket_send_locks.setdefault(endpoint, threading.Lock())
+        with send_lock:
+            self._connect(endpoint, is_ipv6=is_ipv6).send_multipart(frames)
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
@@ -781,6 +890,7 @@ class CommonKVSender(BaseKVSender):
         self._transfer_metric = KVTransferMetric()
         self._transfer_num_kv_indices = 0
         self._transfer_num_state_indices = 0
+        self.checksum_plan = None
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None
@@ -838,6 +948,9 @@ class CommonKVSender(BaseKVSender):
 
     def pop_decode_prefix_len(self) -> int:
         return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
+
+    def set_checksum_plan(self, plan) -> None:
+        self.checksum_plan = plan
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0 or last_chunk
@@ -925,11 +1038,12 @@ class CommonKVSender(BaseKVSender):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
-            self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "transfer_infos"):
-            self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        with self.kv_mgr.request_status_lock:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+            if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
+                self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
+            if hasattr(self.kv_mgr, "transfer_infos"):
+                self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -983,9 +1097,10 @@ class CommonKVReceiver(BaseKVReceiver):
             self.prefill_info.required_prefill_response_num
         )
 
-        self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
-            self.required_prefill_response_num
-        )
+        with self.kv_mgr.request_status_lock:
+            self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
+                self.required_prefill_response_num
+            )
 
         if self.kv_mgr.enable_staging:
             self.require_staging = (
@@ -1026,6 +1141,10 @@ class CommonKVReceiver(BaseKVReceiver):
                             else:
                                 # For non-MLA: all target_tp_ranks are selected real ranks
                                 bootstrap_info["is_dummy"] = False
+                            bootstrap_info["producer_id"] = (
+                                target_pp_rank * self.prefill_info.attn_cp_size
+                                + target_cp_rank
+                            ) * self.prefill_info.attn_tp_size + target_tp_rank
                             logger.debug(
                                 f"Fetched bootstrap info: {bootstrap_info} for DP {self.prefill_dp_rank} CP {target_cp_rank} TP {target_tp_rank} PP {target_pp_rank}"
                             )
@@ -1173,9 +1292,12 @@ class CommonKVReceiver(BaseKVReceiver):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-        self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
-        self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
+        with self.kv_mgr.request_status_lock:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+            self.kv_mgr.required_prefill_response_num_table.pop(
+                self.bootstrap_room, None
+            )
+            self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -1231,6 +1353,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
+        self.protection_protocol_version: Optional[int] = None
+        self.protection_feature_bitmap: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1297,6 +1421,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        protection_protocol_version = int(data.get("protection_protocol_version", 0))
+        protection_feature_bitmap = int(data.get("protection_feature_bitmap", 0))
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1315,6 +1441,18 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
+
+        if self.protection_protocol_version is None:
+            self.protection_protocol_version = protection_protocol_version
+            self.protection_feature_bitmap = protection_feature_bitmap
+        elif (
+            self.protection_protocol_version != protection_protocol_version
+            or self.protection_feature_bitmap != protection_feature_bitmap
+        ):
+            return web.Response(
+                text="Prefill workers disagree on KV protection capabilities.",
+                status=400,
+            )
 
         if self.follow_bootstrap_room is None:
             load_balance_method = data.get(
@@ -1385,6 +1523,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
+                protection_protocol_version=self.protection_protocol_version or 0,
+                protection_feature_bitmap=self.protection_feature_bitmap or 0,
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 

@@ -30,6 +30,7 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
+    repeat_request_indices_into,
 )
 from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.dsa.transform_index import (
@@ -55,6 +56,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_position,
 )
+from sglang.srt.mem_cache.kv_page_tags import should_use_fused_kv_page_protection
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -122,6 +124,15 @@ else:
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
     )
+
+
+def _protected_topk_binary_available() -> bool:
+    try:
+        from sgl_kernel import fast_topk_kv_page_protection_supported
+
+        return fast_topk_kv_page_protection_supported()
+    except (ImportError, RuntimeError, AttributeError):
+        return False
 
 
 def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -220,6 +231,8 @@ class DSAMetadata:
     indexer_seq_lens: Optional[torch.Tensor] = None
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
+    kv_page_protection: Optional[dict] = None
+    protected_request_indices: Optional[torch.Tensor] = None
 
 
 @torch.compile
@@ -281,6 +294,18 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
     def get_token_to_batch_idx(self) -> torch.Tensor:
         return self.attn_metadata.token_to_batch_idx
+
+    def preflight_indexer_page_table(self) -> None:
+        protection = self.attn_metadata.kv_page_protection
+        if protection is None:
+            return
+        if protection.get("page_table") is not self.attn_metadata.real_page_table:
+            raise RuntimeError(
+                "DSA pre-indexer protection must sanitize the page table consumed by the indexer"
+            )
+        from sgl_kernel import kv_page_protection_preflight
+
+        kv_page_protection_preflight(protection, phase="pre_indexer")
 
     def topk_transform(
         self,
@@ -370,6 +395,9 @@ class DeepseekSparseAttnBackend(
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.kv_attention_tag_table = getattr(
+            model_runner, "kv_attention_tag_table", None
+        )
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
@@ -381,13 +409,47 @@ class DeepseekSparseAttnBackend(
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
+        self.device_capability = torch.cuda.get_device_capability(self.device)
+        self.device_sm_major = self.device_capability[0]
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
             self.flashmla_kv_num_q_heads = 128
         else:
-            # Keep original head count if it exceeds current padded variants.
             self.flashmla_kv_num_q_heads = self.num_q_heads
+        fused_protection_requested = (
+            self.kv_attention_tag_table is not None
+            and not envs.SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION.get()
+        )
+        producer_supported = (
+            self.dsa_topk_backend.is_sgl_kernel()
+            and envs.SGLANG_DSA_FUSE_TOPK.get()
+            and self.hisparse_coordinator is None
+            and (not fused_protection_requested or _protected_topk_binary_available())
+        )
+        consumer_supported, consumer_reason = self._protected_consumer_capability()
+        fused_protection_supported = producer_supported and consumer_supported
+        if fused_protection_requested and not fused_protection_supported:
+            reason = (
+                consumer_reason
+                if not consumer_supported
+                else "the protected SGL top-k producer is unavailable"
+            )
+            raise RuntimeError(
+                "Fused DSA KV page protection is unavailable: "
+                f"{reason}. Install an architecture-specific protected consumer "
+                "leaf or set SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION=1 to use "
+                "scheduler validation explicitly."
+            )
+        self.kv_protected_consumer_supported = consumer_supported
+        self.kv_fused_page_protection_enabled = should_use_fused_kv_page_protection(
+            self.kv_attention_tag_table,
+            supported=fused_protection_supported,
+        )
+        if self.kv_attention_tag_table is not None:
+            model_runner.kv_requires_pre_indexer_page_validation = True
+        if self.kv_fused_page_protection_enabled:
+            model_runner.kv_fused_page_protection_enabled = True
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
@@ -437,8 +499,6 @@ class DeepseekSparseAttnBackend(
         )
         self.speculative_step_id = speculative_step_id
 
-        self.device_capability = torch.cuda.get_device_capability()
-        self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
@@ -453,6 +513,10 @@ class DeepseekSparseAttnBackend(
             self.workspace_buffer = global_workspace_buffer
         else:
             self.workspace_buffer = None
+
+    def _protected_consumer_capability(self) -> Tuple[bool, str]:
+        """Leaf hook for an audited consumer of protected physical-slot top-k."""
+        return False, "no architecture-specific protected DSA consumer is installed"
 
     def _make_aiter_dsa_decode_metadata_buffer(
         self,
@@ -668,6 +732,20 @@ class DeepseekSparseAttnBackend(
             f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
         )
 
+    def _enforce_protected_consumer_boundary(self, metadata: DSAMetadata) -> None:
+        """Fail closed unless a leaf has installed an audited consumer boundary."""
+        protection = metadata.kv_page_protection
+        if protection is None:
+            return
+        if not self.kv_protected_consumer_supported:
+            raise RuntimeError(
+                "protected top-k reached a backend without an architecture-specific consumer"
+            )
+        if protection["validated_epochs"] is protection["pre_indexer_validated_epochs"]:
+            raise RuntimeError(
+                "DSA pre-indexer validation cannot publish the protected top-k epoch"
+            )
+
     def get_device_int32_arange(self, length: int) -> torch.Tensor:
         if length > len(self._arange_buf):
             next_pow_of_2 = 1 << (length - 1).bit_length()
@@ -693,6 +771,62 @@ class DeepseekSparseAttnBackend(
             0, max_seqlen_k, page_size, device=page_table.device, dtype=torch.int32
         )
         return page_table[:, strided_indices] // page_size
+
+    def _set_kv_page_protection(
+        self,
+        metadata: DSAMetadata,
+        request_indices: torch.Tensor,
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ) -> None:
+        table = self.kv_attention_tag_table
+        protection = None
+        if self.kv_fused_page_protection_enabled:
+            if forward_mode.is_draft_extend_v2():
+                raise RuntimeError(
+                    "Fused DSA KV page protection does not support draft-extend: "
+                    "both pre-indexer and protected top-k boundaries are required"
+                )
+            if forward_mode.is_decode_or_idle() or forward_mode.is_target_verify():
+                if forward_mode.is_target_verify():
+                    source_request_indices = request_indices
+                    rows = (
+                        source_request_indices.shape[0]
+                        * self.speculative_num_draft_tokens
+                    )
+                    protected_request_indices = metadata.protected_request_indices
+                    if protected_request_indices is None:
+                        protected_request_indices = torch.empty(
+                            rows,
+                            dtype=request_indices.dtype,
+                            device=request_indices.device,
+                        )
+                        object.__setattr__(
+                            metadata,
+                            "protected_request_indices",
+                            protected_request_indices,
+                        )
+                    request_indices = repeat_request_indices_into(
+                        source_request_indices,
+                        self.speculative_num_draft_tokens,
+                        protected_request_indices,
+                    )
+                    indexer_seqlens = metadata.dsa_seqlens_expanded
+                else:
+                    indexer_seqlens = metadata.cache_seqlens_int32
+                if request_indices.shape[0] != metadata.real_page_table.shape[0]:
+                    raise RuntimeError(
+                        "protected DSA request rows do not match the indexer page table"
+                    )
+                protection = table.fused_forward_args(
+                    request_indices=request_indices,
+                    seqlens=indexer_seqlens,
+                    page_table=metadata.real_page_table,
+                    page_size=self.real_page_size,
+                    validate_full_mapping=True,
+                    pre_indexer_cache_by_request=(not forward_mode.is_target_verify()),
+                )
+        object.__setattr__(metadata, "kv_page_protection", protection)
 
     def init_forward_metadata_out_graph(
         self,
@@ -1004,6 +1138,12 @@ class DeepseekSparseAttnBackend(
             token_to_batch_idx=token_to_batch_idx,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
         )
+        self._set_kv_page_protection(
+            metadata,
+            forward_batch.req_pool_indices[:batch_size],
+            forward_batch.forward_mode,
+            forward_batch.spec_info,
+        )
         self.forward_metadata = metadata
 
     def _cal_indexer_k_start_end(
@@ -1152,6 +1292,9 @@ class DeepseekSparseAttnBackend(
                     dtype=torch.int32,
                     device=self.device,
                 )
+            ),
+            "protected_request_indices": torch.zeros(
+                max_num_tokens, dtype=torch.int64, device=self.device
             ),
             "flashmla_metadata": (
                 self._compute_flashmla_metadata(
@@ -1326,8 +1469,17 @@ class DeepseekSparseAttnBackend(
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+            protected_request_indices=self.decode_cuda_graph_metadata[
+                "protected_request_indices"
+            ],
         )
         self.decode_cuda_graph_metadata[bs] = metadata
+        self._set_kv_page_protection(
+            metadata,
+            req_pool_indices,
+            forward_mode,
+            spec_info,
+        )
         self.forward_metadata = metadata
 
     def _apply_cuda_graph_metadata(
@@ -1634,6 +1786,12 @@ class DeepseekSparseAttnBackend(
                 )
             )
 
+        self._set_kv_page_protection(
+            metadata,
+            req_pool_indices,
+            forward_mode,
+            spec_info,
+        )
         self.forward_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph_from_precomputed(
@@ -2123,6 +2281,8 @@ class DeepseekSparseAttnBackend(
                 topk_indices=topk_indices,
                 page_size=1,
             )
+
+        self._enforce_protected_consumer_boundary(metadata)
 
         if self.dsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:

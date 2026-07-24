@@ -539,15 +539,29 @@ class SchedulerBatchResultProcessor:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
-        result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
+        failed_rids = (
+            getattr(result, "fused_kv_page_protection_failed_rids", None) or set()
+        )
+        result.num_correct_drafts_per_req_cpu = [
+            0 if req.rid in failed_rids else accept_len - 1
+            for req, accept_len in zip(batch.reqs, accept_lens, strict=True)
+        ]
+        result.num_correct_drafts = sum(result.num_correct_drafts_per_req_cpu)
+        healthy_correct_drafts = [
+            num_correct_drafts
+            for req, num_correct_drafts in zip(
+                batch.reqs, result.num_correct_drafts_per_req_cpu, strict=True
+            )
+            if req.rid not in failed_rids
+        ]
 
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
-        self.model_worker.on_verify_complete_cpu(
-            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
-        )
+        if healthy_correct_drafts:
+            self.model_worker.on_verify_complete_cpu(
+                healthy_correct_drafts, batch_size=len(healthy_correct_drafts)
+            )
 
         predict_tokens = []
         # In adaptive spec-v2, the worker state may already have switched when this
@@ -653,10 +667,14 @@ class SchedulerBatchResultProcessor:
             next_token_ids=next_token_ids,
         )
 
-        self.metrics_reporter.num_generated_tokens += len(batch.reqs)
-        if not batch.spec_algorithm.is_none():
+        failed_rids = (
+            getattr(result, "fused_kv_page_protection_failed_rids", None) or set()
+        )
+        healthy_batch_size = sum(req.rid not in failed_rids for req in batch.reqs)
+        self.metrics_reporter.num_generated_tokens += healthy_batch_size
+        if not batch.spec_algorithm.is_none() and healthy_batch_size:
             self.metrics_reporter.update_spec_metrics(
-                batch.batch_size(), result.num_correct_drafts
+                healthy_batch_size, result.num_correct_drafts
             )
         if self.server_args.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
@@ -665,15 +683,34 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        newly_deferred_rids = (
+            result.fused_kv_page_protection_deferred_release_rids or set()
+        )
         for i, req in enumerate(batch.reqs):
             req: Req
 
-            if (self.enable_overlap or self.enable_overlap_mlx) and (
-                req.finished() or req.is_retracted
-            ):
-                # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
-                # And all the over-allocated tokens will be freed in `release_kv_cache`.
-                continue
+            if req.finished() or req.is_retracted:
+                is_protection_drain = req.rid in failed_rids or getattr(
+                    req, "kv_fused_protection_deferred_release", False
+                )
+                if (
+                    getattr(req, "kv_fused_protection_deferred_release", False)
+                    and req.rid not in newly_deferred_rids
+                ):
+                    if (
+                        req.req_pool_idx is not None or self.tree_cache.supports_mamba()
+                    ) and not getattr(req, "kv_committed_freed", False):
+                        release_kv_cache(req, self.tree_cache, is_insert=False)
+                    req.kv_fused_protection_deferred_release = False
+                if (
+                    is_protection_drain
+                    or self.enable_overlap
+                    or self.enable_overlap_mlx
+                ):
+                    # Overlap can finish a request while its previous result is
+                    # queued. Protection failures use the same drain behavior in
+                    # non-overlap mode to prevent failed-token publication.
+                    continue
 
             # next_token_id is a per-req list: 1 token for non-spec, the verified
             # run for spec (already grammar-truncated in _resolve_spec_v2_tokens).

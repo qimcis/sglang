@@ -801,6 +801,11 @@ class Indexer(MultiPlatformOp):
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
+        # The indexer is the first external reader of the mutable per-forward
+        # page table. This same-stream phase sanitizes it without publishing the
+        # selected-slot epoch used by the later protected top-k producer.
+        metadata.preflight_indexer_page_table()
+
         page_size = get_token_to_kv_pool().page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip:

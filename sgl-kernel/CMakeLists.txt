@@ -247,6 +247,7 @@ endif()
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
+    "csrc/attention/kv_page_protection.cu"
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/vertical_slash_index.cu"
     "csrc/common_extension.cc"
@@ -278,6 +279,7 @@ set(SOURCES
     "csrc/infllm_v2/max_pooling.cu"
 
     "csrc/kvcacheio/transfer.cu"
+    "csrc/kvcacheio/checksum.cu"
     "csrc/mamba/causal_conv1d.cu"
     "csrc/memory/weak_ref_tensor.cpp"
 

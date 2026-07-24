@@ -13,6 +13,28 @@ _FLASHINFER_TIE_BREAK_VALUES = {
 }
 
 
+def repeat_request_indices_into(
+    request_indices: torch.Tensor, repeats: int, output: torch.Tensor
+) -> torch.Tensor:
+    """Repeat request rows into persistent storage without replacing its allocation."""
+    if request_indices.dim() != 1 or output.dim() != 1:
+        raise ValueError("protected DSA request indices must be one-dimensional")
+    if repeats <= 0:
+        raise ValueError("protected DSA request-index repeat count must be positive")
+    if output.device != request_indices.device or output.dtype != request_indices.dtype:
+        raise ValueError("protected DSA request-index buffer type or device mismatch")
+    rows = request_indices.numel() * repeats
+    if output.numel() < rows:
+        raise ValueError(
+            "protected DSA request-index buffer is smaller than the graph shape"
+        )
+    repeated = output[:rows]
+    repeated.view(request_indices.numel(), repeats).copy_(
+        request_indices.reshape(-1, 1)
+    )
+    return repeated
+
+
 class TopkTransformMethod(IntEnum):
     # Transform topk indices to indices to the page table (page_size = 1)
     PAGED = auto()
@@ -85,6 +107,22 @@ class DSATopKBackend(Enum):
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
     ) -> torch.Tensor:
+        kv_page_protection = getattr(attn_metadata, "kv_page_protection", None)
+        if kv_page_protection is not None:
+            if (
+                topk_transform_method != TopkTransformMethod.PAGED
+                or not envs.SGLANG_DSA_FUSE_TOPK.get()
+                or force_unfused_topk
+                or not self.is_sgl_kernel()
+                or row_starts is not None
+                or batch_idx_list is not None
+            ):
+                raise RuntimeError(
+                    "Fused DSA KV page protection requires the SGL fused paged "
+                    "top-k decode path. Disable fused protection explicitly for "
+                    "unsupported DSA top-k layouts."
+                )
+
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
 
@@ -134,6 +172,7 @@ class DSATopKBackend(Enum):
                     cu_seqlens_q=cu_seqlens_q_topk,
                     topk=topk,
                     row_starts=row_starts,
+                    kv_page_protection=kv_page_protection,
                 )
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 if topk_indices_offset is None:

@@ -646,6 +646,12 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
+    request_pool_idx = req.req_pool_idx
+    table = getattr(tree_cache.token_to_kv_pool_allocator, "attention_tag_table", None)
+    if table is not None:
+        # Finished requests cannot run attention again. Invalidate before radix
+        # dedup, speculative-tail trimming, deferred free, or allocator reuse.
+        table.clear_request_slot(request_pool_idx)
     tree_cache.cache_finished_req(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
