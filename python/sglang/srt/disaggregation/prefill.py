@@ -64,6 +64,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.utils import is_cuda
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
@@ -148,7 +149,42 @@ class PrefillBootstrapQueue:
                 "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
+        # KV transfer checksum (prefill side, gated). Attention tags are a
+        # decode-side concept, so the prefill manager is checksum-only.
+        self._init_kv_protection()
         self.kv_manager = self._init_kv_manager()
+
+    def _init_kv_protection(self) -> None:
+        import dataclasses
+
+        from sglang.srt.mem_cache.kv_page_tags import (
+            KVPageProtectionManager,
+            KVProtectionConfig,
+        )
+
+        protocol_config = KVProtectionConfig.from_env(is_pd_decode=True)
+        self.kv_protection_config = protocol_config
+        # Prefill only needs the transfer-checksum half; disable attention tags so we
+        # do not attach a sidecar table / bump generations on the prefill side.
+        config = dataclasses.replace(protocol_config, enable_attention_tags=False)
+        if not config.checksum_enabled:
+            self.scheduler.kv_protection_manager = None
+            return
+        self.scheduler.kv_protection_manager = KVPageProtectionManager(
+            config,
+            allocator=None,
+            num_pages=0,
+            page_size=self.token_to_kv_pool.page_size,
+            device="cpu",
+            metrics_collector=None,
+            transfer_backend=(
+                str(self.transfer_backend.value)
+                if hasattr(self.transfer_backend, "value")
+                else str(self.transfer_backend)
+            ),
+            is_spec_decode=False,
+            is_cuda_device=is_cuda(),
+        )
 
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -202,6 +238,8 @@ class PrefillBootstrapQueue:
                 self.scheduler.model_config.get_total_num_kv_heads()
             )
         kv_args.page_size = self.token_to_kv_pool.page_size
+        kv_args.transfer_page_tag_manager = self.scheduler.kv_protection_manager
+        kv_args.kv_protection_config = self.kv_protection_config
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
@@ -644,15 +682,87 @@ class SchedulerDisaggregationPrefillMixin:
             if extend_logprob_start_len < extend_input_len:
                 logprob_pt += extend_input_len - extend_logprob_start_len
 
+        # Poll optimistic prefill requests in this batch.
+        # Note: In overlap scheduling, a chunked request that was still pending
+        # during process_prefill_chunk is not checked again here.
+        # If it becomes ready in the gap, we still retry the request to keep
+        # chunked-prefill state management simple.
+        optimistic_polls = {}
+        optimistic_reqs = [
+            (i, req)
+            for i, req in enumerate(batch.reqs)
+            if req.pending_bootstrap and req.inflight_middle_chunks <= 0
+        ]
+        if optimistic_reqs:
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                [req.disagg_kv_sender for _, req in optimistic_reqs],
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+            )
+            optimistic_polls = {
+                idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
+            }
+
+        checksum_batch = None
+        checksum_reqs: List[Req] = []
+        manager = getattr(self, "kv_protection_manager", None)
+        if manager is not None and manager.config.checksum_enabled:
+            from sglang.srt.mem_cache.kv_page_tags import swa_checksum_evicted_len
+
+            sliding_window = getattr(self, "sliding_window_size", None)
+            page_size = getattr(self.token_to_kv_pool_allocator, "page_size", 1)
+            req_pool_indices = []
+            bootstrap_rooms = []
+            num_tokens = []
+            swa_evicted = []
+            for i, req in enumerate(batch.reqs):
+                if req.inflight_middle_chunks > 0:
+                    continue
+                if (
+                    i in optimistic_polls
+                    and optimistic_polls[i] != KVPoll.WaitingForInput
+                ):
+                    continue
+                seq_len = min(req.fill_len, len(req.origin_input_ids))
+                if seq_len <= 0 or req.req_pool_idx is None:
+                    continue
+                checksum_reqs.append(req)
+                req_pool_indices.append(int(req.req_pool_idx))
+                bootstrap_rooms.append(int(req.bootstrap_room or 0))
+                num_tokens.append(int(seq_len))
+                swa_evicted.append(
+                    swa_checksum_evicted_len(seq_len, sliding_window, page_size)
+                )
+            if checksum_reqs:
+                try:
+                    kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+                    checksum_batch = manager.begin_transfer_checksums_from_table(
+                        kv_pool,
+                        self.req_to_token_pool.req_to_token,
+                        req_pool_indices=req_pool_indices,
+                        bootstrap_rooms=bootstrap_rooms,
+                        num_tokens=num_tokens,
+                        swa_evicted_lens=swa_evicted,
+                    )
+                except Exception as e:
+                    logger.error("KV transfer checksum batch launch failed: %s", e)
+                    checksum_batch = None
+                    checksum_reqs = []
+
+        final_send_reqs: List[Req] = []
+
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
-                # Test hook: exercise the release/requeue retry path.
-                if req.pending_bootstrap and should_force_retry(req):
-                    self.optimistic_release_and_requeue(req)
+                # Resolve optimistic bootstrap before publishing result metadata.
+                if i in optimistic_polls and not self.handle_pending_bootstrap(
+                    req, optimistic_polls[i]
+                ):
+                    if not is_aborted(req):
+                        self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
                     continue
 
@@ -692,9 +802,7 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor.add_sampling_mask_return_values(
                         i, req, logits_output
                     )
-                if not req.pending_bootstrap:
-                    self.send_kv_chunk(req, last_chunk=True)
-                req.time_stats.set_prefill_transfer_queue_entry_time()
+                final_send_reqs.append(req)
 
                 if req.grammar is not None:
                     try:
@@ -756,6 +864,22 @@ class SchedulerDisaggregationPrefillMixin:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
+        if checksum_batch is not None:
+            try:
+                for req, plan in zip(
+                    checksum_reqs, checksum_batch.finalize(), strict=True
+                ):
+                    req.kv_transfer_checksum = plan
+                    req.disagg_kv_sender.set_checksum_plan(plan)
+            except Exception as e:
+                logger.error("KV transfer checksum batch finalize failed: %s", e)
+                for req in checksum_reqs:
+                    req.kv_transfer_checksum = None
+
+        for req in final_send_reqs:
+            self.send_kv_chunk(req, last_chunk=True)
+            req.time_stats.set_prefill_transfer_queue_entry_time()
+
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
             batch=batch,
@@ -771,6 +895,18 @@ class SchedulerDisaggregationPrefillMixin:
         Poll the requests in the middle of transfer. If done, return the request.
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
+        quarantined = getattr(self, "_quarantined_prefill_source_reqs", {})
+        for room, req in list(quarantined.items()):
+            sender = req.disagg_kv_sender
+            if not getattr(sender, "source_pages_quiescent", lambda: True)():
+                continue
+            sender.clear()
+            if (
+                req.req_pool_idx is not None or self.tree_cache.supports_mamba()
+            ) and not req.kv_committed_freed:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+            quarantined.pop(room, None)
+
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
@@ -826,6 +962,11 @@ class SchedulerDisaggregationPrefillMixin:
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
+                if not getattr(
+                    req.disagg_kv_sender, "source_pages_quiescent", lambda: True
+                )():
+                    undone_reqs.append(req)
+                    continue
                 self.handle_inflight_transfer_failure(req)
                 done_reqs.append(req)
             else:

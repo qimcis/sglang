@@ -308,6 +308,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         self.evictable_leaves = set()
         self.reset()
 
+    def supports_kv_page_protection(self) -> bool:
+        return True
+
     @classmethod
     def create_simulated(
         self,
@@ -494,7 +497,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         token_ids = req.get_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
-        ]
+        ].clone()
 
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
@@ -512,10 +515,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         )
         new_prefix_len = result.prefix_len
 
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[req.cache_protected_len : new_prefix_len]
-        )
-
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
         new_indices, new_last_node = (
@@ -529,6 +528,22 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
             new_indices[req.cache_protected_len :],
+        )
+        if self.token_to_kv_pool_allocator.attention_tag_table is not None:
+            from sglang.srt.mem_cache.kv_page_tags import (
+                refresh_request_expected_mappings,
+            )
+
+            refresh_request_expected_mappings(
+                req,
+                self.req_to_token_pool.req_to_token,
+                self.token_to_kv_pool_allocator,
+            )
+
+        # Refresh protection expectations while duplicate generations still
+        # exist; freeing them may immediately make those pages reusable.
+        self.token_to_kv_pool_allocator.free(
+            kv_indices[req.cache_protected_len : new_prefix_len]
         )
 
         # The cache_protected_len is not always equal to len(req.prefix_indices)

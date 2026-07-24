@@ -16,11 +16,12 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -85,6 +86,7 @@ from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_b
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
+from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
@@ -223,6 +225,127 @@ elif current_platform.is_out_of_tree():
 logger = logging.getLogger(__name__)
 
 
+class _KVProtectionKVCacheConfigurator(KVCacheConfigurator):
+    def config_from_budget(
+        self, budget_bytes: int, *, cap_tokens: Optional[int] = None
+    ) -> MemoryPoolConfig:
+        config = super().config_from_budget(budget_bytes, cap_tokens=cap_tokens)
+
+        from sglang.srt.mem_cache.kv_page_tags import (
+            KV_ATTENTION_TAG_BYTES_PER_PAGE,
+            KV_CHECKSUM_MAX_WORKSPACE_BYTES,
+            KV_EXPECTED_MAPPING_BYTES_PER_PAGE,
+            KV_EXPECTED_MAPPING_NAMESPACE_COUNT,
+            KV_REQUEST_PROTECTION_BYTES_PER_SLOT,
+            KVPageHistory,
+            KVProtectionConfig,
+        )
+
+        protection_config = KVProtectionConfig.from_env(
+            is_pd_decode=self.server_args.disaggregation_mode in ("prefill", "decode")
+        )
+        reserved_bytes = (
+            KV_CHECKSUM_MAX_WORKSPACE_BYTES
+            if protection_config.checksum_enabled
+            else 0
+        )
+        if (
+            self.server_args.disaggregation_mode == "decode"
+            and protection_config.enable_attention_tags
+        ):
+            protected_tokens = (
+                config.full_max_total_num_tokens or config.max_total_num_tokens
+            ) + (config.swa_max_total_num_tokens or 0)
+            protected_pages = protected_tokens // self.page_size + 1
+            bytes_per_page = KV_ATTENTION_TAG_BYTES_PER_PAGE
+            if protection_config.enable_page_history:
+                bytes_per_page += KVPageHistory.BYTES_PER_PAGE
+            reserved_bytes += protected_pages * bytes_per_page
+
+            max_running_requests = self.resolve_max_num_reqs(
+                config.max_total_num_tokens
+            )
+            logical_pages_per_request = (
+                self.model_config.context_len
+                + get_req_to_token_extra_context_len(self.server_args)
+                + self.page_size
+                - 1
+            ) // self.page_size
+            request_slots = (
+                max_running_requests
+                + self.server_args.disaggregation_decode_extra_slots
+                + 1
+            )
+            reserved_bytes += (
+                request_slots
+                * logical_pages_per_request
+                * KV_EXPECTED_MAPPING_BYTES_PER_PAGE
+                * KV_EXPECTED_MAPPING_NAMESPACE_COUNT
+            )
+            reserved_bytes += request_slots * KV_REQUEST_PROTECTION_BYTES_PER_SLOT
+
+        if not reserved_bytes:
+            return config
+        if reserved_bytes >= budget_bytes:
+            raise RuntimeError("KV page-protection workspace exceeds available memory")
+        return super().config_from_budget(
+            budget_bytes - reserved_bytes, cap_tokens=cap_tokens
+        )
+
+
+@dataclass
+class FusedKVPageProtectionCheck:
+    request_pool_indices: torch.Tensor
+    statuses: torch.Tensor
+    failed: torch.Tensor
+    work: Optional[Any] = None
+
+    def wait(self) -> None:
+        if self.work is not None:
+            self.work.wait()
+            self.work = None
+
+    def copy_to_cpu(self) -> None:
+        self.wait()
+        self.request_pool_indices = self.request_pool_indices.to(
+            "cpu", non_blocking=True
+        )
+        self.statuses = self.statuses.to("cpu", non_blocking=True)
+        self.failed = self.failed.to("cpu", non_blocking=True)
+
+    def mask_failed_rows(
+        self, values: torch.Tensor, fallback: torch.Tensor
+    ) -> torch.Tensor:
+        self.wait()
+        failed = self.failed.to(device=values.device, dtype=torch.bool)
+        return torch.where(failed, fallback.to(values.device), values)
+
+    def materialize_error(self):
+        self.wait()
+        if not bool(self.failed.any().item()):
+            return None
+
+        from sglang.srt.mem_cache.kv_page_tags import (
+            KV_PAGE_VALIDATION_REMOTE_FAILURE,
+            KVFusedProtectionError,
+        )
+
+        remote_failure = self.failed.bool() & self.statuses.eq(0)
+        statuses = self.statuses | (
+            remote_failure.to(torch.int32) * KV_PAGE_VALIDATION_REMOTE_FAILURE
+        )
+        bad_batch_indices = self.failed.nonzero(as_tuple=False).flatten()
+        bad_request_indices = self.request_pool_indices.index_select(
+            0, bad_batch_indices.to(self.request_pool_indices.device)
+        )
+        bad_statuses = statuses.index_select(0, bad_batch_indices)
+        return KVFusedProtectionError(
+            batch_indices=bad_batch_indices.cpu().tolist(),
+            request_pool_indices=bad_request_indices.cpu().tolist(),
+            statuses=bad_statuses.cpu().tolist(),
+        )
+
+
 @dataclass
 class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
@@ -230,6 +353,7 @@ class ModelRunnerOutput:
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
+    fused_kv_page_protection_check: Optional[FusedKVPageProtectionCheck] = None
 
 
 class ModelRunner:
@@ -511,7 +635,7 @@ class ModelRunner:
         )
 
     def init_kv_cache_configurator(self):
-        self.kv_cache_configurator = KVCacheConfigurator(
+        self.kv_cache_configurator = _KVProtectionKVCacheConfigurator(
             device=self.device,
             gpu_id=self.gpu_id,
             ps=self.ps,
@@ -1230,6 +1354,24 @@ class ModelRunner:
 
         self.forward_pass_id += 1
 
+        table = getattr(self, "kv_attention_tag_table", None)
+        is_protected_decode = (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.spec_info is None
+        )
+        is_protected_dsa_verify = (
+            forward_batch.forward_mode.is_target_verify()
+            and getattr(self, "kv_requires_pre_indexer_page_validation", False)
+        )
+        if (
+            table is not None
+            and getattr(self, "kv_fused_page_protection_enabled", False)
+            and (is_protected_decode or is_protected_dsa_verify)
+        ):
+            table.begin_fused_forward(
+                forward_batch.req_pool_indices[: forward_batch.batch_size]
+            )
+
         # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = (
@@ -1277,6 +1419,9 @@ class ModelRunner:
                     split_forward_count,
                 )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
+        output.fused_kv_page_protection_check = (
+            self._start_fused_kv_page_protection_check(forward_batch, table)
+        )
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
         if (
@@ -1360,6 +1505,52 @@ class ModelRunner:
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
+
+    def _start_fused_kv_page_protection_check(
+        self, forward_batch: ForwardBatch, table
+    ) -> Optional[FusedKVPageProtectionCheck]:
+        is_protected_decode = (
+            forward_batch.forward_mode.is_decode() and forward_batch.spec_info is None
+        )
+        is_protected_dsa_verify = (
+            forward_batch.forward_mode.is_target_verify()
+            and getattr(self, "kv_requires_pre_indexer_page_validation", False)
+        )
+        if (
+            table is None
+            or not getattr(self, "kv_fused_page_protection_enabled", False)
+            or not (is_protected_decode or is_protected_dsa_verify)
+            or forward_batch.batch_size == 0
+        ):
+            return None
+
+        request_pool_indices = forward_batch.req_pool_indices[
+            : forward_batch.batch_size
+        ]
+        status_result = table.fused_failure_status(
+            request_pool_indices, return_failed=True
+        )
+        if isinstance(status_result, tuple):
+            statuses, failed = status_result
+        else:
+            # Retain compatibility with lightweight test doubles and downstream
+            # tables while the shipped CUDA table emits both tensors in one op.
+            statuses = status_result
+            failed = statuses.ne(0).to(torch.int32)
+        work = None
+        if self.ps.tp_size > 1:
+            work = dist.all_reduce(
+                failed,
+                op=dist.ReduceOp.MAX,
+                group=self.tp_group.device_group,
+                async_op=True,
+            )
+        return FusedKVPageProtectionCheck(
+            request_pool_indices=request_pool_indices,
+            statuses=statuses,
+            failed=failed,
+            work=work,
+        )
 
     def _forward_raw(
         self,
@@ -1481,6 +1672,7 @@ class ModelRunner:
         self,
         logits_output: LogitsProcessorOutput,
         forward_batch: ForwardBatch,
+        fused_kv_page_protection_check: Optional[FusedKVPageProtectionCheck] = None,
     ) -> torch.Tensor:
         """Sample and compute logprobs and update logits_output.
 
@@ -1491,25 +1683,44 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        try:
+            self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
-        # Sample the next tokens
-        next_token_ids = self.sampler(
-            logits_output,
-            forward_batch.sampling_info,
-            forward_batch.return_logprob,
-            forward_batch.top_logprobs_nums,
-            forward_batch.token_ids_logprobs,
-            # For prefill, we only use the position of the last token.
-            (
-                forward_batch.positions
-                if forward_batch.forward_mode.is_decode()
-                else forward_batch.seq_lens - 1
-            ),
+            # Sample the next tokens while the TP failure reduction is in flight.
+            next_token_ids = self.sampler(
+                logits_output,
+                forward_batch.sampling_info,
+                forward_batch.return_logprob,
+                forward_batch.top_logprobs_nums,
+                forward_batch.token_ids_logprobs,
+                # For prefill, we only use the position of the last token.
+                (
+                    forward_batch.positions
+                    if forward_batch.forward_mode.is_decode()
+                    else forward_batch.seq_lens - 1
+                ),
+            )
+        except BaseException:
+            if fused_kv_page_protection_check is not None:
+                fused_kv_page_protection_check.wait()
+            raise
+        failed = (
+            fused_kv_page_protection_check.failed
+            if fused_kv_page_protection_check is not None
+            else None
         )
+        ngram_forward_batch = forward_batch
+        if forward_batch.ngram_embedding_info is not None and failed is not None:
+            fused_kv_page_protection_check.wait()
+            ngram_forward_batch = copy.copy(forward_batch)
+            ngram_forward_batch.req_pool_indices = torch.where(
+                failed.bool(),
+                torch.zeros_like(forward_batch.req_pool_indices),
+                forward_batch.req_pool_indices,
+            )
         self.ngram_embedding_manager.update_after_decode(
             next_token_ids=next_token_ids,
-            forward_batch=forward_batch,
+            forward_batch=ngram_forward_batch,
         )
         return next_token_ids
 

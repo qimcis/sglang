@@ -247,6 +247,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_fast_match_prefix(self) -> bool:
         return False
 
+    def supports_kv_page_protection(self) -> bool:
+        """Whether cache lifecycle changes preserve protected request mappings."""
+        return False
+
     @abstractmethod
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
         pass

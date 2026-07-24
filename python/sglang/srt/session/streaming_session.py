@@ -53,6 +53,12 @@ class SessionSlot:
     cache_protected_len: int = 0
     swa_uuid_for_lock: Optional[str] = None
 
+    # KV page-protection state. release_kv_cache clears the request-logical
+    # sidecar row before this slot takes ownership, so the manifests must stay
+    # with the held KV and be republished when the next turn restores it.
+    kv_attention_tag_manifest: Any = None
+    kv_transfer_page_tag_manifest: Any = None
+
     # Mamba states
     mamba_pool_idx: Any = None
     mamba_ping_pong_track_buffer: Any = None
@@ -70,6 +76,10 @@ class SessionSlot:
         self.req_pool_idx = req.req_pool_idx
         self.kv_committed_len = req.kv_committed_len
         self.kv = copy.copy(req.kv)
+        self.kv_attention_tag_manifest = getattr(req, "kv_attention_tag_manifest", None)
+        self.kv_transfer_page_tag_manifest = getattr(
+            req, "kv_transfer_page_tag_manifest", None
+        )
 
         if is_first:
             self.last_node = req.last_node
@@ -97,6 +107,8 @@ class SessionSlot:
         req.mamba_next_track_idx = None
         req.mamba_last_track_seqlen = None
         req.mamba_branching_seqlen = None
+        req.kv_attention_tag_manifest = None
+        req.kv_transfer_page_tag_manifest = None
 
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
@@ -104,6 +116,8 @@ class SessionSlot:
         req.kv_committed_len = self.kv_committed_len
         req.kv = copy.copy(self.kv)
         req.swa_uuid_for_lock = self.swa_uuid_for_lock
+        req.kv_attention_tag_manifest = self.kv_attention_tag_manifest
+        req.kv_transfer_page_tag_manifest = self.kv_transfer_page_tag_manifest
 
         req.mamba_pool_idx = self.mamba_pool_idx
         req.mamba_ping_pong_track_buffer = self.mamba_ping_pong_track_buffer
@@ -260,6 +274,21 @@ class StreamingSession(BasePrefixCache):
         # or speculative draft tokens).
         self._free_tail(slot, req, prefix_len)
 
+        if (
+            req.kv_attention_tag_manifest is not None
+            or req.kv_transfer_page_tag_manifest is not None
+        ):
+            from sglang.srt.mem_cache.kv_page_tags import (
+                refresh_request_expected_mappings,
+            )
+
+            refresh_request_expected_mappings(
+                req,
+                self.req_to_token_pool.req_to_token,
+                self.token_to_kv_pool_allocator,
+                max_sequence_len=prefix_len,
+            )
+
         device_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefix_len
         ].to(dtype=torch.int64)
@@ -372,6 +401,9 @@ class StreamingSession(BasePrefixCache):
         if result is not None:
             return result
         return self.inner.match_prefix(params)
+
+    def supports_kv_page_protection(self) -> bool:
+        return self.inner.supports_kv_page_protection()
 
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
         if self.try_cache_finished_req(req, is_insert=is_insert, **kwargs):

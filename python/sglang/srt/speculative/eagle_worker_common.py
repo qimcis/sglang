@@ -562,6 +562,15 @@ def run_eagle_verify(
         accept_index,
     ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
     new_seq_lens = batch.seq_lens + accept_lens
+    protection_check = forward_batch_output.fused_kv_page_protection_check
+    if protection_check is not None:
+        accept_lens = protection_check.mask_failed_rows(
+            accept_lens, torch.ones_like(accept_lens)
+        )
+        new_seq_lens = protection_check.mask_failed_rows(
+            new_seq_lens, batch.seq_lens
+        )
+
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",
@@ -616,6 +625,11 @@ def run_eagle_verify(
             num_draft_tokens=num_draft_tokens,
         )
 
+    if protection_check is not None:
+        bonus_tokens = protection_check.mask_failed_rows(
+            bonus_tokens, torch.zeros_like(bonus_tokens)
+        )
+
     next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
 
     # verify_forward_batch transitively holds verify-time GPU tensors
@@ -632,5 +646,6 @@ def run_eagle_verify(
         new_seq_lens=new_seq_lens,
         routed_experts_output=forward_batch_output.routed_experts_output,
         indexer_topk_output=forward_batch_output.indexer_topk_output,
+        fused_kv_page_protection_check=protection_check,
         extra_keep_alive_refs=[verify_forward_batch],
     )

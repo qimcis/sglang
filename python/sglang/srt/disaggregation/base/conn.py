@@ -79,6 +79,9 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
+    # Full wire-protocol policy. Prefill may use a checksum-only local manager,
+    # but still needs to advertise page-tag transport support.
+    kv_protection_config: object
 
 
 class KVPoll:
@@ -139,6 +142,10 @@ class BaseKVSender(ABC):
 
     def pop_decode_prefix_len(self) -> int:
         return 0
+
+    def set_checksum_plan(self, plan) -> None:
+        """Attach optional protection metadata to the final transfer chunk."""
+        pass
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0
@@ -201,6 +208,8 @@ class BaseKVReceiver(ABC):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        transfer_page_tag_ids: Optional[npt.NDArray[np.int32]] = None,
+        transfer_page_tags: Optional[npt.NDArray[np.int32]] = None,
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.

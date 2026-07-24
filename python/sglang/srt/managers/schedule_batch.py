@@ -788,6 +788,7 @@ class Req(ReqDllmMixin):
         # For req-level memory management
         self.kv_committed_len = 0
         self.kv: Optional[ReqKvInfo] = None
+        self.kv_fused_protection_deferred_release = False
 
         # for cross-encoder model
         self.token_type_ids = token_type_ids
@@ -1542,6 +1543,7 @@ class Req(ReqDllmMixin):
         self.already_computed = 0
         assert self.kv is None, "expect it is already released"
         self.kv_committed_len = 0
+        self.kv_fused_protection_deferred_release = False
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
@@ -3003,6 +3005,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,
             req_pool_indices=self.req_pool_indices,
+            req_pool_indices_cpu=self.req_pool_indices_cpu,
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,

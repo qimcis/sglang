@@ -98,9 +98,35 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
   m.impl("fast_topk", torch::kCUDA, &fast_topk_interface);
+  m.def("kv_page_protection_begin_forward(Tensor request_indices, Tensor(a!) request_epochs, Tensor(b!) status) -> ()");
+  m.impl("kv_page_protection_begin_forward", torch::kCUDA, &kv_page_protection_begin_forward);
   m.def(
-      "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_page_table, Tensor src_page_table, Tensor "
-      "cu_seqlens_q, Tensor? row_starts) -> ()");
+      "kv_page_protection_failure_status(Tensor request_indices, Tensor request_epochs, Tensor validated_epochs, "
+      "Tensor status, Tensor(a!) failure_status, Tensor(b!) failed) -> ()");
+  m.impl("kv_page_protection_failure_status", torch::kCUDA, &kv_page_protection_failure_status);
+  m.def("fast_topk_kv_page_protection_supported", &fast_topk_kv_page_protection_supported);
+  m.def("kv_page_protection_preflight_supported", &kv_page_protection_preflight_supported);
+  m.def(
+      "kv_page_protection_preflight(Tensor request_indices, Tensor(a!) seqlens, Tensor(b!) page_table, Tensor(c!)? "
+      "page_table_2, int page_table_page_offset, int page_table_2_page_offset, int "
+      "page_table_expected_mapping_offset, int page_table_2_expected_mapping_offset, int page_table_2_window_size, "
+      "int page_size, bool cache_validated_epochs, Tensor actual_tags, Tensor actual_generations, Tensor "
+      "actual_transfer_tags, Tensor expected_physical_pages, int expected_mapping_stride, int "
+      "expected_mapping_namespace_stride, Tensor expected_tags, Tensor expected_generations, Tensor "
+      "expected_transfer_tags, Tensor request_epochs, Tensor(d!) validated_epochs, Tensor(e!) status) -> ()");
+  m.impl("kv_page_protection_preflight", torch::kCUDA, &kv_page_protection_preflight);
+  m.def(
+      "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor(a!) dst_page_table, Tensor src_page_table, "
+      "Tensor "
+      "cu_seqlens_q, Tensor? row_starts, Tensor? protection_request_indices=None, int protection_page_size=0, int "
+      "protection_page_offset=0, Tensor? protection_actual_tags=None, Tensor? protection_actual_generations=None, "
+      "Tensor? protection_actual_transfer_tags=None, Tensor? protection_expected_physical_pages=None, int "
+      "protection_expected_mapping_stride=0, int protection_expected_mapping_namespace_stride=0, int "
+      "protection_expected_mapping_offset=0, Tensor? protection_expected_tags=None, Tensor? "
+      "protection_expected_generations=None, Tensor? protection_expected_transfer_tags=None, Tensor? "
+      "protection_request_epochs=None, Tensor(b!)? protection_validated_epochs=None, Tensor(c!)? "
+      "protection_status=None) -> "
+      "()");
   m.impl("fast_topk_transform_fused", torch::kCUDA, &fast_topk_transform_interface);
   m.def(
       "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor topk_indices_ragged, Tensor "
@@ -334,6 +360,34 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "transfer_kv_all_layer_direct_lf_pf(Tensor[] src_ptrs, Tensor[] dst_ptrs, Tensor src_indices, "
       "Tensor dst_indices, int page_size) ->() ");
   m.impl("transfer_kv_all_layer_direct_lf_pf", torch::kCUDA, &transfer_kv_all_layer_direct_lf_pf);
+  m.def(
+      "kv_checksum_direct_table_batched(Tensor buffer_ptrs, Tensor row_strides, Tensor row_nbytes, "
+      "Tensor buffer_num_rows, Tensor swa_buffer_flags, Tensor full_to_swa_index_mapping, Tensor req_to_token, "
+      "Tensor req_pool_indices, Tensor starts, Tensor lengths, int max_num_tokens, "
+      "int num_lanes, bool has_swa, bool is_capped, Tensor! accum, Tensor! out) -> ()");
+  m.impl("kv_checksum_direct_table_batched", torch::kCUDA, &kv_checksum_direct_table_batched);
+  m.def(
+      "kv_checksum_direct_table_batched_with_pages(Tensor buffer_ptrs, Tensor row_strides, Tensor row_nbytes, "
+      "Tensor buffer_num_rows, Tensor swa_buffer_flags, Tensor full_to_swa_index_mapping, Tensor req_to_token, "
+      "Tensor req_pool_indices, Tensor starts, Tensor lengths, Tensor logical_starts, int max_num_tokens, "
+      "int num_lanes, int page_size, int max_num_pages, bool has_swa, bool is_capped, Tensor! accum, Tensor! out, "
+      "Tensor! page_accum, Tensor! page_out) -> ()");
+  m.impl("kv_checksum_direct_table_batched_with_pages", torch::kCUDA, &kv_checksum_direct_table_batched_with_pages);
+  m.def(
+      "kv_checksum_direct_table_batched_with_pages_compact(Tensor buffer_ptrs, Tensor row_strides, Tensor row_nbytes, "
+      "Tensor buffer_num_rows, Tensor swa_buffer_flags, Tensor full_to_swa_index_mapping, Tensor req_to_token, "
+      "Tensor req_pool_indices, Tensor starts, Tensor lengths, Tensor logical_starts, Tensor page_output_offsets, "
+      "int max_num_tokens, int num_lanes, int page_size, int max_num_pages, bool has_swa, bool is_capped, "
+      "Tensor! accum, Tensor! out, Tensor! page_accum, Tensor! page_out) -> ()");
+  m.impl(
+      "kv_checksum_direct_table_batched_with_pages_compact",
+      torch::kCUDA,
+      &kv_checksum_direct_table_batched_with_pages_compact);
+  m.def(
+      "kv_page_history_record(Tensor page_ids, int operation, Tensor generations, bool generations_by_page, "
+      "int bootstrap_room, Tensor page_positions, int page_position, Tensor values, int value, "
+      "Tensor(a!) cursor, Tensor(b!) records) -> ()");
+  m.impl("kv_page_history_record", torch::kCUDA, &kv_page_history_record);
 
   /*
    * From csrc/memory

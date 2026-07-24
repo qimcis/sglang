@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Union
 
 import torch
 
@@ -89,6 +89,13 @@ class GenerationBatchResult:
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
 
+    # Fused KV validation is copied under copy_done and checked before this
+    # result is published. One already-launched protected overlap iteration may
+    # drain before a failed request's KV is released.
+    fused_kv_page_protection_check: Optional[Any] = None
+    fused_kv_page_protection_failed_rids: Optional[Set[str]] = None
+    fused_kv_page_protection_deferred_release_rids: Optional[Set[str]] = None
+
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
@@ -157,6 +164,9 @@ class GenerationBatchResult:
         ):
             if holder is not None:
                 holder.map_device_tensors(_async_d2h)
+
+        if self.fused_kv_page_protection_check is not None:
+            self.fused_kv_page_protection_check.copy_to_cpu()
 
         self.copy_done.record()
 

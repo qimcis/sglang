@@ -380,6 +380,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
+    def supports_kv_page_protection(self) -> bool:
+        return True
+
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
         for group in (self.attn_cp_group, self.attn_tp_group):
@@ -788,7 +791,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
+        frees_deferred = kwargs.pop("_kv_protection_frees_deferred", False)
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
+            return
+
+        table = getattr(self.token_to_kv_pool_allocator, "attention_tag_table", None)
+        if table is not None and not frees_deferred:
+            from sglang.srt.mem_cache.kv_page_tags import (
+                defer_kv_frees_until_mapping_refresh,
+            )
+
+            with defer_kv_frees_until_mapping_refresh(self.token_to_kv_pool_allocator):
+                self.cache_unfinished_req(
+                    req,
+                    chunked=chunked,
+                    _kv_protection_frees_deferred=True,
+                    **kwargs,
+                )
             return
 
         token_ids = req.get_fill_ids()
@@ -829,6 +848,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if effective_cache_len <= 0:
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
+            if table is not None:
+                from sglang.srt.mem_cache.kv_page_tags import (
+                    refresh_request_expected_mappings,
+                )
+
+                refresh_request_expected_mappings(
+                    req,
+                    self.req_to_token_pool.req_to_token,
+                    self.token_to_kv_pool_allocator,
+                )
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
                     req, is_finished=False, insert_params=insert_params
@@ -864,6 +893,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
             new_indices[req.cache_protected_len :],
         )
+        if table is not None:
+            from sglang.srt.mem_cache.kv_page_tags import (
+                refresh_request_expected_mappings,
+            )
+
+            refresh_request_expected_mappings(
+                req,
+                self.req_to_token_pool.req_to_token,
+                self.token_to_kv_pool_allocator,
+            )
 
         self.dec_lock_ref(
             req.last_node,
