@@ -89,8 +89,8 @@ def validate_dockerfile() -> None:
     )
     require("COPY sgl-kernel" in builder, "local builder does not copy sgl-kernel")
     require(
-        "pip install scikit-build-core" in builder,
-        "local builder does not install its wheel build backend",
+        'pip install "cmake>=3.31,<4" scikit-build-core' in builder,
+        "local builder does not install its required CMake and wheel backend",
     )
     require(
         "-DSGL_KERNEL_ARCH_PROFILE=${SGL_KERNEL_ARCH_PROFILE}" in builder,

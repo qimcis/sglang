@@ -275,7 +275,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
       *) echo "Unsupported SGL_KERNEL_ARCH_PROFILE: ${SGL_KERNEL_ARCH_PROFILE}" >&2; exit 1 ;; \
     esac \
     && mkdir -p /wheels \
-    && python3 -m pip install scikit-build-core \
+    && python3 -m pip install "cmake>=3.31,<4" scikit-build-core \
     && cd /build/sgl-kernel \
     && CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_AND_DOWNLOAD_PARALLEL} \
        CMAKE_ARGS="-DSGL_KERNEL_ARCH_PROFILE=${SGL_KERNEL_ARCH_PROFILE} -DGITHUB_ARTIFACTORY=${GITHUB_ARTIFACTORY}" \
