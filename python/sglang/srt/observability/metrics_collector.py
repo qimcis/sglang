@@ -591,6 +591,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="Total number of KV pages/tokens covered by transfer checksums.",
             labelnames=labels.keys(),
         )
+        self.kv_fault_injections_total = Counter(
+            name="sglang:kv_fault_injections_total",
+            documentation="Number of explicit test-only KV faults injected.",
+            labelnames=list(labels.keys()) + ["fault"],
+        )
 
         # =================================================================
         # Utilization
@@ -1188,6 +1193,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self.kv_transfer_checksum_checked_pages_total.labels(**self.labels).inc(
                 count
             )
+
+    def increment_kv_fault_injections(self, fault: str) -> None:
+        self.kv_fault_injections_total.labels(**self.labels, fault=fault).inc(1)
 
     def observe_kv_transfer_metrics(
         self,

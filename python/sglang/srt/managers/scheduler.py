@@ -465,6 +465,12 @@ class Scheduler(
         self.tree_cache = result.tree_cache
         self.init_kv_page_protection_prefix_cache()
 
+        # Graph-visible protection buffers require the prefix cache for
+        # compatibility checks and must precede backend construction/capture.
+        self.init_kv_attention_tag_table()
+        self.init_all_attention_backends()
+        self.init_all_cuda_graphs()
+
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
 
@@ -924,19 +930,9 @@ class Scheduler(
         # Prepare KV cache pools for all workers
         self.init_memory_pools()
 
-        # Graph-visible protection buffers must exist before attention backend
-        # construction and CUDA graph capture. The decode-side manager adopts
-        # this table later, once disaggregation is initialized.
-        self.init_kv_attention_tag_table()
-
-        # TODO: make memory profile consider cuda graph memory as well
-        self.init_all_attention_backends()
-        self.init_all_cuda_graphs()
-
         model_runner = self.tp_worker.model_runner
         if model_runner.token_to_kv_pool.post_capture_active:
             model_runner.post_capture_resize_kv_pool()
-
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
             self.model_worker = self.tp_worker
@@ -3841,6 +3837,25 @@ class Scheduler(
 
         error = check.materialize_error()
         result.fused_kv_page_protection_check = None
+
+        manager = getattr(self, "kv_protection_manager", None)
+        metrics = None if manager is None else getattr(manager, "metrics", None)
+        if metrics is not None:
+            attention_pages = sum(
+                manifest.num_pages
+                for req in batch.reqs
+                if (manifest := getattr(req, "kv_attention_tag_manifest", None))
+                is not None
+            )
+            transfer_pages = sum(
+                manifest.num_pages
+                for req in batch.reqs
+                if (manifest := getattr(req, "kv_transfer_page_tag_manifest", None))
+                is not None
+            )
+            metrics.increment_kv_attention_tag_checked_pages(attention_pages)
+            metrics.increment_kv_transfer_page_tag_checked_pages(transfer_pages)
+
         if error is not None:
             (
                 result.fused_kv_page_protection_failed_rids,

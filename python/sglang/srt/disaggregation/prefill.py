@@ -723,7 +723,7 @@ class SchedulerDisaggregationPrefillMixin:
                     and optimistic_polls[i] != KVPoll.WaitingForInput
                 ):
                     continue
-                seq_len = min(req.fill_len, len(req.origin_input_ids))
+                seq_len = min(req.extend_range.end, len(req.origin_input_ids))
                 if seq_len <= 0 or req.req_pool_idx is None:
                     continue
                 checksum_reqs.append(req)

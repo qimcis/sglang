@@ -20,6 +20,7 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections import deque
@@ -1927,6 +1928,30 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
+        self._kv_fault = envs.SGLANG_TEST_KV_FAULT.get()
+        self._kv_fault_rid = envs.SGLANG_TEST_KV_FAULT_RID.get()
+        self._kv_fault_injected = False
+        if self._kv_fault not in (
+            "none",
+            "dst_byte_flip",
+            "fused_page_mapping_shift",
+        ):
+            raise RuntimeError(f"unsupported SGLANG_TEST_KV_FAULT={self._kv_fault!r}")
+        if self._kv_fault != "none" and not self._kv_fault_rid:
+            raise RuntimeError(
+                "SGLANG_TEST_KV_FAULT_RID is required when a KV fault is enabled"
+            )
+        manager = getattr(scheduler, "kv_protection_manager", None)
+        if self._kv_fault != "none" and (manager is None or manager.metrics is None):
+            raise RuntimeError("KV fault injection requires --enable-metrics")
+        if self._kv_fault == "dst_byte_flip" and (
+            manager is None or not manager.config.checksum_enabled
+        ):
+            raise RuntimeError("dst_byte_flip requires KV transfer checksums")
+        if self._kv_fault == "fused_page_mapping_shift" and (
+            manager is None or not manager.config.enable_attention_tags
+        ):
+            raise RuntimeError("fused_page_mapping_shift requires KV attention tags")
         self.transfer_page_pin_manager = KVTransferPagePinManager(
             scheduler.token_to_kv_pool_allocator
         )
@@ -2126,6 +2151,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if self._register_kv_attention_tags(decode_req.req):
             self._clear_receiver(decode_req)
             return
+        self._maybe_inject_fused_page_mapping_shift(decode_req.req)
 
         # Case 3: Success - publish metadata only after all validation gates.
         # PD true-retraction rebootstrap: the prefill recomputed the prefix KV
@@ -2199,6 +2225,120 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._clear_receiver(decode_req)
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return
+
+    def _matches_kv_fault(self, req: Req, fault: str) -> bool:
+        if self._kv_fault != fault or req.rid != self._kv_fault_rid:
+            return False
+        if self._kv_fault_injected:
+            raise RuntimeError(
+                f"KV fault {fault} was already injected on TP rank {self.tp_rank}"
+            )
+        return True
+
+    def _maybe_inject_destination_byte_flip(self, req: Req) -> None:
+        if not self._matches_kv_fault(req, "dst_byte_flip"):
+            return
+        if req.req_pool_idx is None or not req.origin_input_ids:
+            raise RuntimeError(
+                "destination byte fault target has no transferred tokens"
+            )
+        token = len(req.origin_input_ids) - 1
+        table = self.scheduler.req_to_token_pool.req_to_token
+        loc = int(table[req.req_pool_idx, token].item())
+        kv_pool = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
+        key_row = kv_pool.get_key_buffer(0)[loc].view(torch.uint8).reshape(-1)
+        if key_row.numel() == 0:
+            raise RuntimeError("destination byte fault target has an empty KV row")
+        before = int(key_row[0].item())
+        key_row[0] = before ^ 1
+        after = int(key_row[0].item())
+        if after != (before ^ 1):
+            raise RuntimeError("destination KV byte fault did not persist")
+        self._kv_fault_injected = True
+        manager = self.scheduler.kv_protection_manager
+        if manager.metrics is not None:
+            manager.metrics.increment_kv_fault_injections("dst_byte_flip")
+        logger.error(
+            "KV_FAULT_INJECTED %s",
+            json.dumps(
+                {
+                    "fault": "dst_byte_flip",
+                    "stage": "before_destination_checksum",
+                    "rid": req.rid,
+                    "tp_rank": self.tp_rank,
+                    "token": token,
+                    "physical_loc": loc,
+                    "layer": 0,
+                    "before": before,
+                    "after": after,
+                },
+                sort_keys=True,
+            ),
+        )
+
+    def _maybe_inject_fused_page_mapping_shift(self, req: Req) -> None:
+        if not self._matches_kv_fault(req, "fused_page_mapping_shift"):
+            return
+        manifest = getattr(req, "kv_attention_tag_manifest", None)
+        if manifest is None or manifest.num_pages == 0:
+            raise RuntimeError(
+                "page-mapping fault target has no attention-tag manifest"
+            )
+        if req.req_pool_idx is None:
+            raise RuntimeError("page-mapping fault target has no request-pool index")
+        seq_len = len(req.origin_input_ids)
+        allocator = self.scheduler.token_to_kv_pool_allocator
+        page_size = int(allocator.page_size)
+        page_count = (seq_len + page_size - 1) // page_size
+        if page_count < 2:
+            raise RuntimeError("page-mapping fault requires at least two pages")
+        kv_locs = self.scheduler.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :seq_len
+        ]
+        page_starts = torch.arange(
+            0, seq_len, page_size, dtype=torch.long, device=kv_locs.device
+        )
+        first_locs = kv_locs.index_select(0, page_starts).to(torch.long)
+        if bool(first_locs.remainder(page_size).ne(0).any().item()):
+            raise RuntimeError("page-mapping fault target is not page aligned")
+        physical_pages = first_locs // page_size
+        if int(physical_pages.unique().numel()) != page_count:
+            raise RuntimeError("page-mapping fault target contains duplicate pages")
+        logical_offsets = torch.arange(seq_len, dtype=torch.long, device=kv_locs.device)
+        expected_locs = physical_pages.index_select(
+            0, logical_offsets // page_size
+        ) * page_size + logical_offsets.remainder(page_size)
+        if not torch.equal(kv_locs.to(torch.long), expected_locs):
+            raise RuntimeError("page-mapping fault target is not contiguous")
+        rotated_pages = torch.roll(physical_pages, shifts=1)
+        replacement_locs = rotated_pages.index_select(
+            0, logical_offsets // page_size
+        ) * page_size + logical_offsets.remainder(page_size)
+        capacity = int(getattr(allocator, "size_full", allocator.size)) + page_size
+        if int(replacement_locs.max().item()) >= capacity:
+            raise RuntimeError("page-mapping fault replacement is out of bounds")
+        if torch.equal(kv_locs.to(torch.long), replacement_locs):
+            raise RuntimeError("page-mapping fault did not change the mapping")
+        kv_locs.copy_(replacement_locs.to(kv_locs.dtype))
+        self._kv_fault_injected = True
+        manager = self.scheduler.kv_protection_manager
+        if manager.metrics is not None:
+            manager.metrics.increment_kv_fault_injections("fused_page_mapping_shift")
+        logger.error(
+            "KV_FAULT_INJECTED %s",
+            json.dumps(
+                {
+                    "fault": "fused_page_mapping_shift",
+                    "stage": "after_attention_tag_registration",
+                    "rid": req.rid,
+                    "tp_rank": self.tp_rank,
+                    "page_count": page_count,
+                    "physical_pages_before": physical_pages[:8].cpu().tolist(),
+                    "physical_pages_after": rotated_pages[:8].cpu().tolist(),
+                },
+                sort_keys=True,
+            ),
+        )
 
     def _verify_transfer_checksum(self, req: Req, meta_bootstrap_room) -> bool:
         """Return True if the request was aborted due to a checksum mismatch."""
@@ -2388,6 +2528,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             swa_evicted.append(swa_checksum_evicted_len(n, sliding_window, page_size))
         if not reqs:
             return None, []
+        for req in reqs:
+            self._maybe_inject_destination_byte_flip(req)
         kv_pool = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
         batch = manager.begin_transfer_checksums_from_table(
             kv_pool,
@@ -2606,6 +2748,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 logger.error(
                     "KV transfer checksum destination batch launch failed: %s", e
                 )
+                if self._kv_fault == "dst_byte_flip" and self._kv_fault_injected:
+                    raise
                 checksum_batch = None
                 checksum_reqs = []
 
@@ -2625,6 +2769,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 logger.error(
                     "KV transfer checksum destination batch finalize failed: %s", e
                 )
+                if self._kv_fault == "dst_byte_flip" and self._kv_fault_injected:
+                    raise
 
         transferred_reqs = []
         indices_to_remove = set()

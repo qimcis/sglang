@@ -1945,14 +1945,19 @@ class KVAttentionTagTable:
         validate_full_mapping: bool = False,
         pre_indexer_cache_by_request: bool = True,
     ) -> Dict[str, object]:
+        has_secondary_table = page_table_2 is not None
         return {
             "request_indices": request_indices,
             "seqlens": seqlens,
             "page_table": page_table,
             "page_table_2": page_table_2,
             "page_table_page_offset": int(page_table_page_offset),
-            "page_table_2_page_offset": int(page_table_2_page_offset),
-            "page_table_2_window_size": int(page_table_2_window_size),
+            "page_table_2_page_offset": int(
+                page_table_2_page_offset if has_secondary_table else 0
+            ),
+            "page_table_2_window_size": int(
+                page_table_2_window_size if has_secondary_table else 0
+            ),
             "page_size": int(page_size),
             "validate_full_mapping": bool(validate_full_mapping),
             "pre_indexer_cache_by_request": bool(pre_indexer_cache_by_request),
@@ -1963,7 +1968,9 @@ class KVAttentionTagTable:
             "expected_mapping_stride": self.expected_mapping_stride,
             "expected_mapping_namespace_stride": self.expected_mapping_namespace_stride,
             "page_table_expected_mapping_offset": 0,
-            "page_table_2_expected_mapping_offset": self.expected_mapping_namespace_stride,
+            "page_table_2_expected_mapping_offset": (
+                self.expected_mapping_namespace_stride if has_secondary_table else 0
+            ),
             "expected_tags": self.expected_tags,
             "expected_generations": self.expected_generations,
             "expected_transfer_tags": self.expected_transfer_page_tags,
