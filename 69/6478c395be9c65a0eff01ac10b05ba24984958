@@ -1,0 +1,33 @@
+python/sglang/srt/disaggregation/decode.py
+  s_700c7ffe080221::t_65208b5000b904 23,1931-1954,2154,2229-2342,2531-2532,2751-2752,2772-2773
+python/sglang/srt/disaggregation/prefill.py
+  s_24ac15f8822fa5::t_99c04ebfb79b9b 726
+python/sglang/srt/environ.py
+  s_24ac15f8822fa5::t_635e073ba42f53 427-428
+python/sglang/srt/observability/metrics_collector.py
+  s_24ac15f8822fa5::t_e224a01ad0b7f1 594-598,1197-1199
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "696478c395be9c65a0eff01ac10b05ba24984958",
+  "prompts": {},
+  "sessions": {
+    "s_24ac15f8822fa5": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_06e88f59dffecrqkpuZM61iB4X",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    },
+    "s_700c7ffe080221": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_069d953ecffeXK2AlwHoLVvct6",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
