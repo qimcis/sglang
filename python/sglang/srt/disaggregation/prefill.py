@@ -901,9 +901,7 @@ class SchedulerDisaggregationPrefillMixin:
             if not getattr(sender, "source_pages_quiescent", lambda: True)():
                 continue
             sender.clear()
-            if (
-                req.req_pool_idx is not None or self.tree_cache.supports_mamba()
-            ) and not req.kv_committed_freed:
+            if req.req_pool_idx is not None or self.tree_cache.supports_mamba():
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             quarantined.pop(room, None)
 
