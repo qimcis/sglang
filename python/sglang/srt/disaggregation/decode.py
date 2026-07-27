@@ -1941,15 +1941,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             raise RuntimeError(
                 "SGLANG_TEST_KV_FAULT_RID is required when a KV fault is enabled"
             )
-        manager = getattr(scheduler, "kv_protection_manager", None)
-        if self._kv_fault != "none" and (manager is None or manager.metrics is None):
+        if self._kv_fault != "none" and not scheduler.server_args.enable_metrics:
             raise RuntimeError("KV fault injection requires --enable-metrics")
         if self._kv_fault == "dst_byte_flip" and (
-            manager is None or not manager.config.checksum_enabled
+            not envs.SGLANG_KV_TRANSFER_CHECKSUM.get()
         ):
             raise RuntimeError("dst_byte_flip requires KV transfer checksums")
         if self._kv_fault == "fused_page_mapping_shift" and (
-            manager is None or not manager.config.enable_attention_tags
+            not envs.SGLANG_KV_PAGE_PROTECTION.get()
         ):
             raise RuntimeError("fused_page_mapping_shift requires KV attention tags")
         self.transfer_page_pin_manager = KVTransferPagePinManager(
