@@ -318,7 +318,18 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
             )
         from sgl_kernel import kv_page_protection_preflight
 
-        kv_page_protection_preflight(protection, phase="pre_indexer")
+        # The protected v2 producer derives every physical token slot from this
+        # compact page table after the preflight has validated and, on failure,
+        # sanitized it. In that configuration the full-mapping preflight is a
+        # stronger producer proof than revalidating only the selected slots, so
+        # publish the producer epoch here. Legacy wide-table top-k keeps its
+        # independent pre-indexer epoch because it consumes a different table.
+        phase = (
+            "attention"
+            if protection.get("producer_validation_via_full_mapping", False)
+            else "pre_indexer"
+        )
+        kv_page_protection_preflight(protection, phase=phase)
 
     def topk_transform(
         self,
@@ -543,6 +554,25 @@ class DeepseekSparseAttnBackend(
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
+
+        # Normal protected decode can retain production's compact top-k v2
+        # path. Its input is the same real_page_table that the full pre-indexer
+        # validation sanitizes, so that preflight also provides the producer
+        # proof. Speculative rows keep the legacy selected-slot producer until
+        # their expanded-table contract is audited independently.
+        self.kv_protected_topk_v2_enabled = bool(
+            self.kv_fused_page_protection_enabled
+            and is_cuda()
+            and not _is_hip
+            and self.real_page_size > 1
+            and self.hisparse_coordinator is None
+            and not self.speculative_num_draft_tokens
+            and self.dsa_topk_backend.is_sgl_kernel()
+            and envs.SGLANG_DSA_FUSE_TOPK.get()
+            and envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and self.dsa_index_topk is not None
+            and self.dsa_index_topk <= 2048
+        )
 
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
@@ -842,7 +872,10 @@ class DeepseekSparseAttnBackend(
                         * self.speculative_num_draft_tokens
                     )
                     protected_request_indices = metadata.protected_request_indices
-                    if protected_request_indices is None:
+                    if (
+                        protected_request_indices is None
+                        or protected_request_indices.numel() != rows
+                    ):
                         protected_request_indices = torch.empty(
                             rows,
                             dtype=request_indices.dtype,
@@ -860,6 +893,26 @@ class DeepseekSparseAttnBackend(
                     )
                     indexer_seqlens = metadata.dsa_seqlens_expanded
                 else:
+                    # CUDA graphs retain the request-index data_ptr captured by
+                    # both the pre-indexer validator and protected top-k producer.
+                    # Replay supplies a different req_pool_indices tensor, so copy
+                    # it into metadata-owned stable storage instead of replacing
+                    # the captured pointer. Without this, real requests advance
+                    # one epoch while the captured kernels see slot 0 or stale
+                    # slots and never publish completion for the active request.
+                    protected_request_indices = metadata.protected_request_indices
+                    if (
+                        protected_request_indices is None
+                        or protected_request_indices.numel() != request_indices.shape[0]
+                    ):
+                        protected_request_indices = torch.empty_like(request_indices)
+                        object.__setattr__(
+                            metadata,
+                            "protected_request_indices",
+                            protected_request_indices,
+                        )
+                    protected_request_indices.copy_(request_indices)
+                    request_indices = protected_request_indices
                     indexer_seqlens = metadata.cache_seqlens_int32
                 if request_indices.shape[0] != metadata.real_page_table.shape[0]:
                     raise RuntimeError(
@@ -872,6 +925,10 @@ class DeepseekSparseAttnBackend(
                     page_size=self.real_page_size,
                     validate_full_mapping=True,
                     pre_indexer_cache_by_request=(not forward_mode.is_target_verify()),
+                )
+                protection["producer_validation_via_full_mapping"] = bool(
+                    getattr(self, "kv_protected_topk_v2_enabled", False)
+                    and forward_mode.is_decode_or_idle()
                 )
         object.__setattr__(metadata, "kv_page_protection", protection)
 
@@ -1295,6 +1352,13 @@ class DeepseekSparseAttnBackend(
             is_cuda()
             and not _is_hip
             and self.real_page_size > 1
+            # Protected normal decode publishes its producer epoch from the
+            # full compact-table validation, then consumes that exact sanitized
+            # table through v2. Other protected shapes retain the wide table.
+            and (
+                not self.kv_fused_page_protection_enabled
+                or self.kv_protected_topk_v2_enabled
+            )
             and self.hisparse_coordinator is None
             and not self.speculative_num_draft_tokens
             and envs.SGLANG_DSA_FUSE_TOPK.get()

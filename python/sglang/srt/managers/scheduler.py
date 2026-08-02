@@ -57,6 +57,7 @@ from sglang.srt.disaggregation.prefill import (
     maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
+    FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -456,6 +457,12 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+
+        # The concrete prefix cache does not exist when protection metadata is
+        # created (it must precede attention-backend initialization and CUDA
+        # graph capture). Validate its lifecycle support as soon as the cache
+        # builder installs it, without moving graph capture past HiCache setup.
+        self.validate_kv_protection_prefix_cache()
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -898,7 +905,6 @@ class Scheduler(
                 if is_cuda_device
                 else None
             ),
-            prefix_cache=self.tree_cache,
         )
         page_size = allocator.page_size
         num_pages = (
@@ -923,6 +929,19 @@ class Scheduler(
         allocator.attach_attention_tag_table(table)
         self.tp_worker.model_runner.kv_attention_tag_table = table
 
+    def validate_kv_protection_prefix_cache(self):
+        from sglang.srt.mem_cache.kv_page_tags import (
+            KVProtectionConfig,
+            assert_protection_supported,
+        )
+
+        config = KVProtectionConfig.from_env(
+            is_pd_decode=self.server_args.disaggregation_mode == "decode"
+        )
+        if not config.enable_attention_tags:
+            return
+        assert_protection_supported(config, prefix_cache=self.tree_cache)
+
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
@@ -931,9 +950,9 @@ class Scheduler(
         # Allocate KV cache pools for all workers.
         self.init_memory_pools()
 
-        # Graph-visible protection buffers must exist before attention backend
-        # construction and CUDA graph capture. The decode-side manager adopts
-        # this table later, once disaggregation is initialized.
+        # Protection buffers are consumed while attention backends and CUDA
+        # graphs are built. Keep them in the canonical pre-cache-builder order
+        # and validate the concrete cache separately once it exists.
         self.init_kv_attention_tag_table()
 
         # TODO: make memory profile consider cuda graph memory as well
@@ -1581,10 +1600,10 @@ class Scheduler(
             dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
-        # Wait for the prev forward to finish reading the shared buffers this
-        # iter's schedule will overwrite. Fast path: wait on the read-done event
-        # the forward published after its snapshot (non-spec: decode graph;
-        # spec: draft_extend), then clear it. Else fall back to whole-forward
+        # Fence the scheduler's next shared-buffer mutation on the just-launched
+        # forward's last shared read. Fast path: wait on the read-done event the
+        # forward published after its snapshot (or, for fused KV protection,
+        # after its status read), then clear it. Else fall back to whole-forward
         # wait_stream.
         if not self._war_barrier_enabled:
             return
@@ -1595,6 +1614,19 @@ class Scheduler(
             runner.war_fastpath_read_done_event = None
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
+
+    def _run_batch_with_war_barrier(self, batch: ScheduleBatch):
+        """Launch ``batch`` and immediately order later scheduler writes.
+
+        Overlap processes the previous result after launching the current
+        forward. That result processing can free and retag KV pages, so waiting
+        at the top of the *next* loop is too late: the current graph may still
+        be validating those same pages. Install the stream dependency before
+        returning to any result processing instead.
+        """
+        result = self.run_batch(batch)
+        self._apply_war_barrier()
+        return result
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1648,8 +1680,6 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
-            self._apply_war_barrier()
-
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1670,7 +1700,7 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                batch_result = self.run_batch(batch)
+                batch_result = self._run_batch_with_war_barrier(batch)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -2808,7 +2838,9 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
-    def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+    def get_new_batch_prefill(
+        self, *, check_hicache_events: bool = True
+    ) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
@@ -2820,7 +2852,8 @@ class Scheduler(
             )
 
         ret = self._get_new_batch_prefill_raw(
-            prefill_delayer_single_pass=prefill_delayer_single_pass
+            prefill_delayer_single_pass=prefill_delayer_single_pass,
+            check_hicache_events=check_hicache_events,
         )
 
         if self.prefill_delayer:
@@ -2829,7 +2862,10 @@ class Scheduler(
         return ret
 
     def _get_new_batch_prefill_raw(
-        self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
+        self,
+        prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
+        *,
+        check_hicache_events: bool = True,
     ) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
@@ -2837,7 +2873,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache and check_hicache_events:
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
@@ -3798,6 +3834,18 @@ class Scheduler(
         if len(set(bad_indices)) != len(bad_indices):
             raise RuntimeError("duplicate fused KV protection batch index") from error
         bad_indices.sort()
+
+        # The built-in PD server warmup uses FAKE_BOOTSTRAP_HOST and
+        # deliberately performs no KV transfer, so it cannot publish real
+        # transfer/tag ownership metadata. Exempt only that explicit synthetic
+        # path; every fused status on a real request remains fail-closed.
+        bad_indices = [
+            index
+            for index in bad_indices
+            if batch.reqs[index].bootstrap_host != FAKE_BOOTSTRAP_HOST
+        ]
+        if not bad_indices:
+            return set(), set()
 
         status_by_index = dict(zip(error.batch_indices, error.statuses))
         bad_reqs = [batch.reqs[index] for index in bad_indices]

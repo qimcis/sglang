@@ -497,7 +497,12 @@ class SchedulerDisaggregationPrefillMixin:
 
         self.resolve_waiting_queue_bootstrap()
 
-        batch = self.get_new_batch_prefill()
+        # HiCache uses TP control collectives. In PD prefill, run them directly
+        # after every request broadcast (see the event loops below), before
+        # request/bootstrap processing can let ranks enter different loop
+        # phases and desynchronize the collective sequence across the entire
+        # TP cohort.
+        batch = self.get_new_batch_prefill(check_hicache_events=False)
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:
@@ -511,6 +516,8 @@ class SchedulerDisaggregationPrefillMixin:
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
+            if self.enable_hierarchical_cache:
+                self.tree_cache.check_hicache_events()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -543,6 +550,8 @@ class SchedulerDisaggregationPrefillMixin:
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
+            if self.enable_hierarchical_cache:
+                self.tree_cache.check_hicache_events()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -672,7 +681,7 @@ class SchedulerDisaggregationPrefillMixin:
                     and optimistic_polls[i] != KVPoll.WaitingForInput
                 ):
                     continue
-                seq_len = min(req.fill_len, len(req.origin_input_ids))
+                seq_len = min(req.extend_range.end, len(req.origin_input_ids))
                 if seq_len <= 0 or req.req_pool_idx is None:
                     continue
                 checksum_reqs.append(req)

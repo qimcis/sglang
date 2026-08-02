@@ -44,6 +44,25 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+def _select_cache_tp_groups(
+    *,
+    enable_dp_attention: bool,
+    tp_cpu_group: object,
+    attn_tp_cpu_group: object,
+) -> tuple[object, object]:
+    """Return the Gloo groups used for cache control collectives.
+
+    Without DP attention, scheduler request broadcasts run on ``tp_cpu_group``.
+    HiCache must use that exact ProcessGroup object too, not a separately
+    constructed attention-TP group with the same ranks.  Otherwise fast ranks
+    can enter the next request broadcast while slow ranks are still in a cache
+    all-reduce, creating a cross-group collective cycle.  DP attention keeps
+    both cache groups scoped to its attention-TP partition.
+    """
+    cache_tp_group = attn_tp_cpu_group if enable_dp_attention else tp_cpu_group
+    return cache_tp_group, cache_tp_group
+
+
 def get_draft_kv_pool(
     *,
     draft_worker: BaseTpWorker,
@@ -198,6 +217,11 @@ def build_kv_cache(
     if model_config.is_multimodal and uses_transformers_backend:
         effective_chunked_prefill_size = None
 
+    tp_cache_group, attn_tp_cache_group = _select_cache_tp_groups(
+        enable_dp_attention=server_args.enable_dp_attention,
+        tp_cpu_group=tp_cpu_group,
+        attn_tp_cpu_group=attn_tp_cpu_group,
+    )
     params = CacheInitParams(
         disable=disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
@@ -209,11 +233,9 @@ def build_kv_cache(
             page_size if not dcp_enabled() else token_to_kv_pool_allocator.page_size
         ),
         is_eagle=spec_algorithm.is_eagle(),
-        tp_cache_group=(
-            attn_tp_cpu_group if server_args.enable_dp_attention else tp_cpu_group
-        ),
+        tp_cache_group=tp_cache_group,
         attn_cp_cache_group=attn_cp_cpu_group,
-        attn_tp_cache_group=attn_tp_cpu_group,
+        attn_tp_cache_group=attn_tp_cache_group,
         pp_cache_group=pp_group.cpu_group,
         eviction_policy=server_args.radix_eviction_policy,
         enable_metrics=enable_metrics,

@@ -117,6 +117,25 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+def can_publish_war_fastpath_read_done(
+    forward_mode: ForwardMode,
+    *,
+    is_dflash: bool,
+    fused_kv_page_protection_enabled: bool,
+) -> bool:
+    """Whether the pre-replay snapshot ends all shared-buffer reads.
+
+    Fused KV protection is deliberately excluded: its captured pre-indexer and
+    top-k kernels continue to read and update the global protection sidecars
+    during graph replay. Publishing the normal pre-replay event would let the
+    scheduler mutate those sidecars for the next token while the graph still
+    owns them. ModelRunner publishes a later event after the fused status read.
+    """
+    return not fused_kv_page_protection_enabled and (
+        forward_mode.is_decode() or (forward_mode.is_target_verify() and is_dflash)
+    )
+
+
 def build_replay_fb_view(
     forward_batch: ForwardBatch,
     buffers: DecodeInputBuffers,
@@ -1023,9 +1042,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # Publish a read-done event for the WAR barrier: a cuda-graph forward
             # finishes its shared req_to_token / SWA reads at this pre-replay
             # snapshot, so plain DECODE and DFLASH TARGET_VERIFY both qualify.
-            if forward_batch.forward_mode.is_decode() or (
-                forward_batch.forward_mode.is_target_verify()
-                and self.model_runner.spec_algorithm.is_dflash()
+            if can_publish_war_fastpath_read_done(
+                forward_batch.forward_mode,
+                is_dflash=self.model_runner.spec_algorithm.is_dflash(),
+                fused_kv_page_protection_enabled=getattr(
+                    self.model_runner, "kv_fused_page_protection_enabled", False
+                ),
             ):
                 read_done = self.device_module.Event()
                 read_done.record()

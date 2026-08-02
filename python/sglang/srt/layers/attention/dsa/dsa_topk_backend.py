@@ -213,6 +213,14 @@ class DSATopKBackend(Enum):
         # page_size=1 path from here.
         if (
             envs.SGLANG_OPT_USE_TOPK_V2.get()
+            # Protected v2 is allowed only when the full-mapping preflight
+            # validates and sanitizes this same compact table and publishes the
+            # producer epoch. Other protected layouts retain the legacy fused
+            # selected-slot producer below.
+            and (
+                kv_page_protection is None
+                or kv_page_protection.get("producer_validation_via_full_mapping", False)
+            )
             and topk_transform_method == TopkTransformMethod.PAGED
             and row_starts is None
             and batch_idx_list is None

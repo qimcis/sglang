@@ -349,11 +349,19 @@ class FusedKVPageProtectionCheck:
 
     def copy_to_cpu(self) -> None:
         self.wait()
-        self.request_pool_indices = self.request_pool_indices.to(
-            "cpu", non_blocking=True
-        )
-        self.statuses = self.statuses.to("cpu", non_blocking=True)
-        self.failed = self.failed.to("cpu", non_blocking=True)
+        # Overlap scheduling performs this copy on a dedicated CUDA stream.
+        # Use the same pinned-D2H + record_stream primitive as the rest of the
+        # generation result: a plain non_blocking ``to("cpu")`` drops the last
+        # source reference without teaching the caching allocator about the
+        # copy stream. The forward stream can then recycle these small int32
+        # buffers while D2H is still reading them, producing impossible status
+        # bits and stale request-slot identities under sustained concurrency.
+        # Import lazily to avoid the model_runner <-> managers import cycle.
+        from sglang.srt.managers.utils import _async_d2h
+
+        self.request_pool_indices = _async_d2h(self.request_pool_indices)
+        self.statuses = _async_d2h(self.statuses)
+        self.failed = _async_d2h(self.failed)
 
     def mask_failed_rows(
         self, values: torch.Tensor, fallback: torch.Tensor
@@ -3137,6 +3145,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         output.fused_kv_page_protection_check = (
             self._start_fused_kv_page_protection_check(forward_batch, table)
         )
+        if output.fused_kv_page_protection_check is not None:
+            # Protected CUDA graphs keep consuming the global tag/epoch/status
+            # sidecars after their normal pre-replay req_to_token snapshot. The
+            # graph runner therefore withholds its early WAR event. Publish the
+            # replacement only after the fused failure-status kernel has read
+            # those sidecars; the async TP reduction owns only the private
+            # ``failed`` output tensor and does not extend their lifetime.
+            protection_read_done = torch.get_device_module(self.device).Event()
+            protection_read_done.record()
+            self.war_fastpath_read_done_event = protection_read_done
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
         if (
