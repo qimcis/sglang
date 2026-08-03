@@ -39,7 +39,7 @@ from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
-from sglang.srt.configs.model_config import ModelConfig, ModelImpl
+from sglang.srt.configs.model_config import ModelConfig, ModelImpl, is_deepseek_dsa
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation.decode import (
@@ -869,7 +869,7 @@ class Scheduler(
             self.draft_worker.init_cuda_graphs()
 
     def init_kv_attention_tag_table(self):
-        from sglang.srt.mem_cache.kv_page_tags import (
+        from sglang.srt.mem_cache.kv_protection import (
             KVAttentionTagTable,
             KVProtectionConfig,
             assert_protection_supported,
@@ -880,6 +880,19 @@ class Scheduler(
         )
         if not config.enable_attention_tags:
             return
+        if (
+            not is_deepseek_dsa(self.model_config.hf_text_config)
+            or self.server_args.dsa_decode_backend is None
+        ):
+            raise RuntimeError(
+                "KV page protection in this GLM-5.2 build requires the DSA "
+                "attention backend with a protected FlashMLA consumer."
+            )
+        if self.server_args.enable_streaming_session:
+            raise RuntimeError(
+                "KV page protection does not support streaming sessions in "
+                "this production-scoped build."
+            )
 
         _, allocator = self.tp_worker.get_memory_pool()
         is_cuda_device = current_platform.is_cuda()
@@ -930,7 +943,7 @@ class Scheduler(
         self.tp_worker.model_runner.kv_attention_tag_table = table
 
     def validate_kv_protection_prefix_cache(self):
-        from sglang.srt.mem_cache.kv_page_tags import (
+        from sglang.srt.mem_cache.kv_protection import (
             KVProtectionConfig,
             assert_protection_supported,
         )
@@ -3244,42 +3257,23 @@ class Scheduler(
         # Update batch tensors
         batch.prepare_for_decode()
 
-        # Verify KV attention tags before decode attention reads the pages (gated;
-        # no-op unless PD page protection is enabled). Aborts only the affected
-        # requests and rebuilds the batch for the survivors.
+        # Keep the fused validator's expected mappings current when decode opens
+        # a new physical page. Validation itself runs in the protected DSA path.
         if getattr(self, "kv_protection_manager", None) is not None:
-            self._verify_decode_kv_attention_tags(batch)
+            self._refresh_decode_kv_protection_mappings(batch)
             if batch.is_empty():
                 return batch
         return batch
 
-    def _verify_decode_kv_attention_tags(self, batch: ScheduleBatch) -> None:
-        """Vectorized attention-tag verification + per-request abort for PD decode.
-
-        Runs one batched gather+compare over cached page/tag/generation tensors,
-        aborts solely the requests whose pages no longer match, then refreshes
-        survivor tail-page manifests only when a decode step opens a new logical
-        page. Within a page the tag inputs are invariant, so rewriting the tag is
-        a pure no-op that only adds GPU work to the decode hot path.
-        """
+    def _refresh_decode_kv_protection_mappings(self, batch: ScheduleBatch) -> None:
+        """Refresh expected tail-page mappings for the fused DSA validator."""
         manager = self.kv_protection_manager
         if manager is None or not manager.config.enable_attention_tags:
             return
-        use_fused_verification = getattr(
-            self.tp_worker.model_runner,
-            "kv_fused_page_protection_enabled",
-            False,
-        )
-        requires_pre_indexer_validation = getattr(
-            self.tp_worker.model_runner,
-            "kv_requires_pre_indexer_page_validation",
-            False,
-        )
+        pending_refreshes = []
+        mismatches = []
         try:
             page_size = manager.page_size
-            attention_items = []
-            transfer_items = []
-            pending_refreshes = []
             refresh_candidates = []
             for i, req in enumerate(batch.reqs):
                 attention_manifest = getattr(req, "kv_attention_tag_manifest", None)
@@ -3289,10 +3283,6 @@ class Scheduler(
                 logical_pos = int(batch.seq_lens_cpu[i].item()) - 1
                 if logical_pos < 0:
                     continue
-                if attention_manifest is not None:
-                    attention_items.append((req.rid, attention_manifest))
-                if transfer_manifest is not None:
-                    transfer_items.append((req.rid, transfer_manifest))
 
                 # A page tag is a pure function of page id, page position,
                 # bootstrap room, and generation. Those inputs do not change
@@ -3348,19 +3338,13 @@ class Scheduler(
                             ),
                         )
                     )
-            mismatches = (
-                []
-                if use_fused_verification and not requires_pre_indexer_validation
-                else manager.verify_protection_batch(attention_items, transfer_items)
-            )
         except Exception as e:  # fail closed without crashing the decode loop
-            logger.exception("KV attention tag verification error")
-            from sglang.srt.mem_cache.kv_page_tags import (
+            logger.exception("KV protection mapping refresh preparation failed")
+            from sglang.srt.mem_cache.kv_protection import (
                 KVProtectionBookkeepingError,
                 attach_kv_protection_incident,
             )
 
-            mismatches = []
             for req in batch.reqs:
                 if (
                     getattr(req, "kv_attention_tag_manifest", None) is None
@@ -3370,11 +3354,11 @@ class Scheduler(
                 error = KVProtectionBookkeepingError(
                     rid=req.rid,
                     bootstrap_room=req.bootstrap_room,
-                    cause="pre_attention_verification",
+                    cause="tail_page_refresh_preparation",
                     detail=str(e),
                 )
                 attach_kv_protection_incident(
-                    error, kind="attention_tag", phase="pre_attention"
+                    error, kind="attention_tag", phase="mapping_refresh"
                 )
                 mismatches.append(error)
             if not mismatches:
@@ -3412,7 +3396,7 @@ class Scheduler(
                     )
             except Exception as e:
                 logger.exception("KV attention tag tail refresh error for rid=%s", rid)
-                from sglang.srt.mem_cache.kv_page_tags import (
+                from sglang.srt.mem_cache.kv_protection import (
                     KVProtectionBookkeepingError,
                     attach_kv_protection_incident,
                 )
@@ -3424,50 +3408,12 @@ class Scheduler(
                     detail=str(e),
                 )
                 attach_kv_protection_incident(
-                    error, kind="attention_tag", phase="pre_attention"
+                    error, kind="attention_tag", phase="mapping_refresh"
                 )
                 refresh_errors.append(error)
 
         mismatches.extend(refresh_errors)
         bad_rids.update(error.rid for error in refresh_errors)
-
-        if requires_pre_indexer_validation:
-            mapping_items = [
-                (
-                    req.rid,
-                    int(req.req_pool_idx),
-                    int(batch.seq_lens_cpu[i].item()),
-                    req.kv_attention_tag_manifest,
-                )
-                for i, req in enumerate(batch.reqs)
-                if req.rid not in bad_rids
-                and req.req_pool_idx is not None
-                and getattr(req, "kv_attention_tag_manifest", None) is not None
-            ]
-            try:
-                mapping_errors = manager.verify_full_page_mapping_batch(
-                    mapping_items, self.req_to_token_pool.req_to_token
-                )
-            except Exception as e:
-                logger.exception("KV pre-indexer page mapping verification error")
-                from sglang.srt.mem_cache.kv_page_tags import (
-                    KVProtectionBookkeepingError,
-                    attach_kv_protection_incident,
-                )
-
-                mapping_errors = []
-                for rid, _, _, manifest in mapping_items:
-                    error = KVProtectionBookkeepingError(
-                        rid=rid,
-                        bootstrap_room=getattr(manifest, "bootstrap_room", None),
-                        cause="pre_indexer_page_mapping",
-                        detail=str(e),
-                    )
-                    attach_kv_protection_incident(
-                        error, kind="attention_tag", phase="pre_indexer"
-                    )
-                    mapping_errors.append(error)
-            mismatches.extend(mapping_errors)
 
         if not mismatches:
             return
@@ -3479,7 +3425,7 @@ class Scheduler(
             req = rid_to_req.get(m.rid)
             if req is None:
                 continue
-            from sglang.srt.mem_cache.kv_page_tags import emit_kv_protection_incident
+            from sglang.srt.mem_cache.kv_protection import emit_kv_protection_incident
 
             emit_kv_protection_incident(m, logger)
             logger.error("Aborting request due to %s", m)
@@ -3803,7 +3749,7 @@ class Scheduler(
     def _handle_fused_kv_protection_failure(
         self, batch: ScheduleBatch, error
     ) -> Tuple[set, set]:
-        from sglang.srt.mem_cache.kv_page_tags import (
+        from sglang.srt.mem_cache.kv_protection import (
             KVProtectionBookkeepingError,
             attach_kv_protection_incident,
             emit_kv_protection_incident,

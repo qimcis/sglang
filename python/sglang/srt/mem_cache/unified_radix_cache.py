@@ -786,7 +786,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         table = getattr(self.token_to_kv_pool_allocator, "attention_tag_table", None)
         if table is not None and not frees_deferred:
-            from sglang.srt.mem_cache.kv_page_tags import (
+            from sglang.srt.mem_cache.kv_protection import (
                 defer_kv_frees_until_mapping_refresh,
             )
 
@@ -838,7 +838,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if effective_cache_len <= 0:
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             if table is not None:
-                from sglang.srt.mem_cache.kv_page_tags import (
+                from sglang.srt.mem_cache.kv_protection import (
                     refresh_request_expected_mappings,
                 )
 
@@ -883,7 +883,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             new_indices[req.cache_protected_len :],
         )
         if table is not None:
-            from sglang.srt.mem_cache.kv_page_tags import (
+            from sglang.srt.mem_cache.kv_protection import (
                 refresh_request_expected_mappings,
             )
 

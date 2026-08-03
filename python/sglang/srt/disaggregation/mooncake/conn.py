@@ -2372,7 +2372,7 @@ class MooncakeKVManager(CommonKVManager):
                     if msg[3] == self.PROTECTION_NONCE_HEADER:
                         transfer_nonce = int(msg[4].decode("ascii"))
                     elif msg[3] == self.CHECKSUM_MANIFEST_HEADER:
-                        from sglang.srt.mem_cache.kv_page_tags import ChecksumPlan
+                        from sglang.srt.mem_cache.kv_protection import ChecksumPlan
 
                         transfer_nonce, payload_room = ChecksumPlan.wire_identity(
                             msg[4]
@@ -2492,17 +2492,6 @@ class MooncakeKVManager(CommonKVManager):
                                 return
                     if staging_handler is not None:
                         if is_staging_room:
-                            if protection_required and not (
-                                staging_handler.intermediate_scatters_submitted(
-                                    bootstrap_room
-                                )
-                            ):
-                                self.record_failure(
-                                    bootstrap_room,
-                                    "Missing protected Mooncake staging chunk completion",
-                                )
-                                self.update_status(bootstrap_room, KVPoll.Failed)
-                                return
                             if not staging_handler.submit_last_scatter_async(
                                 bootstrap_room
                             ):
@@ -3090,11 +3079,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
             )
             if received != expected:
                 return False
-        handler = getattr(self.kv_mgr, "_staging_handler", None)
-        if handler is not None and handler.is_staging_room(self.bootstrap_room):
-            if not handler.pending_scatter_writes_done(self.bootstrap_room):
-                return False
-            handler.reclaim_unsubmitted_allocations(self.bootstrap_room)
         with self.kv_mgr.request_status_lock:
             received = self.kv_mgr.abort_ack_producers_by_room.get(
                 self.bootstrap_room, set()

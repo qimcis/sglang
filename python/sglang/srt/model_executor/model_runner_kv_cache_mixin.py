@@ -1306,7 +1306,7 @@ class ModelRunnerKVCacheMixin:
         configurator = create_memory_pool_configurator(self)
         config = configurator.calculate_pool_sizes(available_bytes, page_size)
 
-        from sglang.srt.mem_cache.kv_page_tags import (
+        from sglang.srt.mem_cache.kv_protection import (
             KV_ATTENTION_TAG_BYTES_PER_PAGE,
             KV_CHECKSUM_MAX_WORKSPACE_BYTES,
             KV_EXPECTED_MAPPING_BYTES_PER_PAGE,

@@ -16,7 +16,7 @@
 
 namespace {
 
-// Murmur/XXH-style uint32 finalizer, matching `_fmix32_*` in kv_page_tags.py.
+// Murmur/XXH-style uint32 finalizer, matching `_fmix32_*` in kv_protection.py.
 __device__ __forceinline__ uint32_t cksum_fmix32(uint32_t x) {
   x ^= x >> 16;
   x *= 0x85EBCA6Bu;
@@ -26,7 +26,7 @@ __device__ __forceinline__ uint32_t cksum_fmix32(uint32_t x) {
   return x;
 }
 
-// Must match `_CKSUM32_*` constants in kv_page_tags.py.
+// Must match `_CKSUM32_*` constants in kv_protection.py.
 __device__ constexpr uint32_t kCksumSeed = 0x4E474353u;
 __device__ constexpr uint32_t kPosMul = 0x9E3779B1u;
 __device__ constexpr uint32_t kLaneMul = 0x85EBCA77u;

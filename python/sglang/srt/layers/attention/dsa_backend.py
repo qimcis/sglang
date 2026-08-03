@@ -58,7 +58,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_position,
 )
-from sglang.srt.mem_cache.kv_page_tags import should_use_fused_kv_page_protection
+from sglang.srt.mem_cache.kv_protection import should_use_fused_kv_page_protection
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -441,10 +441,7 @@ class DeepseekSparseAttnBackend(
             self.flashmla_kv_num_q_heads = 128
         else:
             self.flashmla_kv_num_q_heads = self.num_q_heads
-        fused_protection_requested = (
-            self.kv_attention_tag_table is not None
-            and not envs.SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION.get()
-        )
+        fused_protection_requested = self.kv_attention_tag_table is not None
         consumer_capability = protected_dsa_consumer_capability(
             self.dsa_decode_impl,
             self.device_capability,
@@ -493,9 +490,7 @@ class DeepseekSparseAttnBackend(
                 "Fused DSA KV page protection is unavailable: "
                 f"{reason}. Supported audited consumers are Blackwell "
                 "flashmla_kv/flashmla_sparse. TRTLLM-GEN remains disabled "
-                "until an exact binary capability probe exists. Set "
-                "SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION=1 to use scheduler "
-                "validation explicitly."
+                "until an exact binary capability probe exists."
             )
         self.kv_protected_consumer_capability = consumer_capability
         self.kv_fused_page_protection_enabled = should_use_fused_kv_page_protection(

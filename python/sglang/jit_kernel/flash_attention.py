@@ -1,4 +1,3 @@
-import inspect
 from typing import Optional, Union
 
 import torch
@@ -44,7 +43,6 @@ def flash_attn_with_kvcache(
     aux_tensors=None,
     ver=3,
     out=None,
-    kv_page_protection=None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -135,18 +133,7 @@ def flash_attn_with_kvcache(
             normalization factor).
     """
 
-    protection_kwargs = {}
-    if kv_page_protection is not None:
-        protection_kwargs["kv_page_protection"] = kv_page_protection
-
     if ver == 3:
-        if protection_kwargs and not _supports_kv_page_protection(
-            fa3_flash_attn_with_kvcache
-        ):
-            raise RuntimeError(
-                "KV page protection was requested, but the FA3 leaf does not "
-                "support the kv_page_protection ABI"
-            )
         return fa3_flash_attn_with_kvcache(
             q,
             k_cache,
@@ -181,20 +168,12 @@ def flash_attn_with_kvcache(
             return_softmax_lse=return_softmax_lse,
             sinks=sinks,
             out=out,
-            **protection_kwargs,
         )
     elif ver == 4:
         from .flash_attention_v4 import (
             flash_attn_with_kvcache as fa4_flash_attn_with_kvcache,
         )
 
-        if protection_kwargs and not _supports_kv_page_protection(
-            fa4_flash_attn_with_kvcache
-        ):
-            raise RuntimeError(
-                "KV page protection was requested, but the FA4 leaf does not "
-                "support the kv_page_protection ABI"
-            )
         return fa4_flash_attn_with_kvcache(
             q,
             k_cache,
@@ -224,18 +203,9 @@ def flash_attn_with_kvcache(
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             return_softmax_lse=return_softmax_lse,
-            **protection_kwargs,
         )
     else:
         raise RuntimeError(f"Unknown flash attention version {ver}")
-
-
-def _supports_kv_page_protection(func) -> bool:
-    """Return whether a leaf explicitly publishes the protection ABI."""
-    try:
-        return "kv_page_protection" in inspect.signature(func).parameters
-    except (TypeError, ValueError):
-        return False
 
 
 def flash_attn_varlen_func(

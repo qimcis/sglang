@@ -529,7 +529,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             new_indices[req.cache_protected_len :],
         )
         if self.token_to_kv_pool_allocator.attention_tag_table is not None:
-            from sglang.srt.mem_cache.kv_page_tags import (
+            from sglang.srt.mem_cache.kv_protection import (
                 refresh_request_expected_mappings,
             )
 

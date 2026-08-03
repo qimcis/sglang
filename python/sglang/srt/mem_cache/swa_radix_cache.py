@@ -489,7 +489,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
-        from sglang.srt.mem_cache.kv_page_tags import (
+        from sglang.srt.mem_cache.kv_protection import (
             defer_kv_frees_until_mapping_refresh,
             refresh_request_expected_mappings,
         )

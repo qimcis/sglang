@@ -375,7 +375,7 @@ class FusedKVPageProtectionCheck:
         if not bool(self.failed.any().item()):
             return None
 
-        from sglang.srt.mem_cache.kv_page_tags import (
+        from sglang.srt.mem_cache.kv_protection import (
             KV_PAGE_VALIDATION_REMOTE_FAILURE,
             KVFusedProtectionError,
         )

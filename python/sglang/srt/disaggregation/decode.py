@@ -262,7 +262,6 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     transfer_pinned_page_ids: Tuple[int, ...] = ()
-    transfer_pinned_page_generations: Tuple[int, ...] = ()
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -349,7 +348,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
     def _init_kv_protection(self) -> None:
-        from sglang.srt.mem_cache.kv_page_tags import (
+        from sglang.srt.mem_cache.kv_protection import (
             KVPageProtectionManager,
             KVProtectionConfig,
         )
@@ -358,6 +357,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not config.enabled:
             self.scheduler.kv_protection_manager = None
             return
+        if self.enable_staging:
+            raise RuntimeError(
+                "KV protection in this GLM-5.2 build supports direct Mooncake "
+                "transfers only; disable SGLANG_DISAGG_STAGING_BUFFER."
+            )
 
         allocator = self.token_to_kv_pool_allocator
         page_size = allocator.page_size
@@ -465,7 +469,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return None, None
 
         try:
-            from sglang.srt.mem_cache.kv_page_tags import (
+            from sglang.srt.mem_cache.kv_protection import (
                 KV_EXPECTED_MAPPING_SWA,
                 TransferPageTagManifestGroup,
             )
@@ -565,7 +569,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "KV transfer page tag preparation failed for rid=%s: %s", req.rid, e
             )
             req.kv_transfer_page_tag_manifest = None
-            from sglang.srt.mem_cache.kv_page_tags import (
+            from sglang.srt.mem_cache.kv_protection import (
                 KVProtectionBookkeepingError,
                 attach_kv_protection_incident,
                 emit_kv_protection_incident,
@@ -1793,21 +1797,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.transfer_pinned_page_ids = self.transfer_page_pin_manager.pin_pages(
             page_indices
         )
-        decode_req.transfer_pinned_page_generations = ()
-        if not decode_req.transfer_pinned_page_ids:
-            return
-        if not self.enable_staging or not getattr(
-            decode_req.kv_receiver, "require_staging", False
-        ):
-            return
-        manager = getattr(self.scheduler, "kv_protection_manager", None)
-        table = getattr(manager, "table", None)
-        if table is None:
-            return
-        page_ids = torch.tensor(decode_req.transfer_pinned_page_ids, dtype=torch.long)
-        decode_req.transfer_pinned_page_generations = tuple(
-            int(x) for x in table.generation_of(page_ids).detach().cpu().tolist()
-        )
 
     def _release_transfer_pins(self, decode_req: DecodeRequest) -> None:
         if not decode_req.transfer_pinned_page_ids:
@@ -1816,7 +1805,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.transfer_pinned_page_ids
         )
         decode_req.transfer_pinned_page_ids = ()
-        decode_req.transfer_pinned_page_generations = ()
 
     def _clear_receiver(self, decode_req: DecodeRequest) -> None:
         if decode_req.kv_receiver is not None:
@@ -1838,8 +1826,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def _reap_quarantined_transfers(self) -> None:
         quarantined = getattr(self, "quarantined_transfer_reqs", {})
         for room, decode_req in list(quarantined.items()):
-            if getattr(decode_req, "_staging_scatter_tracking_failed", False):
-                continue
             receiver = decode_req.kv_receiver
             if not getattr(decode_req, "quarantine_receiver_cleared", False):
                 if (
@@ -1950,13 +1936,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self._clear_receiver(decode_req)
             return
 
-        if self.enable_staging and getattr(
-            decode_req.kv_receiver, "require_staging", False
-        ):
-            if self._write_staged_transfer_page_tags(decode_req.req):
-                self._clear_receiver(decode_req)
-                return
-
         # Register baseline KV attention tags for the transferred prompt pages
         # so a later cross-request page reuse is detectable before decode
         # attention reads them (gated; no-op when disabled).
@@ -2016,7 +1995,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 if not manager.compare_destination_checksum(
                     expected, actual, rid=req.rid
                 ):
-                    from sglang.srt.mem_cache.kv_page_tags import (
+                    from sglang.srt.mem_cache.kv_protection import (
                         KVChecksumError,
                         first_checksum_page_mismatch,
                     )
@@ -2050,7 +2029,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         ),
                     )
             else:
-                from sglang.srt.mem_cache.kv_page_tags import KVChecksumError
+                from sglang.srt.mem_cache.kv_protection import KVChecksumError
 
                 logger.error(
                     "KV transfer checksum missing batched destination result for rid=%s",
@@ -2069,7 +2048,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             logger.error(
                 "KV transfer checksum verification error for rid=%s: %s", req.rid, e
             )
-            from sglang.srt.mem_cache.kv_page_tags import KVChecksumError
+            from sglang.srt.mem_cache.kv_protection import KVChecksumError
 
             if manager.metrics is not None:
                 manager.metrics.increment_kv_transfer_checksum_mismatches()
@@ -2086,7 +2065,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
         if err is None:
             return False
-        from sglang.srt.mem_cache.kv_page_tags import (
+        from sglang.srt.mem_cache.kv_protection import (
             attach_kv_protection_incident,
             emit_kv_protection_incident,
         )
@@ -2111,7 +2090,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         manager = getattr(self.scheduler, "kv_protection_manager", None)
         if manager is None or not manager.config.checksum_enabled:
             return None, []
-        from sglang.srt.mem_cache.kv_page_tags import (
+        from sglang.srt.mem_cache.kv_protection import (
             TRANSFER_CHECKSUM_DIGEST_PAGE_SIZE,
             swa_checksum_evicted_len,
         )
@@ -2197,7 +2176,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if manager is None or not manager.config.enable_attention_tags:
             return False
         try:
-            from sglang.srt.mem_cache.kv_page_tags import (
+            from sglang.srt.mem_cache.kv_protection import (
                 KV_EXPECTED_MAPPING_SWA,
                 AttentionTagManifestGroup,
             )
@@ -2262,7 +2241,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 "KV attention tag registration failed for rid=%s: %s", req.rid, e
             )
             req.kv_attention_tag_manifest = None
-            from sglang.srt.mem_cache.kv_page_tags import (
+            from sglang.srt.mem_cache.kv_protection import (
                 KVProtectionBookkeepingError,
                 attach_kv_protection_incident,
                 emit_kv_protection_incident,
@@ -2276,46 +2255,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
             attach_kv_protection_incident(
                 error, kind="attention_tag", phase="tag_registration"
-            )
-            emit_kv_protection_incident(error, logger)
-            prepare_abort(
-                req,
-                str(error),
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
-            return True
-
-    def _write_staged_transfer_page_tags(self, req: Req) -> bool:
-        """Return True if the request was aborted due to tag write failure."""
-        manager = getattr(self.scheduler, "kv_protection_manager", None)
-        manifest = getattr(req, "kv_transfer_page_tag_manifest", None)
-        if (
-            manager is None
-            or not manager.config.enable_attention_tags
-            or manifest is None
-        ):
-            return False
-        try:
-            manager.commit_transfer_page_tags(manifest)
-            return False
-        except Exception as e:
-            logger.error(
-                "KV transfer page tag write failed for staged rid=%s: %s", req.rid, e
-            )
-            from sglang.srt.mem_cache.kv_page_tags import (
-                KVProtectionBookkeepingError,
-                attach_kv_protection_incident,
-                emit_kv_protection_incident,
-            )
-
-            error = KVProtectionBookkeepingError(
-                rid=req.rid,
-                bootstrap_room=req.bootstrap_room,
-                cause="transfer_page_tag_commit",
-                detail=str(e),
-            )
-            attach_kv_protection_incident(
-                error, kind="transfer_page_tag", phase="tag_commit"
             )
             emit_kv_protection_incident(error, logger)
             prepare_abort(
@@ -2446,7 +2385,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 quarantine = bool(
                     receiver is not None
                     and getattr(receiver, "requires_page_quarantine", lambda: False)()
-                ) or getattr(decode_req, "_staging_scatter_tracking_failed", False)
+                )
                 self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:

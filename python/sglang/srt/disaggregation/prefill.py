@@ -155,7 +155,7 @@ class PrefillBootstrapQueue:
     def _init_kv_protection(self) -> None:
         import dataclasses
 
-        from sglang.srt.mem_cache.kv_page_tags import (
+        from sglang.srt.mem_cache.kv_protection import (
             KVPageProtectionManager,
             KVProtectionConfig,
         )
@@ -168,6 +168,11 @@ class PrefillBootstrapQueue:
         if not config.checksum_enabled:
             self.scheduler.kv_protection_manager = None
             return
+        if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+            raise RuntimeError(
+                "KV protection in this GLM-5.2 build supports direct Mooncake "
+                "transfers only; disable SGLANG_DISAGG_STAGING_BUFFER."
+            )
         self.scheduler.kv_protection_manager = KVPageProtectionManager(
             config,
             allocator=None,
@@ -665,7 +670,7 @@ class SchedulerDisaggregationPrefillMixin:
         checksum_reqs: List[Req] = []
         manager = getattr(self, "kv_protection_manager", None)
         if manager is not None and manager.config.checksum_enabled:
-            from sglang.srt.mem_cache.kv_page_tags import swa_checksum_evicted_len
+            from sglang.srt.mem_cache.kv_protection import swa_checksum_evicted_len
 
             sliding_window = getattr(self, "sliding_window_size", None)
             page_size = getattr(self.token_to_kv_pool_allocator, "page_size", 1)

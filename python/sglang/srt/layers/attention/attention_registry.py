@@ -212,11 +212,6 @@ def create_flashattention_v3_backend(runner):
 
 @register_attention_backend("fa4")
 def create_flashattention_v4_backend(runner):
-    capability = get_device_capability()
-    assert capability in ((10, 0), (10, 3)), (
-        "FlashAttention v4 Backend requires SM100 or SM103. "
-        "Please use `--attention-backend fa3` on SM90."
-    )
     from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 
     return FlashAttentionBackend(runner, fa_impl_ver=4)

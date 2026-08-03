@@ -405,9 +405,9 @@ class MetadataBuffers:
         )
         plan = getattr(req, "kv_transfer_checksum", None)
         if plan is not None:
-            # ``plan`` is a kv_page_tags.ChecksumPlan computed on the prefill side.
+            # ``plan`` is a kv_protection.ChecksumPlan computed on the prefill side.
             # bootstrap_room is an int64 tensor. ``plan.checksum`` is already the
-            # signed int64 bit-pattern representation used by kv_page_tags.
+            # signed int64 bit-pattern representation used by kv_protection.
             # Do not mask to unsigned uint64 here, or large values overflow when
             # assigned back into the int64 metadata buffer.
             checksum_i64 = int(plan.checksum)

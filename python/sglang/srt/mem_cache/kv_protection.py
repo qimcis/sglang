@@ -447,13 +447,8 @@ class KVProtectionConfig:
 
 
 def should_use_fused_kv_page_protection(tag_table: object, *, supported: bool) -> bool:
-    """Select fused validation when available and not explicitly disabled."""
-    if tag_table is None or not supported:
-        return False
-
-    from sglang.srt.environ import envs
-
-    return not envs.SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION.get()
+    """Select the only supported attention-tag validation path."""
+    return tag_table is not None and supported
 
 
 # ---------------------------------------------------------------------------
@@ -470,10 +465,8 @@ SUPPORTED_ALLOCATOR_CLASSES = (
 )
 
 # Transfer backends for which the transfer-checksum manifest exchange is wired.
-SUPPORTED_CHECKSUM_BACKENDS = ("mooncake", "nixl")
-# Fake accepts tag metadata for no-transfer scheduler coverage; Mooncake is the
-# only production backend that transports and commits it.
-SUPPORTED_ATTENTION_TAG_BACKENDS = ("mooncake", "nixl", "fake")
+SUPPORTED_CHECKSUM_BACKENDS = ("mooncake",)
+SUPPORTED_ATTENTION_TAG_BACKENDS = ("mooncake",)
 
 
 def assert_protection_supported(
@@ -556,9 +549,13 @@ def assert_protection_supported(
     if config.enable_attention_tags:
         from sglang.srt.environ import envs
 
-        fused_validation_enabled = (
-            not envs.SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION.get()
-        )
+        if envs.SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION.get():
+            raise RuntimeError(
+                "This GLM-5.2 protection build requires fused DSA validation. "
+                "Scheduler-only validation is not supported. Unset "
+                "SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION or disable "
+                "SGLANG_KV_PAGE_PROTECTION."
+            )
         capability = (
             (device_capability_major, device_capability_minor)
             if device_capability_major is not None
@@ -569,15 +566,13 @@ def assert_protection_supported(
                 else None
             )
         )
-        if fused_validation_enabled and (
-            is_cuda_device is False
-            or (capability is not None and capability not in ((9, 0), (10, 0), (10, 3)))
+        if is_cuda_device is False or (
+            capability is not None and capability not in ((9, 0), (10, 0), (10, 3))
         ):
             raise RuntimeError(
                 "Fused KV page protection requires an NVIDIA Hopper SM90 or "
-                "Blackwell SM100/SM103 GPU. Set "
-                "SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION=1 to use scheduler "
-                "validation, or disable SGLANG_KV_PAGE_PROTECTION."
+                "Blackwell SM100/SM103 GPU. Disable SGLANG_KV_PAGE_PROTECTION "
+                "on unsupported hardware."
             )
 
     if config.checksum_enabled and is_cuda_device is False:
@@ -1816,69 +1811,6 @@ class KVAttentionTagTable:
         self.expected_transfer_page_tags.index_fill_(0, indices, 0)
         self.validated_epochs[request_pool_idx] = -1
         self.pre_indexer_validated_epochs[request_pool_idx] = -1
-
-    def expected_mapping_status(
-        self,
-        request_pool_idx: int,
-        logical_page_positions: torch.Tensor,
-        active_physical_pages: torch.Tensor,
-        mapping_namespace: int = KV_EXPECTED_MAPPING_FULL,
-    ) -> torch.Tensor:
-        """CPU/reference implementation of the fused request-logical ABI."""
-        positions = logical_page_positions.to(self.device, dtype=torch.long).reshape(-1)
-        pages = active_physical_pages.to(self.device, dtype=torch.long).reshape(-1)
-        if positions.numel() != pages.numel():
-            raise RuntimeError("protected mapping metadata length mismatch")
-        status = torch.zeros_like(pages, dtype=torch.int32)
-        valid_request = (
-            0 < request_pool_idx < self.request_epochs.numel()
-            and 0 <= mapping_namespace < KV_EXPECTED_MAPPING_NAMESPACE_COUNT
-        )
-        if not valid_request:
-            status.fill_(KV_PAGE_INVALID_MAPPING)
-            return status
-        valid = (
-            positions.ge(0)
-            & positions.lt(self.num_logical_pages)
-            & pages.gt(0)
-            & pages.lt(self.size)
-        )
-        status |= (~valid).to(torch.int32) * KV_PAGE_INVALID_MAPPING
-        if not bool(valid.any().item()):
-            return status
-        safe_positions = torch.where(valid, positions, 0)
-        safe_pages = torch.where(valid, pages, 0)
-        expected_indices = (
-            request_pool_idx * self.expected_mapping_stride
-            + mapping_namespace * self.expected_mapping_namespace_stride
-            + safe_positions
-        )
-        expected_pages = self.expected_physical_pages.index_select(0, expected_indices)
-        expected_tags = self.expected_tags.index_select(0, expected_indices)
-        expected_generations = self.expected_generations.index_select(
-            0, expected_indices
-        )
-        expected_transfer = self.expected_transfer_page_tags.index_select(
-            0, expected_indices
-        )
-        actual_tags = self.tags.index_select(0, safe_pages)
-        actual_generations = self.generations.index_select(0, safe_pages)
-        actual_transfer = self.transfer_page_tags.index_select(0, safe_pages)
-        status |= (valid & expected_pages.to(torch.long).ne(pages)).to(
-            torch.int32
-        ) * KV_PAGE_OWNER_MISMATCH
-        status |= (valid & actual_tags.ne(expected_tags)).to(
-            torch.int32
-        ) * KV_PAGE_ATTENTION_TAG_MISMATCH
-        status |= (valid & actual_generations.ne(expected_generations)).to(
-            torch.int32
-        ) * KV_PAGE_GENERATION_MISMATCH
-        status |= (
-            valid
-            & expected_transfer.ne(TRANSFER_PAGE_TAG_SKIP)
-            & actual_transfer.ne(expected_transfer)
-        ).to(torch.int32) * KV_PAGE_TRANSFER_TAG_MISMATCH
-        return status
 
     def begin_fused_forward(self, request_pool_indices: torch.Tensor) -> None:
         if request_pool_indices.numel() == 0:
@@ -3178,74 +3110,6 @@ class KVPageProtectionManager:
         )
         return manifest
 
-    def verify_request(
-        self,
-        manifest: Optional[AttentionTagManifest],
-        *,
-        rid: Optional[str] = None,
-    ) -> Optional[KVAttentionTagMismatch]:
-        """Verify one request's pages; return an exception object on mismatch.
-
-        Returns ``None`` when protection is disabled or all pages match.  Only a
-        single ``.any()`` host sync occurs on the happy path.
-        """
-        if (
-            not self.config.enable_attention_tags
-            or manifest is None
-            or self.table is None
-        ):
-            return None
-        if isinstance(manifest, AttentionTagManifestGroup) or isinstance(
-            manifest, (list, tuple)
-        ):
-            mismatches = self.verify_batch([(rid, manifest)])
-            return mismatches[0] if mismatches else None
-        if manifest.num_pages == 0:
-            return None
-        pages = manifest.physical_pages_tensor(self.device)
-        expected = manifest.expected_tags_tensor(self.device)
-        generations = manifest.generations_tensor(self.device)
-        ok, mismatch = verify_attention_tags(self.table, pages, expected, generations)
-        if self.metrics is not None:
-            self.metrics.increment_kv_attention_tag_checked_pages(int(pages.numel()))
-        if ok:
-            return None
-        # Rare path: extract the first offending page for diagnostics.
-        bad = int(torch.nonzero(mismatch).reshape(-1)[0].item())
-        expected_tag = int(expected[bad].item())
-        actual_tag = int(self.table.read_tags(pages[bad : bad + 1])[0].item())
-        expected_generation = int(generations[bad].item())
-        actual_generation = int(
-            self.table.generation_of(pages[bad : bad + 1])[0].item()
-        )
-        tag_differs = expected_tag != actual_tag
-        generation_differs = expected_generation != actual_generation
-        cause = (
-            "both"
-            if tag_differs and generation_differs
-            else "tag_value" if tag_differs else "generation"
-        )
-        exc = KVAttentionTagMismatch(
-            rid=rid,
-            bootstrap_room=manifest.bootstrap_room,
-            page_id=int(pages[bad].item()),
-            page_position=manifest.page_positions[bad],
-            expected_tag=expected_tag,
-            actual_tag=actual_tag,
-            expected_generation=expected_generation,
-            actual_generation=actual_generation,
-            cause=cause,
-        )
-        attach_kv_protection_incident(
-            exc,
-            kind="attention_tag",
-            phase="pre_attention",
-            history=self.table.materialize_history(exc.page_id),
-        )
-        if self.metrics is not None:
-            self.metrics.increment_kv_attention_tag_mismatches()
-        return exc
-
     def refresh_tail_page(
         self,
         manifest: Optional[AttentionTagManifest],
@@ -3768,122 +3632,6 @@ class KVPageProtectionManager:
             )
         if transfer is not None and bool(transfer_mismatch.any().item()):
             result.extend(self._transfer_mismatch_details(transfer, transfer_mismatch))
-        return result
-
-    def verify_full_page_mapping_batch(
-        self,
-        items: Sequence[Tuple[str, int, int, object]],
-        req_to_token: torch.Tensor,
-    ) -> List[KVProtectionBookkeepingError]:
-        """Verify every protected full-cache page-table entry before DSA reads it."""
-        if not self.config.enable_attention_tags or self.table is None:
-            return []
-        if (
-            not isinstance(req_to_token, torch.Tensor)
-            or req_to_token.dim() != 2
-            or req_to_token.device != self.table.tags.device
-        ):
-            raise RuntimeError("protected request-token table has an invalid layout")
-
-        result: List[KVProtectionBookkeepingError] = []
-        mapping_entries = []
-        table_rows, table_columns = req_to_token.shape
-        for rid, request_pool_idx, seq_len, grouped_manifest in items:
-            manifests = _iter_attention_manifests(grouped_manifest)
-            if not manifests:
-                continue
-            manifest = manifests[0]
-            expected_num_pages = (int(seq_len) + self.page_size - 1) // self.page_size
-            expected_positions = list(range(expected_num_pages))
-            detail = None
-            if manifest.page_size != self.page_size:
-                detail = "full-cache manifest page size mismatch"
-            elif manifest.page_positions != expected_positions:
-                detail = (
-                    "full-cache manifest does not cover the complete sequence "
-                    f"(expected_pages={expected_num_pages}, actual={manifest.page_positions})"
-                )
-            elif request_pool_idx <= 0 or request_pool_idx >= table_rows:
-                detail = "request-pool index is out of bounds"
-            elif (
-                expected_num_pages
-                and (expected_num_pages - 1) * self.page_size >= table_columns
-            ):
-                detail = "protected sequence exceeds the request-token table"
-            if detail is not None:
-                error = KVProtectionBookkeepingError(
-                    rid=rid,
-                    bootstrap_room=manifest.bootstrap_room,
-                    cause="pre_indexer_page_mapping",
-                    detail=detail,
-                )
-                attach_kv_protection_incident(
-                    error, kind="attention_tag", phase="pre_indexer"
-                )
-                result.append(error)
-                continue
-            if expected_num_pages:
-                mapping_entries.append((rid, request_pool_idx, manifest))
-
-        if not mapping_entries:
-            return result
-
-        request_indices = []
-        token_positions = []
-        expected_pages = []
-        offsets = [0]
-        for _, request_pool_idx, manifest in mapping_entries:
-            count = manifest.num_pages
-            request_indices.append(
-                torch.full(
-                    (count,),
-                    request_pool_idx,
-                    dtype=torch.long,
-                    device=req_to_token.device,
-                )
-            )
-            token_positions.append(
-                manifest.page_positions_t.to(
-                    device=req_to_token.device, dtype=torch.long
-                )
-                * self.page_size
-            )
-            expected_pages.append(manifest.physical_pages_tensor(req_to_token.device))
-            offsets.append(offsets[-1] + count)
-
-        request_indices_t = torch.cat(request_indices)
-        token_positions_t = torch.cat(token_positions)
-        expected_pages_t = torch.cat(expected_pages)
-        current_pages = (
-            req_to_token[request_indices_t, token_positions_t] // self.page_size
-        )
-        mismatch = current_pages.ne(expected_pages_t)
-        if not bool(mismatch.any().item()):
-            return result
-
-        bad_indices = torch.nonzero(mismatch).reshape(-1).cpu().tolist()
-        seen_rids = set()
-        for index in bad_indices:
-            owner_index = bisect_right(offsets, int(index)) - 1
-            rid, _, manifest = mapping_entries[owner_index]
-            if rid in seen_rids:
-                continue
-            seen_rids.add(rid)
-            page_offset = int(index) - offsets[owner_index]
-            error = KVProtectionBookkeepingError(
-                rid=rid,
-                bootstrap_room=manifest.bootstrap_room,
-                cause="pre_indexer_page_mapping",
-                detail=(
-                    f"logical_page={manifest.page_positions[page_offset]}, "
-                    f"expected_page={int(expected_pages_t[index].item())}, "
-                    f"actual_page={int(current_pages[index].item())}"
-                ),
-            )
-            attach_kv_protection_incident(
-                error, kind="attention_tag", phase="pre_indexer"
-            )
-            result.append(error)
         return result
 
     # -- transfer checksums ------------------------------------------------
