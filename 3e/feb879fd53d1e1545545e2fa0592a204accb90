@@ -1,0 +1,21 @@
+python/sglang/srt/layers/logits_processor.py
+  s_31242d6a60f864::t_3d060a16250326 340,372,928-956,959-962,965-973
+python/sglang/srt/model_executor/runner/shape_key.py
+  s_31242d6a60f864::t_87fcebd4191ebb 32-33,39
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3efeb879fd53d1e1545545e2fa0592a204accb90",
+  "prompts": {},
+  "sessions": {
+    "s_31242d6a60f864": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0525b98f5ffeMDl6gnyhsezi7Q",
+        "model": "gpt-5.5"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
