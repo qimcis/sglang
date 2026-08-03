@@ -97,6 +97,252 @@ def _fused_dsa_decode_metadata_kernel(
         )
 
 
+@triton.jit(
+    do_not_specialize=[
+        "real_page_table_stride_0",
+        "max_len",
+    ]
+)
+def _fused_dsa_decode_metadata_protected_kernel(
+    seq_lens,
+    req_pool_indices,
+    req_to_token,
+    cache_seqlens,
+    cu_seqlens_k,
+    dsa_cache_seqlens,
+    dsa_cu_seqlens_k,
+    real_page_table,
+    protected_request_indices,
+    failure_status,
+    local_failed,
+    global_failed,
+    actual_tags,
+    actual_generations,
+    actual_transfer_tags,
+    expected_physical_pages,
+    expected_tags,
+    expected_generations,
+    expected_transfer_tags,
+    seq_lens_stride: tl.constexpr,
+    req_pool_indices_stride: tl.constexpr,
+    req_to_token_stride_0: tl.constexpr,
+    req_to_token_stride_1: tl.constexpr,
+    real_page_table_stride_0,
+    real_page_table_stride_1: tl.constexpr,
+    bs: tl.constexpr,
+    max_len,
+    dsa_index_topk: tl.constexpr,
+    real_page_size: tl.constexpr,
+    num_sidecar_pages: tl.constexpr,
+    num_request_slots: tl.constexpr,
+    expected_mapping_stride: tl.constexpr,
+    expected_mapping_namespace_stride: tl.constexpr,
+    REAL_PAGE_COLS: tl.constexpr,
+    BLOCK_BS: tl.constexpr,
+    BLOCK_PAGES: tl.constexpr,
+):
+    """Snapshot and validate the compact DSA page table in one launch.
+
+    The protected normal-decode graph consumes only ``real_page_table``.  By
+    validating while that table is copied out of ``req_to_token``, every
+    mutable global sidecar read finishes before graph replay starts.  A bad row
+    is published as all-zero pages, so neither the indexer nor attention can
+    dereference the rejected mapping.
+    """
+    pid = tl.program_id(0)
+    if pid == 0:
+        # Preserve the original metadata kernel's single-pass prefix work.
+        # Shape-invalid rows are clamped consistently; mapping/tag failures are
+        # made safe by redirecting their complete table to reserved page 0.
+        offs_b = tl.arange(0, BLOCK_BS)
+        mask_b = offs_b < bs
+        input_seq = tl.load(
+            seq_lens + offs_b * seq_lens_stride,
+            mask=mask_b,
+            other=0,
+        ).to(tl.int32)
+        # Shape faults need a bounded non-zero length before any external
+        # kernel runs. Mapping/tag faults keep their valid original length and
+        # are made safe by the all-zero compact page table below.
+        max_safe_seq = tl.minimum(max_len, REAL_PAGE_COLS * real_page_size)
+        all_seq = tl.where((input_seq > 0) & (input_seq <= max_safe_seq), input_seq, 1)
+        all_dsa_seq = tl.minimum(all_seq, dsa_index_topk)
+        tl.store(cache_seqlens + offs_b, all_seq, mask=mask_b)
+        tl.store(cu_seqlens_k, 0)
+        tl.store(
+            cu_seqlens_k + 1 + offs_b,
+            tl.cumsum(all_seq, axis=0),
+            mask=mask_b,
+        )
+        tl.store(dsa_cache_seqlens + offs_b, all_dsa_seq, mask=mask_b)
+        tl.store(dsa_cu_seqlens_k, 0)
+        tl.store(
+            dsa_cu_seqlens_k + 1 + offs_b,
+            tl.cumsum(all_dsa_seq, axis=0),
+            mask=mask_b,
+        )
+        return
+
+    row = pid - 1
+    row_mask = row < bs
+    request_idx_i64 = tl.load(
+        req_pool_indices + row * req_pool_indices_stride,
+        mask=row_mask,
+        other=0,
+    ).to(tl.int64)
+    seq = tl.load(
+        seq_lens + row * seq_lens_stride,
+        mask=row_mask,
+        other=0,
+    ).to(tl.int64)
+    tl.store(protected_request_indices + row, request_idx_i64, mask=row_mask)
+
+    graph_padding = request_idx_i64 == 0
+    request_valid = (request_idx_i64 > 0) & (request_idx_i64 < num_request_slots)
+    safe_request_idx = tl.where(request_valid, request_idx_i64, 0)
+    num_pages = (seq + real_page_size - 1) // real_page_size
+    row_shape_valid = (
+        request_valid & (seq > 0) & (seq <= max_len) & (num_pages <= REAL_PAGE_COLS)
+    )
+
+    page_lane = tl.arange(0, BLOCK_PAGES)
+    invalid_any = tl.zeros((), tl.int32)
+    owner_any = tl.zeros((), tl.int32)
+    position_any = tl.zeros((), tl.int32)
+    attention_tag_any = tl.zeros((), tl.int32)
+    generation_any = tl.zeros((), tl.int32)
+    transfer_tag_any = tl.zeros((), tl.int32)
+
+    # Keep register pressure independent of context length and stop at the live
+    # page count. On a clean row the compact table is produced during the same
+    # read that validates it. Only a failed row pays a full write-only clear.
+    scan_pages = tl.where(row_shape_valid, num_pages, 0)
+    for page_start in tl.range(0, scan_pages, BLOCK_PAGES):
+        logical_page = page_start + page_lane
+        output_mask = logical_page < scan_pages
+        active = output_mask
+        token_slot = tl.load(
+            req_to_token
+            + safe_request_idx * req_to_token_stride_0
+            + logical_page * real_page_size * req_to_token_stride_1,
+            mask=active,
+            other=0,
+        ).to(tl.int64)
+        physical_page = token_slot // real_page_size
+        mapping_valid = (
+            active
+            & (token_slot > 0)
+            & ((token_slot % real_page_size) == 0)
+            & (physical_page > 0)
+            & (physical_page < num_sidecar_pages)
+        )
+        expected_position_valid = logical_page < expected_mapping_namespace_stride
+        sidecar_valid = mapping_valid & expected_position_valid
+        safe_physical_page = tl.where(sidecar_valid, physical_page, 0)
+        expected_index = safe_request_idx * expected_mapping_stride + logical_page
+
+        expected_page = tl.load(
+            expected_physical_pages + expected_index,
+            mask=sidecar_valid,
+            other=0,
+        ).to(tl.int64)
+        expected_tag = tl.load(
+            expected_tags + expected_index,
+            mask=sidecar_valid,
+            other=0,
+        )
+        expected_generation = tl.load(
+            expected_generations + expected_index,
+            mask=sidecar_valid,
+            other=0,
+        )
+        expected_transfer_tag = tl.load(
+            expected_transfer_tags + expected_index,
+            mask=sidecar_valid,
+            other=0,
+        )
+        actual_tag = tl.load(
+            actual_tags + safe_physical_page,
+            mask=sidecar_valid,
+            other=0,
+        )
+        actual_generation = tl.load(
+            actual_generations + safe_physical_page,
+            mask=sidecar_valid,
+            other=0,
+        )
+        actual_transfer_tag = tl.load(
+            actual_transfer_tags + safe_physical_page,
+            mask=sidecar_valid,
+            other=0,
+        )
+
+        invalid_mapping = active & ~mapping_valid
+        position_mismatch = mapping_valid & ~expected_position_valid
+        owner_mismatch = sidecar_valid & (expected_page != physical_page)
+        attention_tag_mismatch = sidecar_valid & (actual_tag != expected_tag)
+        generation_mismatch = sidecar_valid & (actual_generation != expected_generation)
+        transfer_tag_mismatch = (
+            sidecar_valid
+            & (expected_transfer_tag != 0)
+            & (actual_transfer_tag != expected_transfer_tag)
+        )
+
+        invalid_any |= tl.max(invalid_mapping.to(tl.int32), axis=0)
+        owner_any |= tl.max(owner_mismatch.to(tl.int32), axis=0)
+        position_any |= tl.max(position_mismatch.to(tl.int32), axis=0)
+        attention_tag_any |= tl.max(attention_tag_mismatch.to(tl.int32), axis=0)
+        generation_any |= tl.max(generation_mismatch.to(tl.int32), axis=0)
+        transfer_tag_any |= tl.max(transfer_tag_mismatch.to(tl.int32), axis=0)
+
+        output_page = tl.where(active, physical_page, 0).to(tl.int32)
+        tl.store(
+            real_page_table
+            + row * real_page_table_stride_0
+            + logical_page * real_page_table_stride_1,
+            output_page,
+            mask=row_mask & output_mask,
+        )
+
+    # Keep these values in sync with KV_PAGE_* in kv_protection.py.
+    status = (
+        invalid_any
+        | (owner_any << 1)
+        | (position_any << 2)
+        | (attention_tag_any << 3)
+        | (generation_any << 4)
+        | (transfer_tag_any << 5)
+    )
+    status = tl.where((~graph_padding) & (~row_shape_valid), status | 0x01, status)
+    status = tl.where(graph_padding, 0, status).to(tl.int32)
+    failed = (status != 0).to(tl.int32)
+
+    if failed != 0:
+        for page_start in tl.range(0, REAL_PAGE_COLS, BLOCK_PAGES):
+            logical_page = page_start + page_lane
+            output_mask = logical_page < REAL_PAGE_COLS
+            tl.store(
+                real_page_table
+                + row * real_page_table_stride_0
+                + logical_page * real_page_table_stride_1,
+                0,
+                mask=row_mask & output_mask,
+            )
+        # Shape-invalid lengths were already clamped consistently by program 0.
+        # Mapping/tag faults retain their valid length, but every page entry is
+        # redirected to reserved page 0. TP-global failure consensus prevents
+        # this row from emitting a token.
+    elif graph_padding:
+        # Padding rows have a graph sentinel length of one, so only the first
+        # compact entry can be consumed.
+        tl.store(real_page_table + row * real_page_table_stride_0, 0)
+    tl.store(failure_status + row, status, mask=row_mask)
+    tl.store(local_failed + row, failed, mask=row_mask)
+    # TP=1 consumes this directly.  TP>1 overwrites it inside the existing
+    # logits all-gather after reducing the per-rank sideband.
+    tl.store(global_failed + row, failed, mask=row_mask)
+
+
 def fused_dsa_decode_metadata(
     seq_lens: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -111,6 +357,7 @@ def fused_dsa_decode_metadata(
     max_len: int,
     dsa_index_topk: int,
     real_page_size: int,
+    protection: Optional[dict] = None,
 ) -> None:
     """Fill decode-graph DSA metadata (seqlens + page tables) from req_to_token.
 
@@ -153,6 +400,60 @@ def fused_dsa_decode_metadata(
         assert page_table_1.is_cuda
 
     block_bs = triton.next_power_of_2(bs)
+
+    if protection is not None:
+        # KV protection is intentionally scoped to the compact page-size=64
+        # GLM/DSA normal-decode path.  Its graph consumes this snapshot and no
+        # longer reads mutable global protection sidecars during replay.
+        assert has_real_page_table and not has_page_table_1
+        assert real_page_size == 64
+        assert protection["page_table"] is real_page_table
+        assert protection["request_indices"].shape[0] == bs
+        max_pages = real_page_table.shape[1]
+        assert max_pages > 0
+        block_pages = min(256, triton.next_power_of_2(max_pages))
+        _fused_dsa_decode_metadata_protected_kernel[(1 + bs,)](
+            seq_lens,
+            req_pool_indices,
+            req_to_token,
+            cache_seqlens,
+            cu_seqlens_k,
+            dsa_cache_seqlens,
+            dsa_cu_seqlens_k,
+            real_page_table,
+            protection["result_request_indices"],
+            protection["failure_status"],
+            protection["local_failed"],
+            protection["failed"],
+            protection["actual_tags"],
+            protection["actual_generations"],
+            protection["actual_transfer_tags"],
+            protection["expected_physical_pages"],
+            protection["expected_tags"],
+            protection["expected_generations"],
+            protection["expected_transfer_tags"],
+            seq_lens.stride(0),
+            req_pool_indices.stride(0),
+            req_to_token.stride(0),
+            req_to_token.stride(1),
+            real_page_table.stride(0),
+            real_page_table.stride(1),
+            bs,
+            max_len,
+            dsa_index_topk,
+            real_page_size,
+            protection["actual_tags"].numel(),
+            protection["num_request_slots"],
+            protection["expected_mapping_stride"],
+            protection["expected_mapping_namespace_stride"],
+            REAL_PAGE_COLS=max_pages,
+            BLOCK_BS=block_bs,
+            BLOCK_PAGES=block_pages,
+            num_warps=8,
+        )
+        protection["validated_in_metadata"] = True
+        return
+
     block_n = 128
     num_col_blocks = triton.cdiv(max_len, block_n)
     grid = (1 + bs * num_col_blocks,)

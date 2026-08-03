@@ -122,16 +122,19 @@ def can_publish_war_fastpath_read_done(
     *,
     is_dflash: bool,
     fused_kv_page_protection_enabled: bool,
+    protection_snapshot_safe: bool = False,
 ) -> bool:
     """Whether the pre-replay snapshot ends all shared-buffer reads.
 
-    Fused KV protection is deliberately excluded: its captured pre-indexer and
-    top-k kernels continue to read and update the global protection sidecars
-    during graph replay. Publishing the normal pre-replay event would let the
-    scheduler mutate those sidecars for the next token while the graph still
-    owns them. ModelRunner publishes a later event after the fused status read.
+    Legacy fused KV protection is excluded because its captured kernels still
+    read mutable global sidecars.  The Blackwell DSA path is safe once its
+    out-of-graph metadata kernel has validated and snapshotted the compact page
+    table: replay consumes only graph-local page/status buffers.
     """
-    return not fused_kv_page_protection_enabled and (
+    protection_allows_early_publish = (
+        not fused_kv_page_protection_enabled or protection_snapshot_safe
+    )
+    return protection_allows_early_publish and (
         forward_mode.is_decode() or (forward_mode.is_target_verify() and is_dflash)
     )
 
@@ -272,6 +275,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
+        self._kv_protection_graph_bank_count = (
+            2
+            if self.capture_forward_mode.is_decode()
+            and getattr(
+                model_runner,
+                "kv_metadata_fused_page_protection_enabled",
+                False,
+            )
+            else 1
+        )
+        self._next_kv_protection_graph_bank = 0
 
         # --- bucket sizes ---------------------------------------------
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
@@ -408,11 +422,43 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
+    def _set_kv_protection_graph_bank(self, backend, bank: int) -> None:
+        """Select a protected metadata bank on every nested DSA backend."""
+        seen = set()
+
+        def visit(candidate):
+            if candidate is None or id(candidate) in seen:
+                return
+            seen.add(id(candidate))
+            setter = getattr(candidate, "set_kv_protection_graph_bank", None)
+            if setter is not None:
+                setter(bank)
+            for child in getattr(candidate, "attn_backends", ()):
+                visit(child)
+            visit(getattr(candidate, "primary", None))
+
+        visit(backend)
+
+    def _claim_kv_protection_graph_bank(self, forward_batch: ForwardBatch):
+        if self._kv_protection_graph_bank_count == 1:
+            return None
+        bank = self._next_kv_protection_graph_bank
+        self._next_kv_protection_graph_bank ^= 1
+        forward_batch.kv_protection_graph_bank = bank
+        return bank
+
+    def _make_graph_key(
+        self,
+        bs,
+        stream_idx=None,
+        variant_label=None,
+        protection_bank=None,
+    ):
         return ShapeKey(
             size=bs,
             stream_idx=stream_idx,
             variant_label=variant_label,
+            protection_bank=protection_bank,
         )
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
@@ -729,6 +775,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
 
+        self._set_kv_protection_graph_bank(self.attn_backend, 0)
+        for attn_backend in getattr(self.model_runner, "decode_attn_backend_group", ()):
+            self._set_kv_protection_graph_bank(attn_backend, 0)
+
         # No pool-side pin to clear: the captured full-physical write loc rides the
         # backend's `ForwardMetadata.out_cache_loc_full_physical` (-> KVWriteLoc.full_loc).
 
@@ -761,14 +811,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
 
             for variant_label, _variant_has_lora in lora_variants:
-                _set_capture_lora_variant(variant_label)
-                with torch_compile_decoration.patch_model(
-                    self.model_runner.model,
-                    bs in self.compile_bs,
-                    num_tokens=bs * self.num_tokens_per_bs,
-                    tp_group=self.model_runner.tp_group,
-                ) as forward:
-                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
+                for protection_bank in range(self._kv_protection_graph_bank_count):
+                    _set_capture_lora_variant(variant_label)
+                    with torch_compile_decoration.patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs,
+                        num_tokens=bs * self.num_tokens_per_bs,
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        self.capture_one_shape(
+                            bs,
+                            forward,
+                            stream_idx,
+                            variant_label,
+                            protection_bank=(
+                                protection_bank
+                                if self._kv_protection_graph_bank_count > 1
+                                else None
+                            ),
+                        )
 
     def capture_one_shape(
         self,
@@ -776,6 +837,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        protection_bank: Optional[int] = None,
     ):
         bs = size
         num_tokens = bs * self.num_tokens_per_bs
@@ -789,6 +851,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             size, stream_idx=stream_idx
         )
+        if protection_bank is not None:
+            forward_batch.kv_protection_graph_bank = protection_bank
+            self._set_kv_protection_graph_bank(attn_backend, protection_bank)
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
@@ -871,7 +936,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # wires no buffer here. (SWA write loc rides the `swa_out_cache_loc` rail.)
 
             with canary_ctx:
-                shape_key = self._make_graph_key(bs, stream_idx, variant_label)
+                shape_key = self._make_graph_key(
+                    bs,
+                    stream_idx,
+                    variant_label,
+                    protection_bank,
+                )
                 post_warmup_hook = getattr(
                     self.model_runner.attn_backend,
                     "on_after_cuda_graph_warmup",
@@ -945,8 +1015,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+            protection_bank = forward_batch.kv_protection_graph_bank
+            if self._kv_protection_graph_bank_count > 1:
+                if protection_bank is None:
+                    raise RuntimeError(
+                        "pre-planned protected decode is missing its metadata bank"
+                    )
+                active_backend = (
+                    self.model_runner.decode_attn_backend_group[stream_idx]
+                    if self.enable_pdmux
+                    else self.attn_backend
+                )
+                self._set_kv_protection_graph_bank(active_backend, protection_bank)
             self._replay_graph_key = self._make_graph_key(
-                self.bs, stream_idx, variant_label
+                self.bs,
+                stream_idx,
+                variant_label,
+                protection_bank,
             )
             return
 
@@ -999,6 +1084,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.attn_backend
+        protection_bank = self._claim_kv_protection_graph_bank(forward_batch)
+        if protection_bank is not None:
+            self._set_kv_protection_graph_bank(attn_backend, protection_bank)
         fb_view = build_replay_fb_view(
             forward_batch=forward_batch,
             buffers=buffers,
@@ -1022,7 +1110,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
-            self.bs, stream_idx, variant_label
+            self.bs,
+            stream_idx,
+            variant_label,
+            protection_bank,
         )
 
     def execute(
@@ -1047,6 +1138,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 is_dflash=self.model_runner.spec_algorithm.is_dflash(),
                 fused_kv_page_protection_enabled=getattr(
                     self.model_runner, "kv_fused_page_protection_enabled", False
+                ),
+                protection_snapshot_safe=bool(
+                    getattr(
+                        self.model_runner,
+                        "kv_fused_page_protection_enabled",
+                        False,
+                    )
+                    and (self.model_runner._get_active_kv_page_protection() or {}).get(
+                        "validated_in_metadata", False
+                    )
                 ),
             ):
                 read_done = self.device_module.Event()

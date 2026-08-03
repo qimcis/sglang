@@ -246,6 +246,9 @@ class DSAMetadata:
     token_to_batch_idx: Optional[torch.Tensor] = None
     kv_page_protection: Optional[dict] = None
     protected_request_indices: Optional[torch.Tensor] = None
+    kv_page_failure_status: Optional[torch.Tensor] = None
+    kv_page_local_failed: Optional[torch.Tensor] = None
+    kv_page_failed: Optional[torch.Tensor] = None
 
 
 @torch.compile
@@ -311,6 +314,12 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     def preflight_indexer_page_table(self) -> None:
         protection = self.attn_metadata.kv_page_protection
         if protection is None:
+            return
+        if protection.get("validated_in_metadata", False):
+            # Normal CUDA-graph decode validated and sanitized the compact page
+            # table while snapshotting it from req_to_token.  The indexer now
+            # consumes only that graph-local table, so a second scan here would
+            # be both redundant and too late for the scheduler WAR fast path.
             return
         if protection.get("page_table") is not self.attn_metadata.real_page_table:
             raise RuntimeError(
@@ -568,6 +577,15 @@ class DeepseekSparseAttnBackend(
             and self.dsa_index_topk is not None
             and self.dsa_index_topk <= 2048
         )
+        self.kv_metadata_fused_page_protection_enabled = bool(
+            self.kv_protected_topk_v2_enabled and self.real_page_size == 64
+        )
+        self.kv_protection_graph_bank = 0
+        if self.kv_metadata_fused_page_protection_enabled:
+            # ModelRunner uses this stable capability bit before eager metadata
+            # exists, so the legacy begin/status kernels are never launched for
+            # the normal protected decode fast path.
+            model_runner.kv_metadata_fused_page_protection_enabled = True
 
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
@@ -860,6 +878,7 @@ class DeepseekSparseAttnBackend(
                     "both pre-indexer and protected top-k boundaries are required"
                 )
             if forward_mode.is_decode_or_idle() or forward_mode.is_target_verify():
+                fused_metadata_validation = False
                 if forward_mode.is_target_verify():
                     source_request_indices = request_indices
                     rows = (
@@ -888,26 +907,29 @@ class DeepseekSparseAttnBackend(
                     )
                     indexer_seqlens = metadata.dsa_seqlens_expanded
                 else:
-                    # CUDA graphs retain the request-index data_ptr captured by
-                    # both the pre-indexer validator and protected top-k producer.
-                    # Replay supplies a different req_pool_indices tensor, so copy
-                    # it into metadata-owned stable storage instead of replacing
-                    # the captured pointer. Without this, real requests advance
-                    # one epoch while the captured kernels see slot 0 or stale
-                    # slots and never publish completion for the active request.
-                    protected_request_indices = metadata.protected_request_indices
-                    if (
-                        protected_request_indices is None
-                        or protected_request_indices.numel() != request_indices.shape[0]
-                    ):
-                        protected_request_indices = torch.empty_like(request_indices)
-                        object.__setattr__(
-                            metadata,
-                            "protected_request_indices",
-                            protected_request_indices,
-                        )
-                    protected_request_indices.copy_(request_indices)
-                    request_indices = protected_request_indices
+                    fused_metadata_validation = (
+                        metadata.kv_page_failure_status is not None
+                        and forward_mode.is_decode_or_idle()
+                    )
+                    if not fused_metadata_validation:
+                        # Legacy eager/spec paths still capture a validator that
+                        # needs a stable request-index address.
+                        protected_request_indices = metadata.protected_request_indices
+                        if (
+                            protected_request_indices is None
+                            or protected_request_indices.numel()
+                            != request_indices.shape[0]
+                        ):
+                            protected_request_indices = torch.empty_like(
+                                request_indices
+                            )
+                            object.__setattr__(
+                                metadata,
+                                "protected_request_indices",
+                                protected_request_indices,
+                            )
+                        protected_request_indices.copy_(request_indices)
+                        request_indices = protected_request_indices
                     indexer_seqlens = metadata.cache_seqlens_int32
                 if request_indices.shape[0] != metadata.real_page_table.shape[0]:
                     raise RuntimeError(
@@ -921,6 +943,17 @@ class DeepseekSparseAttnBackend(
                     validate_full_mapping=True,
                     pre_indexer_cache_by_request=(not forward_mode.is_target_verify()),
                 )
+                if metadata.kv_page_failure_status is not None:
+                    protection.update(
+                        {
+                            "result_request_indices": metadata.protected_request_indices,
+                            "failure_status": metadata.kv_page_failure_status,
+                            "local_failed": metadata.kv_page_local_failed,
+                            "failed": metadata.kv_page_failed,
+                            "num_request_slots": table.request_epochs.numel(),
+                            "validated_in_metadata": fused_metadata_validation,
+                        }
+                    )
                 protection["producer_validation_via_full_mapping"] = bool(
                     getattr(self, "kv_protected_topk_v2_enabled", False)
                     and forward_mode.is_decode_or_idle()
@@ -967,6 +1000,15 @@ class DeepseekSparseAttnBackend(
             # batches; graph replay uses the static page-table width, so only this
             # eager (e.g. over-capture-bs) fallback needs a length here.
             max_seqlen_k = int(forward_batch.seq_lens.max().item()) + draft_token_num
+        if (
+            self.kv_metadata_fused_page_protection_enabled
+            and forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            # Keep an eager faulted row structurally runnable: zero/oversized
+            # input lengths are reported by the fused validator, while the
+            # compact table itself always retains at least reserved page 0 and
+            # never exceeds req_to_token's configured context width.
+            max_seqlen_k = max(1, min(max_seqlen_k, self.req_to_token.shape[1]))
         # [b, max_seqlen_k]
         page_table = self.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
@@ -1236,6 +1278,30 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+            protected_request_indices=(
+                torch.empty(batch_size, dtype=torch.int64, device=device)
+                if self.kv_metadata_fused_page_protection_enabled
+                and forward_batch.forward_mode.is_decode_or_idle()
+                else None
+            ),
+            kv_page_failure_status=(
+                torch.empty(batch_size, dtype=torch.int32, device=device)
+                if self.kv_metadata_fused_page_protection_enabled
+                and forward_batch.forward_mode.is_decode_or_idle()
+                else None
+            ),
+            kv_page_local_failed=(
+                torch.empty(batch_size, dtype=torch.int32, device=device)
+                if self.kv_metadata_fused_page_protection_enabled
+                and forward_batch.forward_mode.is_decode_or_idle()
+                else None
+            ),
+            kv_page_failed=(
+                torch.empty(batch_size, dtype=torch.int32, device=device)
+                if self.kv_metadata_fused_page_protection_enabled
+                and forward_batch.forward_mode.is_decode_or_idle()
+                else None
+            ),
         )
         self._set_kv_page_protection(
             metadata,
@@ -1243,6 +1309,52 @@ class DeepseekSparseAttnBackend(
             forward_batch.forward_mode,
             forward_batch.spec_info,
         )
+        if metadata.kv_page_protection is not None and metadata.kv_page_protection.get(
+            "validated_in_metadata", False
+        ):
+            from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                fused_dsa_decode_metadata,
+            )
+
+            # Eager decode uses the same fused validator/snapshot contract as
+            # graph replay.  The legacy wide table remains allocated for eager
+            # metadata compatibility, but protected v2 consumes only this
+            # sanitized compact table.
+            fused_dsa_decode_metadata(
+                seq_lens=forward_batch.seq_lens[:batch_size],
+                req_pool_indices=forward_batch.req_pool_indices[:batch_size],
+                req_to_token=self.req_to_token,
+                cache_seqlens=metadata.cache_seqlens_int32,
+                cu_seqlens_k=metadata.cu_seqlens_k,
+                page_table_1=None,
+                dsa_cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                dsa_cu_seqlens_k=metadata.dsa_cu_seqlens_k,
+                real_page_table=metadata.real_page_table,
+                bs=batch_size,
+                max_len=max_seqlen_k,
+                dsa_index_topk=self.dsa_index_topk,
+                real_page_size=self.real_page_size,
+                protection=metadata.kv_page_protection,
+            )
+            # Shape faults can clamp a malformed length to one in the fused
+            # kernel. Eager metadata was initially planned from the untrusted
+            # input, so rebuild every length-derived schedule on the same
+            # stream before an external indexer/attention kernel consumes it.
+            corrected_ctx_lens = _to_2d_context_lens(
+                metadata.cache_seqlens_int32, batch_size
+            )
+            self._refresh_paged_mqa_schedule_metadata(metadata, corrected_ctx_lens)
+            self._refresh_topk_v2_plan(metadata)
+            assert metadata.paged_mqa_ctx_lens_2d is not None
+            metadata.paged_mqa_ctx_lens_2d.copy_(corrected_ctx_lens)
+            if self.dsa_decode_impl == "flashmla_kv":
+                assert metadata.flashmla_metadata is not None
+                metadata.flashmla_metadata.copy_(
+                    self._compute_flashmla_metadata(
+                        cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                        seq_len_q=1,
+                    )
+                )
         self.forward_metadata = metadata
 
     def _cal_indexer_k_start_end(
@@ -1321,6 +1433,17 @@ class DeepseekSparseAttnBackend(
             token_to_batch_idx = dsa_cp_round_robin_split_data(token_to_batch_idx)
         return (ks, ke), token_to_batch_idx
 
+    def set_kv_protection_graph_bank(self, bank: int) -> None:
+        """Select the graph-local protected metadata bank for plan/capture."""
+        if bank not in (0, 1):
+            raise ValueError(f"invalid KV protection graph bank: {bank}")
+        self.kv_protection_graph_bank = bank
+
+    def _decode_graph_metadata_key(self, bs: int):
+        if self.kv_metadata_fused_page_protection_enabled:
+            return (bs, self.kv_protection_graph_bank)
+        return bs
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
 
@@ -1363,6 +1486,7 @@ class DeepseekSparseAttnBackend(
         )
 
         max_ctx_len = self.req_to_token.shape[1]
+        protection_banks = 2 if self.kv_metadata_fused_page_protection_enabled else 1
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
                 max_num_tokens, dtype=torch.int32, device=self.device
@@ -1381,6 +1505,7 @@ class DeepseekSparseAttnBackend(
             # derive real from it per batch size.
             "real_page_table": (
                 torch.zeros(
+                    protection_banks,
                     max_num_tokens,
                     (max_ctx_len + self.real_page_size - 1) // self.real_page_size,
                     dtype=torch.int32,
@@ -1400,7 +1525,31 @@ class DeepseekSparseAttnBackend(
                 )
             ),
             "protected_request_indices": torch.zeros(
-                max_num_tokens, dtype=torch.int64, device=self.device
+                protection_banks,
+                max_num_tokens,
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            # Replay reads one graph-stable bank while overlap planning writes
+            # the other. Each protected bank has its own captured graph, so all
+            # consumers retain direct pointers (no indirection kernel).
+            "kv_page_failure_status": torch.zeros(
+                protection_banks,
+                max_num_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "kv_page_local_failed": torch.zeros(
+                protection_banks,
+                max_num_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "kv_page_failed": torch.zeros(
+                protection_banks,
+                max_num_tokens,
+                dtype=torch.int32,
+                device=self.device,
             ),
             "flashmla_metadata": (
                 self._compute_flashmla_metadata(
@@ -1538,7 +1687,7 @@ class DeepseekSparseAttnBackend(
             # Compact page_size=64 static buffer; filled per-replay by the fused
             # metadata kernel straight from req_to_token (no wide table needed).
             real_page_table = self.decode_cuda_graph_metadata["real_page_table"][
-                :real_rows, :
+                self.kv_protection_graph_bank, :real_rows, :
             ]
         else:
             real_page_table = self._transform_table_1_to_real(page_table_1)
@@ -1577,9 +1726,33 @@ class DeepseekSparseAttnBackend(
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
             protected_request_indices=self.decode_cuda_graph_metadata[
                 "protected_request_indices"
-            ],
+            ][self.kv_protection_graph_bank],
+            kv_page_failure_status=(
+                self.decode_cuda_graph_metadata["kv_page_failure_status"][
+                    self.kv_protection_graph_bank, :real_rows
+                ]
+                if self.kv_metadata_fused_page_protection_enabled
+                and forward_mode.is_decode_or_idle()
+                else None
+            ),
+            kv_page_local_failed=(
+                self.decode_cuda_graph_metadata["kv_page_local_failed"][
+                    self.kv_protection_graph_bank, :real_rows
+                ]
+                if self.kv_metadata_fused_page_protection_enabled
+                and forward_mode.is_decode_or_idle()
+                else None
+            ),
+            kv_page_failed=(
+                self.decode_cuda_graph_metadata["kv_page_failed"][
+                    self.kv_protection_graph_bank, :real_rows
+                ]
+                if self.kv_metadata_fused_page_protection_enabled
+                and forward_mode.is_decode_or_idle()
+                else None
+            ),
         )
-        self.decode_cuda_graph_metadata[bs] = metadata
+        self.decode_cuda_graph_metadata[self._decode_graph_metadata_key(bs)] = metadata
         self._set_kv_page_protection(
             metadata,
             req_pool_indices,
@@ -1605,7 +1778,8 @@ class DeepseekSparseAttnBackend(
         also call this directly via _apply_cuda_graph_metadata when they
         need to pass out_cache_loc / actual_forward_mode explicitly.
         """
-        if bs not in self.decode_cuda_graph_metadata:
+        metadata_key = self._decode_graph_metadata_key(bs)
+        if metadata_key not in self.decode_cuda_graph_metadata:
             self._build_forward_metadata_cuda_graph(
                 bs,
                 None,
@@ -1625,7 +1799,13 @@ class DeepseekSparseAttnBackend(
         req_pool_indices = req_pool_indices[:bs]
 
         # Normal Decode
-        metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
+        metadata: DSAMetadata = self.decode_cuda_graph_metadata[metadata_key]
+        self._set_kv_page_protection(
+            metadata,
+            req_pool_indices,
+            forward_mode,
+            spec_info,
+        )
         used_fused_metadata_generation = False
         target_verify_ctx_lens_written = False
         if forward_mode.is_decode_or_idle():
@@ -1651,6 +1831,7 @@ class DeepseekSparseAttnBackend(
                     max_len=max_len,
                     dsa_index_topk=self.dsa_index_topk,
                     real_page_size=self.real_page_size,
+                    protection=metadata.kv_page_protection,
                 )
                 cache_seqlens = metadata.cache_seqlens_int32
                 dsa_cache_seqlens = metadata.dsa_cache_seqlens_int32
@@ -1892,12 +2073,6 @@ class DeepseekSparseAttnBackend(
                 )
             )
 
-        self._set_kv_page_protection(
-            metadata,
-            req_pool_indices,
-            forward_mode,
-            spec_info,
-        )
         self.forward_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph_from_precomputed(

@@ -52,6 +52,27 @@ def _multimem_st_128(multicast_ptrs, x, y, z, w, mask):
 
 
 @triton.jit
+def _multimem_st_32(multicast_ptr, value, mask):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            mov.u32 $0, 0;
+            setp.eq.s32 %p0, $3, 1;
+            @!%p0 bra end;
+            multimem.st.relaxed.sys.global.b32 [$1], $2;
+            end:
+        }
+        """,
+        "=r,l,r,r",
+        args=[multicast_ptr, value, mask.to(tl.int32)],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
 def _local_ld_128(in_ptr, mask):
     return tl.inline_asm_elementwise(
         """
@@ -67,6 +88,25 @@ def _local_ld_128(in_ptr, mask):
         args=[in_ptr, mask.to(tl.int32)],
         dtype=(tl.uint32, tl.uint32, tl.uint32, tl.uint32),
         is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _local_ld_32(in_ptr, mask):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            mov.u32 $0, 0;
+            setp.eq.s32 %p0, $2, 1;
+            @%p0 ld.relaxed.sys.global.b32 $0, [$1];
+        }
+        """,
+        "=r,l,r",
+        args=[in_ptr, mask.to(tl.int32)],
+        dtype=tl.uint32,
+        is_pure=False,
         pack=1,
     )
 
@@ -247,6 +287,10 @@ def _all_gather_kernel_inner(
     signal_pad_ptr,
     total_tokens,
     hidden_offset,
+    local_failure_ptr,
+    global_failure_ptr,
+    failure_multicast_ptr,
+    failure_buffer_ptr,
     LOCAL_HIDDEN: tl.constexpr,
     TOTAL_HIDDEN: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -254,6 +298,7 @@ def _all_gather_kernel_inner(
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
     SKIP_ENTRY_SYNC: tl.constexpr,
+    HAS_FAILURE: tl.constexpr,
 ) -> None:
     if SKIP_ENTRY_SYNC == 0:
         _blockwise_barrier(signal_pad_ptr, RANK, WORLD_SIZE, sem="relaxed")
@@ -283,8 +328,39 @@ def _all_gather_kernel_inner(
         _multimem_st_128(out_ptr, x, y, z, w, mask)
         block_start += tl.num_programs(axis=0) * BLOCK_SIZE
 
+    # Publish one int32 failure word per row/rank through the same symmetric
+    # memory operation as the logits.  Block zero owns the sideband, and its
+    # existing cross-rank exit barrier is the publication fence.
+    if HAS_FAILURE and pid == 0:
+        failure_row = tid
+        while failure_row < total_tokens:
+            failure = tl.load(local_failure_ptr + failure_row).to(tl.uint32)
+            failure_out = (
+                failure_multicast_ptr.to(tl.int64).to(tl.pointer_type(tl.uint32))
+                + failure_row * WORLD_SIZE
+                + RANK
+            )
+            _multimem_st_32(failure_out, failure, failure_row < total_tokens)
+            failure_row += BLOCK_SIZE
+
     _sync_threads()
     _blockwise_barrier(signal_pad_ptr, RANK, WORLD_SIZE, sem="acq_rel")
+    if HAS_FAILURE:
+        # Only WORLD_SIZE lanes execute the cross-rank wait. Hold the rest of
+        # the block until those lanes observe every sideband publication.
+        _sync_threads()
+
+    if HAS_FAILURE and pid == 0:
+        failure_row = tid
+        while failure_row < total_tokens:
+            failed = tl.zeros((), tl.uint32)
+            for remote_rank in range(0, WORLD_SIZE):
+                failed |= _local_ld_32(
+                    failure_buffer_ptr + failure_row * WORLD_SIZE + remote_rank,
+                    failure_row < total_tokens,
+                )
+            tl.store(global_failure_ptr + failure_row, (failed != 0).to(tl.int32))
+            failure_row += BLOCK_SIZE
 
 
 # ------------------------------------------------------------------------------
@@ -301,8 +377,10 @@ class MultimemAllGatherState:
     max_token_num: int
     hidden_dim: int
     comm_buff: torch.Tensor
+    failure_buff: torch.Tensor | None
     # Rendezvous handle; stable for the buffer's lifetime, resolved once.
     symm_mem_hdl: Any
+    failure_symm_mem_hdl: Any | None
 
 
 def create_state(
@@ -311,6 +389,7 @@ def create_state(
     max_tokens: int,
     hidden_size: int,
     device: torch.device | None = None,
+    enable_failure_sideband: bool = False,
 ) -> MultimemAllGatherState:
     """Allocate and rendezvous the symmetric-memory buffer. Collective: call
     once outside CUDA-graph capture with identical args on every rank."""
@@ -328,11 +407,22 @@ def create_state(
         comm_buff = symm_mem.empty(
             (max_tokens, hidden_size), dtype=torch.bfloat16, device=device
         )
+        failure_buff = (
+            symm_mem.empty((max_tokens, group.size()), dtype=torch.int32, device=device)
+            if enable_failure_sideband
+            else None
+        )
     hdl = symm_mem.rendezvous(comm_buff, group=group)
+    failure_hdl = (
+        symm_mem.rendezvous(failure_buff, group=group)
+        if failure_buff is not None
+        else None
+    )
     assert hdl.rank == rank_in_group, (
         f"symm_mem handle rank {hdl.rank} != rank_in_group {rank_in_group}; the "
         f"hidden-shard offset would be wrong"
     )
+    assert failure_hdl is None or failure_hdl.rank == rank_in_group
     return MultimemAllGatherState(
         group=group,
         rank_in_group=rank_in_group,
@@ -341,7 +431,9 @@ def create_state(
         max_token_num=max_tokens,
         hidden_dim=hidden_size,
         comm_buff=comm_buff,
+        failure_buff=failure_buff,
         symm_mem_hdl=hdl,
+        failure_symm_mem_hdl=failure_hdl,
     )
 
 
@@ -356,11 +448,17 @@ def all_gather_inner(
     tp_hidden_dim: int,
     skip_entry_sync: bool = False,
     safe: bool = True,
+    local_failure: torch.Tensor | None = None,
+    global_failure: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gather ``[T, H/TP]`` shards into ``[T, H]`` along the hidden dim.
 
-    ``tp_hidden_dim`` is the gathered width ``H``. Returns a clone when ``safe``,
-    else a view into the symmetric buffer (valid until the next collective)."""
+    When both failure tensors are supplied, the same launch publishes each
+    rank's local bit and writes the TP-wide OR to ``global_failure`` before it
+    returns. ``tp_hidden_dim`` is the gathered width ``H``.
+
+    Returns a clone when ``safe``, else a view into the symmetric buffer (valid
+    until the next collective)."""
     world_size = state.world_size
     assert hidden_states.dtype == torch.bfloat16, "Only bfloat16 is supported"
     assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
@@ -387,9 +485,25 @@ def all_gather_inner(
     assert (
         total_tokens <= state.max_token_num
     ), f"total_tokens={total_tokens} exceeds max_token_num={state.max_token_num}"
+    has_failure = local_failure is not None or global_failure is not None
+    if has_failure:
+        assert local_failure is not None and global_failure is not None
+        assert local_failure.dtype == torch.int32
+        assert global_failure.dtype == torch.int32
+        assert local_failure.is_cuda and global_failure.is_cuda
+        assert local_failure.numel() >= total_tokens
+        assert global_failure.numel() >= total_tokens
+        assert state.failure_buff is not None
+        assert state.failure_symm_mem_hdl is not None
 
     hidden_offset = local_hidden * state.rank_in_group
     symm_mem_hdl = state.symm_mem_hdl
+    failure_symm_mem_hdl = (
+        state.failure_symm_mem_hdl
+        if state.failure_symm_mem_hdl is not None
+        else symm_mem_hdl
+    )
+    failure_buff = state.failure_buff if has_failure else state.comm_buff
     num_blocks, block_size, num_warps, numel_per_thread = _launch_config(
         total_tokens * local_hidden
     )
@@ -400,6 +514,10 @@ def all_gather_inner(
         signal_pad_ptr=symm_mem_hdl.signal_pad_ptrs_dev,
         total_tokens=total_tokens,
         hidden_offset=hidden_offset,
+        local_failure_ptr=(local_failure if has_failure else hidden_states),
+        global_failure_ptr=(global_failure if has_failure else hidden_states),
+        failure_multicast_ptr=failure_symm_mem_hdl.multicast_ptr,
+        failure_buffer_ptr=failure_buff,
         LOCAL_HIDDEN=local_hidden,
         TOTAL_HIDDEN=state.hidden_dim,
         BLOCK_SIZE=block_size,
@@ -407,6 +525,7 @@ def all_gather_inner(
         RANK=symm_mem_hdl.rank,
         WORLD_SIZE=symm_mem_hdl.world_size,
         SKIP_ENTRY_SYNC=1 if skip_entry_sync else 0,
+        HAS_FAILURE=has_failure,
         num_warps=num_warps,
     )
     output = state.comm_buff[:total_tokens, :tp_hidden_dim]
@@ -457,9 +576,11 @@ class MultimemAllGatherer:
         *,
         enabled: bool = True,
         skip_entry_sync: bool = False,
+        enable_failure_sideband: bool = False,
     ):
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
+        self._enable_failure_sideband = enable_failure_sideband
         # None => always NCCL; _UNINIT => build on first eager call.
         self._state = self._UNINIT if enabled else None
         if self._state is self._UNINIT:
@@ -486,7 +607,18 @@ class MultimemAllGatherer:
                 )
                 self._state = None
 
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+    def __call__(
+        self,
+        x: torch.Tensor,
+        *,
+        local_failure: torch.Tensor | None = None,
+        global_failure: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        has_failure = local_failure is not None or global_failure is not None
+        if has_failure and (local_failure is None or global_failure is None):
+            raise ValueError(
+                "local_failure and global_failure must be provided together"
+            )
         state = self._state
         if state is self._UNINIT:
             state = self._build(x)
@@ -501,6 +633,13 @@ class MultimemAllGatherer:
             and 0 < x.shape[0] <= state.max_token_num
             and x.data_ptr() % 16 == 0
             and x.shape[-1] * state.world_size <= state.hidden_dim
+            and (
+                not has_failure
+                or (
+                    state.failure_symm_mem_hdl is not None
+                    and state.failure_symm_mem_hdl.multicast_ptr != 0
+                )
+            )
         ):
             return all_gather_inner(
                 state,
@@ -508,11 +647,37 @@ class MultimemAllGatherer:
                 tp_hidden_dim=x.shape[-1] * state.world_size,
                 skip_entry_sync=self._skip_entry_sync,
                 safe=False,
+                local_failure=local_failure,
+                global_failure=global_failure,
             )
         # Lazy import avoids a module-load dependency on the distributed facade.
         from sglang.srt.distributed import tensor_model_parallel_all_gather
 
-        return tensor_model_parallel_all_gather(x, dim=-1)
+        if not has_failure:
+            return tensor_model_parallel_all_gather(x, dim=-1)
+
+        # Keep the fallback correct without adding a second collective or
+        # sacrificing a real logit as an in-band marker. One extra element per
+        # row carries the failure bit through the same NCCL all-gather.
+        if x.dim() != 2 or not x.is_floating_point():
+            raise RuntimeError(
+                "KV failure sideband fallback requires a 2D floating tensor"
+            )
+        packed = torch.empty(
+            (x.shape[0], x.shape[1] + 1),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        packed[:, :-1].copy_(x)
+        packed[:, -1].copy_(local_failure)
+        gathered = tensor_model_parallel_all_gather(packed, dim=-1)
+
+        from sglang.srt.distributed import get_tp_group
+
+        world_size = get_tp_group().world_size
+        gathered = gathered.reshape(x.shape[0], world_size, x.shape[1] + 1)
+        global_failure.copy_(gathered[:, :, -1].ne(0).any(dim=1).to(torch.int32))
+        return gathered[:, :, :-1].reshape(x.shape[0], world_size * x.shape[1])
 
     def _build(self, x: torch.Tensor):
         if x.dim() != 2 or x.dtype != torch.bfloat16:
@@ -533,6 +698,7 @@ class MultimemAllGatherer:
                 rank_in_group=tp_group.rank_in_group,
                 max_tokens=self._max_tokens,
                 hidden_size=x.shape[-1] * tp_group.world_size,
+                enable_failure_sideband=self._enable_failure_sideband,
             )
             if state.symm_mem_hdl.multicast_ptr == 0:
                 # No multicast for this world size / arch; multimem.st would

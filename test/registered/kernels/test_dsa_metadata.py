@@ -115,6 +115,212 @@ class TestDSAMetadataKernels(CustomTestCase):
                 "decode real_page_table",
             )
 
+    def _run_protected_decode(self, fault: str | None, max_len: int = 256):
+        page_size = 64
+        bs = 3
+        max_pages = (max_len + page_size - 1) // page_size
+        num_request_slots = 4
+        num_sidecar_pages = 32
+        mapping_stride = max_pages * 2
+        mapping_namespace_stride = max_pages
+
+        seq_lens = torch.tensor([192, 128, 1], device=self.device)
+        req_pool_indices = torch.tensor([1, 2, 0], device=self.device)
+        req_to_token = torch.zeros(
+            (num_request_slots, max_len), dtype=torch.int32, device=self.device
+        )
+        expected_pages_by_request = {1: [3, 4, 5], 2: [7, 8]}
+        for request_idx, pages in expected_pages_by_request.items():
+            for logical_page, physical_page in enumerate(pages):
+                offsets = torch.arange(page_size, device=self.device)
+                start = logical_page * page_size
+                req_to_token[request_idx, start : start + page_size] = (
+                    physical_page * page_size + offsets
+                )
+
+        actual_tags = (
+            torch.arange(num_sidecar_pages, dtype=torch.int64, device=self.device) + 100
+        )
+        actual_generations = (
+            torch.arange(num_sidecar_pages, dtype=torch.int64, device=self.device) + 200
+        )
+        actual_transfer_tags = (
+            torch.arange(num_sidecar_pages, dtype=torch.int32, device=self.device) + 300
+        )
+        expected_physical_pages = torch.zeros(
+            num_request_slots * mapping_stride,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        expected_tags = torch.zeros_like(expected_physical_pages, dtype=torch.int64)
+        expected_generations = torch.zeros_like(
+            expected_physical_pages, dtype=torch.int64
+        )
+        expected_transfer_tags = torch.zeros_like(expected_physical_pages)
+        for request_idx, pages in expected_pages_by_request.items():
+            for logical_page, physical_page in enumerate(pages):
+                index = request_idx * mapping_stride + logical_page
+                expected_physical_pages[index] = physical_page
+                expected_tags[index] = actual_tags[physical_page]
+                expected_generations[index] = actual_generations[physical_page]
+                expected_transfer_tags[index] = actual_transfer_tags[physical_page]
+
+        expected_status = 0
+        fault_page = expected_pages_by_request[1][1]
+        fault_index = mapping_stride + 1
+        if fault == "mapping":
+            req_to_token[1, page_size] = 0
+            expected_status = 0x01
+        elif fault == "owner":
+            expected_physical_pages[fault_index] = fault_page + 1
+            expected_status = 0x02
+        elif fault == "attention_tag":
+            actual_tags[fault_page] += 1
+            expected_status = 0x08
+        elif fault == "generation":
+            actual_generations[fault_page] += 1
+            expected_status = 0x10
+        elif fault == "transfer_tag":
+            actual_transfer_tags[fault_page] += 1
+            expected_status = 0x20
+        elif fault == "position":
+            mapping_namespace_stride = 2
+            expected_status = 0x04
+        elif fault == "invalid_request":
+            req_pool_indices[0] = num_request_slots
+            expected_status = 0x01
+        elif fault == "invalid_shape":
+            seq_lens[0] = 0
+            expected_status = 0x01
+        elif fault == "invalid_shape_long":
+            seq_lens[0] = max_pages * page_size + 1
+            expected_status = 0x01
+
+        cache_seqlens = torch.empty(bs, dtype=torch.int32, device=self.device)
+        cu_seqlens_k = torch.empty(bs + 1, dtype=torch.int32, device=self.device)
+        dsa_cache_seqlens = torch.empty(bs, dtype=torch.int32, device=self.device)
+        dsa_cu_seqlens_k = torch.empty(bs + 1, dtype=torch.int32, device=self.device)
+        real_page_table = torch.zeros(
+            (bs, max_pages), dtype=torch.int32, device=self.device
+        )
+        result_request_indices = torch.empty_like(req_pool_indices)
+        failure_status = torch.empty(bs, dtype=torch.int32, device=self.device)
+        local_failed = torch.empty_like(failure_status)
+        failed = torch.empty_like(failure_status)
+        protection = {
+            "request_indices": req_pool_indices,
+            "page_table": real_page_table,
+            "actual_tags": actual_tags,
+            "actual_generations": actual_generations,
+            "actual_transfer_tags": actual_transfer_tags,
+            "expected_physical_pages": expected_physical_pages,
+            "expected_mapping_stride": mapping_stride,
+            "expected_mapping_namespace_stride": mapping_namespace_stride,
+            "expected_tags": expected_tags,
+            "expected_generations": expected_generations,
+            "expected_transfer_tags": expected_transfer_tags,
+            "result_request_indices": result_request_indices,
+            "failure_status": failure_status,
+            "local_failed": local_failed,
+            "failed": failed,
+            "num_request_slots": num_request_slots,
+        }
+
+        fused_dsa_decode_metadata(
+            seq_lens=seq_lens,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_k=cu_seqlens_k,
+            page_table_1=None,
+            dsa_cache_seqlens=dsa_cache_seqlens,
+            dsa_cu_seqlens_k=dsa_cu_seqlens_k,
+            real_page_table=real_page_table,
+            bs=bs,
+            max_len=max_len,
+            dsa_index_topk=2048,
+            real_page_size=page_size,
+            protection=protection,
+        )
+
+        expected_table = torch.zeros(
+            (bs, max_pages), dtype=torch.int32, device=self.device
+        )
+        expected_table[0, :3] = torch.tensor(
+            [3, 4, 5], dtype=torch.int32, device=self.device
+        )
+        expected_table[1, :2] = torch.tensor(
+            [7, 8], dtype=torch.int32, device=self.device
+        )
+        if fault is not None:
+            expected_table[0].zero_()
+        _assert_equal(real_page_table, expected_table, "protected compact table")
+        _assert_equal(
+            result_request_indices,
+            req_pool_indices,
+            "protected request indices",
+        )
+        _assert_equal(
+            failure_status,
+            torch.tensor(
+                [expected_status, 0, 0], dtype=torch.int32, device=self.device
+            ),
+            "protected failure status",
+        )
+        _assert_equal(
+            local_failed,
+            torch.tensor(
+                [int(expected_status != 0), 0, 0],
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "protected local failure",
+        )
+        _assert_equal(failed, local_failed, "TP=1 protected failure")
+        expected_cache_seqlens = seq_lens.to(torch.int32)
+        if fault in ("invalid_shape", "invalid_shape_long"):
+            expected_cache_seqlens[0] = 1
+        _assert_equal(
+            cache_seqlens,
+            expected_cache_seqlens,
+            "protected cache seqlens",
+        )
+        _assert_equal(
+            cu_seqlens_k,
+            _cu_seqlens(expected_cache_seqlens),
+            "protected cumulative cache seqlens",
+        )
+        expected_dsa_seqlens = _dsa_seqlens(expected_cache_seqlens, 2048)
+        _assert_equal(
+            dsa_cache_seqlens,
+            expected_dsa_seqlens,
+            "protected DSA cache seqlens",
+        )
+        _assert_equal(
+            dsa_cu_seqlens_k,
+            _cu_seqlens(expected_dsa_seqlens),
+            "protected cumulative DSA cache seqlens",
+        )
+
+    def test_protected_decode_clean_and_faults(self):
+        for fault in (
+            None,
+            "mapping",
+            "owner",
+            "attention_tag",
+            "generation",
+            "transfer_tag",
+            "position",
+            "invalid_request",
+            "invalid_shape",
+            "invalid_shape_long",
+        ):
+            with self.subTest(fault=fault):
+                self._run_protected_decode(fault)
+
+    def test_protected_decode_production_context_width(self):
+        self._run_protected_decode(None, max_len=256_000)
+
     def _check_target_verify(
         self,
         seq_lens_values,

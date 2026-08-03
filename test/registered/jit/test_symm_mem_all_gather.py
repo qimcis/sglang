@@ -94,6 +94,7 @@ def _init_state_once():
         rank_in_group=coord.rank_in_group,
         max_tokens=MAX_TOKENS,
         hidden_size=MAX_HIDDEN,
+        enable_failure_sideband=True,
     )
 
 
@@ -140,13 +141,19 @@ def test_symm_mem_all_gather(
     if hidden % world_size != 0 or local_hidden % 8 != 0:
         pytest.skip(f"hidden={hidden} incompatible with world_size={world_size}")
 
-    def gather(x: torch.Tensor) -> torch.Tensor:
+    def gather(
+        x: torch.Tensor,
+        local_failure: torch.Tensor | None = None,
+        global_failure: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         return all_gather_inner(
             state,
             x,
             tp_hidden_dim=hidden,
             skip_entry_sync=skip_entry_sync,
             safe=safe,
+            local_failure=local_failure,
+            global_failure=global_failure,
         ).clone()
 
     for _ in range(TEST_LOOP):
@@ -158,6 +165,17 @@ def test_symm_mem_all_gather(
         out = gather(x)
         # Pure copy gather: exact bitwise equality.
         torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+        if state.failure_symm_mem_hdl.multicast_ptr == 0:
+            continue
+        local_failure = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+        local_failure[state.rank_in_group % num_tokens] = 1
+        global_failure = torch.full_like(local_failure, -1)
+        out = gather(x, local_failure, global_failure)
+        expected_failure = torch.zeros_like(local_failure)
+        expected_failure[: min(world_size, num_tokens)] = 1
+        torch.testing.assert_close(out, ref, atol=0, rtol=0)
+        torch.testing.assert_close(global_failure, expected_failure, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

@@ -547,6 +547,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # forward-path re-plan would clobber their metadata.
     forward_metadata_replan_equivalent: bool = False
 
+    # Selected by DecodeCudaGraphRunner when protected DSA decode is planned.
+    # It follows a pre-planned ForwardBatch into replay so metadata prepared on
+    # the overlap stream and the captured graph always use the same bank.
+    kv_protection_graph_bank: Optional[int] = None
+
     def mark_forward_metadata_ready(self, replan_equivalent: bool = False):
         """Record that attention metadata was pre-planned for this batch.
 

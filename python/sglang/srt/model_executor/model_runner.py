@@ -3088,10 +3088,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.forward_mode.is_target_verify()
             and getattr(self, "kv_requires_pre_indexer_page_validation", False)
         )
+        uses_metadata_fused_protection = bool(
+            is_protected_decode
+            and getattr(
+                self,
+                "kv_metadata_fused_page_protection_enabled",
+                False,
+            )
+        )
         if (
             table is not None
             and getattr(self, "kv_fused_page_protection_enabled", False)
             and (is_protected_decode or is_protected_dsa_verify)
+            and not uses_metadata_fused_protection
         ):
             table.begin_fused_forward(
                 forward_batch.req_pool_indices[: forward_batch.batch_size]
@@ -3145,7 +3154,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         output.fused_kv_page_protection_check = (
             self._start_fused_kv_page_protection_check(forward_batch, table)
         )
-        if output.fused_kv_page_protection_check is not None:
+        active_kv_protection = (
+            self._get_active_kv_page_protection()
+            if output.fused_kv_page_protection_check is not None
+            else None
+        )
+        if output.fused_kv_page_protection_check is not None and not (
+            active_kv_protection is not None
+            and active_kv_protection.get("validated_in_metadata", False)
+        ):
             # Protected CUDA graphs keep consuming the global tag/epoch/status
             # sidecars after their normal pre-replay req_to_token snapshot. The
             # graph runner therefore withholds its early WAR event. Publish the
@@ -3239,6 +3256,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
 
+    def _get_active_kv_page_protection(self):
+        """Return the protection view owned by the active attention metadata.
+
+        Multi-backend wrappers keep the DSA backend in ``attn_backends``; the
+        production GLM path exposes ``forward_metadata`` directly.
+        """
+        backends = [self.attn_backend]
+        backends.extend(getattr(self, "decode_attn_backend_group", ()))
+        backends.extend(getattr(self.attn_backend, "attn_backends", ()))
+        for backend in backends:
+            metadata = getattr(backend, "forward_metadata", None)
+            protection = getattr(metadata, "kv_page_protection", None)
+            if protection is not None:
+                return protection
+            for child in getattr(backend, "attn_backends", ()):
+                metadata = getattr(child, "forward_metadata", None)
+                protection = getattr(metadata, "kv_page_protection", None)
+                if protection is not None:
+                    return protection
+        return None
+
     def _start_fused_kv_page_protection_check(
         self, forward_batch: ForwardBatch, table
     ) -> Optional[FusedKVPageProtectionCheck]:
@@ -3260,6 +3298,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         request_pool_indices = forward_batch.req_pool_indices[
             : forward_batch.batch_size
         ]
+        protection = self._get_active_kv_page_protection()
+        if protection is not None and protection.get("validated_in_metadata", False):
+            # The out-of-graph DSA snapshot already emitted row status and the
+            # logits all-gather has reduced ``failed`` across TP ranks.  These
+            # buffers are graph-stable and require no bookkeeping kernel or
+            # dedicated collective here.
+            return FusedKVPageProtectionCheck(
+                request_pool_indices=protection["result_request_indices"][
+                    : forward_batch.batch_size
+                ],
+                statuses=protection["failure_status"][: forward_batch.batch_size],
+                failed=protection["failed"][: forward_batch.batch_size],
+            )
+
         status_result = table.fused_failure_status(
             request_pool_indices, return_failed=True
         )

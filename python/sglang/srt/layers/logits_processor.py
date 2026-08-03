@@ -337,6 +337,7 @@ class LogitsProcessor(nn.Module):
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_flags().enable_dp_lm_head
         self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
+        self.kv_protection_enabled = envs.SGLANG_KV_PROTECTION.get()
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
             self.do_tensor_parallel_all_gather = (
@@ -368,6 +369,7 @@ class LogitsProcessor(nn.Module):
             ),
             enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
             skip_entry_sync=True,
+            enable_failure_sideband=self.kv_protection_enabled,
         )
 
         # enable chunked logprobs processing
@@ -923,11 +925,52 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
+        protection = None
+        if self.kv_protection_enabled and logits_metadata.forward_mode.is_decode():
+            # Normal protected DSA decode publishes a graph-local per-rank
+            # failure vector before replay.  Carry it through the logits
+            # all-gather so TP consensus shares an existing collective.
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            active_backend = get_attn_backend()
+            backends = [active_backend]
+            backends.extend(getattr(active_backend, "attn_backends", ()))
+            for backend in backends:
+                metadata = getattr(backend, "forward_metadata", None)
+                candidate = getattr(metadata, "kv_page_protection", None)
+                if candidate is not None and candidate.get(
+                    "validated_in_metadata", False
+                ):
+                    protection = candidate
+                    break
+
+        if (
+            protection is not None
+            and get_parallel().tp_size > 1
+            and not self.do_tensor_parallel_all_gather
+        ):
+            raise RuntimeError(
+                "KV page protection requires the TP logits gather for global "
+                "failure consensus"
+            )
+
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
+                if protection is not None:
+                    raise RuntimeError(
+                        "KV page protection requires the non-DP TP logits gather"
+                    )
                 logits = self._gather_attn_tp_logits(logits)
             else:
-                logits = self._logits_gatherer(logits)
+                logits = self._logits_gatherer(
+                    logits,
+                    local_failure=(
+                        protection["local_failed"] if protection is not None else None
+                    ),
+                    global_failure=(
+                        protection["failed"] if protection is not None else None
+                    ),
+                )
 
         logits = self._scatter_dp_attn_logits(
             logits, local_hidden_states, logits_metadata
