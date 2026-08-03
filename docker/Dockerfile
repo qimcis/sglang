@@ -161,8 +161,7 @@ ENV LANG=en_US.UTF-8 \
 #   base
 #     |
 #     +-- torch_deps ------> deepep_builder (needs torch)
-#     |                  +-> flashinfer_cache (needs flashinfer)
-#     |                  \-> local_kernel_builder (KV protection target only)
+#     |                  \-> flashinfer_cache (needs flashinfer)
 #     |
 #     +-- devtools_builder (independent)
 #     +-- gateway_builder  (independent, only needs gateway source)
@@ -251,40 +250,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
     && pip freeze | grep -v "^sglang==" > /sgl-workspace/constraints.txt
-
-########################################################
-# LOCAL SGL-KERNEL BUILDER (KV protection images only)
-########################################################
-FROM torch_deps AS local_kernel_builder
-
-ARG BUILD_AND_DOWNLOAD_PARALLEL
-ARG GITHUB_ARTIFACTORY
-ARG SGL_KERNEL_ARCH_PROFILE=auto
-ARG SGL_KERNEL_SOURCE_REVISION=unknown
-
-COPY sgl-kernel /build/sgl-kernel
-RUN --mount=type=cache,target=/root/.cache/pip \
-    case "${SGL_KERNEL_ARCH_PROFILE}" in \
-      hopper-sm90) \
-        test -f /build/sgl-kernel/sgl-attn-kv-page-protection.patch \
-        && grep -q "SGL_ATTN_KV_PAGE_PROTECTION_PATCH_SHA256" /build/sgl-kernel/CMakeLists.txt ;; \
-      blackwell-sm100|blackwell-sm103) \
-        test -f /build/sgl-kernel/csrc/flashmla_capability.cu \
-        && grep -q "flashmla_protected_consumer_image_available" /build/sgl-kernel/csrc/flashmla_capability.cu ;; \
-      auto) ;; \
-      *) echo "Unsupported SGL_KERNEL_ARCH_PROFILE: ${SGL_KERNEL_ARCH_PROFILE}" >&2; exit 1 ;; \
-    esac \
-    && mkdir -p /wheels \
-    && python3 -m pip install "cmake>=3.31,<4" scikit-build-core \
-    && cd /build/sgl-kernel \
-    && CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_AND_DOWNLOAD_PARALLEL} \
-       CMAKE_ARGS="-DSGL_KERNEL_ARCH_PROFILE=${SGL_KERNEL_ARCH_PROFILE} -DGITHUB_ARTIFACTORY=${GITHUB_ARTIFACTORY}" \
-       python3 -m pip wheel --no-build-isolation --no-deps --wheel-dir /wheels . \
-    && python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])' > /wheels/version \
-    && printf '%s\n' "${SGL_KERNEL_ARCH_PROFILE}" > /wheels/arch-profile \
-    && printf '%s\n' "${SGL_KERNEL_SOURCE_REVISION}" > /wheels/source-revision \
-    && cd /wheels \
-    && sha256sum sglang_kernel-*.whl > sha256
 
 ########################################################
 # PARALLEL STAGE 2: DeepEP Builder (needs torch_deps)
@@ -760,31 +725,6 @@ LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
       ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
-
-########################################################
-########## KV Protection Final Image ###################
-########################################################
-FROM framework_final AS kv_protection_final
-
-ARG SGL_KERNEL_ARCH_PROFILE
-ARG SGL_KERNEL_SOURCE_REVISION=unknown
-
-COPY --from=local_kernel_builder /wheels /tmp/local-sgl-kernel
-RUN --mount=type=cache,target=/root/.cache/pip \
-    test "$(cat /tmp/local-sgl-kernel/arch-profile)" = "${SGL_KERNEL_ARCH_PROFILE}" \
-    && test "$(cat /tmp/local-sgl-kernel/source-revision)" = "${SGL_KERNEL_SOURCE_REVISION}" \
-    && cd /tmp/local-sgl-kernel \
-    && sha256sum --check sha256 \
-    && python3 -m pip uninstall -y sglang-kernel \
-    && python3 -m pip install --force-reinstall --no-deps /tmp/local-sgl-kernel/sglang_kernel-*.whl \
-    && SGL_KERNEL_EXPECTED_VERSION="$(cat /tmp/local-sgl-kernel/version)" python3 -c 'import importlib.metadata as m, importlib.util as u, os; version=m.version("sglang-kernel"); spec=u.find_spec("sgl_kernel"); path=os.path.realpath(spec.origin) if spec and spec.origin else ""; expected=os.environ["SGL_KERNEL_EXPECTED_VERSION"]; assert version == expected, (version, expected); assert path.startswith("/usr/local/lib/python3.12/dist-packages/sgl_kernel/"), path; print(f"verified local sgl-kernel {version} at {path}")' \
-    && rm -rf /tmp/local-sgl-kernel
-
-ENV SGL_KERNEL_ARCH_PROFILE=${SGL_KERNEL_ARCH_PROFILE} \
-    SGL_KERNEL_SOURCE_REVISION=${SGL_KERNEL_SOURCE_REVISION}
-LABEL org.opencontainers.image.revision="${SGL_KERNEL_SOURCE_REVISION}" \
-      ai.sglang.kernel.arch-profile="${SGL_KERNEL_ARCH_PROFILE}" \
-      ai.sglang.kernel.source-revision="${SGL_KERNEL_SOURCE_REVISION}"
 
 ########################################################
 ########## Runtime Image ##############################
