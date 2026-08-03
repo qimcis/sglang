@@ -427,40 +427,6 @@ __global__ void kv_checksum_finalize_requests_with_pages_kernel(
   }
 }
 
-template <typename ValueT>
-__global__ void kv_page_history_record_kernel(
-    const int64_t* __restrict__ page_ids,
-    int64_t count,
-    int64_t operation,
-    const int64_t* __restrict__ generations,
-    bool generations_by_page,
-    int64_t bootstrap_room,
-    const int64_t* __restrict__ page_positions,
-    int64_t page_positions_count,
-    int64_t page_position,
-    const ValueT* __restrict__ values,
-    int64_t values_count,
-    int64_t value,
-    int64_t size,
-    int64_t depth,
-    int64_t* __restrict__ cursor,
-    int64_t* __restrict__ records) {
-  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index >= count) return;
-  const int64_t page_id = page_ids[index];
-  if (page_id < 0 || page_id >= size) return;
-
-  const auto sequence =
-      atomicAdd(reinterpret_cast<unsigned long long*>(cursor + page_id), static_cast<unsigned long long>(1));
-  const int64_t slot = static_cast<int64_t>(sequence % static_cast<unsigned long long>(depth));
-  int64_t* record = records + (page_id * depth + slot) * 5;
-  record[0] = operation;
-  record[1] = generations_by_page ? generations[page_id] : generations[index];
-  record[2] = bootstrap_room;
-  record[3] = page_positions_count == 0 ? page_position : page_positions[page_positions_count == 1 ? 0 : index];
-  record[4] = values_count == 0 ? value : static_cast<int64_t>(values[values_count == 1 ? 0 : index]);
-}
-
 }  // namespace
 
 template <int kBlock, bool kCapped, typename LocT>
@@ -1021,75 +987,4 @@ void kv_checksum_direct_table_batched_with_pages_compact(
       page_accum,
       page_out,
       true);
-}
-
-void kv_page_history_record(
-    const at::Tensor& page_ids,
-    int64_t operation,
-    const at::Tensor& generations,
-    bool generations_by_page,
-    int64_t bootstrap_room,
-    const at::Tensor& page_positions,
-    int64_t page_position,
-    const at::Tensor& values,
-    int64_t value,
-    at::Tensor& cursor,
-    at::Tensor& records) {
-#if defined(USE_ROCM) || defined(USE_MUSA)
-  TORCH_CHECK(false, "kv_page_history_record is CUDA-only and is not supported on ROCm/MUSA");
-#else
-  TORCH_CHECK(page_ids.is_cuda() && generations.is_cuda(), "page_ids/generations must be CUDA tensors");
-  TORCH_CHECK(cursor.is_cuda() && records.is_cuda(), "cursor/records must be CUDA tensors");
-  TORCH_CHECK(page_positions.is_cuda() && values.is_cuda(), "history field tensors must be CUDA tensors");
-  const auto device = page_ids.device();
-  TORCH_CHECK(
-      generations.device() == device && page_positions.device() == device && values.device() == device &&
-          cursor.device() == device && records.device() == device,
-      "all history tensors must be on the same CUDA device");
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(page_ids));
-  TORCH_CHECK(page_ids.scalar_type() == at::kLong, "page_ids must be int64");
-  TORCH_CHECK(generations.scalar_type() == at::kLong, "generations must be int64");
-  TORCH_CHECK(page_positions.scalar_type() == at::kLong, "page_positions must be int64");
-  TORCH_CHECK(values.scalar_type() == at::kLong || values.scalar_type() == at::kInt, "values must be int32 or int64");
-  TORCH_CHECK(cursor.scalar_type() == at::kLong && records.scalar_type() == at::kLong, "history must be int64");
-  TORCH_CHECK(
-      page_ids.is_contiguous() && generations.is_contiguous() && page_positions.is_contiguous() &&
-          values.is_contiguous() && cursor.is_contiguous() && records.is_contiguous(),
-      "history tensors must be contiguous");
-  TORCH_CHECK(cursor.dim() == 1, "cursor must be one-dimensional");
-  TORCH_CHECK(records.dim() == 3 && records.size(2) == 5, "records must have shape [size, depth, 5]");
-  TORCH_CHECK(records.size(0) == cursor.numel(), "history size mismatch");
-  TORCH_CHECK(records.size(1) > 0, "history depth must be positive");
-  const int64_t count = page_ids.numel();
-  TORCH_CHECK(
-      generations_by_page ? generations.numel() == cursor.numel() : generations.numel() == count,
-      "history generation length mismatch");
-  TORCH_CHECK(
-      page_positions.numel() == 0 || page_positions.numel() == 1 || page_positions.numel() == count,
-      "history page-position length mismatch");
-  TORCH_CHECK(values.numel() == 0 || values.numel() == 1 || values.numel() == count, "history value length mismatch");
-  if (count == 0) return;
-
-  constexpr int threads = 256;
-  const int64_t blocks64 = (count + threads - 1) / threads;
-  TORCH_CHECK(blocks64 <= std::numeric_limits<int>::max(), "history launch exceeds CUDA grid limit");
-  const int blocks = static_cast<int>(blocks64);
-  auto stream = at::cuda::getCurrentCUDAStream();
-  // clang-format off
-  if (values.scalar_type() == at::kInt) {
-    kv_page_history_record_kernel<int32_t><<<blocks, threads, 0, stream>>>(
-        page_ids.data_ptr<int64_t>(), count, operation, generations.data_ptr<int64_t>(), generations_by_page,
-        bootstrap_room, page_positions.data_ptr<int64_t>(), page_positions.numel(), page_position,
-        values.data_ptr<int32_t>(), values.numel(), value, cursor.numel(), records.size(1),
-        cursor.data_ptr<int64_t>(), records.data_ptr<int64_t>());
-  } else {
-    kv_page_history_record_kernel<int64_t><<<blocks, threads, 0, stream>>>(
-        page_ids.data_ptr<int64_t>(), count, operation, generations.data_ptr<int64_t>(), generations_by_page,
-        bootstrap_room, page_positions.data_ptr<int64_t>(), page_positions.numel(), page_position,
-        values.data_ptr<int64_t>(), values.numel(), value, cursor.numel(), records.size(1),
-        cursor.data_ptr<int64_t>(), records.data_ptr<int64_t>());
-  }
-  // clang-format on
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-#endif
 }

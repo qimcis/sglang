@@ -353,7 +353,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             KVProtectionConfig,
         )
 
-        config = KVProtectionConfig.from_env(is_pd_decode=True)
+        config = KVProtectionConfig.from_env(is_pd_role=True)
         if not config.enabled:
             self.scheduler.kv_protection_manager = None
             return

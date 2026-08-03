@@ -149,35 +149,6 @@ def kv_checksum_direct_table_batched_with_pages_compact(
     )
 
 
-def kv_page_history_record(
-    page_ids: torch.Tensor,
-    operation: int,
-    generations: torch.Tensor,
-    generations_by_page: bool,
-    bootstrap_room: int,
-    page_positions: torch.Tensor,
-    page_position: int,
-    values: torch.Tensor,
-    value: int,
-    cursor: torch.Tensor,
-    records: torch.Tensor,
-) -> None:
-    """Record one bounded page-history event per page with one CUDA launch."""
-    torch.ops.sgl_kernel.kv_page_history_record.default(
-        page_ids,
-        int(operation),
-        generations,
-        bool(generations_by_page),
-        int(bootstrap_room),
-        page_positions,
-        int(page_position),
-        values,
-        int(value),
-        cursor,
-        records,
-    )
-
-
 def transfer_kv_per_layer(
     src_k: torch.Tensor,
     dst_k: torch.Tensor,

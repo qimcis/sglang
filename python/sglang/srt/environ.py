@@ -331,23 +331,10 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
 
-    # PD Disaggregation: KV page protection + transfer checksums.
-    # These only take effect in PD *decode* (gated in KVProtectionConfig.from_env);
-    # they are inert for non-PD serving, so the default path is unaffected.
-    # Enable a sidecar uint64 page-tag buffer that detects stale/wrong/mid-decode
-    # KV page reuse before decode attention reads pages.
-    SGLANG_KV_PAGE_PROTECTION = EnvBool(False)
-    # Expert A/B kill-switch: keep page protection enabled but use the
-    # scheduler-side validator instead of producer-fused DSA top-k validation.
-    SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION = EnvBool(False)
-    # Retain the last eight ownership operations for every physical page. This
-    # costs 328 bytes per page and is intended only for targeted diagnostics.
-    SGLANG_KV_PAGE_HISTORY = EnvBool(False)
-    # Enable full direct-KV transfer checksums. When enabled, every transferred
-    # token row is checksummed and the direct CUDA kernel is required.
-    SGLANG_KV_TRANSFER_CHECKSUM = EnvBool(False)
-    # Deprecated unsafe legacy mode. Enabling it now fails at startup.
-    SGLANG_ENABLE_LEGACY_KV_PROTECTION_COMPLETION = EnvBool(False)
+    # Enable the complete PD KV-protection protocol: page ownership tags,
+    # transfer-written tags, full transfer checksums, and fused DSA validation.
+    # The feature remains inert outside PD serving.
+    SGLANG_KV_PROTECTION = EnvBool(False)
 
     # Scheduler: others:
     # in seconds. Set if you observe high memory accumulation over a long serving period.

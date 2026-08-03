@@ -160,7 +160,7 @@ class PrefillBootstrapQueue:
             KVProtectionConfig,
         )
 
-        protocol_config = KVProtectionConfig.from_env(is_pd_decode=True)
+        protocol_config = KVProtectionConfig.from_env(is_pd_role=True)
         self.kv_protection_config = protocol_config
         # Prefill only needs the transfer-checksum half; disable attention tags so we
         # do not attach a sidecar table / bump generations on the prefill side.

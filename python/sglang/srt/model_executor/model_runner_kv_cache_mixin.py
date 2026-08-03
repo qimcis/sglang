@@ -1312,13 +1312,12 @@ class ModelRunnerKVCacheMixin:
             KV_EXPECTED_MAPPING_BYTES_PER_PAGE,
             KV_EXPECTED_MAPPING_NAMESPACE_COUNT,
             KV_REQUEST_PROTECTION_BYTES_PER_SLOT,
-            KVPageHistory,
             KVProtectionConfig,
         )
 
         disaggregation_mode = self.server_args.disaggregation_mode
         protection_config = KVProtectionConfig.from_env(
-            is_pd_decode=disaggregation_mode in ("prefill", "decode")
+            is_pd_role=disaggregation_mode in ("prefill", "decode")
         )
         reserved_bytes = (
             KV_CHECKSUM_MAX_WORKSPACE_BYTES if protection_config.checksum_enabled else 0
@@ -1329,8 +1328,6 @@ class ModelRunnerKVCacheMixin:
             ) + (config.swa_max_total_num_tokens or 0)
             protected_pages = protected_tokens // page_size + 1
             bytes_per_page = KV_ATTENTION_TAG_BYTES_PER_PAGE
-            if protection_config.enable_page_history:
-                bytes_per_page += KVPageHistory.BYTES_PER_PAGE
             reserved_bytes += protected_pages * bytes_per_page
             max_running_requests = self._resolve_max_num_reqs(
                 config.max_total_num_tokens

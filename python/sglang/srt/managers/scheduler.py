@@ -876,7 +876,7 @@ class Scheduler(
         )
 
         config = KVProtectionConfig.from_env(
-            is_pd_decode=self.server_args.disaggregation_mode == "decode"
+            is_pd_role=self.server_args.disaggregation_mode == "decode"
         )
         if not config.enable_attention_tags:
             return
@@ -937,7 +937,6 @@ class Scheduler(
                 - 1
             )
             // page_size,
-            enable_history=config.enable_page_history,
         )
         allocator.attach_attention_tag_table(table)
         self.tp_worker.model_runner.kv_attention_tag_table = table
@@ -949,7 +948,7 @@ class Scheduler(
         )
 
         config = KVProtectionConfig.from_env(
-            is_pd_decode=self.server_args.disaggregation_mode == "decode"
+            is_pd_role=self.server_args.disaggregation_mode == "decode"
         )
         if not config.enable_attention_tags:
             return

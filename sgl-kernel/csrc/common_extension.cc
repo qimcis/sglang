@@ -388,12 +388,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "kv_checksum_direct_table_batched_with_pages_compact",
       torch::kCUDA,
       &kv_checksum_direct_table_batched_with_pages_compact);
-  m.def(
-      "kv_page_history_record(Tensor page_ids, int operation, Tensor generations, bool generations_by_page, "
-      "int bootstrap_room, Tensor page_positions, int page_position, Tensor values, int value, "
-      "Tensor(a!) cursor, Tensor(b!) records) -> ()");
-  m.impl("kv_page_history_record", torch::kCUDA, &kv_page_history_record);
-
   /*
    * From csrc/memory
    */

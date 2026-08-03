@@ -83,7 +83,6 @@ else:
         kv_checksum_direct_table_batched,
         kv_checksum_direct_table_batched_with_pages,
         kv_checksum_direct_table_batched_with_pages_compact,
-        kv_page_history_record,
         transfer_kv_all_layer,
         transfer_kv_all_layer_mla,
         transfer_kv_per_layer,

@@ -2,10 +2,10 @@
 KV Attention Tags + Transfer Checksums for PD Disaggregation.
 
 This module protects PD (prefill/decode) disaggregated decoding from using
-stale, wrong, or mid-decode KV pages, and optionally proves that the KV bytes
+stale, wrong, or mid-decode KV pages, and proves that the KV bytes
 copied across the network (e.g. by Mooncake) are byte-for-byte correct.
 
-Two independent (but related) mechanisms live here:
+One production switch enables two coordinated mechanisms:
 
 1. Attention tags
    A sidecar GPU buffer of ``uint64`` tags, one per physical KV page, stored
@@ -23,7 +23,7 @@ Two independent (but related) mechanisms live here:
    :class:`KVAttentionTagMismatch`.
 
 2. Transfer checksums
-   An optional, full byte-level proof that the KV bytes copied from
+   A full byte-level proof that the KV bytes copied from
    prefill to decode are identical.  The prefill side hashes its *source* KV
    bytes in a consistent *logical* order (token-by-token, never by physical
    page id); the decode side hashes its *destination* KV bytes in the same
@@ -38,8 +38,8 @@ Design constraints (hard requirements):
   * Verification is vectorized: a single gather + compare over the batch, never
     a per-page Python loop with ``.item()`` over full-sequence pages.
   * Transfer checksums NEVER hash node-local physical page ids.
-  * The whole feature is gated; see :class:`KVProtectionConfig`.  When disabled
-    (the default for non-PD serving) there is zero allocator/decode overhead.
+  * ``SGLANG_KV_PROTECTION`` gates the complete protocol. When disabled there
+    is zero allocator/decode overhead.
 """
 
 from __future__ import annotations
@@ -299,15 +299,11 @@ class KVProtectionIncident:
     actual_page_digest: Optional[int] = None
     num_checked_tokens: Optional[int] = None
     detail: Optional[str] = None
-    history: Tuple[Dict[str, Any], ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         payload = {
-            key: value
-            for key, value in self.__dict__.items()
-            if value is not None and key != "history"
+            key: value for key, value in self.__dict__.items() if value is not None
         }
-        payload["history"] = list(self.history)
         for key in (
             "expected_tag",
             "actual_tag",
@@ -327,7 +323,6 @@ def attach_kv_protection_incident(
     *,
     kind: str,
     phase: str,
-    history: Sequence[Dict[str, Any]] = (),
 ) -> KVProtectionIncident:
     incident = KVProtectionIncident(
         schema_version=1,
@@ -356,7 +351,6 @@ def attach_kv_protection_incident(
         actual_page_digest=getattr(error, "actual_page_digest", None),
         num_checked_tokens=getattr(error, "num_checked_tokens", None),
         detail=getattr(error, "detail", None),
-        history=tuple(history),
     )
     error.incident = incident
     return incident
@@ -386,7 +380,7 @@ def emit_kv_protection_incident(
 
 @dataclass(frozen=True)
 class KVProtectionConfig:
-    """Resolved configuration for KV attention tags + transfer checksums.
+    """Resolved role-specific state for the complete KV-protection protocol.
 
     The feature only activates for PD disaggregation *and* when explicitly
     enabled.  ``from_env`` returns a fully-disabled config for non-PD serving so
@@ -395,7 +389,6 @@ class KVProtectionConfig:
 
     enable_attention_tags: bool = False
     enable_transfer_checksum: bool = False
-    enable_page_history: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -410,10 +403,10 @@ class KVProtectionConfig:
         return KVProtectionConfig()
 
     @classmethod
-    def from_env(cls, *, is_pd_decode: bool) -> KVProtectionConfig:
+    def from_env(cls, *, is_pd_role: bool) -> KVProtectionConfig:
         """Build the config from environment variables.
 
-        ``is_pd_decode`` gates the whole feature: outside PD disaggregation the
+        ``is_pd_role`` gates the whole feature: outside PD disaggregation the
         protection is always disabled regardless of env vars, guaranteeing no
         regression for non-PD serving.
         """
@@ -421,28 +414,15 @@ class KVProtectionConfig:
         # without the full server/env stack.
         from sglang.srt.environ import envs
 
-        if not is_pd_decode:
+        if not is_pd_role:
             return cls.disabled()
 
-        enable_attention_tags = envs.SGLANG_KV_PAGE_PROTECTION.get()
-        enable_transfer_checksum = envs.SGLANG_KV_TRANSFER_CHECKSUM.get()
-
-        if not enable_attention_tags and not enable_transfer_checksum:
+        if not envs.SGLANG_KV_PROTECTION.get():
             return cls.disabled()
-
-        if envs.SGLANG_ENABLE_LEGACY_KV_PROTECTION_COMPLETION.get():
-            raise RuntimeError(
-                "Legacy nonce-less KV protection completion is not safe and is "
-                "no longer supported. Upgrade prefill workers before enabling "
-                "KV page protection or transfer checksums."
-            )
 
         return cls(
-            enable_attention_tags=enable_attention_tags,
-            enable_transfer_checksum=enable_transfer_checksum,
-            enable_page_history=(
-                enable_attention_tags and envs.SGLANG_KV_PAGE_HISTORY.get()
-            ),
+            enable_attention_tags=True,
+            enable_transfer_checksum=True,
         )
 
 
@@ -509,7 +489,7 @@ def assert_protection_supported(
                 "KV attention tags / transfer checksums are enabled but the "
                 f"active allocator {name!r} is not supported. Supported "
                 f"allocators: {SUPPORTED_ALLOCATOR_CLASSES}. Disable the feature "
-                "(SGLANG_KV_PAGE_PROTECTION=0, SGLANG_KV_TRANSFER_CHECKSUM=0) "
+                "(SGLANG_KV_PROTECTION=0) "
                 "or run a supported layout (plain paged/token or SWA)."
             )
 
@@ -521,19 +501,19 @@ def assert_protection_supported(
         raise RuntimeError(
             "KV attention-tag protection requires a speculative target backend "
             "with both pre-indexer and protected top-k validation. Disable "
-            "SGLANG_KV_PAGE_PROTECTION or use audited DSA target verification."
+            "SGLANG_KV_PROTECTION or use audited DSA target verification."
         )
 
     if config.enable_attention_tags and pp_size > 1:
         raise RuntimeError(
             "KV attention-tag protection does not yet support pipeline "
-            "parallelism. Set --pp-size 1 or disable SGLANG_KV_PAGE_PROTECTION."
+            "parallelism. Set --pp-size 1 or disable SGLANG_KV_PROTECTION."
         )
 
     if config.enable_attention_tags and enable_dp_attention:
         raise RuntimeError(
             "KV attention-tag protection does not yet support DP attention. "
-            "Disable --enable-dp-attention or SGLANG_KV_PAGE_PROTECTION."
+            "Disable --enable-dp-attention or SGLANG_KV_PROTECTION."
         )
 
     if config.enable_attention_tags and transfer_backend is not None:
@@ -543,19 +523,10 @@ def assert_protection_supported(
                 "KV attention tags are enabled but transfer backend "
                 f"{transfer_backend!r} does not transport page-tag metadata. "
                 f"Supported backends: {SUPPORTED_ATTENTION_TAG_BACKENDS}. "
-                "Set SGLANG_KV_PAGE_PROTECTION=0 or use a supported backend."
+                "Set SGLANG_KV_PROTECTION=0 or use a supported backend."
             )
 
     if config.enable_attention_tags:
-        from sglang.srt.environ import envs
-
-        if envs.SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION.get():
-            raise RuntimeError(
-                "This GLM-5.2 protection build requires fused DSA validation. "
-                "Scheduler-only validation is not supported. Unset "
-                "SGLANG_DISABLE_FUSED_KV_PAGE_PROTECTION or disable "
-                "SGLANG_KV_PAGE_PROTECTION."
-            )
         capability = (
             (device_capability_major, device_capability_minor)
             if device_capability_major is not None
@@ -571,14 +542,14 @@ def assert_protection_supported(
         ):
             raise RuntimeError(
                 "Fused KV page protection requires an NVIDIA Hopper SM90 or "
-                "Blackwell SM100/SM103 GPU. Disable SGLANG_KV_PAGE_PROTECTION "
+                "Blackwell SM100/SM103 GPU. Disable SGLANG_KV_PROTECTION "
                 "on unsupported hardware."
             )
 
     if config.checksum_enabled and is_cuda_device is False:
         raise RuntimeError(
             "KV transfer checksums require the NVIDIA CUDA checksum kernel. "
-            "Set SGLANG_KV_TRANSFER_CHECKSUM=0 or run on CUDA."
+            "Set SGLANG_KV_PROTECTION=0 or run on CUDA."
         )
 
     if config.checksum_enabled and transfer_backend is not None:
@@ -588,7 +559,7 @@ def assert_protection_supported(
                 "KV transfer checksums are enabled but transfer backend "
                 f"{transfer_backend!r} does not support the checksum manifest "
                 f"exchange. Supported backends: {SUPPORTED_CHECKSUM_BACKENDS}. "
-                "Set SGLANG_KV_TRANSFER_CHECKSUM=0 or use a supported backend."
+                "Set SGLANG_KV_PROTECTION=0 or use a supported backend."
             )
 
 
@@ -1427,157 +1398,6 @@ def _iter_transfer_page_tag_manifests(
 # ---------------------------------------------------------------------------
 
 
-class KVPageHistory:
-    """Small device-resident operation ring, materialized only after a mismatch."""
-
-    DEPTH = 8
-    BYTES_PER_PAGE = 8 + DEPTH * 5 * 8
-    ALLOC = 1
-    FREE = 2
-    FREE_DEFERRED = 3
-    FREE_RELEASED = 4
-    TRANSFER_EXPECTED = 5
-    TRANSFER_WRITE = 6
-    TAG_REFRESH = 7
-    _OP_NAMES = {
-        ALLOC: "alloc",
-        FREE: "free",
-        FREE_DEFERRED: "free_deferred",
-        FREE_RELEASED: "free_released",
-        TRANSFER_EXPECTED: "transfer_expected",
-        TRANSFER_WRITE: "transfer_write",
-        TAG_REFRESH: "tag_refresh",
-    }
-
-    def __init__(self, size: int, device: str):
-        shape = (size, self.DEPTH)
-        self.device = device
-        self.cursor = torch.zeros(size, dtype=TAG_DTYPE, device=device)
-        self.records = torch.zeros((*shape, 5), dtype=TAG_DTYPE, device=device)
-        self.records[:, :, 3].fill_(-1)
-        self.operations = self.records[:, :, 0]
-        self.generations = self.records[:, :, 1]
-        self.bootstrap_rooms = self.records[:, :, 2]
-        self.page_positions = self.records[:, :, 3]
-        self.values = self.records[:, :, 4]
-
-    @staticmethod
-    def _field_tensor(value, page_ids: torch.Tensor, default: int) -> torch.Tensor:
-        if value is None:
-            return torch.full_like(page_ids, default, dtype=TAG_DTYPE)
-        value_t = torch.as_tensor(
-            value, dtype=TAG_DTYPE, device=page_ids.device
-        ).reshape(-1)
-        if value_t.numel() == 1 and page_ids.numel() != 1:
-            value_t = value_t.expand(page_ids.numel())
-        if value_t.numel() != page_ids.numel():
-            raise RuntimeError("KV page history metadata length mismatch")
-        return value_t
-
-    def record(
-        self,
-        page_ids,
-        operation: int,
-        *,
-        generations=None,
-        bootstrap_rooms=None,
-        page_positions=None,
-        values=None,
-        generations_by_page: bool = False,
-    ) -> None:
-        page_ids_t = torch.as_tensor(
-            page_ids, dtype=torch.long, device=self.device
-        ).reshape(-1)
-        if page_ids_t.numel() == 0:
-            return
-        if page_ids_t.is_cuda:
-            if generations is None:
-                raise RuntimeError("CUDA KV page history requires generations")
-            if not isinstance(bootstrap_rooms, (int, type(None))):
-                raise RuntimeError("CUDA KV page history requires a scalar room")
-
-            def field_arg(value, default):
-                if value is None:
-                    return page_ids_t[:0], default
-                if isinstance(value, int):
-                    return page_ids_t[:0], int(value)
-                value_t = torch.as_tensor(value, device=self.device).reshape(-1)
-                if value_t.numel() not in (1, page_ids_t.numel()):
-                    raise RuntimeError("KV page history metadata length mismatch")
-                return value_t.contiguous(), default
-
-            generations_t = torch.as_tensor(
-                generations, dtype=TAG_DTYPE, device=self.device
-            ).reshape(-1)
-            expected_generations = (
-                self.cursor.numel() if generations_by_page else page_ids_t.numel()
-            )
-            if generations_t.numel() != expected_generations:
-                raise RuntimeError("KV page history generation length mismatch")
-            page_positions_t, page_position = field_arg(page_positions, -1)
-            values_t, value = field_arg(values, 0)
-            from sgl_kernel.kvcacheio import kv_page_history_record
-
-            kv_page_history_record(
-                page_ids_t,
-                operation,
-                generations_t.contiguous(),
-                generations_by_page,
-                int(bootstrap_rooms or 0),
-                page_positions_t,
-                page_position,
-                values_t,
-                value,
-                self.cursor,
-                self.records,
-            )
-            return
-        cursors = self.cursor.index_select(0, page_ids_t)
-        slots = torch.remainder(cursors, self.DEPTH).to(torch.long)
-        flat_indices = page_ids_t * self.DEPTH + slots
-        if generations_by_page:
-            generations_t = torch.as_tensor(
-                generations, dtype=TAG_DTYPE, device=page_ids_t.device
-            ).reshape(-1)
-            generations_t = generations_t.index_select(0, page_ids_t)
-        else:
-            generations_t = generations
-        fields = torch.stack(
-            (
-                torch.full_like(page_ids_t, int(operation), dtype=TAG_DTYPE),
-                self._field_tensor(generations_t, page_ids_t, 0),
-                self._field_tensor(bootstrap_rooms, page_ids_t, 0),
-                self._field_tensor(page_positions, page_ids_t, -1),
-                self._field_tensor(values, page_ids_t, 0),
-            ),
-            dim=1,
-        )
-        self.records.view(-1, 5).index_copy_(0, flat_indices, fields)
-        self.cursor.index_add_(
-            0, page_ids_t, torch.ones_like(page_ids_t, dtype=TAG_DTYPE)
-        )
-
-    def materialize(self, page_id: int) -> List[Dict[str, Any]]:
-        cursor = int(self.cursor[page_id].item())
-        count = min(cursor, self.DEPTH)
-        start = cursor - count
-        result = []
-        for sequence in range(start, cursor):
-            slot = sequence % self.DEPTH
-            operation = int(self.operations[page_id, slot].item())
-            result.append(
-                {
-                    "sequence": sequence,
-                    "operation": self._OP_NAMES.get(operation, f"unknown_{operation}"),
-                    "generation": int(self.generations[page_id, slot].item()),
-                    "bootstrap_room": int(self.bootstrap_rooms[page_id, slot].item()),
-                    "page_position": int(self.page_positions[page_id, slot].item()),
-                    "value": f"0x{int(self.values[page_id, slot].item()) & _U64_MASK:016x}",
-                }
-            )
-        return result
-
-
 class KVAttentionTagTable:
     """Sidecar GPU buffer of per-physical-page attention tags + generations.
 
@@ -1592,7 +1412,6 @@ class KVAttentionTagTable:
         *,
         num_request_slots: int = 2,
         num_logical_pages: Optional[int] = None,
-        enable_history: bool = False,
     ):
         # +1 so physical page ids (which are 1-based in the paged allocator) fit.
         self._size = num_pages + 1
@@ -1634,38 +1453,10 @@ class KVAttentionTagTable:
         self.validation_status = torch.zeros(
             num_request_slots, dtype=torch.int32, device=device
         )
-        self.history = KVPageHistory(self._size, device) if enable_history else None
-        self._history_warning_emitted = False
 
     @property
     def size(self) -> int:
         return self._size
-
-    def _record_history(self, *args, **kwargs) -> None:
-        if self.history is None:
-            return
-        try:
-            self.history.record(*args, **kwargs)
-        except Exception:
-            if not self._history_warning_emitted:
-                logger.warning(
-                    "KV page history recording failed; protection remains active",
-                    exc_info=True,
-                )
-                self._history_warning_emitted = True
-
-    def materialize_history(self, page_id: int) -> List[Dict[str, Any]]:
-        if self.history is None:
-            return []
-        try:
-            return self.history.materialize(page_id)
-        except Exception:
-            logger.warning(
-                "KV page history materialization failed for page_id=%s",
-                page_id,
-                exc_info=True,
-            )
-            return []
 
     def bump_generations(self, page_ids: torch.Tensor) -> None:
         """Increment the allocation generation of the given physical pages.
@@ -1690,13 +1481,6 @@ class KVAttentionTagTable:
                 torch.zeros_like(page_ids),
                 generations,
             ),
-        )
-        history_pages = torch.unique(page_ids)
-        self._record_history(
-            history_pages,
-            KVPageHistory.ALLOC,
-            generations=self.generations,
-            generations_by_page=True,
         )
 
     def generation_of(self, page_ids: torch.Tensor) -> torch.Tensor:
@@ -1936,7 +1720,7 @@ class KVAttentionTagTable:
         ).reshape(-1)
         return self.transfer_page_tags.index_select(0, page_ids)
 
-    def record_free(self, page_ids, *, deferred: bool = False) -> None:
+    def record_free(self, page_ids) -> None:
         page_ids_t = torch.as_tensor(
             page_ids, dtype=torch.long, device=self.generations.device
         ).reshape(-1)
@@ -1944,23 +1728,6 @@ class KVAttentionTagTable:
             return
         self.tags.index_fill_(0, page_ids_t, 0)
         self.transfer_page_tags.index_fill_(0, page_ids_t, TRANSFER_PAGE_TAG_SKIP)
-        self._record_history(
-            page_ids_t,
-            KVPageHistory.FREE_DEFERRED if deferred else KVPageHistory.FREE,
-            generations=self.generations,
-            generations_by_page=True,
-        )
-
-    def record_free_released(self, page_ids) -> None:
-        page_ids_t = torch.as_tensor(
-            page_ids, dtype=torch.long, device=self.generations.device
-        )
-        self._record_history(
-            page_ids_t,
-            KVPageHistory.FREE_RELEASED,
-            generations=self.generations,
-            generations_by_page=True,
-        )
 
 
 def _attention_tag_mismatch_mask(
@@ -3017,13 +2784,6 @@ class KVPageProtectionManager:
         self._attention_verification_cache: Optional[_FlattenedTagBatch] = None
         self._transfer_verification_cache: Optional[_FlattenedTagBatch] = None
         if config.enable_attention_tags:
-            if config.enable_page_history:
-                history_bytes = (num_pages + 1) * KVPageHistory.BYTES_PER_PAGE
-                logger.warning(
-                    "KV page history enabled; allocating %.2f MiB for %s pages",
-                    history_bytes / (1024 * 1024),
-                    num_pages + 1,
-                )
             attached_table = getattr(allocator, "attention_tag_table", None)
             if attached_table is not None:
                 if not isinstance(attached_table, KVAttentionTagTable):
@@ -3038,8 +2798,6 @@ class KVPageProtectionManager:
                     attached_table.num_logical_pages != int(num_logical_pages)
                 ):
                     raise RuntimeError("preallocated KV logical-page count mismatch")
-                if config.enable_page_history and attached_table.history is None:
-                    raise RuntimeError("preallocated KV page history is missing")
                 self.table = attached_table
             else:
                 self.table = KVAttentionTagTable(
@@ -3047,7 +2805,6 @@ class KVPageProtectionManager:
                     device=device,
                     num_request_slots=num_request_slots,
                     num_logical_pages=num_logical_pages,
-                    enable_history=config.enable_page_history,
                 )
                 if allocator is not None and hasattr(
                     allocator, "attach_attention_tag_table"
@@ -3098,15 +2855,6 @@ class KVPageProtectionManager:
             generations=manifest.generations_t,
             attention_tags=manifest.expected_tags_t,
             mapping_namespace=manifest.mapping_namespace,
-        )
-        self.table._record_history(
-            manifest.physical_page_ids_t,
-            KVPageHistory.TAG_REFRESH,
-            generations=self.table.generations,
-            bootstrap_rooms=bootstrap_room,
-            page_positions=manifest.page_positions_t,
-            values=manifest.expected_tags_t,
-            generations_by_page=True,
         )
         return manifest
 
@@ -3171,15 +2919,6 @@ class KVPageProtectionManager:
             attention_tags=expected_t,
             mapping_namespace=manifest.mapping_namespace,
         )
-        self.table._record_history(
-            page_id_t,
-            KVPageHistory.TAG_REFRESH,
-            generations=self.table.generations,
-            bootstrap_rooms=manifest.bootstrap_room,
-            page_positions=page_position,
-            values=expected_t,
-            generations_by_page=True,
-        )
 
     # -- transfer-written page tags ----------------------------------------
 
@@ -3228,15 +2967,6 @@ class KVPageProtectionManager:
             transfer_page_tags=manifest.expected_tags_t,
             mapping_namespace=manifest.mapping_namespace,
         )
-        self.table._record_history(
-            manifest.physical_page_ids_t,
-            KVPageHistory.TRANSFER_EXPECTED,
-            generations=self.table.generations,
-            bootstrap_rooms=bootstrap_room,
-            page_positions=manifest.page_positions_t,
-            values=manifest.expected_tags_t,
-            generations_by_page=True,
-        )
         return manifest
 
     def commit_transfer_page_tags(self, manifest) -> None:
@@ -3247,15 +2977,6 @@ class KVPageProtectionManager:
             self.table.write_transfer_page_tags(
                 sub_manifest.physical_page_ids_t,
                 sub_manifest.expected_tags_t,
-            )
-            self.table._record_history(
-                sub_manifest.physical_page_ids_t,
-                KVPageHistory.TRANSFER_WRITE,
-                generations=self.table.generations,
-                bootstrap_rooms=sub_manifest.bootstrap_room,
-                page_positions=sub_manifest.page_positions_t,
-                values=sub_manifest.expected_tags_t,
-                generations_by_page=True,
             )
 
     def write_transfer_page_tags(
@@ -3277,14 +2998,7 @@ class KVPageProtectionManager:
         pages_t = torch.tensor(page_ids, dtype=torch.long, device=self.device)
         tags_t = transfer_page_tags_to_tensor(tags, device=self.device)
         self.table.write_transfer_page_tags(pages_t, tags_t)
-        self.table._record_history(
-            pages_t,
-            KVPageHistory.TRANSFER_WRITE,
-            generations=self.table.generations,
-            bootstrap_rooms=bootstrap_room,
-            values=tags_t,
-            generations_by_page=True,
-        )
+        del bootstrap_room
         if pages_t.is_cuda:
             event = torch.cuda.Event()
             event.record(torch.cuda.current_stream(pages_t.device))
@@ -3347,15 +3061,6 @@ class KVPageProtectionManager:
             generations=manifest.generations_t[entry_index : entry_index + 1],
             transfer_page_tags=expected_t,
             mapping_namespace=manifest.mapping_namespace,
-        )
-        self.table._record_history(
-            page_id_t,
-            KVPageHistory.TRANSFER_WRITE,
-            generations=self.table.generations,
-            bootstrap_rooms=manifest.bootstrap_room,
-            page_positions=page_position,
-            values=expected_t,
-            generations_by_page=True,
         )
 
     def _flatten_tag_batch(
@@ -3462,7 +3167,6 @@ class KVPageProtectionManager:
                 error,
                 kind="transfer_page_tag",
                 phase="pre_attention",
-                history=self.table.materialize_history(error.page_id),
             )
             result.append(error)
         if self.metrics is not None and result:
@@ -3510,7 +3214,6 @@ class KVPageProtectionManager:
                 error,
                 kind="attention_tag",
                 phase="pre_attention",
-                history=self.table.materialize_history(error.page_id),
             )
             result.append(error)
         if self.metrics is not None:

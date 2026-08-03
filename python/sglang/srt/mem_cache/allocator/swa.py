@@ -45,13 +45,9 @@ class _OffsetAttentionTagTable:
     def read_tags(self, page_ids: torch.Tensor) -> torch.Tensor:
         return self.table.read_tags(self._global_page_ids(page_ids))
 
-    def record_free(self, page_ids, *, deferred: bool = False) -> None:
+    def record_free(self, page_ids) -> None:
         page_ids = torch.as_tensor(page_ids, dtype=torch.long, device=self.device)
-        self.table.record_free(self._global_page_ids(page_ids), deferred=deferred)
-
-    def record_free_released(self, page_ids) -> None:
-        page_ids = torch.as_tensor(page_ids, dtype=torch.long, device=self.device)
-        self.table.record_free_released(self._global_page_ids(page_ids))
+        self.table.record_free(self._global_page_ids(page_ids))
 
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -471,9 +467,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             deferred_indices = self._expand_to_full_pages(deferred * self.page_size)
             swa_indices = self.full_to_swa_index_mapping[deferred_indices]
             swa_page_ids = torch.unique(swa_indices[swa_indices > 0] // self.page_size)
-            self.swa_attn_allocator.attention_tag_table.record_free(
-                swa_page_ids, deferred=True
-            )
+            self.swa_attn_allocator.attention_tag_table.record_free(swa_page_ids)
         if unpinned_pages.numel() == 0:
             return free_index.new_empty((0,))
         page_offsets = torch.arange(

@@ -756,19 +756,6 @@ void kv_checksum_direct_table_batched_with_pages_compact(
     at::Tensor& page_accum,
     at::Tensor& page_out);
 
-void kv_page_history_record(
-    const at::Tensor& page_ids,
-    int64_t operation,
-    const at::Tensor& generations,
-    bool generations_by_page,
-    int64_t bootstrap_room,
-    const at::Tensor& page_positions,
-    int64_t page_position,
-    const at::Tensor& values,
-    int64_t value,
-    at::Tensor& cursor,
-    at::Tensor& records);
-
 /*
  * From csrc/memory
  */

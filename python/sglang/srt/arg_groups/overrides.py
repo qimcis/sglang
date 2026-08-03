@@ -1145,7 +1145,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         prefer_protected_flashmla = (major, minor) == (
             10,
             3,
-        ) or (is_protected_blackwell and envs.SGLANG_KV_PAGE_PROTECTION.get())
+        ) or (is_protected_blackwell and envs.SGLANG_KV_PROTECTION.get())
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = (
                 "flashmla_kv" if major < 10 or prefer_protected_flashmla else "trtllm"
@@ -1161,7 +1161,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         prefer_protected_flashmla = (major, minor) == (
             10,
             3,
-        ) or (is_protected_blackwell and envs.SGLANG_KV_PAGE_PROTECTION.get())
+        ) or (is_protected_blackwell and envs.SGLANG_KV_PROTECTION.get())
         # Set prefill/decode backends based on hardware architecture.
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = "flashmla_sparse"
