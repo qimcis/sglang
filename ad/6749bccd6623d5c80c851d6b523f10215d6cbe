@@ -1,0 +1,31 @@
+python/sglang/srt/disaggregation/utils.py
+  s_31242d6a60f864::t_162ec607403bad 408,410
+python/sglang/srt/mem_cache/radix_cache.py
+  s_31242d6a60f864::t_2ecdcd54a99ce7 532
+python/sglang/srt/mem_cache/swa_radix_cache.py
+  s_31242d6a60f864::t_73c56d1545035b 492
+python/sglang/srt/mem_cache/unified_radix_cache.py
+  s_31242d6a60f864::t_bd793f61c95aba 789,841,886
+python/sglang/srt/model_executor/model_runner.py
+  s_31242d6a60f864::t_ef9f675ebbe643 378
+python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+  s_31242d6a60f864::t_7dd94365d662da 1309
+sgl-kernel/csrc/kvcacheio/checksum.cu
+  s_31242d6a60f864::t_5de3f46906b9a7 19,29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ad6749bccd6623d5c80c851d6b523f10215d6cbe",
+  "prompts": {},
+  "sessions": {
+    "s_31242d6a60f864": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0525b98f5ffeMDl6gnyhsezi7Q",
+        "model": "gpt-5.5"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
