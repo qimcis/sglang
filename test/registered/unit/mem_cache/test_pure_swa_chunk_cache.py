@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.chunk_cache import PureSWAChunkCache
+from sglang.srt.mem_cache.chunk_cache import ChunkCache, PureSWAChunkCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -30,6 +30,12 @@ class _FakeReq:
 
 
 class TestPureSWAChunkCache(CustomTestCase):
+    def test_only_plain_chunk_cache_supports_kv_page_protection(self):
+        cache = ChunkCache.__new__(ChunkCache)
+        swa_cache = PureSWAChunkCache.__new__(PureSWAChunkCache)
+        self.assertTrue(cache.supports_kv_page_protection())
+        self.assertFalse(swa_cache.supports_kv_page_protection())
+
     def test_finished_req_skips_already_evicted_swa_range(self):
         cache = PureSWAChunkCache.__new__(PureSWAChunkCache)
         cache.req_to_token_pool = SimpleNamespace(

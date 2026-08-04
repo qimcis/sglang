@@ -54,6 +54,15 @@ class ChunkCache(BasePrefixCache):
     def is_chunk_cache(self) -> bool:
         return True
 
+    def supports_kv_page_protection(self) -> bool:
+        """ChunkCache never retains, shares, or remaps a finished prefix.
+
+        Request mappings therefore remain owned by the request until
+        ``release_kv_cache`` invalidates its protection row, after which this
+        cache frees the same mapped pages through the protected allocator.
+        """
+        return True
+
     # NOTE (csy): this is to determine if a cache has prefix matching feature.
     # Chunk cache always return True to indicate no prefix matching.
     # TODO (csy): Using a prefix cache trait to replace this
@@ -132,6 +141,11 @@ class SWAChunkCache(ChunkCache):
             self.sliding_window_size is not None
         ), "sliding_window_size must be set for SWAChunkCache"
         return True
+
+    def supports_kv_page_protection(self) -> bool:
+        # SWA mutates the live window while a request is active. Keep it
+        # fail-closed until that lifecycle is audited independently.
+        return False
 
     def evict(self, params: EvictParams) -> EvictResult:
         return EvictResult()
