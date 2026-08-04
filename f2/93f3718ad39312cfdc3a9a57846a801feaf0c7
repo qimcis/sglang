@@ -1,0 +1,23 @@
+python/sglang/srt/disaggregation/base/conn.py
+  s_31242d6a60f864::t_c10ffaee16d48b 77-78
+python/sglang/srt/disaggregation/common/conn.py
+  s_31242d6a60f864::t_63dd96a95224e9 52,54,112,132,499,1331,1398,1418-1420,1422,1495
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_31242d6a60f864::t_db6c612aec7bea 25,112,121-122,1963,2109-2110,2112,2129,2315,2368-2374,2696,2698,2711,2714,2719,2729,2850,2905,2909,2924
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f293f3718ad39312cfdc3a9a57846a801feaf0c7",
+  "prompts": {},
+  "sessions": {
+    "s_31242d6a60f864": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0525b98f5ffeMDl6gnyhsezi7Q",
+        "model": "gpt-5.5"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
