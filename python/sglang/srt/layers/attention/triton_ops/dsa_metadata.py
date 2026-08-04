@@ -217,8 +217,8 @@ def _fused_dsa_decode_metadata_protected_kernel(
     # page count. On a clean row the compact table is produced during the same
     # read that validates it. Only a failed row pays a full write-only clear.
     scan_pages = tl.where(row_shape_valid, num_pages, 0)
-    for page_start in tl.range(0, scan_pages, BLOCK_PAGES):
-        logical_page = page_start + page_lane
+    for scan_start in tl.range(0, scan_pages, BLOCK_PAGES):
+        logical_page = scan_start + page_lane
         output_mask = logical_page < scan_pages
         active = output_mask
         token_slot = tl.load(
@@ -318,8 +318,12 @@ def _fused_dsa_decode_metadata_protected_kernel(
     failed = (status != 0).to(tl.int32)
 
     if failed != 0:
-        for page_start in tl.range(0, REAL_PAGE_COLS, BLOCK_PAGES):
-            logical_page = page_start + page_lane
+        # Use a distinct induction variable from the live-page scan above.
+        # Triton otherwise merges both loop variables through the surrounding
+        # dynamic branch and rejects the int64 live bound / int32 constexpr
+        # bound mismatch during TTIR construction on SM100.
+        for clear_start in tl.range(0, REAL_PAGE_COLS, BLOCK_PAGES):
+            logical_page = clear_start + page_lane
             output_mask = logical_page < REAL_PAGE_COLS
             tl.store(
                 real_page_table
