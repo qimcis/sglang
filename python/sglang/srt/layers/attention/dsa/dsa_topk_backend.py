@@ -184,6 +184,13 @@ class DSATopKBackend(Enum):
     ) -> torch.Tensor:
         kv_page_protection = getattr(attn_metadata, "kv_page_protection", None)
         if kv_page_protection is not None:
+            if not kv_page_protection.get(
+                "producer_validation_via_full_mapping", False
+            ):
+                raise RuntimeError(
+                    "KV page protection requires metadata-fused compact-table "
+                    "validation before DSA top-k"
+                )
             if (
                 topk_transform_method != TopkTransformMethod.PAGED
                 or not envs.SGLANG_DSA_FUSE_TOPK.get()
@@ -213,10 +220,8 @@ class DSATopKBackend(Enum):
         # page_size=1 path from here.
         if (
             envs.SGLANG_OPT_USE_TOPK_V2.get()
-            # Protected v2 is allowed only when the full-mapping preflight
-            # validates and sanitizes this same compact table and publishes the
-            # producer epoch. Other protected layouts retain the legacy fused
-            # selected-slot producer below.
+            # Protected v2 is allowed only when metadata generation validates
+            # and sanitizes this same compact table before the indexer.
             and (
                 kv_page_protection is None
                 or kv_page_protection.get("producer_validation_via_full_mapping", False)

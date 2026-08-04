@@ -98,12 +98,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
   m.impl("fast_topk", torch::kCUDA, &fast_topk_interface);
-  m.def("kv_page_protection_begin_forward(Tensor request_indices, Tensor(a!) request_epochs, Tensor(b!) status) -> ()");
-  m.impl("kv_page_protection_begin_forward", torch::kCUDA, &kv_page_protection_begin_forward);
-  m.def(
-      "kv_page_protection_failure_status(Tensor request_indices, Tensor request_epochs, Tensor validated_epochs, "
-      "Tensor status, Tensor(a!) failure_status, Tensor(b!) failed) -> ()");
-  m.impl("kv_page_protection_failure_status", torch::kCUDA, &kv_page_protection_failure_status);
   m.def("fast_topk_kv_page_protection_supported", &fast_topk_kv_page_protection_supported);
   m.def("kv_page_protection_preflight_supported", &kv_page_protection_preflight_supported);
   m.def(

@@ -95,7 +95,6 @@ KV_PAGE_POSITION_MISMATCH = 1 << 2
 KV_PAGE_ATTENTION_TAG_MISMATCH = 1 << 3
 KV_PAGE_GENERATION_MISMATCH = 1 << 4
 KV_PAGE_TRANSFER_TAG_MISMATCH = 1 << 5
-KV_PAGE_VALIDATION_INCOMPLETE = 1 << 30
 KV_PAGE_VALIDATION_REMOTE_FAILURE = 1 << 29
 
 
@@ -455,7 +454,6 @@ def assert_protection_supported(
     allocator: object = None,
     transfer_backend: Optional[str] = None,
     is_spec_decode: bool = False,
-    supports_spec_target_verify: bool = False,
     pp_size: int = 1,
     enable_dp_attention: bool = False,
     is_cuda_device: Optional[bool] = None,
@@ -493,15 +491,11 @@ def assert_protection_supported(
                 "or run a supported layout (plain paged/token or SWA)."
             )
 
-    if (
-        is_spec_decode
-        and config.enable_attention_tags
-        and not supports_spec_target_verify
-    ):
+    if is_spec_decode and config.enable_attention_tags:
         raise RuntimeError(
-            "KV attention-tag protection requires a speculative target backend "
-            "with both pre-indexer and protected top-k validation. Disable "
-            "SGLANG_KV_PROTECTION or use audited DSA target verification."
+            "KV attention-tag protection requires metadata-fused normal DSA "
+            "decode and does not support speculative decoding. Disable the "
+            "speculative algorithm or SGLANG_KV_PROTECTION."
         )
 
     if config.enable_attention_tags and pp_size > 1:
@@ -1445,8 +1439,9 @@ class KVAttentionTagTable:
         self.validated_epochs = torch.full(
             (num_request_slots,), -1, dtype=torch.int32, device=device
         )
-        # DSA validates its full per-forward page table before the indexer, then
-        # independently publishes selected-slot validation from fused top-k.
+        # Generic fused validators retain separate pre-indexer and consumer
+        # epochs. Production metadata-fused GLM decode validates independently
+        # on every compact-table snapshot and does not launch epoch kernels.
         self.pre_indexer_validated_epochs = torch.full(
             (num_request_slots,), -1, dtype=torch.int32, device=device
         )
@@ -1595,57 +1590,6 @@ class KVAttentionTagTable:
         self.expected_transfer_page_tags.index_fill_(0, indices, 0)
         self.validated_epochs[request_pool_idx] = -1
         self.pre_indexer_validated_epochs[request_pool_idx] = -1
-
-    def begin_fused_forward(self, request_pool_indices: torch.Tensor) -> None:
-        if request_pool_indices.numel() == 0:
-            return
-        indices = request_pool_indices.to(
-            self.request_epochs.device, dtype=torch.long
-        ).reshape(-1)
-        if self.request_epochs.is_cuda:
-            torch.ops.sgl_kernel.kv_page_protection_begin_forward(
-                indices, self.request_epochs, self.validation_status
-            )
-            return
-        valid = indices.gt(0) & indices.lt(self.request_epochs.numel())
-        safe_indices = torch.where(valid, indices, 0)
-        self.validation_status.index_fill_(0, safe_indices, 0)
-        self.request_epochs.index_add_(0, safe_indices, valid.to(torch.int32))
-
-    def fused_failure_status(
-        self, request_pool_indices: torch.Tensor, *, return_failed: bool = False
-    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
-        indices = request_pool_indices.to(
-            self.request_epochs.device, dtype=torch.long
-        ).reshape(-1)
-        if self.request_epochs.is_cuda:
-            failure_status = torch.empty_like(indices, dtype=torch.int32)
-            failed = torch.empty_like(indices, dtype=torch.int32)
-            torch.ops.sgl_kernel.kv_page_protection_failure_status(
-                indices,
-                self.request_epochs,
-                self.validated_epochs,
-                self.validation_status,
-                failure_status,
-                failed,
-            )
-            return (failure_status, failed) if return_failed else failure_status
-        invalid = indices.lt(0) | indices.ge(self.request_epochs.numel())
-        safe_indices = torch.where(invalid, 0, indices)
-        status = self.validation_status.index_select(0, safe_indices)
-        request_epochs = self.request_epochs.index_select(0, safe_indices)
-        validated_epochs = self.validated_epochs.index_select(0, safe_indices)
-        incomplete = validated_epochs.ne(request_epochs).to(torch.int32)
-        failure_status = status | (incomplete * KV_PAGE_VALIDATION_INCOMPLETE)
-        failure_status = torch.where(
-            invalid,
-            torch.full_like(failure_status, KV_PAGE_INVALID_MAPPING),
-            failure_status,
-        )
-        failure_status = torch.where(indices.eq(0), 0, failure_status)
-        if return_failed:
-            return failure_status, failure_status.ne(0).to(torch.int32)
-        return failure_status
 
     def fused_forward_args(
         self,
@@ -2764,7 +2708,6 @@ class KVPageProtectionManager:
         metrics_collector: object = None,
         transfer_backend: Optional[str] = None,
         is_spec_decode: bool = False,
-        supports_spec_target_verify: bool = False,
         is_cuda_device: Optional[bool] = None,
     ):
         assert_protection_supported(
@@ -2772,7 +2715,6 @@ class KVPageProtectionManager:
             allocator=allocator,
             transfer_backend=transfer_backend,
             is_spec_decode=is_spec_decode,
-            supports_spec_target_verify=supports_spec_target_verify,
             is_cuda_device=is_cuda_device,
         )
         self.config = config

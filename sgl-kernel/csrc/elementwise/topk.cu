@@ -54,7 +54,6 @@ constexpr int32_t kKVPagePositionMismatch = 0x04;
 constexpr int32_t kKVPageAttentionTagMismatch = 0x08;
 constexpr int32_t kKVPageGenerationMismatch = 0x10;
 constexpr int32_t kKVPageTransferTagMismatch = 0x20;
-constexpr int32_t kKVPageValidationIncomplete = 1 << 30;
 
 struct KVTopKProtectionParams {
   const int64_t* __restrict__ request_indices;  // [B]
@@ -76,50 +75,6 @@ struct KVTopKProtectionParams {
   int32_t* __restrict__ validated_epochs;
   int32_t* __restrict__ status;
 };
-
-__global__ void kv_page_protection_begin_forward_kernel(
-    const int64_t* __restrict__ request_indices,
-    int64_t count,
-    int32_t num_request_slots,
-    int32_t* __restrict__ request_epochs,
-    int32_t* __restrict__ status) {
-  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index >= count) return;
-  const int64_t request_idx = request_indices[index];
-  if (request_idx > 0 && request_idx < num_request_slots) {
-    status[request_idx] = 0;
-    atomicAdd(request_epochs + request_idx, 1);
-  } else {
-    // Preserve the eager implementation's safe-index behavior for graph
-    // padding and malformed indices without treating slot 0 as a request.
-    status[0] = 0;
-  }
-}
-
-__global__ void kv_page_protection_failure_status_kernel(
-    const int64_t* __restrict__ request_indices,
-    int64_t count,
-    int32_t num_request_slots,
-    const int32_t* __restrict__ request_epochs,
-    const int32_t* __restrict__ validated_epochs,
-    const int32_t* __restrict__ status,
-    int32_t* __restrict__ failure_status,
-    int32_t* __restrict__ failed) {
-  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index >= count) return;
-  const int64_t request_idx = request_indices[index];
-  int32_t result = 0;
-  if (request_idx < 0 || request_idx >= num_request_slots) {
-    result = kKVPageInvalidMapping;
-  } else if (request_idx != 0) {
-    result = status[request_idx];
-    if (validated_epochs[request_idx] != request_epochs[request_idx]) {
-      result |= kKVPageValidationIncomplete;
-    }
-  }
-  failure_status[index] = result;
-  failed[index] = result != 0;
-}
 
 template <bool kPageSize64>
 __device__ __forceinline__ int32_t validate_selected_token_slot(
@@ -651,14 +606,6 @@ void check_protection_tensor(
   TORCH_CHECK(tensor.scalar_type() == dtype, name, " has an invalid dtype");
 }
 
-void check_request_sidecar_tensor(
-    const at::Tensor& tensor, const at::Tensor& reference, at::ScalarType dtype, const char* name) {
-  TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
-  TORCH_CHECK(tensor.device() == reference.device(), name, " must be on the request-indices device");
-  TORCH_CHECK(tensor.dim() == 1 && tensor.is_contiguous(), name, " must be a contiguous 1D tensor");
-  TORCH_CHECK(tensor.scalar_type() == dtype, name, " has an invalid dtype");
-}
-
 }  // namespace
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
@@ -677,70 +624,6 @@ bool fast_topk_kv_page_protection_supported() {
   cudaGetLastError();
   return false;
 #endif
-}
-
-void kv_page_protection_begin_forward(
-    const at::Tensor& request_indices, at::Tensor& request_epochs, at::Tensor& status) {
-  check_request_sidecar_tensor(request_indices, request_indices, at::kLong, "request_indices");
-  check_request_sidecar_tensor(request_epochs, request_indices, at::kInt, "request_epochs");
-  check_request_sidecar_tensor(status, request_indices, at::kInt, "status");
-  TORCH_CHECK(request_epochs.numel() == status.numel(), "request sidecar length mismatch");
-  TORCH_CHECK(
-      request_epochs.numel() > 0 && request_epochs.numel() <= std::numeric_limits<int32_t>::max(),
-      "request sidecar size is out of range");
-  if (request_indices.numel() == 0) return;
-  const at::cuda::OptionalCUDAGuard device_guard(request_indices.device());
-  const auto stream = at::cuda::getCurrentCUDAStream().stream();
-  constexpr int threads = 256;
-  const int64_t blocks = (request_indices.numel() + threads - 1) / threads;
-  kv_page_protection_begin_forward_kernel<<<blocks, threads, 0, stream>>>(
-      request_indices.data_ptr<int64_t>(),
-      request_indices.numel(),
-      static_cast<int32_t>(request_epochs.numel()),
-      request_epochs.data_ptr<int32_t>(),
-      status.data_ptr<int32_t>());
-  const auto result = cudaGetLastError();
-  TORCH_CHECK(result == cudaSuccess, "KV page protection begin kernel failed: ", cudaGetErrorString(result));
-}
-
-void kv_page_protection_failure_status(
-    const at::Tensor& request_indices,
-    const at::Tensor& request_epochs,
-    const at::Tensor& validated_epochs,
-    const at::Tensor& status,
-    at::Tensor& failure_status,
-    at::Tensor& failed) {
-  check_request_sidecar_tensor(request_indices, request_indices, at::kLong, "request_indices");
-  check_request_sidecar_tensor(request_epochs, request_indices, at::kInt, "request_epochs");
-  check_request_sidecar_tensor(validated_epochs, request_indices, at::kInt, "validated_epochs");
-  check_request_sidecar_tensor(status, request_indices, at::kInt, "status");
-  check_request_sidecar_tensor(failure_status, request_indices, at::kInt, "failure_status");
-  check_request_sidecar_tensor(failed, request_indices, at::kInt, "failed");
-  TORCH_CHECK(
-      request_epochs.numel() == validated_epochs.numel() && request_epochs.numel() == status.numel(),
-      "request sidecar length mismatch");
-  TORCH_CHECK(
-      request_epochs.numel() > 0 && request_epochs.numel() <= std::numeric_limits<int32_t>::max(),
-      "request sidecar size is out of range");
-  TORCH_CHECK(
-      failure_status.numel() == request_indices.numel() && failed.numel() == request_indices.numel(),
-      "failure output length mismatch");
-  if (request_indices.numel() == 0) return;
-  const at::cuda::OptionalCUDAGuard device_guard(request_indices.device());
-  const auto stream = at::cuda::getCurrentCUDAStream().stream();
-  constexpr int threads = 256;
-  const int64_t blocks = (request_indices.numel() + threads - 1) / threads;
-  kv_page_protection_failure_status_kernel<<<blocks, threads, 0, stream>>>(
-      request_indices.data_ptr<int64_t>(),
-      request_indices.numel(),
-      static_cast<int32_t>(request_epochs.numel()),
-      request_epochs.data_ptr<int32_t>(),
-      validated_epochs.data_ptr<int32_t>(),
-      status.data_ptr<int32_t>(),
-      failure_status.data_ptr<int32_t>(),
-      failed.data_ptr<int32_t>());
-  const auto result = cudaGetLastError();
-  TORCH_CHECK(result == cudaSuccess, "KV page protection status kernel failed: ", cudaGetErrorString(result));
 }
 
 void fast_topk_interface(

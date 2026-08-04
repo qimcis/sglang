@@ -393,16 +393,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 else str(self.transfer_backend)
             ),
             is_spec_decode=not self.scheduler.spec_algorithm.is_none(),
-            supports_spec_target_verify=getattr(
-                self.scheduler.tp_worker.model_runner,
-                "kv_requires_pre_indexer_page_validation",
-                False,
-            )
-            and getattr(
-                self.scheduler.tp_worker.model_runner,
-                "kv_fused_page_protection_enabled",
-                False,
-            ),
             is_cuda_device=is_cuda(),
         )
         self.scheduler.kv_protection_manager = manager

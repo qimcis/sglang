@@ -32,7 +32,6 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     TopkTransformMethod,
     protected_dsa_consumer_capability,
     protected_dsa_producer_capability,
-    repeat_request_indices_into,
 )
 from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.dsa.transform_index import (
@@ -506,8 +505,6 @@ class DeepseekSparseAttnBackend(
             self.kv_attention_tag_table,
             supported=fused_protection_supported,
         )
-        if self.kv_attention_tag_table is not None:
-            model_runner.kv_requires_pre_indexer_page_validation = True
         if self.kv_fused_page_protection_enabled:
             model_runner.kv_fused_page_protection_enabled = True
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
@@ -559,11 +556,9 @@ class DeepseekSparseAttnBackend(
         )
         self.speculative_step_id = speculative_step_id
 
-        # Normal protected decode can retain production's compact top-k v2
-        # path. Its input is the same real_page_table that the full pre-indexer
-        # validation sanitizes, so that preflight also provides the producer
-        # proof. Speculative rows keep the legacy selected-slot producer until
-        # their expanded-table contract is audited independently.
+        # Protected decode is deliberately limited to production's compact
+        # top-k v2 path. Its input is the same real_page_table that metadata
+        # generation validates and sanitizes before graph replay.
         self.kv_protected_topk_v2_enabled = bool(
             self.kv_fused_page_protection_enabled
             and is_cuda()
@@ -575,16 +570,40 @@ class DeepseekSparseAttnBackend(
             and envs.SGLANG_DSA_FUSE_TOPK.get()
             and envs.SGLANG_OPT_USE_TOPK_V2.get()
             and self.dsa_index_topk is not None
+            and self.dsa_index_topk > 0
             and self.dsa_index_topk <= 2048
         )
         self.kv_metadata_fused_page_protection_enabled = bool(
             self.kv_protected_topk_v2_enabled and self.real_page_size == 64
         )
         self.kv_protection_graph_bank = 0
-        if self.kv_metadata_fused_page_protection_enabled:
-            # ModelRunner uses this stable capability bit before eager metadata
-            # exists, so the legacy begin/status kernels are never launched for
-            # the normal protected decode fast path.
+        if fused_protection_requested:
+            if not self.kv_metadata_fused_page_protection_enabled:
+                if self.speculative_num_draft_tokens:
+                    reason = "speculative decoding is enabled"
+                elif not envs.SGLANG_OPT_USE_TOPK_V2.get():
+                    reason = "SGLANG_OPT_USE_TOPK_V2=1 is required"
+                elif self.real_page_size != 64:
+                    reason = (
+                        "the protected GLM/DSA page size must be 64 "
+                        f"(got {self.real_page_size})"
+                    )
+                elif (
+                    self.dsa_index_topk is None
+                    or self.dsa_index_topk <= 0
+                    or self.dsa_index_topk > 2048
+                ):
+                    reason = (
+                        "the DSA index top-k must be in [1, 2048] "
+                        f"(got {self.dsa_index_topk})"
+                    )
+                else:
+                    reason = "the compact CUDA top-k v2 path is unavailable"
+                raise RuntimeError(
+                    "KV page protection requires metadata-fused normal DSA "
+                    f"decode: {reason}. Disable SGLANG_KV_PROTECTION or use "
+                    "the production GLM-5.2 DSA configuration."
+                )
             model_runner.kv_metadata_fused_page_protection_enabled = True
 
         self.kv_cache_dtype = model_runner.kv_cache_dtype
@@ -867,96 +886,51 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         request_indices: torch.Tensor,
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
     ) -> None:
         table = self.kv_attention_tag_table
         protection = None
-        if self.kv_fused_page_protection_enabled:
-            if forward_mode.is_draft_extend_v2():
+        if table is not None:
+            if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
                 raise RuntimeError(
-                    "Fused DSA KV page protection does not support draft-extend: "
-                    "both pre-indexer and protected top-k boundaries are required"
+                    "KV page protection does not support speculative DSA forwards; "
+                    "startup should have rejected this configuration"
                 )
-            if forward_mode.is_decode_or_idle() or forward_mode.is_target_verify():
-                fused_metadata_validation = False
-                if forward_mode.is_target_verify():
-                    source_request_indices = request_indices
-                    rows = (
-                        source_request_indices.shape[0]
-                        * self.speculative_num_draft_tokens
+            if forward_mode.is_decode_or_idle():
+                if not self.kv_metadata_fused_page_protection_enabled:
+                    raise RuntimeError(
+                        "protected DSA decode reached a non-metadata-fused path"
                     )
-                    protected_request_indices = metadata.protected_request_indices
-                    if (
-                        protected_request_indices is None
-                        or protected_request_indices.numel() != rows
-                    ):
-                        protected_request_indices = torch.empty(
-                            rows,
-                            dtype=request_indices.dtype,
-                            device=request_indices.device,
-                        )
-                        object.__setattr__(
-                            metadata,
-                            "protected_request_indices",
-                            protected_request_indices,
-                        )
-                    request_indices = repeat_request_indices_into(
-                        source_request_indices,
-                        self.speculative_num_draft_tokens,
-                        protected_request_indices,
+                if (
+                    metadata.protected_request_indices is None
+                    or metadata.kv_page_failure_status is None
+                    or metadata.kv_page_local_failed is None
+                    or metadata.kv_page_failed is None
+                ):
+                    raise RuntimeError(
+                        "protected DSA metadata is missing graph-stable result buffers"
                     )
-                    indexer_seqlens = metadata.dsa_seqlens_expanded
-                else:
-                    fused_metadata_validation = (
-                        metadata.kv_page_failure_status is not None
-                        and forward_mode.is_decode_or_idle()
-                    )
-                    if not fused_metadata_validation:
-                        # Legacy eager/spec paths still capture a validator that
-                        # needs a stable request-index address.
-                        protected_request_indices = metadata.protected_request_indices
-                        if (
-                            protected_request_indices is None
-                            or protected_request_indices.numel()
-                            != request_indices.shape[0]
-                        ):
-                            protected_request_indices = torch.empty_like(
-                                request_indices
-                            )
-                            object.__setattr__(
-                                metadata,
-                                "protected_request_indices",
-                                protected_request_indices,
-                            )
-                        protected_request_indices.copy_(request_indices)
-                        request_indices = protected_request_indices
-                    indexer_seqlens = metadata.cache_seqlens_int32
                 if request_indices.shape[0] != metadata.real_page_table.shape[0]:
                     raise RuntimeError(
                         "protected DSA request rows do not match the indexer page table"
                     )
                 protection = table.fused_forward_args(
                     request_indices=request_indices,
-                    seqlens=indexer_seqlens,
+                    seqlens=metadata.cache_seqlens_int32,
                     page_table=metadata.real_page_table,
                     page_size=self.real_page_size,
                     validate_full_mapping=True,
-                    pre_indexer_cache_by_request=(not forward_mode.is_target_verify()),
+                    pre_indexer_cache_by_request=True,
                 )
-                if metadata.kv_page_failure_status is not None:
-                    protection.update(
-                        {
-                            "result_request_indices": metadata.protected_request_indices,
-                            "failure_status": metadata.kv_page_failure_status,
-                            "local_failed": metadata.kv_page_local_failed,
-                            "failed": metadata.kv_page_failed,
-                            "num_request_slots": table.request_epochs.numel(),
-                            "validated_in_metadata": fused_metadata_validation,
-                        }
-                    )
-                protection["producer_validation_via_full_mapping"] = bool(
-                    getattr(self, "kv_protected_topk_v2_enabled", False)
-                    and forward_mode.is_decode_or_idle()
+                protection.update(
+                    {
+                        "result_request_indices": metadata.protected_request_indices,
+                        "failure_status": metadata.kv_page_failure_status,
+                        "local_failed": metadata.kv_page_local_failed,
+                        "failed": metadata.kv_page_failed,
+                        "num_request_slots": table.request_epochs.numel(),
+                        "validated_in_metadata": True,
+                        "producer_validation_via_full_mapping": True,
+                    }
                 )
         object.__setattr__(metadata, "kv_page_protection", protection)
 
@@ -1307,7 +1281,6 @@ class DeepseekSparseAttnBackend(
             metadata,
             forward_batch.req_pool_indices[:batch_size],
             forward_batch.forward_mode,
-            forward_batch.spec_info,
         )
         if metadata.kv_page_protection is not None and metadata.kv_page_protection.get(
             "validated_in_metadata", False
@@ -1757,7 +1730,6 @@ class DeepseekSparseAttnBackend(
             metadata,
             req_pool_indices,
             forward_mode,
-            spec_info,
         )
         self.forward_metadata = metadata
 
@@ -1804,7 +1776,6 @@ class DeepseekSparseAttnBackend(
             metadata,
             req_pool_indices,
             forward_mode,
-            spec_info,
         )
         used_fused_metadata_generation = False
         target_verify_ctx_lens_written = False

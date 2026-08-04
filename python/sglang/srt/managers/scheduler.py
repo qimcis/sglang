@@ -900,11 +900,6 @@ class Scheduler(
             config,
             allocator=allocator,
             is_spec_decode=not self.spec_algorithm.is_none(),
-            supports_spec_target_verify=(
-                self.server_args.dsa_decode_backend is not None
-                and self.server_args.dsa_topk_backend == "sgl-kernel"
-                and envs.SGLANG_DSA_FUSE_TOPK.get()
-            ),
             pp_size=self.ps.pp_size,
             enable_dp_attention=self.server_args.enable_dp_attention,
             is_cuda_device=is_cuda_device,

@@ -340,15 +340,8 @@ class FusedKVPageProtectionCheck:
     request_pool_indices: torch.Tensor
     statuses: torch.Tensor
     failed: torch.Tensor
-    work: Optional[Any] = None
-
-    def wait(self) -> None:
-        if self.work is not None:
-            self.work.wait()
-            self.work = None
 
     def copy_to_cpu(self) -> None:
-        self.wait()
         # Overlap scheduling performs this copy on a dedicated CUDA stream.
         # Use the same pinned-D2H + record_stream primitive as the rest of the
         # generation result: a plain non_blocking ``to("cpu")`` drops the last
@@ -366,12 +359,10 @@ class FusedKVPageProtectionCheck:
     def mask_failed_rows(
         self, values: torch.Tensor, fallback: torch.Tensor
     ) -> torch.Tensor:
-        self.wait()
         failed = self.failed.to(device=values.device, dtype=torch.bool)
         return torch.where(failed, fallback.to(values.device), values)
 
     def materialize_error(self):
-        self.wait()
         if not bool(self.failed.any().item()):
             return None
 
@@ -3080,31 +3071,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.forward_pass_id += 1
 
         table = getattr(self, "kv_attention_tag_table", None)
-        is_protected_decode = (
-            forward_batch.forward_mode.is_decode_or_idle()
-            and forward_batch.spec_info is None
-        )
-        is_protected_dsa_verify = (
-            forward_batch.forward_mode.is_target_verify()
-            and getattr(self, "kv_requires_pre_indexer_page_validation", False)
-        )
-        uses_metadata_fused_protection = bool(
-            is_protected_decode
-            and getattr(
-                self,
-                "kv_metadata_fused_page_protection_enabled",
-                False,
-            )
-        )
-        if (
-            table is not None
-            and getattr(self, "kv_fused_page_protection_enabled", False)
-            and (is_protected_decode or is_protected_dsa_verify)
-            and not uses_metadata_fused_protection
-        ):
-            table.begin_fused_forward(
-                forward_batch.req_pool_indices[: forward_batch.batch_size]
-            )
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
@@ -3154,24 +3120,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         output.fused_kv_page_protection_check = (
             self._start_fused_kv_page_protection_check(forward_batch, table)
         )
-        active_kv_protection = (
-            self._get_active_kv_page_protection()
-            if output.fused_kv_page_protection_check is not None
-            else None
-        )
-        if output.fused_kv_page_protection_check is not None and not (
-            active_kv_protection is not None
-            and active_kv_protection.get("validated_in_metadata", False)
-        ):
-            # Protected CUDA graphs keep consuming the global tag/epoch/status
-            # sidecars after their normal pre-replay req_to_token snapshot. The
-            # graph runner therefore withholds its early WAR event. Publish the
-            # replacement only after the fused failure-status kernel has read
-            # those sidecars; the async TP reduction owns only the private
-            # ``failed`` output tensor and does not extend their lifetime.
-            protection_read_done = torch.get_device_module(self.device).Event()
-            protection_read_done.record()
-            self.war_fastpath_read_done_event = protection_read_done
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
         if (
@@ -3280,61 +3228,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _start_fused_kv_page_protection_check(
         self, forward_batch: ForwardBatch, table
     ) -> Optional[FusedKVPageProtectionCheck]:
-        is_protected_decode = (
-            forward_batch.forward_mode.is_decode() and forward_batch.spec_info is None
-        )
-        is_protected_dsa_verify = (
-            forward_batch.forward_mode.is_target_verify()
-            and getattr(self, "kv_requires_pre_indexer_page_validation", False)
-        )
-        if (
-            table is None
-            or not getattr(self, "kv_fused_page_protection_enabled", False)
-            or not (is_protected_decode or is_protected_dsa_verify)
-            or forward_batch.batch_size == 0
-        ):
+        if table is None or forward_batch.batch_size == 0:
             return None
-
-        request_pool_indices = forward_batch.req_pool_indices[
-            : forward_batch.batch_size
-        ]
-        protection = self._get_active_kv_page_protection()
-        if protection is not None and protection.get("validated_in_metadata", False):
-            # The out-of-graph DSA snapshot already emitted row status and the
-            # logits all-gather has reduced ``failed`` across TP ranks.  These
-            # buffers are graph-stable and require no bookkeeping kernel or
-            # dedicated collective here.
-            return FusedKVPageProtectionCheck(
-                request_pool_indices=protection["result_request_indices"][
-                    : forward_batch.batch_size
-                ],
-                statuses=protection["failure_status"][: forward_batch.batch_size],
-                failed=protection["failed"][: forward_batch.batch_size],
+        if forward_batch.forward_mode.is_target_verify():
+            raise RuntimeError(
+                "KV page protection does not support speculative target verification"
             )
-
-        status_result = table.fused_failure_status(
-            request_pool_indices, return_failed=True
-        )
-        if isinstance(status_result, tuple):
-            statuses, failed = status_result
-        else:
-            # Retain compatibility with lightweight test doubles and downstream
-            # tables while the shipped CUDA table emits both tensors in one op.
-            statuses = status_result
-            failed = statuses.ne(0).to(torch.int32)
-        work = None
-        if self.tp_size > 1:
-            work = dist.all_reduce(
-                failed,
-                op=dist.ReduceOp.MAX,
-                group=self.tp_group.device_group,
-                async_op=True,
+        if not forward_batch.forward_mode.is_decode():
+            return None
+        if forward_batch.spec_info is not None:
+            raise RuntimeError(
+                "KV page protection does not support speculative decode batches"
+            )
+        if not getattr(self, "kv_metadata_fused_page_protection_enabled", False):
+            raise RuntimeError(
+                "protected decode reached token publication without the "
+                "metadata-fused DSA validator"
+            )
+        protection = self._get_active_kv_page_protection()
+        if protection is None or not protection.get("validated_in_metadata", False):
+            raise RuntimeError(
+                "protected decode reached token publication without validated "
+                "graph-stable DSA metadata"
+            )
+        required = ("result_request_indices", "failure_status", "failed")
+        missing = [name for name in required if protection.get(name) is None]
+        if missing:
+            raise RuntimeError(
+                "protected DSA metadata is missing result buffers: "
+                + ", ".join(missing)
             )
         return FusedKVPageProtectionCheck(
-            request_pool_indices=request_pool_indices,
-            statuses=statuses,
-            failed=failed,
-            work=work,
+            request_pool_indices=protection["result_request_indices"][
+                : forward_batch.batch_size
+            ],
+            statuses=protection["failure_status"][: forward_batch.batch_size],
+            failed=protection["failed"][: forward_batch.batch_size],
         )
 
     def _forward_raw(
@@ -3468,37 +3397,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Returns:
             A list of next_token_ids
         """
-        try:
-            self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
-            # Sample the next tokens while the TP failure reduction is in flight.
-            next_token_ids = self.sampler(
-                logits_output,
-                forward_batch.sampling_info,
-                forward_batch.return_logprob,
-                forward_batch.top_logprobs_nums,
-                forward_batch.token_ids_logprobs,
-                # For prefill, we only use the position of the last token.
-                (
-                    forward_batch.positions
-                    if forward_batch.forward_mode.is_decode()
-                    else forward_batch.seq_lens - 1
-                ),
-            )
-        except BaseException:
-            if fused_kv_page_protection_check is not None:
-                fused_kv_page_protection_check.wait()
-            raise
+        next_token_ids = self.sampler(
+            logits_output,
+            forward_batch.sampling_info,
+            forward_batch.return_logprob,
+            forward_batch.top_logprobs_nums,
+            forward_batch.token_ids_logprobs,
+            # For prefill, we only use the position of the last token.
+            (
+                forward_batch.positions
+                if forward_batch.forward_mode.is_decode()
+                else forward_batch.seq_lens - 1
+            ),
+        )
         failed = (
             fused_kv_page_protection_check.failed
             if fused_kv_page_protection_check is not None
             else None
         )
-        if (
-            getattr(forward_batch, "ngram_embedding_info", None) is not None
-            and failed is not None
-        ):
-            fused_kv_page_protection_check.wait()
         self.maybe_update_ngram_token_table(
             next_token_ids, forward_batch, failed=failed
         )

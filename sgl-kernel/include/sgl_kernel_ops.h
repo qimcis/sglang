@@ -162,15 +162,6 @@ void fast_topk_interface(
     at::Tensor& indices,
     const at::Tensor& lengths,
     std::optional<at::Tensor> row_starts_opt = std::nullopt);
-void kv_page_protection_begin_forward(
-    const at::Tensor& request_indices, at::Tensor& request_epochs, at::Tensor& status);
-void kv_page_protection_failure_status(
-    const at::Tensor& request_indices,
-    const at::Tensor& request_epochs,
-    const at::Tensor& validated_epochs,
-    const at::Tensor& status,
-    at::Tensor& failure_status,
-    at::Tensor& failed);
 bool fast_topk_kv_page_protection_supported();
 bool kv_page_protection_preflight_supported();
 void kv_page_protection_preflight(
