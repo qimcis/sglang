@@ -17,16 +17,12 @@ from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
-    KV_PROTECTION_FEATURE_ALL,
-    KV_PROTECTION_FEATURE_CHECKSUM,
-    KV_PROTECTION_FEATURE_PAGE_TAGS,
-    KV_PROTECTION_PROTOCOL_VERSION,
     CommonKVBootstrapServer,
     CommonKVManager,
     CommonKVReceiver,
     CommonKVSender,
     KVTransferError,
-    kv_protection_feature_bitmap,
+    kv_protection_enabled,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingContext,
@@ -87,16 +83,6 @@ class TransferInfo:
     transfer_nonce: int = 0
     # Keep staging in its legacy positional slot.
     staging: Optional[StagingTransferInfo] = None
-    protection_protocol_version: int = 0
-    protection_feature_bitmap: int = 0
-
-    @property
-    def is_protected(self) -> bool:
-        return bool(
-            self.transfer_nonce
-            or self.protection_protocol_version
-            or self.protection_feature_bitmap
-        )
 
     def validate(self) -> None:
         ids = np.asarray(
@@ -123,32 +109,17 @@ class TransferInfo:
             if page_id in seen and seen[page_id] != tag:
                 raise ValueError("conflicting duplicate Mooncake transfer page id")
             seen[page_id] = tag
-        if not self.is_protected:
+        if not self.transfer_nonce:
             if len(ids):
                 raise ValueError(
                     "legacy Mooncake metadata cannot carry transfer page tags"
                 )
             return
-        if not self.transfer_nonce:
-            raise ValueError("protected Mooncake metadata requires a nonzero nonce")
-        if self.protection_protocol_version != KV_PROTECTION_PROTOCOL_VERSION:
-            raise ValueError("unsupported Mooncake protection protocol version")
-        if (
-            not self.protection_feature_bitmap
-            or self.protection_feature_bitmap & ~KV_PROTECTION_FEATURE_ALL
-        ):
-            raise ValueError("invalid Mooncake protection feature bitmap")
-        if len(ids) and not (
-            self.protection_feature_bitmap & KV_PROTECTION_FEATURE_PAGE_TAGS
-        ):
-            raise ValueError("Mooncake page-tag payload lacks negotiated capability")
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
-        if len(msg) < 8 or len(msg) > 14 or len(msg) == 13:
-            raise ValueError(
-                "Mooncake transfer metadata must have 8-12 legacy or 14 protected fields"
-            )
+        if len(msg) < 8 or len(msg) > 12:
+            raise ValueError("Mooncake transfer metadata must have 8-12 fields")
         for index in (4, 9, 10):
             if len(msg) > index and len(msg[index]) % np.dtype(np.int32).itemsize:
                 raise ValueError(
@@ -193,12 +164,6 @@ class TransferInfo:
             dst_transfer_page_tags=dst_transfer_page_tags,
             transfer_nonce=(
                 int(msg[11].decode("ascii")) if len(msg) > 11 and msg[11] else 0
-            ),
-            protection_protocol_version=(
-                int(msg[12].decode("ascii")) if len(msg) > 12 and msg[12] else 0
-            ),
-            protection_feature_bitmap=(
-                int(msg[13].decode("ascii")) if len(msg) > 13 and msg[13] else 0
             ),
         )
         info.validate()
@@ -1995,9 +1960,7 @@ class MooncakeKVManager(CommonKVManager):
                     except (IndexError, UnicodeDecodeError, ValueError) as e:
                         logger.warning("Ignoring malformed ABORT message: %s", e)
                         continue
-                    protection_required = bool(
-                        kv_protection_feature_bitmap(self.kv_args)
-                    )
+                    protection_required = kv_protection_enabled(self.kv_args)
                     with self.request_status_lock:
                         active_nonce = self.active_transfer_nonce_by_room.get(
                             room_to_be_aborted, 0
@@ -2143,15 +2106,10 @@ class MooncakeKVManager(CommonKVManager):
                         continue
                     required_dst_info_num = transfer_info.required_dst_info_num
                     transfer_nonce = transfer_info.transfer_nonce
-                    local_features = kv_protection_feature_bitmap(self.kv_args)
-                    expected_protocol = (
-                        KV_PROTECTION_PROTOCOL_VERSION if local_features else 0
-                    )
-                    if (
-                        transfer_info.protection_protocol_version != expected_protocol
-                        or transfer_info.protection_feature_bitmap != local_features
+                    if bool(transfer_info.transfer_nonce) != kv_protection_enabled(
+                        self.kv_args
                     ):
-                        reason = "Mooncake protection feature negotiation mismatch"
+                        reason = "Mooncake KV protection enablement mismatch"
                         self.record_failure(room, reason)
                         self.update_status(room, KVPoll.Failed)
                         if transfer_nonce:
@@ -2168,7 +2126,7 @@ class MooncakeKVManager(CommonKVManager):
                             )
                         except Exception as e:
                             logger.debug(
-                                "Failed to report Mooncake negotiation mismatch "
+                                "Failed to report Mooncake enablement mismatch "
                                 "for room=%s: %s",
                                 room,
                                 e,
@@ -2217,10 +2175,6 @@ class MooncakeKVManager(CommonKVManager):
                             first = next(iter(self.transfer_infos[room].values()))
                             if (
                                 first.transfer_nonce != transfer_nonce
-                                or first.protection_protocol_version
-                                != transfer_info.protection_protocol_version
-                                or first.protection_feature_bitmap
-                                != transfer_info.protection_feature_bitmap
                                 or first.required_dst_info_num
                                 != transfer_info.required_dst_info_num
                             ):
@@ -2358,11 +2312,7 @@ class MooncakeKVManager(CommonKVManager):
                 return
             if self.request_status[bootstrap_room] == KVPoll.Failed:
                 return
-            protection_features = kv_protection_feature_bitmap(self.kv_args)
-            protection_required = bool(protection_features)
-            checksum_required = bool(
-                protection_features & KV_PROTECTION_FEATURE_CHECKSUM
-            )
+            protection_required = kv_protection_enabled(self.kv_args)
             plan = None
             if protection_required:
                 expected_nonce = self.checksum_nonce_table.get(bootstrap_room)
@@ -2415,16 +2365,13 @@ class MooncakeKVManager(CommonKVManager):
 
                 try:
                     if status == KVPoll.Success:
-                        if checksum_required:
-                            if msg[3] != self.CHECKSUM_MANIFEST_HEADER:
-                                raise ValueError("missing checksum page manifest")
-                            plan = ChecksumPlan.from_wire_bytes(
-                                msg[4],
-                                expected_transfer_nonce=expected_nonce,
-                                expected_bootstrap_room=bootstrap_room,
-                            )
-                        elif msg[3] != self.PROTECTION_NONCE_HEADER:
-                            raise ValueError("unexpected checksum page manifest")
+                        if msg[3] != self.CHECKSUM_MANIFEST_HEADER:
+                            raise ValueError("missing checksum page manifest")
+                        plan = ChecksumPlan.from_wire_bytes(
+                            msg[4],
+                            expected_transfer_nonce=expected_nonce,
+                            expected_bootstrap_room=bootstrap_room,
+                        )
                     elif msg[3] != self.PROTECTION_NONCE_HEADER:
                         raise ValueError("failure completion has invalid nonce framing")
                 except Exception as e:
@@ -2746,9 +2693,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
     ):
         self.session_id = mgr.get_session_id()
         self.init_time = None
-        self.protection_feature_bitmap = kv_protection_feature_bitmap(mgr.kv_args)
+        self.protection_enabled = kv_protection_enabled(mgr.kv_args)
         self.transfer_nonce = (
-            secrets.randbits(64) or 1 if self.protection_feature_bitmap else 0
+            secrets.randbits(64) or 1 if self.protection_enabled else 0
         )
         self.started_transfer = False
         self.page_quarantine_required = False
@@ -2761,22 +2708,15 @@ class MooncakeKVReceiver(CommonKVReceiver):
         super().init(prefill_dp_rank)
         if self.conclude_state == KVPoll.Failed:
             return
-        expected_protocol = (
-            KV_PROTECTION_PROTOCOL_VERSION if self.protection_feature_bitmap else 0
-        )
-        if (
-            self.prefill_info.protection_protocol_version != expected_protocol
-            or self.prefill_info.protection_feature_bitmap
-            != self.protection_feature_bitmap
-        ):
+        if self.prefill_info.kv_protection_enabled != self.protection_enabled:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
-                "Mooncake prefill KV protection capability mismatch",
+                "Mooncake prefill KV protection enablement mismatch",
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             self.conclude_state = KVPoll.Failed
             return
-        if self.protection_feature_bitmap:
+        if self.protection_enabled:
             manager = getattr(self.kv_mgr.kv_args, "transfer_page_tag_manager", None)
             if manager is None or not manager.config.enabled:
                 self.kv_mgr.record_failure(
@@ -2786,10 +2726,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 self.conclude_state = KVPoll.Failed
                 return
-            if (
-                self.protection_feature_bitmap & KV_PROTECTION_FEATURE_CHECKSUM
-                and getattr(self, "required_prefill_response_num", 1) != 1
-            ):
+            if getattr(self, "required_prefill_response_num", 1) != 1:
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
                     "KV checksum page manifests require one prefill completion per decode rank",
@@ -2910,7 +2847,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
             if transfer_page_tags is not None
             else b""
         )
-        if self.protection_feature_bitmap & KV_PROTECTION_FEATURE_PAGE_TAGS:
+        if self.protection_enabled:
             tag_ids = np.asarray(
                 transfer_page_tag_ids if transfer_page_tag_ids is not None else [],
                 dtype=np.int32,
@@ -2963,20 +2900,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     transfer_page_tags_bytes if not is_dummy else b"",
                     str(self.transfer_nonce).encode("ascii"),
                 ]
-                if self.protection_feature_bitmap:
-                    frames.extend(
-                        [
-                            str(KV_PROTECTION_PROTOCOL_VERSION).encode("ascii"),
-                            str(self.protection_feature_bitmap).encode("ascii"),
-                        ]
-                    )
                 with lock:
                     sock.send_multipart(frames)
-                if self.protection_feature_bitmap and not is_dummy:
+                if self.protection_enabled and not is_dummy:
                     self.notified_producers.add(int(bootstrap_info["producer_id"]))
                     self.started_transfer = True
             except Exception as e:
-                if not self.protection_feature_bitmap:
+                if not self.protection_enabled:
                     raise
                 with self.kv_mgr.request_status_lock:
                     self.kv_mgr.expected_abort_ack_producers_by_room[
@@ -2991,7 +2921,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 self._send_abort_notification()
                 self.init_time = time.time()
                 return
-        if self.protection_feature_bitmap:
+        if self.protection_enabled:
             with self.kv_mgr.request_status_lock:
                 self.kv_mgr.expected_abort_ack_producers_by_room[
                     self.bootstrap_room

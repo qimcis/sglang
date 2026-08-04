@@ -48,27 +48,10 @@ from sglang.srt.utils.network import (
 
 logger = logging.getLogger(__name__)
 
-KV_PROTECTION_PROTOCOL_VERSION = 2
-KV_PROTECTION_FEATURE_CHECKSUM = 1 << 0
-KV_PROTECTION_FEATURE_PAGE_TAGS = 1 << 1
-KV_PROTECTION_FEATURE_ALL = (
-    KV_PROTECTION_FEATURE_CHECKSUM | KV_PROTECTION_FEATURE_PAGE_TAGS
-)
 
-
-def kv_protection_feature_bitmap(kv_args: KVArgs) -> int:
+def kv_protection_enabled(kv_args: KVArgs) -> bool:
     config = getattr(kv_args, "kv_protection_config", None)
-    if config is None:
-        manager = getattr(kv_args, "transfer_page_tag_manager", None)
-        config = getattr(manager, "config", None)
-    if config is None or not config.enabled:
-        return 0
-    features = 0
-    if config.checksum_enabled:
-        features |= KV_PROTECTION_FEATURE_CHECKSUM
-    if config.enable_attention_tags:
-        features |= KV_PROTECTION_FEATURE_PAGE_TAGS
-    return features
+    return bool(config is not None and config.enabled)
 
 
 def send_metadata_with_staging_registration(
@@ -126,8 +109,7 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
-    protection_protocol_version: int = 0
-    protection_feature_bitmap: int = 0
+    kv_protection_enabled: bool = False
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -147,8 +129,7 @@ class PrefillServerInfo:
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
-        self.protection_protocol_version = int(self.protection_protocol_version)
-        self.protection_feature_bitmap = int(self.protection_feature_bitmap)
+        self.kv_protection_enabled = bool(self.kv_protection_enabled)
 
 
 @dataclasses.dataclass
@@ -515,13 +496,7 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
         }
-        if self.server_args.disaggregation_transfer_backend in ("mooncake", "nixl"):
-            features = kv_protection_feature_bitmap(self.kv_args)
-            if features:
-                payload.update(
-                    protection_protocol_version=KV_PROTECTION_PROTOCOL_VERSION,
-                    protection_feature_bitmap=features,
-                )
+        payload["kv_protection_enabled"] = kv_protection_enabled(self.kv_args)
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
         for attempt in range(max_retries):
@@ -1353,8 +1328,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
-        self.protection_protocol_version: Optional[int] = None
-        self.protection_feature_bitmap: Optional[int] = None
+        self.kv_protection_enabled: Optional[bool] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1421,8 +1395,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
-        protection_protocol_version = int(data.get("protection_protocol_version", 0))
-        protection_feature_bitmap = int(data.get("protection_feature_bitmap", 0))
+        kv_protection_enabled = bool(data.get("kv_protection_enabled", False))
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1442,15 +1415,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
 
-        if self.protection_protocol_version is None:
-            self.protection_protocol_version = protection_protocol_version
-            self.protection_feature_bitmap = protection_feature_bitmap
-        elif (
-            self.protection_protocol_version != protection_protocol_version
-            or self.protection_feature_bitmap != protection_feature_bitmap
-        ):
+        if self.kv_protection_enabled is None:
+            self.kv_protection_enabled = kv_protection_enabled
+        elif self.kv_protection_enabled != kv_protection_enabled:
             return web.Response(
-                text="Prefill workers disagree on KV protection capabilities.",
+                text="Prefill workers disagree on whether KV protection is enabled.",
                 status=400,
             )
 
@@ -1523,8 +1492,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
-                protection_protocol_version=self.protection_protocol_version or 0,
-                protection_feature_bitmap=self.protection_feature_bitmap or 0,
+                kv_protection_enabled=bool(self.kv_protection_enabled),
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 

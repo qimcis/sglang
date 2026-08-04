@@ -74,8 +74,8 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
-    # Full wire-protocol policy. Prefill may use a checksum-only local manager,
-    # but still needs to advertise page-tag transport support.
+    # All-or-nothing wire-protocol enablement. Prefill may use a checksum-only
+    # local manager, but both roles still advertise protection as enabled.
     kv_protection_config: object
 
 
