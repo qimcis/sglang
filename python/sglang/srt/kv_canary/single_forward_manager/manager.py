@@ -143,7 +143,7 @@ class SingleForwardManager:
                 f"CanaryLaunchCapacities.from_args"
             )
 
-        if self._config.enable_verify_token_assert:
+        if self._buffer_groups and self._config.enable_verify_token_assert:
             populate_req_to_expected_token_ids(
                 forward_batch=maybe_inaccurate_forward_batch,
                 req_to_verify_expected_tokens=self._device_state.req_to_verify_expected_tokens,
@@ -268,8 +268,14 @@ class SingleForwardManager:
                 enable_verify_token_assert=self._config.enable_verify_token_assert,
             )
 
-        verify_plan_enable_combined = _torch_reduce_minimum(
-            [x.enable for x in pre_ops_output.verify_plans]
+        verify_plan_enable_combined = (
+            _torch_reduce_minimum([x.enable for x in pre_ops_output.verify_plans])
+            if pre_ops_output.verify_plans
+            else torch.ones(
+                1,
+                dtype=self._output_buffer.verify_plan_enable.dtype,
+                device=self._device,
+            )
         )
         self._output_buffer.copy_from(
             verify_plan_enable=verify_plan_enable_combined,
@@ -295,7 +301,7 @@ class SingleForwardManager:
     def _should_enable_write_input_assert_for_launch(
         self, forward_batch: ForwardBatch
     ) -> bool:
-        if not self._config.enable_write_input_assert:
+        if not self._buffer_groups or not self._config.enable_write_input_assert:
             return False
         forward_mode = forward_batch.forward_mode
         if (

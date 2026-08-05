@@ -601,6 +601,7 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
+                state_protection_check=out.state_protection_check,
             )
 
             if is_verify:
@@ -617,6 +618,12 @@ class TpModelWorker(BaseTpWorker):
                     batch_result.next_token_ids = self.model_runner.sample(
                         logits_output, forward_batch
                     )
+                    if out.state_protection_check is not None:
+                        batch_result.next_token_ids = (
+                            out.state_protection_check.mask_failed_rows(
+                                batch_result.next_token_ids
+                            )
+                        )
                     return batch_result
 
                 batch_result.delay_sample_func = sample_batch_func
@@ -627,6 +634,12 @@ class TpModelWorker(BaseTpWorker):
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
                 )
+                if out.state_protection_check is not None:
+                    batch_result.next_token_ids = (
+                        out.state_protection_check.mask_failed_rows(
+                            batch_result.next_token_ids
+                        )
+                    )
             else:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens
@@ -655,6 +668,7 @@ class TpModelWorker(BaseTpWorker):
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
+                state_protection_check=out.state_protection_check,
             )
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
@@ -674,12 +688,17 @@ class TpModelWorker(BaseTpWorker):
             next_token_ids = self.model_runner.sample(
                 logits_output, batch.split_forward_batch
             )
+            if out.state_protection_check is not None:
+                next_token_ids = out.state_protection_check.mask_failed_rows(
+                    next_token_ids
+                )
         else:
             next_token_ids = None
         batch_result = GenerationBatchResult(
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
             expert_distribution_metrics=out.expert_distribution_metrics,
+            state_protection_check=out.state_protection_check,
         )
         batch_result.next_token_ids = next_token_ids
         return batch_result

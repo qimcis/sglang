@@ -1094,7 +1094,17 @@ class MoriKVManager(CommonKVManager):
                         dst_dims,
                     )
                 )
-            elif st in ("swa", "dsa", "swa_ring", "c128_state", "minimax_index_k"):
+            elif st in (
+                "swa",
+                "dsa",
+                "swa_ring",
+                "c128_state",
+                "minimax_index_k",
+                "protected_paged",
+                "protected_swa",
+                "protected_aux",
+                "protected_swa_aux",
+            ):
                 statuses.extend(
                     self._send_swa_dsa_state(
                         peer_info,
@@ -1136,6 +1146,15 @@ class MoriKVManager(CommonKVManager):
             not src_state_dim_per_tensor or not dst_state_dim_per_tensor
         ):
             tp_mismatch = False
+
+        if tp_mismatch and (
+            any(dim == 0 for dim in src_state_dim_per_tensor)
+            or any(dim == 0 for dim in dst_state_dim_per_tensor)
+        ):
+            raise RuntimeError(
+                "protected recurrent-state digests require matching prefill/decode "
+                "attention TP layouts; canonical cross-TP manifests are not available"
+            )
 
         if tp_mismatch:
             logger.warning_once(
@@ -1213,12 +1232,20 @@ class MoriKVManager(CommonKVManager):
     ) -> List[TransferStatus]:
         # TP mismatch check for non-MLA SWA
         if (
-            state_type == "swa"
-            and not self.is_mla_backend
+            (
+                state_type
+                in (
+                    "protected_paged",
+                    "protected_swa",
+                    "protected_aux",
+                    "protected_swa_aux",
+                )
+                or (state_type == "swa" and not self.is_mla_backend)
+            )
             and peer_info.decode_tp_size != self.attn_tp_size
         ):
             raise RuntimeError(
-                f"PD state transfer does not support TP-mismatched non-MLA SWA models "
+                f"PD state transfer does not support TP-mismatched {state_type} state "
                 f"(prefill_tp_size={self.attn_tp_size}, decode_tp_size={peer_info.decode_tp_size})"
             )
         if state_type == "minimax_index_k":

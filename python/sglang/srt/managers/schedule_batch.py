@@ -848,6 +848,11 @@ class Req(ReqDllmMixin):
         # For req-level memory management
         self.kv_committed_len = 0
         self.kv: Optional[ReqKvInfo] = None
+        # Set while a fail-closed state-validation result is draining through
+        # overlap/chunked result processing. These are explicit request state,
+        # not optional scheduler decorations.
+        self.state_protection_abort = False
+        self.state_protection_deferred_release = False
 
         # for cross-encoder model
         self.token_type_ids = token_type_ids
@@ -1650,18 +1655,45 @@ class Req(ReqDllmMixin):
             self.req_pool_idx, : self.seqlen - 1
         ]
         # Copies over both the kv cache and mamba state if available
-        self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
+        cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
             token_indices, mamba_indices=self.mamba_pool_idx
         )
+        kvcache = token_to_kv_pool_allocator.get_kvcache()
+        protection = getattr(kvcache, "paged_state_protection", None)
+        if protection is None:
+            self.kv_cache_cpu = cache_cpu
+        else:
+            self.kv_cache_cpu = {
+                "__state_protection_cache__": cache_cpu,
+                "__state_protection_paged__": protection.get_cpu_copy(
+                    token_indices
+                ),
+            }
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
         ]
         # Loads both the kv cache and mamba state if exists
+        cache_cpu = self.kv_cache_cpu
+        protection_cpu = None
+        if (
+            isinstance(cache_cpu, dict)
+            and "__state_protection_cache__" in cache_cpu
+        ):
+            protection_cpu = cache_cpu["__state_protection_paged__"]
+            cache_cpu = cache_cpu["__state_protection_cache__"]
         token_to_kv_pool_allocator.load_cpu_copy(
-            self.kv_cache_cpu, token_indices, mamba_indices=self.mamba_pool_idx
+            cache_cpu, token_indices, mamba_indices=self.mamba_pool_idx
         )
+        if protection_cpu is not None:
+            kvcache = token_to_kv_pool_allocator.get_kvcache()
+            protection = getattr(kvcache, "paged_state_protection", None)
+            if protection is None:
+                raise RuntimeError(
+                    "protected paged state was restored without its accessor"
+                )
+            protection.load_cpu_copy(protection_cpu, token_indices)
         del self.kv_cache_cpu
 
     def build_rebootstrap_payload(self) -> dict:

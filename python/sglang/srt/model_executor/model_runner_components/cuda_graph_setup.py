@@ -172,6 +172,11 @@ def capture_cuda_graphs(
 
     if model_runner.canary_manager is not None and not model_runner.is_draft_worker:
         model_runner.canary_manager.mark_init_finished()
+    if (
+        model_runner.state_protection_manager is not None
+        and not model_runner.is_draft_worker
+    ):
+        model_runner.state_protection_manager.mark_init_finished()
 
     return CudaGraphsCapture(eager_runner=eager_runner, prefill=prefill, decode=decode)
 

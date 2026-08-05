@@ -61,13 +61,22 @@ class CanaryConfig:
 
     @classmethod
     def from_env(cls, server_args: ServerArgs) -> CanaryConfig:
-        mode_raw = server_args.kv_canary.strip().lower()
+        fail_closed = bool(server_args.enable_state_protection)
+        mode_raw = (
+            CanaryMode.LOG.value
+            if fail_closed
+            else server_args.kv_canary.strip().lower()
+        )
         if mode_raw not in ("none", "log", "raise"):
             raise ValueError(
                 f"kv-canary: kv_canary must be one of none/log/raise, got {mode_raw!r}"
             )
 
-        real_kv_raw = server_args.kv_canary_real_data.strip().upper()
+        real_kv_raw = (
+            RealKvHashMode.ALL.name
+            if fail_closed
+            else server_args.kv_canary_real_data.strip().upper()
+        )
 
         return cls(
             mode=CanaryMode(mode_raw),
@@ -75,6 +84,9 @@ class CanaryConfig:
             sweep_interval=server_args.kv_canary_sweep_interval,
             real_kv_hash_mode=RealKvHashMode[real_kv_raw],
             enable_write_input_assert=envs.SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT.get(),
-            enable_verify_token_assert=envs.SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT.get(),
+            enable_verify_token_assert=(
+                fail_closed
+                or envs.SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT.get()
+            ),
             stats_print_every_n_steps=envs.SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS.get(),
         )

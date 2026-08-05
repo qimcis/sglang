@@ -1233,6 +1233,35 @@ def setup_state_kv_args(
                 slice_outer_counts,
             )
 
+    paged_protection = getattr(token_to_kv_pool, "paged_state_protection", None)
+    if paged_protection is not None:
+        for transfer_kind, state_type in (
+            ("contiguous", StateType.PROTECTED_PAGED),
+            ("state", StateType.PROTECTED_SWA),
+        ):
+            data_ptrs, data_lens, item_lens = (
+                paged_protection.get_transfer_buf_infos(transfer_kind)
+            )
+            if data_ptrs:
+                append_state_component(
+                    kv_args, state_type, data_ptrs, data_lens, item_lens
+                )
+        for transfer_kind, state_type in (
+            ("contiguous", StateType.PROTECTED_AUX),
+            ("state", StateType.PROTECTED_SWA_AUX),
+        ):
+            data_ptrs, data_lens, item_lens = (
+                paged_protection.get_aux_transfer_buf_infos(transfer_kind)
+            )
+            if data_ptrs:
+                append_state_component(
+                    kv_args,
+                    state_type,
+                    data_ptrs,
+                    data_lens,
+                    item_lens,
+                )
+
 
 def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT

@@ -8,8 +8,8 @@ from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.pool_patcher.buf_info_splice import patch_buf_info_method
 from sglang.srt.kv_canary.pool_patcher.buffer_alloc import (
     alloc_canary_buf,
-    make_row_source,
 )
+from sglang.srt.kv_canary.pool_patcher.adapters.mha import _slot_major_source
 
 
 def attach_swa(
@@ -62,7 +62,7 @@ def _build_subpool_group(
     swa_lut: Optional[torch.Tensor],
     kv_token_id_vs_position_offset: int,
 ) -> CanaryBufferGroup:
-    num_slots = int(sub_pool.k_buffer[0].shape[0])
+    num_slots = int(sub_pool.size) + int(sub_pool.page_size)
     k_head = alloc_canary_buf(num_slots=num_slots, device=device)
     k_tail = alloc_canary_buf(num_slots=num_slots, device=device)
     v_head = alloc_canary_buf(num_slots=num_slots, device=device)
@@ -73,11 +73,11 @@ def _build_subpool_group(
         k_tail=k_tail,
         v_head=v_head,
         v_tail=v_tail,
-        real_kv_sources_k=make_row_source(
-            layer_buffer=sub_pool.k_buffer[0], read_bytes=read_bytes
+        real_kv_sources_k=_slot_major_source(
+            sub_pool.k_buffer[0], num_slots=num_slots, read_bytes=read_bytes
         ),
-        real_kv_sources_v=make_row_source(
-            layer_buffer=sub_pool.v_buffer[0], read_bytes=read_bytes
+        real_kv_sources_v=_slot_major_source(
+            sub_pool.v_buffer[0], num_slots=num_slots, read_bytes=read_bytes
         ),
         swa_index_lut=swa_lut,
         kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,

@@ -93,6 +93,25 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
 
+    def _release_state_protection_abort_if_ready(self, req: Req) -> bool:
+        if not getattr(req, "state_protection_abort", False):
+            return False
+        if req.inflight_middle_chunks > 0 or not req.finished():
+            return False
+        if req.req_pool_idx is not None:
+            if self.server_args.enable_hisparse:
+                self.hisparse_coordinator.request_finished(req)
+            prepare_release = getattr(
+                self.model_worker, "prepare_for_kv_cache_release", None
+            )
+            if callable(prepare_release):
+                prepare_release(req)
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+        req.state_protection_deferred_release = False
+        req.state_protection_abort = False
+        req.time_stats.set_completion_time()
+        return True
+
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
@@ -260,6 +279,17 @@ class SchedulerBatchResultProcessor:
                     # drain its accounting without streaming it.
                     continue
 
+                if (
+                    result.state_protection_failed_indices is not None
+                    and i in result.state_protection_failed_indices
+                ):
+                    req.update_finish_state(0)
+                    if req.inflight_middle_chunks > 0:
+                        req.inflight_middle_chunks -= 1
+                    if not getattr(req, "state_protection_deferred_release", False):
+                        self._release_state_protection_abort_if_ready(req)
+                    continue
+
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
 
@@ -305,6 +335,8 @@ class SchedulerBatchResultProcessor:
                 else:
                     # being chunked reqs' prefill is not finished
                     req.inflight_middle_chunks -= 1
+                    if req.finished():
+                        self._release_state_protection_abort_if_ready(req)
                     # There is only at most one request being currently chunked.
                     # Because this request does not finish prefill,
                     # we don't want to stream the request currently being chunked.
@@ -851,6 +883,16 @@ class SchedulerBatchResultProcessor:
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
+            if (
+                result.state_protection_failed_indices is not None
+                and i in result.state_protection_failed_indices
+            ):
+                req.update_finish_state(0)
+                self._handle_finish_state_updated_req(
+                    req, batch, result, i, logits_output
+                )
+                continue
+
             # next_token_id is a per-req list: 1 token for non-spec, the verified
             # run for spec (already grammar-truncated in _resolve_spec_v2_tokens).
             next_token_id = next_token_ids[i]
@@ -1015,7 +1057,9 @@ class SchedulerBatchResultProcessor:
     ):
         # Called here (after update_finish_state) so req.finished() is valid
         # for mamba_lazy_post_decode_at_boundary inside.
-        self._mamba_prefix_cache_update(req, batch, result, i)
+        is_state_protection_abort = getattr(req, "state_protection_abort", False)
+        if not is_state_protection_abort:
+            self._mamba_prefix_cache_update(req, batch, result, i)
 
         if (
             get_disagg().disaggregation_decode_enable_offload_kvcache
@@ -1038,6 +1082,8 @@ class SchedulerBatchResultProcessor:
             self._maybe_collect_routed_experts(req)
             self._maybe_collect_indexer_topk(req)
 
+            if getattr(req, "state_protection_deferred_release", False):
+                return
             if get_disagg().disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                 if not self.decode_offload_manager.offload_kv_cache(req):
@@ -1051,11 +1097,17 @@ class SchedulerBatchResultProcessor:
                 if callable(prepare_release):
                     prepare_release(req)
                 is_insert = (
-                    req.mamba_lazy_is_insert
-                    if get_server_args().enable_mamba_extra_buffer_lazy()
-                    else True
+                    False
+                    if is_state_protection_abort
+                    else (
+                        req.mamba_lazy_is_insert
+                        if get_server_args().enable_mamba_extra_buffer_lazy()
+                        else True
+                    )
                 )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                if is_state_protection_abort:
+                    req.state_protection_abort = False
 
             req.time_stats.set_completion_time()
 

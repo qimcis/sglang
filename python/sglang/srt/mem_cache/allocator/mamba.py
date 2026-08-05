@@ -38,6 +38,7 @@ class MambaSlotAllocator:
     def __init__(self, size: int, device: str):
         self.size = size
         self.device = device
+        self.state_protection = None
         # Active preallocated batch for `alloc_group_begin` / `alloc_group_end`.
         # When non-None, `alloc(1)` consumes the next slot from this iterator
         # instead of calling `_do_alloc(1)` per request. Reset to None outside
@@ -83,11 +84,15 @@ class MambaSlotAllocator:
             return None
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        if self.state_protection is not None:
+            self.state_protection.on_allocate(select_index)
         return select_index
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        if self.state_protection is not None:
+            self.state_protection.on_free(free_index)
         self.free_slots = torch.cat((self.free_slots, free_index))
 
     def clear(self):
@@ -95,3 +100,10 @@ class MambaSlotAllocator:
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
+        if self.state_protection is not None:
+            self.state_protection.clear()
+
+    def attach_state_protection(self, protection) -> None:
+        if self.state_protection is not None:
+            raise RuntimeError("MambaSlotAllocator protection is already attached")
+        self.state_protection = protection

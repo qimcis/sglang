@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.state_protection.paged import maybe_paged_guard
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -148,6 +149,33 @@ class RadixAttention(nn.Module):
         self.xai_temperature_len = -1
 
     def forward(
+        self,
+        q,
+        k,
+        v,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        key_value_num_tokens: Optional[int] = None,
+        **kwargs,
+    ):
+        backend = get_attn_backend()
+        with maybe_paged_guard(
+            backend,
+            layer=self,
+            forward_batch=forward_batch,
+            save_kv_cache=save_kv_cache,
+        ):
+            return self._forward_unprotected(
+                q,
+                k,
+                v,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                key_value_num_tokens=key_value_num_tokens,
+                **kwargs,
+            )
+
+    def _forward_unprotected(
         self,
         q,
         k,

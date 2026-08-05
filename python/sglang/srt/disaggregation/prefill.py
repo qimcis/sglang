@@ -697,6 +697,22 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            if (
+                result.state_protection_failed_indices is not None
+                and i in result.state_protection_failed_indices
+            ):
+                req.update_finish_state(0)
+                if req.inflight_middle_chunks > 0:
+                    req.inflight_middle_chunks -= 1
+                if hasattr(req, "disagg_kv_sender") and req.disagg_kv_sender is not None:
+                    abort = getattr(req.disagg_kv_sender, "abort", None)
+                    if callable(abort):
+                        abort()
+                if not getattr(req, "state_protection_deferred_release", False):
+                    self.batch_result_processor._release_state_protection_abort_if_ready(
+                        req
+                    )
+                continue
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
@@ -778,6 +794,9 @@ class SchedulerDisaggregationPrefillMixin:
                 # Optimistic bootstrap can fail while this overlapped chunk is
                 # already running. Drop aborted chunks instead of sending KV.
                 if is_aborted(req):
+                    self.batch_result_processor._release_state_protection_abort_if_ready(
+                        req
+                    )
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
@@ -1215,6 +1234,10 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.MINIMAX_INDEX_K: _dsa_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
+                StateType.PROTECTED_PAGED: _dsa_payload,
+                StateType.PROTECTED_SWA: _swa_payload,
+                StateType.PROTECTED_AUX: _dsa_payload,
+                StateType.PROTECTED_SWA_AUX: _swa_payload,
             }
             if _is_npu and isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(),

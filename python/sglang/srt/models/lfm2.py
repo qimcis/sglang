@@ -271,37 +271,39 @@ class Lfm2ShortConv(nn.Module):
         # The backend owns the per-request conv-state plumbing (slot indices,
         # prefix mask, cu-seqlens, cuda-graph buffers); this layer just runs its
         # depthwise conv against the returned handle.
-        meta = get_attn_backend().conv_state_metadata(self.layer_idx, forward_batch)
-        conv_state = meta.layer_cache.conv[0]
+        with get_attn_backend().conv_state_guard(
+            self.layer_idx, forward_batch
+        ) as meta:
+            conv_state = meta.layer_cache.conv[0]
 
-        # Project and split into gates: B (pre-conv), C (post-conv), x (input)
-        proj, _ = self.in_proj(hidden_states)
-        B_gate, C_gate, x = proj.chunk(3, dim=-1)
-        Bx = B_gate * x
+            # Project and split into gates: B (pre-conv), C (post-conv), x (input)
+            proj, _ = self.in_proj(hidden_states)
+            B_gate, C_gate, x = proj.chunk(3, dim=-1)
+            Bx = B_gate * x
 
-        if forward_batch.forward_mode.is_decode():
-            # Decode: single token per request, use optimized update kernel
-            conv_out = causal_conv1d_update(
-                Bx,
-                conv_state,
-                self.conv_weight,
-                self.conv_bias,
-                activation=None,
-                conv_state_indices=meta.cache_indices,
-            )
-        else:
-            # Prefill: multiple tokens, use varlen kernel
-            Bx_t = Bx.transpose(0, 1).contiguous()
-            conv_out = causal_conv1d_fn(
-                Bx_t,
-                self.conv_weight,
-                self.conv_bias,
-                query_start_loc=meta.query_start_loc,
-                cache_indices=meta.cache_indices,
-                has_initial_state=meta.has_initial_state,
-                conv_states=conv_state,
-                activation=None,
-            ).transpose(0, 1)
+            if forward_batch.forward_mode.is_decode():
+                # Decode: single token per request, use optimized update kernel
+                conv_out = causal_conv1d_update(
+                    Bx,
+                    conv_state,
+                    self.conv_weight,
+                    self.conv_bias,
+                    activation=None,
+                    conv_state_indices=meta.cache_indices,
+                )
+            else:
+                # Prefill: multiple tokens, use varlen kernel
+                Bx_t = Bx.transpose(0, 1).contiguous()
+                conv_out = causal_conv1d_fn(
+                    Bx_t,
+                    self.conv_weight,
+                    self.conv_bias,
+                    query_start_loc=meta.query_start_loc,
+                    cache_indices=meta.cache_indices,
+                    has_initial_state=meta.has_initial_state,
+                    conv_states=conv_state,
+                    activation=None,
+                ).transpose(0, 1)
 
         output, _ = self.out_proj(C_gate * conv_out)
         return output

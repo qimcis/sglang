@@ -1165,6 +1165,10 @@ class MooncakeKVManager(CommonKVManager):
             StateType.DSA,
             StateType.SWA_RING,
             StateType.C128_STATE,
+            StateType.PROTECTED_PAGED,
+            StateType.PROTECTED_SWA,
+            StateType.PROTECTED_AUX,
+            StateType.PROTECTED_SWA_AUX,
         )
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
@@ -1277,6 +1281,22 @@ class MooncakeKVManager(CommonKVManager):
                     )
             elif self._is_generic_kvcache_state_type(st):
                 if (
+                    st
+                    in (
+                        StateType.PROTECTED_PAGED,
+                        StateType.PROTECTED_SWA,
+                        StateType.PROTECTED_AUX,
+                        StateType.PROTECTED_SWA_AUX,
+                    )
+                    and target_rank_registration_info is not None
+                    and self.attn_tp_size
+                    != target_rank_registration_info.dst_attn_tp_size
+                ):
+                    raise RuntimeError(
+                        "protected paged-state transfer requires identical "
+                        "prefill/decode attention TP layouts"
+                    )
+                if (
                     target_rank_registration_info is not None
                     and not self.is_mla_backend
                     and self.attn_tp_size
@@ -1320,6 +1340,13 @@ class MooncakeKVManager(CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         state_type=st,
+                        force_flat=st
+                        in (
+                            StateType.PROTECTED_PAGED,
+                            StateType.PROTECTED_SWA,
+                            StateType.PROTECTED_AUX,
+                            StateType.PROTECTED_SWA_AUX,
+                        ),
                     )
                     or rc
                 )
@@ -1438,6 +1465,13 @@ class MooncakeKVManager(CommonKVManager):
                 dst_mamba_index,
                 src_layer_ids,
                 dst_layer_ids,
+            )
+        if any(dim == 0 for dim in src_state_dim_per_tensor) or any(
+            dim == 0 for dim in dst_state_dim_per_tensor
+        ):
+            raise RuntimeError(
+                "protected recurrent-state digests require matching prefill/decode "
+                "attention TP layouts; canonical cross-TP manifests are not available"
             )
 
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size

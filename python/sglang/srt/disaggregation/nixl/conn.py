@@ -2115,6 +2115,13 @@ class NixlKVManager(CommonKVManager):
                 src_layer_ids=src_layer_ids,
                 dst_layer_ids=dst_layer_ids,
             )
+        if any(dim == 0 for dim in src_state_dim_per_tensor) or any(
+            dim == 0 for dim in dst_state_dim_per_tensor
+        ):
+            raise RuntimeError(
+                "protected recurrent-state digests require matching prefill/decode "
+                "attention TP layouts; canonical cross-TP manifests are not available"
+            )
 
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
         dst_tp_rank_in_group = decode_tp_rank % decode_tp_size
@@ -2298,7 +2305,25 @@ class NixlKVManager(CommonKVManager):
                 StateType.DSA,
                 StateType.SWA_RING,
                 StateType.C128_STATE,
+                StateType.PROTECTED_PAGED,
+                StateType.PROTECTED_SWA,
+                StateType.PROTECTED_AUX,
+                StateType.PROTECTED_SWA_AUX,
             ):
+                if (
+                    st
+                    in (
+                        StateType.PROTECTED_PAGED,
+                        StateType.PROTECTED_SWA,
+                        StateType.PROTECTED_AUX,
+                        StateType.PROTECTED_SWA_AUX,
+                    )
+                    and self.attn_tp_size != decode_tp_size
+                ):
+                    raise RuntimeError(
+                        "protected paged-state transfer requires identical "
+                        "prefill/decode attention TP layouts"
+                    )
                 if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
@@ -2324,6 +2349,13 @@ class NixlKVManager(CommonKVManager):
                     dst_gpu_id=dst_gpu_id,
                     notif=comp_notif,
                     state_type=st,
+                    force_flat=st
+                    in (
+                        StateType.PROTECTED_PAGED,
+                        StateType.PROTECTED_SWA,
+                        StateType.PROTECTED_AUX,
+                        StateType.PROTECTED_SWA_AUX,
+                    ),
                 )
             elif st == StateType.MINIMAX_INDEX_K:
                 # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer

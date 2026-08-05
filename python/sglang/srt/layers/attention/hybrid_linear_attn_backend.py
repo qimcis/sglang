@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
+from sglang.srt.state_protection.recurrent import recurrent_guard_for_layer
+
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
     fused_replay_state_indices,
@@ -77,6 +79,24 @@ class MambaAttnBackendBase(AttentionBackend):
         pool). Must run everywhere mamba ids feed the SSM/conv kernels or mamba-pool
         state ops, incl. the cuda-graph replay-prep copy into ``state_indices_list``."""
         return self.req_to_token_pool.translate_mamba_indices(mamba_indices)
+
+    def recurrent_state_guard(
+        self,
+        layer_id: int,
+        forward_batch: ForwardBatch,
+        *,
+        cache_indices: Optional[torch.Tensor] = None,
+    ):
+        """Small protection integration point shared by linear kernel families."""
+        return recurrent_guard_for_layer(
+            self,
+            global_layer_id=layer_id,
+            forward_batch=forward_batch,
+            cache_indices=cache_indices,
+            track_indices=getattr(
+                self.forward_metadata, "mamba_track_indices", None
+            ),
+        )
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
@@ -898,36 +918,37 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         use_triton_causal_conv = (
             use_triton_causal_conv or get_memory().enable_page_major_kv_layout
         )
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        mixer_out, intermediate_states = mixer.forward(
-            hidden_states=hidden_states,
-            output=output,
-            layer_cache=layer_cache,
-            metadata=self.forward_metadata,
-            mup_vector=mup_vector,
-            use_triton_causal_conv=use_triton_causal_conv,
-        )
+        with self.recurrent_state_guard(layer_id, forward_batch):
+            layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+            mixer_out, intermediate_states = mixer.forward(
+                hidden_states=hidden_states,
+                output=output,
+                layer_cache=layer_cache,
+                metadata=self.forward_metadata,
+                mup_vector=mup_vector,
+                use_triton_causal_conv=use_triton_causal_conv,
+            )
 
-        if forward_batch.mamba_track_mask is not None:
-            if intermediate_states is not None:
-                self._track_mamba_state_extend(
-                    forward_batch,
-                    intermediate_states,
-                    layer_cache.temporal,
-                    self.forward_metadata,
-                )
+            if forward_batch.mamba_track_mask is not None:
+                if intermediate_states is not None:
+                    self._track_mamba_state_extend(
+                        forward_batch,
+                        intermediate_states,
+                        layer_cache.temporal,
+                        self.forward_metadata,
+                    )
 
-            if self.forward_metadata.num_decodes > 0:
-                num_decodes = self.forward_metadata.num_decodes
-                track_mamba_states_if_needed(
-                    layer_cache.conv[0],
-                    layer_cache.temporal,
-                    self.forward_metadata.mamba_cache_indices[-num_decodes:],
-                    forward_batch.mamba_track_mask[-num_decodes:],
-                    self.forward_metadata.mamba_track_indices[-num_decodes:],
-                    num_decodes,
-                    check_freed_slots=self.enable_unified_memory,
-                )
+                if self.forward_metadata.num_decodes > 0:
+                    num_decodes = self.forward_metadata.num_decodes
+                    track_mamba_states_if_needed(
+                        layer_cache.conv[0],
+                        layer_cache.temporal,
+                        self.forward_metadata.mamba_cache_indices[-num_decodes:],
+                        forward_batch.mamba_track_mask[-num_decodes:],
+                        self.forward_metadata.mamba_track_indices[-num_decodes:],
+                        num_decodes,
+                        check_freed_slots=self.enable_unified_memory,
+                    )
 
         return mixer_out
 
@@ -1089,18 +1110,20 @@ class HybridLinearAttnBackend(AttentionBackend):
             return self.full_attn_backend.forward_decode(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
-        return self.linear_attn_backend.forward_decode(
-            q=q,
-            k=k,
-            v=v,
-            layer=layer,
-            forward_batch=forward_batch,
-            save_kv_cache=save_kv_cache,
-            mixed_qkv=mixed_qkv,
-            a=a,
-            b=b,
-            **kwargs,
-        )
+        layer_id = layer.layer_id if layer is not None else kwargs["layer_id"]
+        with self.linear_attn_backend.recurrent_state_guard(layer_id, forward_batch):
+            return self.linear_attn_backend.forward_decode(
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                forward_batch=forward_batch,
+                save_kv_cache=save_kv_cache,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                **kwargs,
+            )
 
     def forward_extend(
         self,
@@ -1119,18 +1142,20 @@ class HybridLinearAttnBackend(AttentionBackend):
             return self.full_attn_backend.forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
-        return self.linear_attn_backend.forward_extend(
-            q=q,
-            k=k,
-            v=v,
-            layer=layer,
-            forward_batch=forward_batch,
-            save_kv_cache=save_kv_cache,
-            mixed_qkv=mixed_qkv,
-            a=a,
-            b=b,
-            **kwargs,
-        )
+        layer_id = layer.layer_id if layer is not None else kwargs["layer_id"]
+        with self.linear_attn_backend.recurrent_state_guard(layer_id, forward_batch):
+            return self.linear_attn_backend.forward_extend(
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                forward_batch=forward_batch,
+                save_kv_cache=save_kv_cache,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                **kwargs,
+            )
 
     def forward(
         self,
@@ -1264,4 +1289,12 @@ class ShortConvHybridAttnBackend(HybridLinearAttnBackend):
         self.short_conv_backend = short_conv_backend
 
     def conv_state_metadata(self, layer_id: int, forward_batch: ForwardBatch):
+        if getattr(self, "state_protection_manager", None) is not None:
+            raise RuntimeError(
+                "protected short-convolution state must be accessed through "
+                "conv_state_guard(), not conv_state_metadata()"
+            )
         return self.short_conv_backend.conv_state_metadata(layer_id, forward_batch)
+
+    def conv_state_guard(self, layer_id: int, forward_batch: ForwardBatch):
+        return self.short_conv_backend.conv_state_guard(layer_id, forward_batch)

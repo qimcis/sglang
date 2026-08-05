@@ -935,6 +935,9 @@ class MambaPool:
                 t[:, indices] = 0
             t = self.mamba_cache.temporal
             t[:, indices] = 0
+        protection = getattr(self, "state_protection", None)
+        if protection is not None:
+            protection.invalidate_slots(indices)
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         """Clone mamba state (conv + temporal) from src slots into dst slots.
@@ -984,6 +987,9 @@ class MambaPool:
             self.replayssm_cache_base[dst_indices] = 0
         if self.replayssm_is_flush is not None:
             self.replayssm_is_flush[dst_indices] = 0
+        protection = getattr(self, "state_protection", None)
+        if protection is not None:
+            protection.copy_slots(src_indices, dst_indices)
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
@@ -994,29 +1000,46 @@ class MambaPool:
         temporal_cpu = self.mamba_cache.temporal[:, indices].to(
             "cpu", non_blocking=True
         )
-        # ReplaySSM spec-verify ring: round-trip the per-slot cursors with the
-        # checkpoint so a restored slot reconstructs exactly. Only the spec ring
-        # adds the 3rd tuple element; every other config keeps the legacy 2-tuple
-        # so those paths stay byte-identical.
+        # ReplaySSM cursors and protection sidecars are independent optional
+        # payloads. Preserve the legacy 2-/3-tuple shapes when only one exists,
+        # and use a 4-tuple when both features are enabled.
+        cursors_cpu = None
         if self.replayssm_cache_base is not None:
             cursors_cpu = (
                 self.replayssm_write_pos[indices].to("cpu", non_blocking=True),
                 self.replayssm_cache_base[indices].to("cpu", non_blocking=True),
                 self.replayssm_is_flush[indices].to("cpu", non_blocking=True),
             )
-            current_platform.synchronize()
-            return conv_cpu, temporal_cpu, cursors_cpu
+        protection = getattr(self, "state_protection", None)
+        protection_cpu = (
+            protection.get_cpu_copy(indices) if protection is not None else None
+        )
         current_platform.synchronize()
+        if cursors_cpu is not None and protection_cpu is not None:
+            return conv_cpu, temporal_cpu, cursors_cpu, protection_cpu
+        if cursors_cpu is not None:
+            return conv_cpu, temporal_cpu, cursors_cpu
+        if protection_cpu is not None:
+            return conv_cpu, temporal_cpu, protection_cpu
         return conv_cpu, temporal_cpu
 
     def load_cpu_copy(self, mamba_cache_cpu, indices):
-        # Accept both the legacy 2-tuple (conv, temporal) and the 3-tuple that also
-        # carries the ReplaySSM spec-verify cursors.
-        if len(mamba_cache_cpu) == 3:
-            conv_cpu, temporal_cpu, cursors_cpu = mamba_cache_cpu
-        else:
+        cursors_cpu = None
+        protection_cpu = None
+        if len(mamba_cache_cpu) == 2:
             conv_cpu, temporal_cpu = mamba_cache_cpu
-            cursors_cpu = None
+        elif len(mamba_cache_cpu) == 3:
+            conv_cpu, temporal_cpu, extra_cpu = mamba_cache_cpu
+            if isinstance(extra_cpu, tuple):
+                cursors_cpu = extra_cpu
+            else:
+                protection_cpu = extra_cpu
+        elif len(mamba_cache_cpu) == 4:
+            conv_cpu, temporal_cpu, cursors_cpu, protection_cpu = mamba_cache_cpu
+        else:
+            raise RuntimeError(
+                f"invalid recurrent CPU-copy payload length: {len(mamba_cache_cpu)}"
+            )
         current_platform.synchronize()
         for i, conv in enumerate(self.mamba_cache.conv):
             conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)
@@ -1034,6 +1057,13 @@ class MambaPool:
             self.replayssm_is_flush[indices] = fl_cpu.to(
                 self.replayssm_is_flush.device, non_blocking=True
             )
+        protection = getattr(self, "state_protection", None)
+        if protection is not None:
+            if protection_cpu is None:
+                raise RuntimeError(
+                    "protected recurrent state was restored without its sidecar"
+                )
+            protection.load_cpu_copy(protection_cpu, indices)
         current_platform.synchronize()
 
     _NON_TRANSFER_STATE_FIELDS = frozenset(
@@ -1071,6 +1101,12 @@ class MambaPool:
             item_lens += [
                 state_tensor[i][0].nbytes for i in range(self.num_mamba_layers)
             ]
+        protection = getattr(self, "state_protection", None)
+        if protection is not None:
+            for layer_sidecar in protection.sidecars:
+                data_ptrs.append(layer_sidecar.data_ptr())
+                data_lens.append(layer_sidecar.nbytes)
+                item_lens.append(layer_sidecar[0].nbytes)
         return data_ptrs, data_lens, item_lens
 
     def get_state_dim_per_tensor(self):
@@ -1087,6 +1123,10 @@ class MambaPool:
             sliceable_dim = state_tensor.shape[axis]
             # Repeat for each layer since we have per-layer data_ptrs
             dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
+        protection = getattr(self, "state_protection", None)
+        if protection is not None:
+            # Non-sliceable marker for local-shard digests.
+            dim_per_tensor += [0] * protection.num_layers
         return dim_per_tensor
 
     def get_state_layer_ids(self):
@@ -1097,7 +1137,11 @@ class MambaPool:
         by layer id when prefill (PP stage) holds a subset of the mamba layers.
         """
         state_tensor_count = sum(1 for _ in self._iter_transfer_state_tensors())
-        return list(self.mamba_layer_ids) * state_tensor_count
+        layer_ids = list(self.mamba_layer_ids) * state_tensor_count
+        protection = getattr(self, "state_protection", None)
+        if protection is not None:
+            layer_ids += list(self.mamba_layer_ids)
+        return layer_ids
 
     def get_state_slice_outer_counts(self):
         """Get the number of rows preceding each tensor's TP slice axis."""
@@ -1105,6 +1149,9 @@ class MambaPool:
         for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
             outer_count = math.prod(state_tensor.shape[2 : 2 + slice_axis])
             outer_counts += [outer_count] * self.num_mamba_layers
+        protection = getattr(self, "state_protection", None)
+        if protection is not None:
+            outer_counts += [1] * protection.num_layers
         return outer_counts
 
     def get_state_conv_shard_groups(self):
@@ -1127,6 +1174,9 @@ class MambaPool:
                 else None
             )
             subdims_per_tensor += [subdims] * self.num_mamba_layers
+        protection = getattr(self, "state_protection", None)
+        if protection is not None:
+            subdims_per_tensor += [None] * protection.num_layers
         return subdims_per_tensor
 
     def get_kv_size_bytes(self):
@@ -1334,11 +1384,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
             ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
+        protection = getattr(self, "recurrent_state_protection", None)
+        if protection is not None:
+            protection.commit_mapping(select_index, mamba_index_tensor)
         if self.enable_mamba_extra_buffer:
             ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
             self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
                 ping_pong_tensor
             )
+            if protection is not None:
+                protection.commit_tracking_mapping(select_index, ping_pong_tensor)
         return select_index
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
@@ -1434,6 +1489,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx] = (
             req.mamba_ping_pong_track_buffer
         )
+        protection = getattr(self, "recurrent_state_protection", None)
+        if protection is not None:
+            protection.commit_tracking_mapping(
+                [req.req_pool_idx], req.mamba_ping_pong_track_buffer.unsqueeze(0)
+            )
 
     def donate_mamba_ping_pong_slot(
         self, req: Req, new_slot: torch.Tensor
@@ -3012,6 +3072,79 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         del self.k_scale_buffer
         del self.v_scale_buffer
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        super().move_kv_cache(tgt_loc, src_loc)
+        if getattr(self, "paged_state_protection", None) is None:
+            return
+        tgt_loc = tgt_loc.view(-1).long()
+        src_loc = src_loc.view(-1).long()
+        for scale in self.k_scale_buffer + self.v_scale_buffer:
+            scale[tgt_loc] = scale[src_loc]
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        if getattr(self, "paged_state_protection", None) is None:
+            return super().get_cpu_copy(indices, mamba_indices=mamba_indices)
+        current_platform.synchronize()
+        kv_cache_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            kv_cache_cpu.append([])
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                kv_cache_cpu[-1].append(
+                    [
+                        self.k_buffer[layer_id][chunk_indices].to(
+                            "cpu", non_blocking=True
+                        ),
+                        self.v_buffer[layer_id][chunk_indices].to(
+                            "cpu", non_blocking=True
+                        ),
+                        self.k_scale_buffer[layer_id][chunk_indices].to(
+                            "cpu", non_blocking=True
+                        ),
+                        self.v_scale_buffer[layer_id][chunk_indices].to(
+                            "cpu", non_blocking=True
+                        ),
+                    ]
+                )
+        current_platform.synchronize()
+        return kv_cache_cpu
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        if getattr(self, "paged_state_protection", None) is None:
+            return super().load_cpu_copy(
+                kv_cache_cpu, indices, mamba_indices=mamba_indices
+            )
+        current_platform.synchronize()
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                k_cpu, v_cpu, k_scale_cpu, v_scale_cpu = kv_cache_cpu[
+                    layer_id
+                ][i // chunk_size]
+                if not (
+                    k_cpu.shape[0]
+                    == v_cpu.shape[0]
+                    == k_scale_cpu.shape[0]
+                    == v_scale_cpu.shape[0]
+                    == len(chunk_indices)
+                ):
+                    raise RuntimeError("FP4 MHA CPU-offload row-count mismatch")
+                self.k_buffer[layer_id][chunk_indices] = k_cpu.to(
+                    self.k_buffer[0].device, non_blocking=True
+                )
+                self.v_buffer[layer_id][chunk_indices] = v_cpu.to(
+                    self.v_buffer[0].device, non_blocking=True
+                )
+                self.k_scale_buffer[layer_id][chunk_indices] = k_scale_cpu.to(
+                    self.k_scale_buffer[0].device, non_blocking=True
+                )
+                self.v_scale_buffer[layer_id][chunk_indices] = v_scale_cpu.to(
+                    self.v_scale_buffer[0].device, non_blocking=True
+                )
+        current_platform.synchronize()
+
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
         if self.store_dtype != self.dtype:
@@ -4216,6 +4349,63 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
     def _clear_buffers(self):
         del self.kv_buffer
         del self.kv_scale_buffer
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        super().move_kv_cache(tgt_loc, src_loc)
+        if getattr(self, "paged_state_protection", None) is None:
+            return
+        tgt_loc = tgt_loc.view(-1).long()
+        src_loc = src_loc.view(-1).long()
+        for scale in self.kv_scale_buffer:
+            scale[tgt_loc] = scale[src_loc]
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        if getattr(self, "paged_state_protection", None) is None:
+            return super().get_cpu_copy(indices, mamba_indices=mamba_indices)
+        current_platform.synchronize()
+        kv_cache_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            kv_cache_cpu.append([])
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                kv_cache_cpu[-1].append(
+                    [
+                        self.kv_buffer[layer_id][chunk_indices].to(
+                            "cpu", non_blocking=True
+                        ),
+                        self.kv_scale_buffer[layer_id][chunk_indices].to(
+                            "cpu", non_blocking=True
+                        ),
+                    ]
+                )
+        current_platform.synchronize()
+        return kv_cache_cpu
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        if getattr(self, "paged_state_protection", None) is None:
+            return super().load_cpu_copy(
+                kv_cache_cpu, indices, mamba_indices=mamba_indices
+            )
+        current_platform.synchronize()
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                kv_cpu, scale_cpu = kv_cache_cpu[layer_id][i // chunk_size]
+                if not (
+                    kv_cpu.shape[0]
+                    == scale_cpu.shape[0]
+                    == len(chunk_indices)
+                ):
+                    raise RuntimeError("FP4 MLA CPU-offload row-count mismatch")
+                self.kv_buffer[layer_id][chunk_indices] = kv_cpu.to(
+                    self.kv_buffer[0].device, non_blocking=True
+                )
+                self.kv_scale_buffer[layer_id][chunk_indices] = scale_cpu.to(
+                    self.kv_scale_buffer[0].device, non_blocking=True
+                )
+        current_platform.synchronize()
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:

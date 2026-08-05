@@ -199,6 +199,10 @@ from sglang.srt.state_capturer.routed_experts import (
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
+from sglang.srt.state_protection.manager import (
+    StateProtectionCheck,
+    install_state_protection,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
@@ -257,6 +261,7 @@ class ModelRunnerOutput:
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
+    state_protection_check: Optional[StateProtectionCheck] = None
 
 
 class ModelRunner:
@@ -800,6 +805,11 @@ class ModelRunner:
             model_runner=self,
             token_oracle_manager=self._token_oracle_manager,
         )
+        self.state_protection_manager = install_state_protection(
+            server_args=self.server_args,
+            model_runner=self,
+            canary_manager=self.canary_manager,
+        )
 
         # Init ngram embedding token table
         self.init_ngram_embedding_manager()
@@ -896,6 +906,10 @@ class ModelRunner:
         self.decode_attn_backend_group = backends.decode_attn_backend_group
         self.prefill_attention_backend_str = backends.prefill_attention_backend_str
         self.decode_attention_backend_str = backends.decode_attention_backend_str
+        if self.state_protection_manager is not None:
+            self.state_protection_manager.bind_backend(self.attn_backend)
+            for decode_backend in self.decode_attn_backend_group:
+                self.state_protection_manager.bind_backend(decode_backend)
 
         if self.server_args.dcp_size > 1 and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
@@ -1390,6 +1404,10 @@ class ModelRunner:
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
+        protection_manager = self.state_protection_manager
+        if protection_manager is not None:
+            protection_manager.begin_forward(forward_batch)
+
         self.forward_pass_id += 1
 
         # Try msprob debugger
@@ -1438,6 +1456,10 @@ class ModelRunner:
                     reinit_attn_backend,
                     split_forward_count,
                 )
+        if protection_manager is not None:
+            output.state_protection_check = protection_manager.finish_forward(
+                forward_batch
+            )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule

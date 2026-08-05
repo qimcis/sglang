@@ -167,6 +167,12 @@ class CanaryManager:
             for _ in range(num_sfms)
         )
 
+    @property
+    def violation_write_index(self) -> torch.Tensor:
+        """Graph-stable monotonic device counter for fail-closed consumers."""
+
+        return self._device_state.violation_log.violation_write_index
+
     @contextlib.contextmanager
     def with_active_single_forward_manager(self, index: int) -> Iterator[None]:
         assert (

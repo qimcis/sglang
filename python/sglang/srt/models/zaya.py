@@ -756,31 +756,33 @@ class CCA(nn.Module):
         # prefix mask, cuda-graph buffers); CCA runs its own two-stage grouped
         # conv against it and gets back the conv output + val_proj2 input, with
         # the conv_state / prev_hs pool slots updated in place.
-        meta = get_attn_backend().conv_state_metadata(self.layer_id, forward_batch)
-        conv_state = meta.layer_cache.conv[0]
-        prev_hs_state = meta.layer_cache.conv[1]
-        if forward_batch.forward_mode.is_decode_or_idle():
-            qk_out, v2_input = cca_decode(
-                qk,
-                hidden_states,
-                self.conv_qk,
-                conv_state,
-                prev_hs_state,
-                meta.cache_indices,
-                self.total_padding,
-            )
-        else:
-            qk_out, v2_input = cca_extend(
-                qk,
-                hidden_states,
-                self.conv_qk,
-                conv_state,
-                prev_hs_state,
-                meta.slot_ids_cpu,
-                meta.has_prefix_cpu,
-                forward_batch.extend_seq_lens_cpu,
-                self.total_padding,
-            )
+        with get_attn_backend().conv_state_guard(
+            self.layer_id, forward_batch
+        ) as meta:
+            conv_state = meta.layer_cache.conv[0]
+            prev_hs_state = meta.layer_cache.conv[1]
+            if forward_batch.forward_mode.is_decode_or_idle():
+                qk_out, v2_input = cca_decode(
+                    qk,
+                    hidden_states,
+                    self.conv_qk,
+                    conv_state,
+                    prev_hs_state,
+                    meta.cache_indices,
+                    self.total_padding,
+                )
+            else:
+                qk_out, v2_input = cca_extend(
+                    qk,
+                    hidden_states,
+                    self.conv_qk,
+                    conv_state,
+                    prev_hs_state,
+                    meta.slot_ids_cpu,
+                    meta.has_prefix_cpu,
+                    forward_batch.extend_seq_lens_cpu,
+                    self.total_padding,
+                )
 
         query_conv = qk_out[:, : self.latent_q_dim].view(
             T, self.num_q_heads, self.head_dim

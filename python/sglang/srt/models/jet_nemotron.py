@@ -263,9 +263,6 @@ class JetBlock(nn.Module):
         assert isinstance(get_attn_backend().linear_attn_backend, MambaAttnBackendBase)
         linear_attn_backend = get_attn_backend().linear_attn_backend
         forward_metadata = linear_attn_backend.forward_metadata
-        layer_cache = linear_attn_backend.req_to_token_pool.mamba2_layer_cache(
-            self.layer_id
-        )
 
         qkvabz, _ = self.qkvabz_proj(hidden_states)
         q, k, v, a, beta, z = qkvabz.split(
@@ -286,43 +283,52 @@ class JetBlock(nn.Module):
         k = nn.functional.silu(k)
         k = einops.rearrange(k, "l (h d) -> l h d", h=self.num_heads, d=self.head_k_dim)
 
-        conv_cache = layer_cache.conv
-        assert isinstance(conv_cache, torch.Tensor)
-        v, new_conv_state = self.dynamic_conv1d(
-            v,
-            conv_state=conv_cache[
+        with linear_attn_backend.recurrent_state_guard(
+            self.layer_id, forward_batch
+        ):
+            layer_cache = linear_attn_backend.req_to_token_pool.mamba2_layer_cache(
+                self.layer_id
+            )
+            conv_cache = layer_cache.conv
+            assert isinstance(conv_cache, torch.Tensor)
+            v, new_conv_state = self.dynamic_conv1d(
+                v,
+                conv_state=conv_cache[
+                    forward_metadata.mamba_cache_indices, -self.total_v_dim :, :
+                ],
+                generator_input=hidden_states,
+                seq_lens=(
+                    forward_batch.extend_seq_lens
+                    if forward_batch.extend_seq_lens is not None
+                    else torch.ones(
+                        (forward_batch.batch_size,),
+                        dtype=torch.long,
+                    )
+                ),
+            )
+            conv_cache[
                 forward_metadata.mamba_cache_indices, -self.total_v_dim :, :
-            ],
-            generator_input=hidden_states,
-            seq_lens=(
-                forward_batch.extend_seq_lens
-                if forward_batch.extend_seq_lens is not None
-                else torch.ones(
-                    (forward_batch.batch_size,),
-                    dtype=torch.long,
-                )
-            ),
-        )
-        conv_cache[forward_metadata.mamba_cache_indices, -self.total_v_dim :, :] = (
-            new_conv_state
-        )
-        v = einops.rearrange(v, "l (h d) -> l h d", h=self.num_heads, d=self.head_v_dim)
+            ] = new_conv_state
+            v = einops.rearrange(
+                v, "l (h d) -> l h d", h=self.num_heads, d=self.head_v_dim
+            )
 
-        g = -self.A_log.float().exp() * nn.functional.softplus(a.float() + self.dt_bias)
+            g = -self.A_log.float().exp() * nn.functional.softplus(
+                a.float() + self.dt_bias
+            )
+            beta = nn.functional.sigmoid(beta)
 
-        beta = nn.functional.sigmoid(beta)
-
-        o = fused_recurrent_gated_delta_rule_update(
-            q=q.unsqueeze(0),
-            k=k.unsqueeze(0),
-            v=v.unsqueeze(0),
-            g=g.unsqueeze(0),
-            beta=beta.unsqueeze(0),
-            initial_state_source=layer_cache.temporal,
-            initial_state_indices=forward_metadata.mamba_cache_indices,
-            cu_seqlens=cast(torch.LongTensor, forward_metadata.query_start_loc),
-            use_qk_l2norm_in_kernel=True,
-        ).squeeze(0)
+            o = fused_recurrent_gated_delta_rule_update(
+                q=q.unsqueeze(0),
+                k=k.unsqueeze(0),
+                v=v.unsqueeze(0),
+                g=g.unsqueeze(0),
+                beta=beta.unsqueeze(0),
+                initial_state_source=layer_cache.temporal,
+                initial_state_indices=forward_metadata.mamba_cache_indices,
+                cu_seqlens=cast(torch.LongTensor, forward_metadata.query_start_loc),
+                use_qk_l2norm_in_kernel=True,
+            ).squeeze(0)
 
         z = einops.rearrange(z, "l (h d) -> l h d", h=self.num_heads)
 

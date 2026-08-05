@@ -3277,6 +3277,18 @@ class ServerArgs:
     ] = 0
 
     # -------------------------------------------------------------------------
+    # Persistent inference-state protection
+    # -------------------------------------------------------------------------
+    enable_state_protection: A[
+        bool,
+        (
+            "Protect persistent inference state (paged KV, sliding-window "
+            "mappings, and recurrent state) with allocation identities and "
+            "payload checksums. Unsupported cache consumers fail at startup."
+        ),
+    ] = False
+
+    # -------------------------------------------------------------------------
     # Dynamic batch tokenizer
     # -------------------------------------------------------------------------
     enable_dynamic_batch_tokenizer: A[
@@ -8897,10 +8909,56 @@ class ServerArgs:
                     "When setting gc_threshold, it must contain 1 to 3 integers."
                 )
 
-        if self.kv_canary_sweep_interval > 0 and self.kv_canary == "none":
+        if (
+            self.kv_canary_sweep_interval > 0
+            and self.kv_canary == "none"
+            and not self.enable_state_protection
+        ):
             raise ValueError(
                 "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
             )
+
+        if self.enable_state_protection:
+            unsupported = []
+            if self.speculative_algorithm is not None:
+                unsupported.append("speculative decoding")
+            if self.dllm_algorithm is not None:
+                unsupported.append("diffusion decoding")
+            if self.enable_unified_memory:
+                unsupported.append("unified-memory cache compaction")
+            if self.enable_page_major_kv_layout:
+                unsupported.append("page-major KV layout")
+            if self.dcp_size != 1:
+                unsupported.append("decode context parallelism")
+            if self.pp_size != 1:
+                unsupported.append("pipeline parallelism")
+            if self.enable_two_batch_overlap:
+                unsupported.append("two-batch overlap")
+            if self.enable_linear_replayssm:
+                unsupported.append("linear ReplaySSM")
+            if self.enable_int8_mamba_checkpoint:
+                unsupported.append("int8 Mamba checkpoints")
+            if self.enable_hierarchical_cache:
+                unsupported.append("hierarchical KV offload")
+            if self.enable_lmcache:
+                unsupported.append("LMCache")
+            if self.enable_streaming_session:
+                unsupported.append("streaming sessions")
+            if (
+                self.disaggregation_mode != "null"
+                and self.disaggregation_transfer_backend
+                not in ("mooncake", "mooncake_tcp", "nixl", "mori")
+            ):
+                unsupported.append(
+                    "PD transfer backend "
+                    f"{self.disaggregation_transfer_backend!r} "
+                    "(supported: mooncake, nixl, mori)"
+                )
+            if unsupported:
+                raise ValueError(
+                    "--enable-state-protection does not silently weaken coverage; "
+                    "unsupported configuration: " + ", ".join(unsupported)
+                )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"

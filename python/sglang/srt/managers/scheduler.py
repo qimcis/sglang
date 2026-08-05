@@ -256,6 +256,10 @@ from sglang.srt.managers.utils import (
     is_health_check_generate_req,
     validate_input_length,
 )
+from sglang.srt.state_protection.manager import (
+    STATE_PROTECTION_INVALID_REQUEST,
+    STATE_PROTECTION_REQUEST_IDENTITY,
+)
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -3827,6 +3831,9 @@ class Scheduler(
     ):
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
+        if isinstance(result, GenerationBatchResult):
+            self._finalize_state_protection_result(batch, result)
+
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
@@ -3884,6 +3891,145 @@ class Scheduler(
                 step_us,
                 batch_size + result.num_correct_drafts,
             )
+
+    def _finalize_state_protection_result(
+        self,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> None:
+        check = result.state_protection_check
+        if check is not None:
+            if result.copy_done is not None:
+                result.copy_done.synchronize()
+            request_indices_all, statuses_all, failed_all = check.materialize()
+            result.state_protection_check = None
+            if not (
+                len(request_indices_all)
+                == len(statuses_all)
+                == len(failed_all)
+                == batch.batch_size()
+            ):
+                raise RuntimeError("state-protection result length mismatch")
+            for batch_index, req in enumerate(batch.reqs):
+                expected_request_index = int(
+                    batch.req_pool_indices_cpu[batch_index]
+                    if batch.req_pool_indices_cpu is not None
+                    else req.req_pool_idx
+                )
+                request_index = int(request_indices_all[batch_index])
+                invalid_request_was_sanitized = (
+                    request_index == 0
+                    and int(statuses_all[batch_index])
+                    & STATE_PROTECTION_INVALID_REQUEST
+                    != 0
+                )
+                if (
+                    expected_request_index != request_index
+                    and not invalid_request_was_sanitized
+                ):
+                    statuses_all[batch_index] = (
+                        int(statuses_all[batch_index])
+                        | STATE_PROTECTION_REQUEST_IDENTITY
+                    )
+                    failed_all[batch_index] = True
+            failed_indices = [
+                index for index, failed in enumerate(failed_all) if failed
+            ]
+            request_indices = [request_indices_all[index] for index in failed_indices]
+            statuses = [statuses_all[index] for index in failed_indices]
+        else:
+            failed_indices, request_indices, statuses = [], [], []
+
+        # A one-iteration overlap can already be in flight when an earlier
+        # result aborts the request. Treat that later result as failed even when
+        # its own device check is clean, and release only after it is no longer
+        # present in the scheduler's current batch.
+        failed_set: set[int] = {
+            i
+            for i, req in enumerate(batch.reqs)
+            if getattr(req, "state_protection_abort", False)
+        }
+        for batch_index, request_index, status in zip(
+            failed_indices, request_indices, statuses
+        ):
+            batch_index = int(batch_index)
+            if batch_index < 0 or batch_index >= batch.batch_size():
+                raise RuntimeError(
+                    "state-protection result contains an invalid batch index"
+                )
+            req = batch.reqs[batch_index]
+            expected_request_index = int(
+                batch.req_pool_indices_cpu[batch_index]
+                if batch.req_pool_indices_cpu is not None
+                else req.req_pool_idx
+            )
+            request_index = int(request_index)
+            invalid_request_was_sanitized = (
+                request_index == 0
+                and int(status) & STATE_PROTECTION_INVALID_REQUEST != 0
+            )
+            identity_mismatch_was_recorded = (
+                int(status) & STATE_PROTECTION_REQUEST_IDENTITY != 0
+            )
+            if (
+                expected_request_index != request_index
+                and not invalid_request_was_sanitized
+                and not identity_mismatch_was_recorded
+            ):
+                raise RuntimeError(
+                    "state-protection request-pool identity mismatch: "
+                    f"batch={batch_index}, expected={expected_request_index}, "
+                    f"actual={request_index}"
+                )
+            failed_set.add(batch_index)
+            req.state_protection_abort = True
+            message = (
+                "Persistent inference-state validation failed "
+                f"(status=0x{int(status) & 0xFFFFFFFF:08x})"
+            )
+            logger.error("%s rid=%s", message, req.rid)
+            if not req.finished():
+                req.to_finish = FINISH_ABORT(
+                    message,
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "StateProtectionError",
+                )
+
+        for batch_index in failed_set:
+            req = batch.reqs[batch_index]
+            in_flight = (
+                self.enable_overlap
+                and self.cur_batch is not None
+                and any(current is req for current in self.cur_batch.reqs)
+            )
+            if in_flight:
+                req.state_protection_deferred_release = True
+                continue
+            if req.inflight_middle_chunks > 0:
+                # The result processor owns the middle-chunk decrement. Clearing
+                # this flag lets it release exactly when the final chunk drains.
+                req.state_protection_deferred_release = False
+                continue
+            if batch.forward_mode.is_decode() and not self.enable_overlap:
+                # The non-overlap decode result path reaches
+                # _handle_finish_state_updated_req and owns the release.
+                req.state_protection_deferred_release = False
+                continue
+            if req.req_pool_idx is not None:
+                prepare_release = getattr(
+                    self.model_worker, "prepare_for_kv_cache_release", None
+                )
+                if callable(prepare_release):
+                    prepare_release(req)
+                if self.server_args.enable_hisparse:
+                    self.hisparse_coordinator.request_finished(req)
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+            req.state_protection_deferred_release = False
+            req.state_protection_abort = False
+            req.time_stats.set_completion_time()
+
+        if failed_set:
+            result.state_protection_failed_indices = failed_set
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:

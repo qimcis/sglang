@@ -43,6 +43,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional
 
+import contextlib
+
 import torch
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -214,6 +216,16 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
             slot_ids_cpu=self._slot_ids_cpu,
             has_prefix_cpu=self._has_prefix_cpu,
         )
+
+    @contextlib.contextmanager
+    def conv_state_guard(self, layer_id: int, forward_batch: ForwardBatch):
+        """Validate, expose, then seal one short-convolution state consumer."""
+        with self.recurrent_state_guard(
+            layer_id,
+            forward_batch,
+            cache_indices=self._cache_indices,
+        ):
+            yield self.conv_state_metadata(layer_id, forward_batch)
 
     # The short-conv layers are invoked via conv_state_metadata + the model's own
     # conv kernel, never through the HybridLinearAttnBackend full-vs-linear

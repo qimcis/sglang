@@ -1212,6 +1212,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.MINIMAX_INDEX_K: _dsa_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
+                StateType.PROTECTED_PAGED: _dsa_payload,
+                StateType.PROTECTED_SWA: _swa_payload,
+                StateType.PROTECTED_AUX: _dsa_payload,
+                StateType.PROTECTED_SWA_AUX: _swa_payload,
             }
             if hasattr(self.req_to_token_pool, "req_to_token_c4"):
                 # DSV4 on NPU: per-pool dst page indices, produced by the same

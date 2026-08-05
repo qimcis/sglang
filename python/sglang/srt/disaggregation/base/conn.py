@@ -24,6 +24,13 @@ class StateType(str, enum.Enum):
     SWA_RING = "swa_ring"
     # DeepSeek-V4 online C128 request-scoped state.
     C128_STATE = "c128_state"
+    # State-protection digests for ordinary paged KV and translated SWA slots.
+    # They use the state channel so they never perturb the main K/V descriptor
+    # ordering used by heterogeneous-TP head slicing.
+    PROTECTED_PAGED = "protected_paged"
+    PROTECTED_SWA = "protected_swa"
+    PROTECTED_AUX = "protected_aux"
+    PROTECTED_SWA_AUX = "protected_swa_aux"
 
 
 @dataclasses.dataclass

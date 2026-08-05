@@ -101,6 +101,11 @@ class GenerationBatchResult:
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
 
+    # Fail-closed persistent-state validation. The device result is masked
+    # before overlap relay and copied under copy_done before host publication.
+    state_protection_check: Optional[Any] = None
+    state_protection_failed_indices: Optional[set[int]] = None
+
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
@@ -169,6 +174,9 @@ class GenerationBatchResult:
         ):
             if holder is not None:
                 holder.map_device_tensors(_async_d2h)
+
+        if self.state_protection_check is not None:
+            self.state_protection_check.copy_to_cpu()
 
         self.copy_done.record()
 
