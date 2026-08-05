@@ -1,0 +1,33 @@
+python/sglang/srt/kv_canary/pool_patcher/adapters/mha.py
+  s_0070db74b0f9cb::t_e33737f9646d69 13-21,29,41-42,44-45
+python/sglang/srt/kv_canary/runner/canary_manager.py
+  s_31242d6a60f864::t_ef2249a73bc420 170-175
+python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+  s_31242d6a60f864::t_812ef60e098051 84-102,248-258,312-313,735-744,908-910,933-934,948-954,957-958
+python/sglang/srt/managers/utils.py
+  s_31242d6a60f864::t_dfc62c6d399050 92-96,166-168
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7d51220f0d3e355f962c74562a7122fc7b939568",
+  "prompts": {},
+  "sessions": {
+    "s_0070db74b0f9cb": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_02ccb85c1ffe9ThtpdWfOFa0q5",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    },
+    "s_31242d6a60f864": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0525b98f5ffeMDl6gnyhsezi7Q",
+        "model": "gpt-5.5"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
