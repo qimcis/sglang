@@ -1,0 +1,23 @@
+python/sglang/srt/layers/dp_attention.py
+  s_31242d6a60f864::t_3b18ef07983d82 437-438,440,445-448,461-474,480-490,494-502,507-518,706-708,715-720,729-736
+python/sglang/srt/managers/scheduler.py
+  s_31242d6a60f864::t_1bca0abb96c8fc 905
+python/sglang/srt/mem_cache/kv_protection.py
+  s_31242d6a60f864::t_1c6198eec2f091 459,508,510-513
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "87f52ff8dc026828f77d7ab223549d808c01e0ca",
+  "prompts": {},
+  "sessions": {
+    "s_31242d6a60f864": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0525b98f5ffeMDl6gnyhsezi7Q",
+        "model": "gpt-5.5"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
