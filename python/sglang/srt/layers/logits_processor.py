@@ -926,16 +926,24 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         protection = None
-        if self.kv_protection_enabled and logits_metadata.forward_mode.is_decode():
+        protected_decode_forward = (
+            self.kv_protection_enabled
+            and logits_metadata.forward_mode.is_decode_or_idle()
+        )
+        if protected_decode_forward:
             # Normal protected DSA decode publishes a graph-local per-rank
             # failure vector before replay.  Carry it through the logits
             # all-gather so TP consensus shares an existing collective.
             from sglang.srt.model_executor.forward_context import get_attn_backend
 
             active_backend = get_attn_backend()
-            backends = [active_backend]
-            backends.extend(getattr(active_backend, "attn_backends", ()))
-            for backend in backends:
+            pending_backends = [active_backend]
+            seen_backends = set()
+            while pending_backends:
+                backend = pending_backends.pop()
+                if backend is None or id(backend) in seen_backends:
+                    continue
+                seen_backends.add(id(backend))
                 metadata = getattr(backend, "forward_metadata", None)
                 candidate = getattr(metadata, "kv_page_protection", None)
                 if candidate is not None and candidate.get(
@@ -943,6 +951,12 @@ class LogitsProcessor(nn.Module):
                 ):
                     protection = candidate
                     break
+                pending_backends.extend(getattr(backend, "attn_backends", ()) or ())
+                pending_backends.extend(getattr(backend, "children", ()) or ())
+                pending_backends.append(getattr(backend, "primary", None))
+                decode_backend = getattr(backend, "decode_backend", None)
+                if not isinstance(decode_backend, str):
+                    pending_backends.append(decode_backend)
 
         if (
             protection is not None
@@ -954,26 +968,81 @@ class LogitsProcessor(nn.Module):
                 "failure consensus"
             )
 
+        failure_local_start = None
+        failure_local_num_rows = None
+        local_failure = (
+            protection.get("local_failed") if protection is not None else None
+        )
+        local_consensus = protection.get("failed") if protection is not None else None
+        global_failure = None
+        protection_uses_dpa = (
+            protected_decode_forward and get_parallel().attn_dp_size > 1
+        )
+        if protection_uses_dpa:
+            if self.use_attn_tp_group:
+                raise RuntimeError(
+                    "KV page protection with DPA requires the full TP logits gather; "
+                    "--enable-dp-lm-head is unsupported"
+                )
+            if (
+                logits_metadata.dp_local_start_pos is None
+                or logits_metadata.dp_local_num_tokens is None
+            ):
+                raise RuntimeError(
+                    "protected DPA logits are missing lane-local row metadata"
+                )
+            if protection is None:
+                if not logits_metadata.forward_mode.is_idle():
+                    raise RuntimeError(
+                        "protected DPA decode is missing fused validator metadata"
+                    )
+                # An eager idle DPA lane has no attention metadata, but it must
+                # still enter the full-TP logits gather with the same packed
+                # shape as active lanes. It owns zero global rows, so a single
+                # zero word is sufficient and is never read by the pack kernel.
+                local_failure = torch.zeros(1, dtype=torch.int32, device=logits.device)
+                local_consensus = local_failure
+                global_failure_storage = torch.empty(
+                    logits.shape[0], dtype=torch.int32, device=logits.device
+                )
+            else:
+                global_failure_storage = protection.get("global_failed")
+                if (
+                    global_failure_storage is None
+                    or global_failure_storage.numel() < logits.shape[0]
+                ):
+                    raise RuntimeError(
+                        "protected DPA metadata is missing a sufficiently large "
+                        "graph-stable global failure buffer"
+                    )
+            global_failure = global_failure_storage[: logits.shape[0]]
+            failure_local_start = logits_metadata.dp_local_start_pos
+            failure_local_num_rows = logits_metadata.dp_local_num_tokens
+        elif protection is not None:
+            global_failure = protection["failed"]
+
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
                 if protection is not None:
                     raise RuntimeError(
-                        "KV page protection requires the non-DP TP logits gather"
+                        "KV page protection requires the full TP logits gather"
                     )
                 logits = self._gather_attn_tp_logits(logits)
             else:
                 logits = self._logits_gatherer(
                     logits,
-                    local_failure=(
-                        protection["local_failed"] if protection is not None else None
-                    ),
-                    global_failure=(
-                        protection["failed"] if protection is not None else None
-                    ),
+                    local_failure=local_failure,
+                    global_failure=global_failure,
+                    failure_local_start=failure_local_start,
+                    failure_local_num_rows=failure_local_num_rows,
                 )
 
         logits = self._scatter_dp_attn_logits(
-            logits, local_hidden_states, logits_metadata
+            logits,
+            local_hidden_states,
+            logits_metadata,
+            local_failure=(local_consensus if protection_uses_dpa else None),
+            global_failure=(global_failure if protection_uses_dpa else None),
         )
 
         logits = self._copy_logits_to_buffer(logits, logits_metadata)
@@ -1080,6 +1149,9 @@ class LogitsProcessor(nn.Module):
         logits: torch.Tensor,
         local_hidden_states: torch.Tensor,
         logits_metadata: LogitsMetadata,
+        *,
+        local_failure: Optional[torch.Tensor] = None,
+        global_failure: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.do_tensor_parallel_all_gather_dp_attn:
             global_logits = logits
@@ -1088,7 +1160,17 @@ class LogitsProcessor(nn.Module):
                 device=global_logits.device,
                 dtype=global_logits.dtype,
             )
-            dp_scatter(logits, global_logits, logits_metadata)
+            dp_scatter(
+                logits,
+                global_logits,
+                logits_metadata,
+                local_sideband=local_failure,
+                global_sideband=global_failure,
+            )
+        elif local_failure is not None or global_failure is not None:
+            raise RuntimeError(
+                "protected DPA failure consensus requires the DP logits scatter"
+            )
         return logits
 
     def _copy_logits_to_buffer(

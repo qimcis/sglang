@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
+import json
 import logging
 import threading
 import time
@@ -47,6 +49,34 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def kv_row_layout_fingerprint(kv_args: KVArgs) -> str:
+    """Return a stable fingerprint of every row layout transferred with KV.
+
+    Physical pointers and pool capacities intentionally do not participate:
+    prefill and decode allocate different pages.  Item lengths, component
+    order, and per-tensor slice dimensions do participate because the direct
+    MLA transfer and its checksum must interpret each logical row identically.
+    """
+    state_types = [
+        value.value if isinstance(value, StateType) else str(value)
+        for value in getattr(kv_args, "state_types", ())
+    ]
+    payload = {
+        "kv_item_lens": [int(value) for value in kv_args.kv_item_lens],
+        "state_types": state_types,
+        "state_item_lens": [
+            [int(value) for value in component]
+            for component in getattr(kv_args, "state_item_lens", ())
+        ],
+        "state_dim_per_tensor": [
+            [int(value) for value in component]
+            for component in getattr(kv_args, "state_dim_per_tensor", ())
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def kv_protection_enabled(kv_args: KVArgs) -> bool:
@@ -110,6 +140,7 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     kv_protection_enabled: bool = False
+    kv_row_layout_fingerprint: Optional[str] = None
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -130,6 +161,11 @@ class PrefillServerInfo:
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
         self.kv_protection_enabled = bool(self.kv_protection_enabled)
+        self.kv_row_layout_fingerprint = (
+            str(self.kv_row_layout_fingerprint)
+            if self.kv_row_layout_fingerprint is not None
+            else None
+        )
 
 
 @dataclasses.dataclass
@@ -413,17 +449,35 @@ class CommonKVManager(BaseKVManager):
         if (
             protection_manager is not None
             and protection_manager.config.checksum_enabled
-            and (
+        ):
+            local_layout = kv_row_layout_fingerprint(self.kv_args)
+            layouts_match = (
+                info.kv_row_layout_fingerprint is not None
+                and info.kv_row_layout_fingerprint == local_layout
+            )
+            tp_ratio_is_integral = (
+                max(self.attn_tp_size, info.attn_tp_size)
+                % min(self.attn_tp_size, info.attn_tp_size)
+                == 0
+            )
+            heterogeneous_mla = (
                 self.attn_tp_size != info.attn_tp_size
-                or self.attn_cp_size != info.attn_cp_size
+                and self.is_mla_backend
+                and tp_ratio_is_integral
+                and layouts_match
+            )
+            if (
+                self.attn_cp_size != info.attn_cp_size
                 or self.pp_size != info.pp_size
                 or required_prefill_response_num != 1
-            )
-        ):
-            raise RuntimeError(
-                "KV checksum page manifests require matching prefill/decode "
-                "TP, CP, and PP layouts with one prefill completion per decode rank"
-            )
+                or not layouts_match
+                or (self.attn_tp_size != info.attn_tp_size and not heterogeneous_mla)
+            ):
+                raise RuntimeError(
+                    "KV checksum page manifests require identical transferred KV "
+                    "row layouts, matching CP/PP, one prefill completion per decode "
+                    "rank, and either matching attention TP or an integral MLA TP mapping"
+                )
 
         info.target_tp_rank = target_tp_rank
         info.target_tp_ranks = target_tp_ranks
@@ -495,6 +549,7 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
+            "kv_row_layout_fingerprint": kv_row_layout_fingerprint(self.kv_args),
         }
         payload["kv_protection_enabled"] = kv_protection_enabled(self.kv_args)
 
@@ -1329,6 +1384,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.kv_protection_enabled: Optional[bool] = None
+        self.kv_row_layout_fingerprint: Optional[str] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1396,6 +1452,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         kv_protection_enabled = bool(data.get("kv_protection_enabled", False))
+        row_layout_fingerprint = data.get("kv_row_layout_fingerprint")
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1422,6 +1479,24 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 text="Prefill workers disagree on whether KV protection is enabled.",
                 status=400,
             )
+
+        if kv_protection_enabled:
+            if (
+                not isinstance(row_layout_fingerprint, str)
+                or len(row_layout_fingerprint) != 64
+                or any(c not in "0123456789abcdef" for c in row_layout_fingerprint)
+            ):
+                return web.Response(
+                    text="Protected prefill worker has an invalid KV row layout fingerprint.",
+                    status=400,
+                )
+            if self.kv_row_layout_fingerprint is None:
+                self.kv_row_layout_fingerprint = row_layout_fingerprint
+            elif self.kv_row_layout_fingerprint != row_layout_fingerprint:
+                return web.Response(
+                    text="Protected prefill workers disagree on transferred KV row layout.",
+                    status=400,
+                )
 
         if self.follow_bootstrap_room is None:
             load_balance_method = data.get(
@@ -1493,6 +1568,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     else True
                 ),
                 kv_protection_enabled=bool(self.kv_protection_enabled),
+                kv_row_layout_fingerprint=self.kv_row_layout_fingerprint,
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 

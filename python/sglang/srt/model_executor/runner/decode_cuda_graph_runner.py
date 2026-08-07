@@ -433,9 +433,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             setter = getattr(candidate, "set_kv_protection_graph_bank", None)
             if setter is not None:
                 setter(bank)
-            for child in getattr(candidate, "attn_backends", ()):
+            for child in getattr(candidate, "attn_backends", ()) or ():
+                visit(child)
+            # TboAttnBackend owns two independently captured child backends.
+            # They must select the same protection bank as the primary or
+            # consecutive overlapped replays can race through child bank 0.
+            for child in getattr(candidate, "children", ()) or ():
                 visit(child)
             visit(getattr(candidate, "primary", None))
+            decode_backend = getattr(candidate, "decode_backend", None)
+            if not isinstance(decode_backend, str):
+                visit(decode_backend)
 
         visit(backend)
 

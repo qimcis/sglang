@@ -456,6 +456,7 @@ def assert_protection_supported(
     is_spec_decode: bool = False,
     pp_size: int = 1,
     enable_dp_attention: bool = False,
+    enable_dp_lm_head: bool = False,
     is_cuda_device: Optional[bool] = None,
     device_capability_major: Optional[int] = None,
     device_capability_minor: Optional[int] = None,
@@ -504,10 +505,12 @@ def assert_protection_supported(
             "parallelism. Set --pp-size 1 or disable SGLANG_KV_PROTECTION."
         )
 
-    if config.enable_attention_tags and enable_dp_attention:
+    if config.enable_attention_tags and enable_dp_lm_head:
         raise RuntimeError(
-            "KV attention-tag protection does not yet support DP attention. "
-            "Disable --enable-dp-attention or SGLANG_KV_PROTECTION."
+            "KV attention-tag protection with DP attention requires the full TP "
+            "logits gather for failure consensus and does not support "
+            "--enable-dp-lm-head. Disable --enable-dp-lm-head or "
+            "SGLANG_KV_PROTECTION."
         )
 
     if config.enable_attention_tags and transfer_backend is not None:

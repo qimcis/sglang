@@ -32,6 +32,7 @@ from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
     all_gather_inner,
     create_state,
 )
+from sglang.srt.layers.dp_attention import memcpy_triton
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=240, stage="base-b-kernel-unit", runner_config="8-gpu-h200")
@@ -118,6 +119,59 @@ def _nccl_all_gather(x: torch.Tensor, group: dist.ProcessGroup, world_size: int)
 # ---------------------------------------------------------------------------
 
 
+@torch.inference_mode()
+def test_dp_logits_scatter_copies_failure_sideband() -> None:
+    _init_cpu_group_once()
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    total_rows, local_capacity, hidden = 11, 6, 32
+    local_start, local_rows = 3, 5
+
+    global_logits = torch.arange(
+        total_rows * hidden, dtype=torch.float32, device=device
+    ).reshape(total_rows, hidden)
+    local_logits = torch.full(
+        (local_capacity, hidden), -1, dtype=torch.float32, device=device
+    )
+    global_failure = torch.arange(total_rows, dtype=torch.int32, device=device) % 2
+    local_failure = torch.full((local_capacity,), -1, dtype=torch.int32, device=device)
+
+    memcpy_triton(
+        local_logits,
+        global_logits,
+        0,
+        torch.tensor(local_start, dtype=torch.int64, device=device),
+        torch.tensor(local_rows, dtype=torch.int64, device=device),
+        True,
+        local_sideband=local_failure,
+        global_sideband=global_failure,
+    )
+
+    torch.testing.assert_close(
+        local_logits[:local_rows],
+        global_logits[local_start : local_start + local_rows],
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        local_failure[:local_rows],
+        global_failure[local_start : local_start + local_rows],
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        local_logits[local_rows:],
+        torch.full_like(local_logits[local_rows:], -1),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        local_failure[local_rows:],
+        torch.full_like(local_failure[local_rows:], -1),
+        atol=0,
+        rtol=0,
+    )
+
+
 @pytest.mark.parametrize("skip_entry_sync", [False, True])
 @pytest.mark.parametrize("safe", [False, True])
 @pytest.mark.parametrize("hidden", TEST_HIDDEN)
@@ -145,6 +199,8 @@ def test_symm_mem_all_gather(
         x: torch.Tensor,
         local_failure: torch.Tensor | None = None,
         global_failure: torch.Tensor | None = None,
+        failure_local_start: torch.Tensor | None = None,
+        failure_local_num_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return all_gather_inner(
             state,
@@ -154,6 +210,8 @@ def test_symm_mem_all_gather(
             safe=safe,
             local_failure=local_failure,
             global_failure=global_failure,
+            failure_local_start=failure_local_start,
+            failure_local_num_rows=failure_local_num_rows,
         ).clone()
 
     for _ in range(TEST_LOOP):
@@ -176,6 +234,88 @@ def test_symm_mem_all_gather(
         expected_failure[: min(world_size, num_tokens)] = 1
         torch.testing.assert_close(out, ref, atol=0, rtol=0)
         torch.testing.assert_close(global_failure, expected_failure, atol=0, rtol=0)
+
+        # DPA lanes own disjoint row ranges. Every attention-TP rank publishes
+        # only its lane-local vector; the full TP gather must OR matching ranks
+        # without confusing equal local batch indices from different lanes.
+        if num_tokens >= 8 and world_size % 2 == 0:
+            dp_size = 2
+            attn_tp_size = world_size // dp_size
+            dp_rank = state.rank_in_group // attn_tp_size
+            attn_tp_rank = state.rank_in_group % attn_tp_size
+            local_num_rows = num_tokens // dp_size
+            local_start = dp_rank * local_num_rows
+            local_failure = torch.zeros(
+                local_num_rows, dtype=torch.int32, device=device
+            )
+            local_failure[attn_tp_rank % local_num_rows] = 1
+            global_failure = torch.full(
+                (num_tokens,), -1, dtype=torch.int32, device=device
+            )
+            out = gather(
+                x,
+                local_failure,
+                global_failure,
+                torch.tensor(local_start, dtype=torch.int32, device=device),
+                torch.tensor(local_num_rows, dtype=torch.int32, device=device),
+            )
+            expected_failure = torch.zeros_like(global_failure)
+            for lane in range(dp_size):
+                lane_start = lane * local_num_rows
+                expected_failure[
+                    lane_start : lane_start + min(attn_tp_size, local_num_rows)
+                ] = 1
+            torch.testing.assert_close(out, ref, atol=0, rtol=0)
+            torch.testing.assert_close(global_failure, expected_failure, atol=0, rtol=0)
+
+            # Uneven lanes use cumulative global offsets rather than fixed-size
+            # slots. Verify the sideband follows the same compact row layout.
+            uneven_counts = (3, num_tokens - 3)
+            uneven_local_rows = uneven_counts[dp_rank]
+            uneven_local_start = sum(uneven_counts[:dp_rank])
+            uneven_failure = torch.zeros(
+                uneven_local_rows, dtype=torch.int32, device=device
+            )
+            uneven_failure[attn_tp_rank % uneven_local_rows] = 1
+            global_failure.fill_(-1)
+            out = gather(
+                x,
+                uneven_failure,
+                global_failure,
+                torch.tensor(uneven_local_start, dtype=torch.int32, device=device),
+                torch.tensor(uneven_local_rows, dtype=torch.int32, device=device),
+            )
+            expected_failure.zero_()
+            for lane, lane_rows in enumerate(uneven_counts):
+                lane_start = sum(uneven_counts[:lane])
+                expected_failure[
+                    lane_start : lane_start + min(attn_tp_size, lane_rows)
+                ] = 1
+            torch.testing.assert_close(out, ref, atol=0, rtol=0)
+            torch.testing.assert_close(global_failure, expected_failure, atol=0, rtol=0)
+
+            # An idle lane contributes no failures to another lane's rows.
+            if dp_rank == 0:
+                idle_local_start = 0
+                idle_local_rows = num_tokens
+                idle_failure = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+                idle_failure[attn_tp_rank % num_tokens] = 1
+            else:
+                idle_local_start = num_tokens
+                idle_local_rows = 0
+                idle_failure = torch.zeros(1, dtype=torch.int32, device=device)
+            global_failure.fill_(-1)
+            out = gather(
+                x,
+                idle_failure,
+                global_failure,
+                torch.tensor(idle_local_start, dtype=torch.int32, device=device),
+                torch.tensor(idle_local_rows, dtype=torch.int32, device=device),
+            )
+            expected_failure.zero_()
+            expected_failure[: min(attn_tp_size, num_tokens)] = 1
+            torch.testing.assert_close(out, ref, atol=0, rtol=0)
+            torch.testing.assert_close(global_failure, expected_failure, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

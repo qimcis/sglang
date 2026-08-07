@@ -3207,22 +3207,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _get_active_kv_page_protection(self):
         """Return the protection view owned by the active attention metadata.
 
-        Multi-backend wrappers keep the DSA backend in ``attn_backends``; the
-        production GLM path exposes ``forward_metadata`` directly.
+        Multi-backend wrappers can keep the DSA backend in ``attn_backends``,
+        TBO primary/children, or a hybrid decode backend. The production GLM
+        path exposes ``forward_metadata`` directly.
         """
-        backends = [self.attn_backend]
-        backends.extend(getattr(self, "decode_attn_backend_group", ()))
-        backends.extend(getattr(self.attn_backend, "attn_backends", ()))
-        for backend in backends:
+        # LIFO traversal: prefer the currently selected PDMux decode backend,
+        # then the normal backend, and keep the full group only as a fallback.
+        pending_backends = list(getattr(self, "decode_attn_backend_group", ()))
+        pending_backends.append(self.attn_backend)
+        pending_backends.append(getattr(self, "decode_attn_backend", None))
+        seen_backends = set()
+        while pending_backends:
+            backend = pending_backends.pop()
+            if backend is None or id(backend) in seen_backends:
+                continue
+            seen_backends.add(id(backend))
             metadata = getattr(backend, "forward_metadata", None)
             protection = getattr(metadata, "kv_page_protection", None)
             if protection is not None:
                 return protection
-            for child in getattr(backend, "attn_backends", ()):
-                metadata = getattr(child, "forward_metadata", None)
-                protection = getattr(metadata, "kv_page_protection", None)
-                if protection is not None:
-                    return protection
+            pending_backends.extend(getattr(backend, "attn_backends", ()) or ())
+            pending_backends.extend(getattr(backend, "children", ()) or ())
+            pending_backends.append(getattr(backend, "primary", None))
+            decode_backend = getattr(backend, "decode_backend", None)
+            if not isinstance(decode_backend, str):
+                pending_backends.append(decode_backend)
         return None
 
     def _start_fused_kv_page_protection_check(

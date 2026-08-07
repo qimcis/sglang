@@ -248,6 +248,11 @@ class DSAMetadata:
     kv_page_failure_status: Optional[torch.Tensor] = None
     kv_page_local_failed: Optional[torch.Tensor] = None
     kv_page_failed: Optional[torch.Tensor] = None
+    # DPA logits are gathered in global-DP row order.  The local validator
+    # writes ``kv_page_local_failed``; the logits collective publishes its
+    # lane-aware TP consensus here before scattering the owning lane back into
+    # ``kv_page_failed``.
+    kv_page_global_failed: Optional[torch.Tensor] = None
 
 
 @torch.compile
@@ -927,6 +932,7 @@ class DeepseekSparseAttnBackend(
                         "failure_status": metadata.kv_page_failure_status,
                         "local_failed": metadata.kv_page_local_failed,
                         "failed": metadata.kv_page_failed,
+                        "global_failed": metadata.kv_page_global_failed,
                         "num_request_slots": table.request_epochs.numel(),
                         "validated_in_metadata": True,
                         "producer_validation_via_full_mapping": True,
@@ -1276,6 +1282,21 @@ class DeepseekSparseAttnBackend(
                 and forward_batch.forward_mode.is_decode_or_idle()
                 else None
             ),
+            kv_page_global_failed=(
+                torch.empty(
+                    (
+                        sum(forward_batch.global_num_tokens_for_logprob_cpu)
+                        if forward_batch.global_num_tokens_for_logprob_cpu is not None
+                        else int(forward_batch.global_dp_buffer_len or batch_size)
+                    ),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                if self.kv_metadata_fused_page_protection_enabled
+                and forward_batch.forward_mode.is_decode_or_idle()
+                and get_parallel().attn_dp_size > 1
+                else None
+            ),
         )
         self._set_kv_page_protection(
             metadata,
@@ -1524,6 +1545,17 @@ class DeepseekSparseAttnBackend(
                 dtype=torch.int32,
                 device=self.device,
             ),
+            "kv_page_global_failed": (
+                torch.zeros(
+                    protection_banks,
+                    max_num_tokens * get_parallel().attn_dp_size,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                if self.kv_metadata_fused_page_protection_enabled
+                and get_parallel().attn_dp_size > 1
+                else None
+            ),
             "flashmla_metadata": (
                 self._compute_flashmla_metadata(
                     cache_seqlens=torch.ones(
@@ -1722,6 +1754,15 @@ class DeepseekSparseAttnBackend(
                 ]
                 if self.kv_metadata_fused_page_protection_enabled
                 and forward_mode.is_decode_or_idle()
+                else None
+            ),
+            kv_page_global_failed=(
+                self.decode_cuda_graph_metadata["kv_page_global_failed"][
+                    self.kv_protection_graph_bank
+                ]
+                if self.kv_metadata_fused_page_protection_enabled
+                and forward_mode.is_decode_or_idle()
+                and self.decode_cuda_graph_metadata["kv_page_global_failed"] is not None
                 else None
             ),
         )

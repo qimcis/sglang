@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.observability.mooncake_trace import (
     MooncakeRequestStage,
     mooncake_trace_func,
@@ -2684,6 +2685,37 @@ class MooncakeKVSender(CommonKVSender):
         self.trace_ctx.trace_req_finish()
 
 
+def synchronize_fan_in_transfer_nonce(
+    local_nonce: int, required_dst_info_num: int, group
+) -> int:
+    """Give every decode rank in a protected Mooncake fan-in one nonce.
+
+    A smaller prefill attention-TP rank receives metadata from multiple decode
+    attention-TP ranks.  The nonce identifies the request transfer, so those
+    records must agree even when several prefill ranks partition the group.
+    Broadcasting across the request's attention-TP group is safe and keeps the
+    normal one-to-one path free of an extra collective.
+    """
+    if required_dst_info_num <= 1:
+        return local_nonce
+    if required_dst_info_num > group.world_size:
+        raise RuntimeError(
+            "Mooncake protected fan-in exceeds the decode attention-TP group"
+        )
+
+    synchronized_nonce = group.broadcast_object(
+        local_nonce if group.rank_in_group == 0 else None,
+        src=0,
+    )
+    if (
+        isinstance(synchronized_nonce, bool)
+        or not isinstance(synchronized_nonce, int)
+        or not 0 < synchronized_nonce < (1 << 64)
+    ):
+        raise RuntimeError("Mooncake protected fan-in received an invalid nonce")
+    return synchronized_nonce
+
+
 class MooncakeKVReceiver(CommonKVReceiver):
     def __init__(
         self,
@@ -2708,6 +2740,12 @@ class MooncakeKVReceiver(CommonKVReceiver):
         super().init(prefill_dp_rank)
         if self.conclude_state == KVPoll.Failed:
             return
+        if self.protection_enabled and self.required_dst_info_num > 1:
+            self.transfer_nonce = synchronize_fan_in_transfer_nonce(
+                self.transfer_nonce,
+                self.required_dst_info_num,
+                get_attention_tp_group(),
+            )
         if self.prefill_info.kv_protection_enabled != self.protection_enabled:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,

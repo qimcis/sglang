@@ -434,13 +434,18 @@ def memcpy_triton_kernel(
     src_ptr,
     offset_ptr,
     sz_ptr,
+    local_sideband_ptr,
+    global_sideband_ptr,
     offset_src: tl.constexpr,
+    has_sideband: tl.constexpr,
     chunk_size,  # multiplied for offset and sz
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0).to(tl.int64)
-    offset = tl.load(offset_ptr).to(tl.int64) * chunk_size
-    sz = tl.load(sz_ptr).to(tl.int64) * chunk_size
+    offset_rows = tl.load(offset_ptr).to(tl.int64)
+    local_rows = tl.load(sz_ptr).to(tl.int64)
+    offset = offset_rows * chunk_size
+    sz = local_rows * chunk_size
 
     start_index = pid * BLOCK_SIZE
     offs = tl.arange(0, BLOCK_SIZE)
@@ -453,20 +458,64 @@ def memcpy_triton_kernel(
         data = tl.load(src_ptr + start_index + offs, mask=mask)
         tl.store(dst_ptr + offset + start_index + offs, data, mask=mask)
 
+    if has_sideband:
+        # The logits scatter already visits enough programs to cover every
+        # local row. Copy the TP-consensus failure sideband in the same launch
+        # so protected DPA does not add a bookkeeping kernel here.
+        if start_index < local_rows:
+            sideband_row = start_index + offs
+            sideband_mask = sideband_row < local_rows
+            sideband = tl.load(
+                global_sideband_ptr + offset_rows + sideband_row,
+                mask=sideband_mask,
+                other=0,
+            )
+            tl.store(local_sideband_ptr + sideband_row, sideband, mask=sideband_mask)
+
 
 def prod(x):
     return functools.reduce(lambda a, b: a * b, x, 1)
 
 
-def memcpy_triton(dst, src, dim, offset, sz, offset_src):
+def memcpy_triton(
+    dst,
+    src,
+    dim,
+    offset,
+    sz,
+    offset_src,
+    *,
+    local_sideband: Optional[torch.Tensor] = None,
+    global_sideband: Optional[torch.Tensor] = None,
+):
     max_size = min(src.numel(), dst.numel())
     assert dim == 0, "dim != 0 unsupported"
     assert src.shape[1:] == dst.shape[1:], "src and dst must have same shape"
+    has_sideband = local_sideband is not None or global_sideband is not None
+    if has_sideband:
+        assert local_sideband is not None and global_sideband is not None
+        assert local_sideband.dtype == torch.int32
+        assert global_sideband.dtype == torch.int32
+        assert local_sideband.is_cuda and global_sideband.is_cuda
+        assert local_sideband.is_contiguous() and global_sideband.is_contiguous()
+        assert local_sideband.numel() >= dst.shape[0]
+        assert global_sideband.numel() >= src.shape[0]
     chunk_size = prod(src.shape[1:])
     BLOCK_SIZE = 8192
     grid = (triton.cdiv(max_size, BLOCK_SIZE),)
 
-    memcpy_triton_kernel[grid](dst, src, offset, sz, offset_src, chunk_size, BLOCK_SIZE)
+    memcpy_triton_kernel[grid](
+        dst,
+        src,
+        offset,
+        sz,
+        local_sideband if has_sideband else dst,
+        global_sideband if has_sideband else src,
+        offset_src,
+        has_sideband,
+        chunk_size,
+        BLOCK_SIZE,
+    )
 
 
 def _dp_gather_via_all_reduce(
@@ -654,12 +703,21 @@ def dp_scatter(
     local_tokens: torch.Tensor,  # output
     global_tokens: torch.Tensor,  # input
     forward_batch: ForwardBatch,
+    *,
+    local_sideband: Optional[torch.Tensor] = None,
+    global_sideband: Optional[torch.Tensor] = None,
 ):
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
     local_tokens.fill_(0)
+    has_sideband = local_sideband is not None or global_sideband is not None
+    if has_sideband:
+        if local_sideband is None or global_sideband is None:
+            raise ValueError(
+                "local_sideband and global_sideband must be provided together"
+            )
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:
@@ -668,7 +726,14 @@ def dp_scatter(
         ), "aliasing between local_tokens and global_tokens not allowed"
 
         memcpy_triton(
-            local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
+            local_tokens,
+            global_tokens,
+            0,
+            local_start_pos,
+            local_num_tokens,
+            True,
+            local_sideband=local_sideband,
+            global_sideband=global_sideband,
         )
 
 

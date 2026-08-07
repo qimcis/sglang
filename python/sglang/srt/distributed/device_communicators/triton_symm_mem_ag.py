@@ -112,6 +112,26 @@ def _local_ld_32(in_ptr, mask):
 
 
 @triton.jit
+def _local_st_32(out_ptr, value, mask):
+    """Issue one system-scope global store from each physical CUDA thread."""
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            mov.u32 $0, 0;
+            setp.eq.s32 %p0, $3, 1;
+            @%p0 st.relaxed.sys.global.b32 [$1], $2;
+        }
+        """,
+        "=r,l,r,r",
+        args=[out_ptr, value, mask.to(tl.int32)],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
 def _get_tid():
     return tl.inline_asm_elementwise(
         """
@@ -289,6 +309,8 @@ def _all_gather_kernel_inner(
     hidden_offset,
     local_failure_ptr,
     global_failure_ptr,
+    failure_local_start_ptr,
+    failure_local_num_rows_ptr,
     failure_multicast_ptr,
     failure_buffer_ptr,
     LOCAL_HIDDEN: tl.constexpr,
@@ -299,6 +321,8 @@ def _all_gather_kernel_inner(
     WORLD_SIZE: tl.constexpr,
     SKIP_ENTRY_SYNC: tl.constexpr,
     HAS_FAILURE: tl.constexpr,
+    FAILURE_IS_DP_LOCAL: tl.constexpr,
+    LOCAL_FAILURE_ROWS: tl.constexpr,
 ) -> None:
     if SKIP_ENTRY_SYNC == 0:
         _blockwise_barrier(signal_pad_ptr, RANK, WORLD_SIZE, sem="relaxed")
@@ -334,7 +358,22 @@ def _all_gather_kernel_inner(
     if HAS_FAILURE and pid == 0:
         failure_row = tid
         while failure_row < total_tokens:
-            failure = tl.load(local_failure_ptr + failure_row).to(tl.uint32)
+            if FAILURE_IS_DP_LOCAL:
+                local_start = tl.load(failure_local_start_ptr).to(tl.int32)
+                local_num_rows = tl.load(failure_local_num_rows_ptr).to(tl.int32)
+                local_row = failure_row - local_start
+                owns_row = (local_row >= 0) & (local_row < local_num_rows)
+                local_row_in_bounds = owns_row & (local_row < LOCAL_FAILURE_ROWS)
+                failure = tl.load(
+                    local_failure_ptr + local_row,
+                    mask=local_row_in_bounds,
+                    other=0,
+                ).to(tl.uint32)
+                # A malformed row count must fail closed instead of reading past
+                # the validator's lane-local result buffer.
+                failure |= (owns_row & ~local_row_in_bounds).to(tl.uint32)
+            else:
+                failure = tl.load(local_failure_ptr + failure_row).to(tl.uint32)
             failure_out = (
                 failure_multicast_ptr.to(tl.int64).to(tl.pointer_type(tl.uint32))
                 + failure_row * WORLD_SIZE
@@ -359,8 +398,44 @@ def _all_gather_kernel_inner(
                     failure_buffer_ptr + failure_row * WORLD_SIZE + remote_rank,
                     failure_row < total_tokens,
                 )
-            tl.store(global_failure_ptr + failure_row, (failed != 0).to(tl.int32))
+            # ``failure_row`` is derived from the physical CUDA thread ID. A
+            # scalar ``tl.store`` is emitted for only one Triton lane, whereas
+            # this sideband needs one store from every physical block thread.
+            _local_st_32(
+                global_failure_ptr + failure_row,
+                (failed != 0).to(tl.uint32),
+                failure_row < total_tokens,
+            )
             failure_row += BLOCK_SIZE
+
+
+@triton.jit
+def _pack_dp_local_failure_kernel(
+    packed_ptr,
+    packed_row_stride,
+    failure_column,
+    total_rows,
+    local_failure_ptr,
+    failure_local_start_ptr,
+    failure_local_num_rows_ptr,
+    BLOCK_SIZE: tl.constexpr,
+    LOCAL_FAILURE_ROWS: tl.constexpr,
+):
+    """Write a lane-local failure vector into a global-DP packed column."""
+    row = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    row_mask = row < total_rows
+    local_start = tl.load(failure_local_start_ptr).to(tl.int32)
+    local_num_rows = tl.load(failure_local_num_rows_ptr).to(tl.int32)
+    local_row = row - local_start
+    owns_row = row_mask & (local_row >= 0) & (local_row < local_num_rows)
+    local_row_in_bounds = owns_row & (local_row < LOCAL_FAILURE_ROWS)
+    failure = tl.load(local_failure_ptr + local_row, mask=local_row_in_bounds, other=0)
+    failure |= (owns_row & ~local_row_in_bounds).to(tl.int32)
+    tl.store(
+        packed_ptr + row * packed_row_stride + failure_column,
+        failure,
+        mask=row_mask,
+    )
 
 
 # ------------------------------------------------------------------------------
@@ -450,12 +525,17 @@ def all_gather_inner(
     safe: bool = True,
     local_failure: torch.Tensor | None = None,
     global_failure: torch.Tensor | None = None,
+    failure_local_start: torch.Tensor | None = None,
+    failure_local_num_rows: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gather ``[T, H/TP]`` shards into ``[T, H]`` along the hidden dim.
 
     When both failure tensors are supplied, the same launch publishes each
     rank's local bit and writes the TP-wide OR to ``global_failure`` before it
-    returns. ``tp_hidden_dim`` is the gathered width ``H``.
+    returns. Under DPA, ``failure_local_start`` and
+    ``failure_local_num_rows`` place the rank's lane-local vector into the
+    global-DP row layout; rows owned by other lanes contribute zero.
+    ``tp_hidden_dim`` is the gathered width ``H``.
 
     Returns a clone when ``safe``, else a view into the symmetric buffer (valid
     until the next collective)."""
@@ -486,15 +566,29 @@ def all_gather_inner(
         total_tokens <= state.max_token_num
     ), f"total_tokens={total_tokens} exceeds max_token_num={state.max_token_num}"
     has_failure = local_failure is not None or global_failure is not None
+    failure_is_dp_local = (
+        failure_local_start is not None or failure_local_num_rows is not None
+    )
     if has_failure:
         assert local_failure is not None and global_failure is not None
         assert local_failure.dtype == torch.int32
         assert global_failure.dtype == torch.int32
         assert local_failure.is_cuda and global_failure.is_cuda
-        assert local_failure.numel() >= total_tokens
         assert global_failure.numel() >= total_tokens
         assert state.failure_buff is not None
         assert state.failure_symm_mem_hdl is not None
+        if failure_is_dp_local:
+            assert failure_local_start is not None
+            assert failure_local_num_rows is not None
+            assert failure_local_start.is_cuda and failure_local_num_rows.is_cuda
+            assert failure_local_start.numel() == 1
+            assert failure_local_num_rows.numel() == 1
+            assert failure_local_start.dtype in (torch.int32, torch.int64)
+            assert failure_local_num_rows.dtype in (torch.int32, torch.int64)
+        else:
+            assert local_failure.numel() >= total_tokens
+    elif failure_is_dp_local:
+        raise ValueError("DPA failure row metadata requires failure sideband tensors")
 
     hidden_offset = local_hidden * state.rank_in_group
     symm_mem_hdl = state.symm_mem_hdl
@@ -516,6 +610,12 @@ def all_gather_inner(
         hidden_offset=hidden_offset,
         local_failure_ptr=(local_failure if has_failure else hidden_states),
         global_failure_ptr=(global_failure if has_failure else hidden_states),
+        failure_local_start_ptr=(
+            failure_local_start if failure_is_dp_local else hidden_states
+        ),
+        failure_local_num_rows_ptr=(
+            failure_local_num_rows if failure_is_dp_local else hidden_states
+        ),
         failure_multicast_ptr=failure_symm_mem_hdl.multicast_ptr,
         failure_buffer_ptr=failure_buff,
         LOCAL_HIDDEN=local_hidden,
@@ -526,6 +626,8 @@ def all_gather_inner(
         WORLD_SIZE=symm_mem_hdl.world_size,
         SKIP_ENTRY_SYNC=1 if skip_entry_sync else 0,
         HAS_FAILURE=has_failure,
+        FAILURE_IS_DP_LOCAL=failure_is_dp_local,
+        LOCAL_FAILURE_ROWS=(local_failure.numel() if has_failure else 0),
         num_warps=num_warps,
     )
     output = state.comm_buff[:total_tokens, :tp_hidden_dim]
@@ -613,12 +715,62 @@ class MultimemAllGatherer:
         *,
         local_failure: torch.Tensor | None = None,
         global_failure: torch.Tensor | None = None,
+        failure_local_start: torch.Tensor | None = None,
+        failure_local_num_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
         has_failure = local_failure is not None or global_failure is not None
+        failure_is_dp_local = (
+            failure_local_start is not None or failure_local_num_rows is not None
+        )
         if has_failure and (local_failure is None or global_failure is None):
             raise ValueError(
                 "local_failure and global_failure must be provided together"
             )
+        if failure_is_dp_local and (
+            not has_failure
+            or failure_local_start is None
+            or failure_local_num_rows is None
+        ):
+            raise ValueError(
+                "DPA failure sideband requires local/global failure tensors and "
+                "both local row metadata tensors"
+            )
+        if has_failure:
+            if (
+                local_failure.dtype != torch.int32
+                or global_failure.dtype != torch.int32
+            ):
+                raise ValueError("KV failure sideband tensors must use torch.int32")
+            if not local_failure.is_cuda or not global_failure.is_cuda:
+                raise ValueError("KV failure sideband tensors must be CUDA tensors")
+            if local_failure.device != x.device or global_failure.device != x.device:
+                raise ValueError(
+                    "KV failure sideband tensors must be on the logits device"
+                )
+            if not local_failure.is_contiguous() or not global_failure.is_contiguous():
+                raise ValueError("KV failure sideband tensors must be contiguous")
+            if global_failure.numel() < x.shape[0]:
+                raise ValueError(
+                    "global_failure must have at least one element per logits row"
+                )
+            if not failure_is_dp_local and local_failure.numel() < x.shape[0]:
+                raise ValueError(
+                    "local_failure must have at least one element per logits row"
+                )
+        if failure_is_dp_local:
+            for name, value in (
+                ("failure_local_start", failure_local_start),
+                ("failure_local_num_rows", failure_local_num_rows),
+            ):
+                if not value.is_cuda or value.device != x.device:
+                    raise ValueError(
+                        f"{name} must be a CUDA scalar on the logits device"
+                    )
+                if value.numel() != 1 or value.dtype not in (
+                    torch.int32,
+                    torch.int64,
+                ):
+                    raise ValueError(f"{name} must be an int32/int64 scalar tensor")
         state = self._state
         if state is self._UNINIT:
             state = self._build(x)
@@ -649,6 +801,8 @@ class MultimemAllGatherer:
                 safe=False,
                 local_failure=local_failure,
                 global_failure=global_failure,
+                failure_local_start=failure_local_start,
+                failure_local_num_rows=failure_local_num_rows,
             )
         # Lazy import avoids a module-load dependency on the distributed facade.
         from sglang.srt.distributed import tensor_model_parallel_all_gather
@@ -669,7 +823,20 @@ class MultimemAllGatherer:
             device=x.device,
         )
         packed[:, :-1].copy_(x)
-        packed[:, -1].copy_(local_failure)
+        if failure_is_dp_local:
+            _pack_dp_local_failure_kernel[(triton.cdiv(x.shape[0], 256),)](
+                packed,
+                packed.stride(0),
+                packed.shape[1] - 1,
+                x.shape[0],
+                local_failure,
+                failure_local_start,
+                failure_local_num_rows,
+                BLOCK_SIZE=256,
+                LOCAL_FAILURE_ROWS=local_failure.numel(),
+            )
+        else:
+            packed[:, -1].copy_(local_failure)
         gathered = tensor_model_parallel_all_gather(packed, dim=-1)
 
         from sglang.srt.distributed import get_tp_group

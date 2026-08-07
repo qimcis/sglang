@@ -902,6 +902,7 @@ class Scheduler(
             is_spec_decode=not self.spec_algorithm.is_none(),
             pp_size=self.ps.pp_size,
             enable_dp_attention=self.server_args.enable_dp_attention,
+            enable_dp_lm_head=self.server_args.enable_dp_lm_head,
             is_cuda_device=is_cuda_device,
             device_capability_major=(
                 torch.cuda.get_device_capability(allocator.device)[0]
