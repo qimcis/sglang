@@ -49,6 +49,7 @@ def protected_dsa_consumer_capability(
     device_capability: Tuple[int, int],
     *,
     flashmla_operation_available: bool = False,
+    trtllm_operation_available: bool = False,
 ) -> ProtectedDSAConsumerCapability:
     """Audited Blackwell consumers of protected physical-slot top-k output."""
     sm = tuple(device_capability)
@@ -72,14 +73,26 @@ def protected_dsa_consumer_capability(
         return ProtectedDSAConsumerCapability(True, True, True)
 
     if impl == "trtllm":
-        return ProtectedDSAConsumerCapability(
-            False,
-            False,
-            False,
-            "TRTLLM-GEN protected DSA is disabled because no exact op- and "
-            "architecture-specific binary capability probe is available; use "
-            "flashmla_kv or flashmla_sparse on Blackwell",
-        )
+        if sm != (10, 0):
+            return ProtectedDSAConsumerCapability(
+                False,
+                True,
+                True,
+                f"TRTLLM-GEN protected DSA is audited only on SM100, got SM{sm[0]}{sm[1]}",
+            )
+        if not trtllm_operation_available:
+            return ProtectedDSAConsumerCapability(
+                False,
+                True,
+                True,
+                "TRTLLM-GEN protected DSA requires a successful exact sparse-MLA "
+                f"operation probe for SM{sm[0]}{sm[1]}",
+            )
+        # TRTLLM-GEN sparse MLA consumes physical token indices. Slot 0 is a
+        # valid index into the reserved, zero-initialized padding page. Failed
+        # rows are clamped to one token and filled with slot 0, then discarded
+        # by the post-forward status-publication barrier.
+        return ProtectedDSAConsumerCapability(True, True, True)
 
     if impl == "fa3":
         reason = "FA3 has no Blackwell protected-slot consumer contract"

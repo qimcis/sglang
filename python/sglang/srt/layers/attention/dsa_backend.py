@@ -160,6 +160,203 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
 
 # Reuse this workspace buffer across all DSA backend instances
 global_workspace_buffer = None
+_trtllm_protected_consumer_probe_cache: Dict[Tuple, bool] = {}
+
+
+def _get_global_workspace_buffer(device: torch.device) -> torch.Tensor:
+    """Return the process-local FlashInfer workspace, zeroed on first use."""
+    global global_workspace_buffer
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    if global_workspace_buffer is None:
+        global_workspace_buffer = torch.zeros(
+            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+            dtype=torch.uint8,
+            device=device,
+        )
+    elif global_workspace_buffer.device != torch.device(device):
+        raise RuntimeError(
+            "the process-global FlashInfer workspace cannot span CUDA devices"
+        )
+    return global_workspace_buffer
+
+
+def _run_trtllm_protected_consumer_probe(
+    decode_fn,
+    *,
+    device: torch.device,
+    workspace_buffer: torch.Tensor,
+    num_q_heads: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    page_size: int,
+    sparse_mla_top_k: int,
+    max_seq_len: int,
+    kv_cache_dtype: torch.dtype,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
+) -> bool:
+    """Exercise the exact failed-row contract used by protected TRTLLM decode.
+
+    A failed row is published to the external consumer as one active token at
+    physical slot 0. The output buffer starts as NaN so this probe verifies
+    both that the selected TRTLLM-GEN image runs and that it overwrites the
+    result with the finite zero value produced by the reserved padding slot.
+    """
+    if page_size != 64:
+        raise ValueError(f"protected TRTLLM-GEN requires page size 64, got {page_size}")
+    if sparse_mla_top_k <= 0 or sparse_mla_top_k % 4 != 0:
+        raise ValueError(
+            "protected TRTLLM-GEN requires a positive sparse top-k divisible by 4"
+        )
+    if num_q_heads <= 0:
+        raise ValueError("protected TRTLLM-GEN requires at least one query head")
+    if max_seq_len <= 0:
+        raise ValueError(
+            "protected TRTLLM-GEN requires a positive maximum sequence length"
+        )
+    if kv_cache_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError(
+            "protected TRTLLM-GEN supports only bfloat16 or fp8_e4m3 KV cache"
+        )
+
+    head_dim = kv_lora_rank + qk_rope_head_dim
+    query = torch.ones(
+        (1, 1, num_q_heads, head_dim),
+        dtype=kv_cache_dtype,
+        device=device,
+    )
+    kv_cache = torch.zeros(
+        (1, 1, page_size, head_dim),
+        dtype=kv_cache_dtype,
+        device=device,
+    )
+    block_tables = torch.zeros(
+        (1, 1, sparse_mla_top_k), dtype=torch.int32, device=device
+    )
+    seq_lens = torch.ones(1, dtype=torch.int32, device=device)
+    out = torch.full(
+        (1, 1, num_q_heads, kv_lora_rank),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    workspace_buffer.zero_()
+    result = decode_fn(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace_buffer,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        sparse_mla_top_k=sparse_mla_top_k,
+        out=out,
+        bmm1_scale=1.0,
+        bmm2_scale=1.0,
+        backend="trtllm-gen",
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+    )
+    if not isinstance(result, torch.Tensor) or result.shape != out.shape:
+        return False
+    return bool(
+        torch.isfinite(result).all().item() and torch.count_nonzero(result).item() == 0
+    )
+
+
+def _trtllm_protected_consumer_available(
+    *,
+    device: torch.device,
+    workspace_buffer: Optional[torch.Tensor],
+    num_q_heads: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    page_size: int,
+    sparse_mla_top_k: Optional[int],
+    max_seq_len: int,
+    kv_cache_dtype: torch.dtype,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
+) -> bool:
+    """Probe the installed TRTLLM-GEN sparse-MLA op and exact SM image."""
+    if workspace_buffer is None or sparse_mla_top_k is None:
+        return False
+    device = torch.device(device)
+    if device.type != "cuda":
+        return False
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    device_capability = torch.cuda.get_device_capability(device)
+    if device_capability != (10, 0):
+        return False
+    device_index = device.index
+    key = (
+        device_index,
+        device_capability,
+        num_q_heads,
+        qk_nope_head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        page_size,
+        sparse_mla_top_k,
+        max_seq_len,
+        kv_cache_dtype,
+        skip_softmax_threshold_scale_factor,
+    )
+    cached = _trtllm_protected_consumer_probe_cache.get(key)
+    if cached is not None:
+        return cached
+
+    available = False
+    try:
+        import flashinfer.decode
+
+        with torch.cuda.device(device):
+            available = _run_trtllm_protected_consumer_probe(
+                flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla,
+                device=device,
+                workspace_buffer=workspace_buffer,
+                num_q_heads=num_q_heads,
+                qk_nope_head_dim=qk_nope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                page_size=page_size,
+                sparse_mla_top_k=sparse_mla_top_k,
+                max_seq_len=max_seq_len,
+                kv_cache_dtype=kv_cache_dtype,
+                skip_softmax_threshold_scale_factor=(
+                    skip_softmax_threshold_scale_factor
+                ),
+            )
+            torch.cuda.synchronize(device)
+        if not available:
+            logger.warning(
+                "TRTLLM-GEN protected consumer probe returned an unsafe slot-0 result"
+            )
+        else:
+            logger.info(
+                "TRTLLM-GEN protected consumer probe passed on SM100 "
+                "(page_size=%d, sparse_top_k=%d, max_seq_len=%d, kv_cache_dtype=%s)",
+                page_size,
+                sparse_mla_top_k,
+                max_seq_len,
+                kv_cache_dtype,
+            )
+    except (ImportError, RuntimeError, ValueError, TypeError, AttributeError) as exc:
+        logger.warning("TRTLLM-GEN protected consumer probe failed: %s", exc)
+        available = False
+    finally:
+        try:
+            workspace_buffer.zero_()
+            torch.cuda.synchronize(device)
+        except (RuntimeError, ValueError):
+            available = False
+
+    _trtllm_protected_consumer_probe_cache[key] = available
+    return available
 
 
 @dataclass(frozen=True)
@@ -448,6 +645,14 @@ class DeepseekSparseAttnBackend(
         )
         self.device_capability = torch.cuda.get_device_capability(self.device)
         self.device_sm_major = self.device_capability[0]
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
+        # Allocate before protected-consumer admission so TRTLLM-GEN can prove
+        # the exact sparse-MLA operation, SM image, and reserved-slot contract.
+        self.workspace_buffer = (
+            _get_global_workspace_buffer(self.device)
+            if self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm"
+            else None
+        )
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -470,6 +675,25 @@ class DeepseekSparseAttnBackend(
                 )
                 if fused_protection_requested
                 and self.dsa_decode_impl in ("flashmla_kv", "flashmla_sparse")
+                else False
+            ),
+            trtllm_operation_available=(
+                _trtllm_protected_consumer_available(
+                    device=self.device,
+                    workspace_buffer=self.workspace_buffer,
+                    num_q_heads=self.num_q_heads,
+                    qk_nope_head_dim=self.qk_nope_head_dim,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    page_size=self.real_page_size,
+                    sparse_mla_top_k=self.dsa_index_topk,
+                    max_seq_len=self.max_context_len,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    skip_softmax_threshold_scale_factor=(
+                        envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get()
+                    ),
+                )
+                if fused_protection_requested and self.dsa_decode_impl == "trtllm"
                 else False
             ),
         )
@@ -502,8 +726,7 @@ class DeepseekSparseAttnBackend(
             raise RuntimeError(
                 "Fused DSA KV page protection is unavailable: "
                 f"{reason}. Supported audited consumers are Blackwell "
-                "flashmla_kv/flashmla_sparse. TRTLLM-GEN remains disabled "
-                "until an exact binary capability probe exists."
+                "flashmla_kv/flashmla_sparse and probed TRTLLM-GEN sparse MLA."
             )
         self.kv_protected_consumer_capability = consumer_capability
         self.kv_fused_page_protection_enabled = should_use_fused_kv_page_protection(
@@ -610,21 +833,6 @@ class DeepseekSparseAttnBackend(
                     "the production GLM-5.2 DSA configuration."
                 )
             model_runner.kv_metadata_fused_page_protection_enabled = True
-
-        self.kv_cache_dtype = model_runner.kv_cache_dtype
-
-        # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
-        if self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
-            global global_workspace_buffer
-            if global_workspace_buffer is None:
-                global_workspace_buffer = torch.empty(
-                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                    dtype=torch.uint8,
-                    device=model_runner.device,
-                )
-            self.workspace_buffer = global_workspace_buffer
-        else:
-            self.workspace_buffer = None
 
     def _make_aiter_dsa_decode_metadata_buffer(
         self,
@@ -854,6 +1062,10 @@ class DeepseekSparseAttnBackend(
         if not capability.requires_status_publication_barrier:
             raise RuntimeError(
                 f"protected DSA consumer {consumer} lacks a fail-closed publication barrier"
+            )
+        if not capability.zero_is_valid:
+            raise RuntimeError(
+                f"protected DSA consumer {consumer} cannot consume reserved slot 0"
             )
         if protection["validated_epochs"] is protection["pre_indexer_validated_epochs"]:
             raise RuntimeError(

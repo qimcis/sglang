@@ -886,7 +886,7 @@ class Scheduler(
         ):
             raise RuntimeError(
                 "KV page protection in this GLM-5.2 build requires the DSA "
-                "attention backend with a protected FlashMLA consumer."
+                "attention backend with an audited protected consumer."
             )
         if self.server_args.enable_streaming_session:
             raise RuntimeError(

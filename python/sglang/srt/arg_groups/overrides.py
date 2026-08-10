@@ -1139,36 +1139,25 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         declared["dsa_prefill_backend"] = "tilelang"
         declared["dsa_decode_backend"] = "tilelang"
     elif kv_cache_dtype == "fp8_e4m3":
-        from sglang.srt.environ import envs
-
-        is_protected_blackwell = (major, minor) in ((10, 0), (10, 3))
-        prefer_protected_flashmla = (major, minor) == (
-            10,
-            3,
-        ) or (is_protected_blackwell and envs.SGLANG_KV_PROTECTION.get())
+        # TRTLLM-GEN is unaudited on SM103, so FlashMLA remains its default.
+        prefer_flashmla = (major, minor) == (10, 3)
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = (
-                "flashmla_kv" if major < 10 or prefer_protected_flashmla else "trtllm"
+                "flashmla_kv" if major < 10 or prefer_flashmla else "trtllm"
             )
         if not user_set_decode:
             declared["dsa_decode_backend"] = (
-                "flashmla_kv" if major < 10 or prefer_protected_flashmla else "trtllm"
+                "flashmla_kv" if major < 10 or prefer_flashmla else "trtllm"
             )
     else:
-        from sglang.srt.environ import envs
-
-        is_protected_blackwell = (major, minor) in ((10, 0), (10, 3))
-        prefer_protected_flashmla = (major, minor) == (
-            10,
-            3,
-        ) or (is_protected_blackwell and envs.SGLANG_KV_PROTECTION.get())
+        prefer_flashmla = (major, minor) == (10, 3)
         # Set prefill/decode backends based on hardware architecture.
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = "flashmla_sparse"
         if not user_set_decode:
             declared["dsa_decode_backend"] = (
                 "flashmla_sparse"
-                if prefer_protected_flashmla
+                if prefer_flashmla
                 else "trtllm" if major >= 10 else "fa3"
             )
 
