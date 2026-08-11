@@ -1,0 +1,33 @@
+docs_new/docs/advanced_features/attention_backend.mdx
+  s_9e88db837fdf9d::t_7c5157bf474cb3 382
+docs_new/docs/advanced_features/quantized_kv_cache.mdx
+  s_9e88db837fdf9d::t_b71688455ee1e9 54,56-57,248
+docs_new/docs/advanced_features/server_arguments.mdx
+  s_9e88db837fdf9d::t_a8d1d7aea9149e 345,347
+test/manual/quant/test_kvfp4_quant_dequant.py
+  s_9e88db837fdf9d::t_ffa23c2233f97f 9,31,55-56,60,66,94-96,99-101,115-116
+test/registered/unit/disaggregation/test_disaggregation_wire.py
+  s_9e88db837fdf9d::t_7b19b7fb32685c 12
+test/registered/unit/disaggregation/test_register_to_bootstrap.py
+  s_9e88db837fdf9d::t_1e863eab93c8a3 8
+test/registered/unit/layers/quantization/test_fp4_kv_cache_quant_method.py
+  s_9e88db837fdf9d::t_c169834fae6592 1,11-12,23,26,28,31-32,36-37,40-41,43-44,46,48-49,52-54,58,62,65-66,70,73,81,84,86,95-96,104,107,114,117,125,127,131,134,156,158,174-175,179,182-184,189,192,198,202,204,207,234,237-238,241,244-245,254-263
+test/registered/unit/server_args/test_server_args.py
+  s_9e88db837fdf9d::t_d90dde62139b0a 1174,1224-1225
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "52c2852148ad66634ef3a36054647b79f0963c5b",
+  "prompts": {},
+  "sessions": {
+    "s_9e88db837fdf9d": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_05fc65619ffe53PiifOjSulftM",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
