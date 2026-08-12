@@ -1,0 +1,74 @@
+python/sglang/srt/speculative/frozen_kv_mtp_utils.py
+  s_9e88db837fdf9d::t_51a507c8190329 52-57,64-65,88-93,99-100
+python/sglang/srt/mem_cache/kv_cache_builder.py
+  s_9e88db837fdf9d::t_dda4198554e624 55-59
+python/sglang/srt/disaggregation/decode.py
+  s_9e88db837fdf9d::t_12d1e25e5566b4 55,1018-1024,1071-1074
+python/sglang/srt/speculative/eagle_utils.py
+  s_9e88db837fdf9d::t_7df1c736145f82 455-459
+python/sglang/srt/layers/quantization/kv_cache.py
+  s_9e88db837fdf9d::t_fb302c7d973908 52-55,62
+python/sglang/srt/layers/attention/flashinfer_backend.py
+  s_9e88db837fdf9d::t_6cb3832de3ff30 12,21-22,32-34,67-305,319-339,575,591-633,636,644-645,695-706,796-800,822-831,1016-1018,1029-1030,1113-1272,1297-1299,1310-1311,1337-1340,1350-1353,1368-1369,1618-2028,2030-2370,2392-2455,2457,2459-2465,2473,2492-2495,2503-2505,2550,2565,2597,2600-2616,2620,2624-2625,2652-2663,2722,2775,2815,2831,2859-2862,2893-2895,2912-2914,2939-2950,2986-2987,3007-3008,3010-3015,3044-3045,3063-3064,3066-3073,3118-3125,3144-3146,3205-3206,3208-3213,3244,3266-3268,3270-3278,3284-3289,3291-3308,3337,3347
+  s_9e88db837fdf9d::t_9b7cb2dffdd7d8 3334-3336
+  s_9e88db837fdf9d::t_8842b63d49e94d 3338
+  s_9e88db837fdf9d::t_6142302b286d38 3345-3346
+python/sglang/srt/mem_cache/memory_pool.py
+  s_9e88db837fdf9d::t_3057b920984009 30,52-54,81,1291-1309,1334,1398-1401,1478-1481,1483-1594,1703-1710,1715-1722,1756-1779,1792-1812,1826-1836,1838-1855,1860-1869,1871-1872,1884-1893,1895-1896,1916-1920,1926-1965,2059-2397,2499,2504-2511,2518,2546,2565,2747,2750,2765,2768,2799,2802-2807,3011,3036,3040,3042-3044,3050,3056-3057,3069,3138,3141-3142,3145,3148-3149,3157-3180
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_9e88db837fdf9d::t_800ed93328791e 17-22,131-132,155-164,953-977,1049-1050,1064-1077,1091-1101,1103,1445,1447,1455,1460-1469,1954-1958
+python/sglang/srt/layers/attention/trtllm_mha_backend.py
+  s_9e88db837fdf9d::t_7446b3efb5983a 31-33,105-115,189-214,338,632-651,653-657,822-918,932-936,951-979,981-990,994-1001,1003-1008,1013-1023,1036-1040,1042-1052,1066-1072,1074,1076-1077,1092-1117,1120-1132,1137-1144,1148-1153,1156-1164,1182-1186,1209-1219
+python/sglang/srt/managers/schedule_policy.py
+  s_9e88db837fdf9d::t_640f13b2050d61 451,542,656-676,821,838-839,1086-1095,1117,1137
+python/sglang/srt/disaggregation/utils.py
+  s_9e88db837fdf9d::t_50b5f9a525c26a 60-77,701-718,737-750
+python/sglang/srt/model_executor/pool_configurator.py
+  s_31242d6a60f864::t_df7484708409df 17,264-271,273,312-346,348-359,363-374,401-415,424-438
+python/sglang/srt/speculative/spec_info.py
+  s_9e88db837fdf9d::t_5714df81e60da4 153-161,164-168
+python/sglang/srt/managers/scheduler.py
+  s_9e88db837fdf9d::t_19d399867a5e69 2833
+python/sglang/srt/mem_cache/swa_memory_pool.py
+  s_9e88db837fdf9d::t_4ed741dd4a0566 34-37,52-53,66-68,71,73,78-80,83,85,129-131,139-141,166-197,211-215,226,233-237,241,248-252,276-279,282,284
+python/sglang/srt/layers/attention/attention_registry.py
+  s_9e88db837fdf9d::t_9cbbe1de144e51 270-274,298-316
+python/sglang/srt/layers/quantization/fp4_kv_cache_quant_method.py
+  s_9e88db837fdf9d::t_7a98c6c2723c32 19-33,37-39,45-50,53-111,120-144,146-222,228-270,273-279,320,323-334,341,346-388,397-411,417-418,423-459,461-482,485-488,511,518-520,544-546,551-552,557-559,561-567,572-587,599-601,607-609,613-623,646-650,652-755,758-760,763,766-772,804-814,818-823,825,828-833,836-842,845-846,856,873-876,878-881,906-911,918-933,942-945,954-963,967-1061,1065-1101,1103-1104,1106
+python/sglang/srt/server_args.py
+  s_9e88db837fdf9d::t_a5952fbc3cb5d4 564-567,569-578,2784,4148-4150,4152-4153,4155-4156,4159-4165,4520,4528-4578,4613,4635-4647,5351,5354-5355
+python/sglang/srt/disaggregation/base/conn.py
+  s_9e88db837fdf9d::t_0fbfc20e6f0f39 20-21,31-33
+python/sglang/srt/disaggregation/prefill.py
+  s_9e88db837fdf9d::t_4bbc6803bfa318 44,1030-1036,1083-1086
+python/sglang/srt/disaggregation/common/conn.py
+  s_9e88db837fdf9d::t_b0bfcae8ab9e23 19,79-80,100-109,132-133,290-320,467-470,832,896-901,913-917,919,1290-1291,1330-1338,1367-1368,1388-1420,1438,1444-1445,1492-1493,1495-1501
+python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+  s_9e88db837fdf9d::t_cd67d85726df6b 5,24-27,108-121,918-936,965-967,1004-1015,1025,1035,1043-1046,1064
+python/sglang/srt/layers/quantization/kvfp4_tensor.py
+  s_9e88db837fdf9d::t_8db9b9b3d1d2ae 32-51,53,56,67,94-95,136-137,178-182,184-186,191-193,200-203,205,252-256,260-262,269-272,274,284-286,294-295
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "692c2a99f54f375a592ea642299b8eb4c5cbfdc5",
+  "prompts": {},
+  "sessions": {
+    "s_31242d6a60f864": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0525b98f5ffeMDl6gnyhsezi7Q",
+        "model": "gpt-5.5"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    },
+    "s_9e88db837fdf9d": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_05fc65619ffe53PiifOjSulftM",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
