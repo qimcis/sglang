@@ -14,6 +14,7 @@ Two entry points, same core computation:
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -257,13 +258,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
 
             if is_float4_e2m1fn_x2(kv_cache_dtype):
-                # kv_scale_buffer
                 scale_block_size = 16
                 n = model_config.get_num_kv_heads(tp_size)
                 k = model_config.head_dim
-                cell_size = (cell_size // 2) + (
-                    (n * k * num_layers * 2 * kv_size) // scale_block_size
+                v = model_config.v_head_dim
+                cell_size = (n * (k + v) * num_layers * kv_size // 2) + (
+                    n * (k + v) * num_layers * kv_size // scale_block_size
                 )
+                # NVFP4 owns one shared FP8 workspace. fp4_mx_block16 creates
+                # full BF16 K/V reads on demand, so reserve their simultaneous peak.
+                workspace_element_size = (
+                    1 if mr.server_args.kv_cache_dtype == "nvfp4" else 2
+                )
+                cell_size += n * (k + v) * workspace_element_size
 
         return cell_size
 
@@ -302,18 +309,69 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._swa_full_tokens_ratio = mr.server_args.swa_full_tokens_ratio
 
+        is_fp4 = is_float4_e2m1fn_x2(kv_cache_dtype)
+        fp4_recipe = getattr(mr.server_args, "kv_cache_dtype", None)
+        fp4_workspace_element_size = 1 if fp4_recipe == "nvfp4" else 2
+        full_uses_fp8 = (
+            is_fp4
+            and fp4_recipe == "nvfp4"
+            and os.environ.get("SGLANG_GEMMA4_HYBRID_KV_FP8_FULL") == "1"
+        )
+
+        def per_layer_bytes(
+            head_num: int,
+            head_dim: int,
+            v_head_dim: int,
+            *,
+            quantized: bool,
+        ) -> int:
+            if not quantized:
+                return head_num * (head_dim + v_head_dim) * kv_size
+            return (
+                head_num
+                * ((head_dim + v_head_dim) // 2 + (head_dim + v_head_dim) // 16)
+                * kv_size
+            )
+
+        def workspace_bytes(
+            head_num: int,
+            head_dim: int,
+            v_head_dim: int,
+            *,
+            quantized: bool,
+        ) -> int:
+            if not quantized:
+                return 0
+            return head_num * (head_dim + v_head_dim) * fp4_workspace_element_size
+
         # Full layer per-token memory (bytes)
-        self._full_per_token = (
-            model_config.get_num_kv_heads(tp_size)
-            * (model_config.head_dim + model_config.v_head_dim)
-            * kv_size
+        full_head_num = model_config.get_num_kv_heads(tp_size)
+        self._full_per_token = per_layer_bytes(
+            full_head_num,
+            model_config.head_dim,
+            model_config.v_head_dim,
+            quantized=is_fp4 and not full_uses_fp8,
+        )
+        self._full_workspace_per_token = workspace_bytes(
+            full_head_num,
+            model_config.head_dim,
+            model_config.v_head_dim,
+            quantized=is_fp4 and not full_uses_fp8,
         )
 
         # SWA layer per-token memory (bytes)
-        self._swa_per_token = (
-            model_config.get_swa_num_kv_heads(tp_size)
-            * (model_config.swa_head_dim + model_config.swa_v_head_dim)
-            * kv_size
+        swa_head_num = model_config.get_swa_num_kv_heads(tp_size)
+        self._swa_per_token = per_layer_bytes(
+            swa_head_num,
+            model_config.swa_head_dim,
+            model_config.swa_v_head_dim,
+            quantized=is_fp4,
+        )
+        self._swa_workspace_per_token = workspace_bytes(
+            swa_head_num,
+            model_config.swa_head_dim,
+            model_config.swa_v_head_dim,
+            quantized=is_fp4,
         )
 
         # EAGLE/STANDALONE draft KV pool inherits max_total tokens with its
@@ -340,6 +398,21 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 self._swa_per_token * self._swa_layers_num
                 + self._full_per_token * self._draft_full_layers_num
             )
+            if fp4_recipe == "nvfp4":
+                self._cell_size += self._swa_workspace_per_token + (
+                    self._full_workspace_per_token
+                    if self._draft_full_layers_num > 0
+                    else 0
+                )
+            elif is_fp4:
+                self._cell_size += max(
+                    self._swa_workspace_per_token,
+                    (
+                        self._full_workspace_per_token
+                        if self._draft_full_layers_num > 0
+                        else 0
+                    ),
+                )
         else:
             self._cell_size = (
                 self._full_per_token
@@ -348,6 +421,21 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 * self._swa_per_token
                 * self._swa_layers_num
             )
+            if fp4_recipe == "nvfp4":
+                self._cell_size += (
+                    self._full_workspace_per_token
+                    + (
+                        self._full_workspace_per_token
+                        if self._draft_full_layers_num > 0
+                        else 0
+                    )
+                    + self._swa_full_tokens_ratio * self._swa_workspace_per_token
+                )
+            elif is_fp4:
+                self._cell_size += max(
+                    self._full_workspace_per_token,
+                    self._swa_full_tokens_ratio * self._swa_workspace_per_token,
+                )
 
     def _solve_pool_sizes(
         self, max_total_num_tokens: int, page_size: int

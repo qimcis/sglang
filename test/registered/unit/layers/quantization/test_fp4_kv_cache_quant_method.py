@@ -73,7 +73,6 @@ class TestNVFP4KVMethod(CustomTestCase):
         m = NVFP4KVMethod(num_layers=4, device="cpu", sm_version=120)
         self.assertEqual(m.name, "nvfp4")
         self.assertEqual(m.SCALE_BLOCK_SIZE, 16)
-        self.assertTrue(m.needs_dequant_workspace())
         self.assertTrue(m.needs_global_scale())
 
     def test_create_buffers_shapes(self):
@@ -181,7 +180,6 @@ class TestBlockFP4KVMethod(CustomTestCase):
 
         m = BlockFP4KVMethod()
         self.assertEqual(m.name, "blockfp4")
-        self.assertTrue(m.needs_dequant_workspace())
         self.assertFalse(m.needs_global_scale())
 
     def test_create_buffers_shapes(self):

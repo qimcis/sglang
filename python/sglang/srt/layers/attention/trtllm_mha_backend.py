@@ -28,6 +28,9 @@ from sglang.srt.layers.attention.triton_ops.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.layers.attention.utils import canonicalize_stride
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    KVCacheAttentionAccessKind,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -99,6 +102,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         super().__init__(
             model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
         )
+        self.decode_kv_access = self.kv_cache_quant_method.resolve_attention_access(
+            "decode", "trtllm_mha"
+        )
+        self._check_decode_kv_access()
+        self.decode_uses_native_fp4 = (
+            self.decode_kv_access.kind == KVCacheAttentionAccessKind.NATIVE_FP4
+        )
+        self.is_nvfp4_kvcache = (
+            self.decode_uses_native_fp4
+            and self.decode_kv_access.scale_recipe == "nvfp4"
+        )
 
         config = model_runner.model_config
 
@@ -107,7 +121,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.hidden_size = config.hidden_size
 
         # Runtime parameters
-        self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -171,6 +184,32 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV bf16: q_type = bf16, out_type=model_runner.dtype
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
+
+        # CUDA graphs retain these buffers, so growth is append-only.
+        self._nvfp4_q_e4m3_buffers = {}
+        self._nvfp4_o_e4m3_buffers = {}
+        self._nvfp4_o_out_buffers = {}
+        self._nvfp4_retired_buffers = []
+        self._nvfp4_decode_kv_view_cache = {}
+        self._nvfp4_bmm_scale_cache = {}
+
+    def _check_decode_kv_access(self) -> None:
+        supported_kinds = {
+            KVCacheAttentionAccessKind.PLAIN,
+            KVCacheAttentionAccessKind.NATIVE_FP4,
+        }
+        if (
+            self.decode_kv_access is not None
+            and self.decode_kv_access.kind in supported_kinds
+        ):
+            return
+
+        method_name = getattr(self.kv_cache_quant_method, "name", "unknown")
+        available = self.kv_cache_quant_method.describe_attention_accesses("decode")
+        raise ValueError(
+            f"KV cache method {method_name!r} does not support decode with "
+            f"trtllm_mha. Available decode accesses: {available}."
+        )
 
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
@@ -295,7 +334,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         need Q and K descales in BMM1 and V descale in BMM2. Non-FP8 KV cache
         entries are already in model dtype.
         """
-        if self.data_type != torch.float8_e4m3fn:
+        if self._get_layer_kv_dtype(layer) != torch.float8_e4m3fn:
             return layer.scaling, 1.0
 
         k_scale = self._get_scalar_scale(layer, "k_scale_float", "k_scale")
@@ -589,9 +628,32 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
-    def _should_use_fused_fp8_path(self, save_kv_cache: bool, k: torch.Tensor) -> bool:
+    def _get_layer_kv_pool(self, layer: RadixAttention):
+        if self._swa_kv_pool is None:
+            return self.token_to_kv_pool
+        _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
+        return (
+            self._swa_kv_pool.swa_kv_pool if is_swa else self._swa_kv_pool.full_kv_pool
+        )
+
+    def _get_layer_kv_dtype(self, layer: RadixAttention) -> torch.dtype:
+        return self._get_layer_kv_pool(layer).dtype
+
+    def _layer_uses_native_fp4(self, layer: RadixAttention) -> bool:
+        return (
+            self.is_nvfp4_kvcache
+            and self._get_layer_kv_pool(layer).is_quantized_kv_cache
+        )
+
+    def _should_use_fused_fp8_path(
+        self, save_kv_cache: bool, k: torch.Tensor, layer: RadixAttention
+    ) -> bool:
         """Check if we should use the fused FP8 KV cache write path."""
-        return save_kv_cache and k is not None and self.data_type == torch.float8_e4m3fn
+        return (
+            save_kv_cache
+            and k is not None
+            and self._get_layer_kv_dtype(layer) == torch.float8_e4m3fn
+        )
 
     def _fused_fp8_set_kv_buffer(
         self,
@@ -756,6 +818,103 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         self.forward_metadata = metadata
 
+    def _reshape_paged_kv_cache(
+        self,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        layer: RadixAttention,
+        head_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        k_cache = k_cache.view(
+            -1, self.page_size, layer.tp_k_head_num, head_dim
+        ).permute(0, 2, 1, 3)
+        v_cache = v_cache.view(
+            -1, self.page_size, layer.tp_v_head_num, head_dim
+        ).permute(0, 2, 1, 3)
+        if layer.tp_k_head_num == 1:
+            k_cache = canonicalize_stride(k_cache)
+        if layer.tp_v_head_num == 1:
+            v_cache = canonicalize_stride(v_cache)
+        return k_cache, v_cache
+
+    def _nvfp4_static_rows_buffer(self, table, rows, num_heads, head_dim, dtype):
+        """Return a [rows, num_heads, head_dim] slice of a persistent buffer.
+
+        Growth is append-only: a superseded buffer moves to the retired list
+        instead of being freed, because a captured CUDA graph may still replay
+        into its storage. SGLang captures the largest decode bucket first, so
+        steady-state serving never grows the buffer after capture.
+        """
+        key = (num_heads, head_dim, dtype)
+        entry = table.get(key)
+        if entry is not None and entry.shape[0] >= rows:
+            return entry[:rows]
+
+        # Autotuning runs under inference mode before CUDA graph capture. The
+        # persistent destinations must remain normal tensors for graph replay.
+        with torch.inference_mode(False):
+            new_rows = rows if entry is None else max(rows, entry.shape[0] * 2)
+            if entry is not None:
+                self._nvfp4_retired_buffers.append(entry)
+            entry = torch.empty(
+                (new_rows, num_heads, head_dim), dtype=dtype, device=self.device
+            )
+            table[key] = entry
+            return entry[:rows]
+
+    def _get_nvfp4_bmm_scales(self, layer: RadixAttention) -> tuple[float, float]:
+        assert self.is_nvfp4_kvcache
+        cached = self._nvfp4_bmm_scale_cache.get(layer.layer_id)
+        if cached is None:
+            cached = self.kv_cache_quant_method.get_bmm_scales(layer.layer_id)
+            self._nvfp4_bmm_scale_cache[layer.layer_id] = cached
+        return cached
+
+    def _get_nvfp4_decode_kv_cache(self, layer: RadixAttention) -> tuple[
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+    ]:
+        assert self.is_nvfp4_kvcache
+        cached = self._nvfp4_decode_kv_view_cache.get(layer.layer_id)
+        if cached is not None:
+            return cached
+        k_fp4, v_fp4, k_scale, v_scale = self.token_to_kv_pool.get_raw_kv_buffer(
+            layer.layer_id
+        )
+        kv_cache = self._reshape_paged_kv_cache(
+            k_fp4, v_fp4, layer, layer.head_dim // 2
+        )
+        k_scale_shape = (
+            layer.tp_k_head_num,
+            self.page_size,
+            layer.head_dim // 16,
+        )
+        v_scale_shape = (
+            layer.tp_v_head_num,
+            self.page_size,
+            layer.head_dim // 16,
+        )
+        if (
+            tuple(k_scale.shape[1:]) != k_scale_shape
+            or tuple(v_scale.shape[1:]) != v_scale_shape
+            or k_scale.stride(-1) != 1
+            or v_scale.stride(-1) != 1
+            or k_scale.stride(-2) != k_scale_shape[-1]
+            or v_scale.stride(-2) != v_scale_shape[-1]
+        ):
+            raise RuntimeError(
+                "Native NVFP4 decode requires HND scale storage with contiguous "
+                f"token/block dimensions; got K {tuple(k_scale.shape)} "
+                f"stride={k_scale.stride()} and V {tuple(v_scale.shape)} "
+                f"stride={v_scale.stride()}."
+            )
+        kv_cache_block_scales = (k_scale, v_scale)
+        # The pool buffers are static for the process lifetime, so the views
+        # and the stride validation above only need to run once per layer.
+        result = (kv_cache, kv_cache_block_scales)
+        self._nvfp4_decode_kv_view_cache[layer.layer_id] = result
+        return result
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -769,7 +928,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Run forward for decode using TRTLLM MHA kernel."""
         cache_loc = forward_batch.out_cache_loc
 
-        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
+        layer_uses_native_fp4 = self._layer_uses_native_fp4(layer)
+        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k, layer)
+        use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
+        pool = self.token_to_kv_pool
+        fused_nvfp4_q = None
 
         if use_fused_fp8_path:
             # Use fused FP8 quantization + KV cache write path
@@ -783,48 +946,80 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             k = None
             v = None
         else:
-            # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
-                    k,
-                    v,
-                    layer.k_scale,
-                    layer.v_scale,
-                )
+                if layer_uses_native_fp4:
+                    # Quantize K/V and convert Q to E4M3 in one launch.
+                    q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+                    fused_nvfp4_q = self._nvfp4_static_rows_buffer(
+                        self._nvfp4_q_e4m3_buffers,
+                        q.shape[0],
+                        layer.tp_q_head_num,
+                        layer.head_dim,
+                        torch.float8_e4m3fn,
+                    )
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        *self._kv_write_scales(layer),
+                        fused_q_src=q,
+                        fused_q_dst=fused_nvfp4_q,
+                    )
+                else:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        *self._kv_write_scales(layer),
+                    )
 
-        # For XQA, q_dtype should be bf16. For trtllm-gen,
-        # q_dtype should be FP8 when KV is in FP8.
+        # XQA uses BF16 queries; TRTLLM-Gen uses E4M3 for FP8 and native NVFP4 KV.
         q_scale = 1.0
-        if self.data_type == torch.float8_e4m3fn and not self.is_xqa_impl:
+        if layer_uses_native_fp4:
+            if fused_nvfp4_q is not None:
+                q = fused_nvfp4_q
+            else:
+                q = q.to(torch.float8_e4m3fn)
+        elif (
+            self._get_layer_kv_dtype(layer) == torch.float8_e4m3fn
+            and not self.is_xqa_impl
+            and not use_fused_qkv
+        ):
             q = q.to(torch.float8_e4m3fn)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        # shape conversion:
-        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
 
-        if layer.tp_k_head_num == 1:
-            k_cache = canonicalize_stride(k_cache)
-        if layer.tp_v_head_num == 1:
-            v_cache = canonicalize_stride(v_cache)
+        if layer_uses_native_fp4:
+            kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
+        else:
+            k_cache, v_cache = pool.get_kv_buffer(layer.layer_id)
+            kv_cache = self._reshape_paged_kv_cache(
+                k_cache, v_cache, layer, layer.head_dim
+            )
+            kv_cache_block_scales = None
 
-        kv_cache = (k_cache, v_cache)
-
-        bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
-        # sink: additional value per head in the denominator of the softmax.
+        if layer_uses_native_fp4:
+            k_scale, v_scale = self._get_nvfp4_bmm_scales(layer)
+            bmm1_scale = q_scale * k_scale * layer.scaling
+            bmm2_scale = v_scale
+        else:
+            bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
         attention_sink = kwargs.get("sinks", None)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 
-        # Call TRT-LLM kernel
-        # raw_out: like q, [bs, acc_q_len, num_q_heads, head_dim] but with output dtype
+        nvfp4_out = None
+        if layer_uses_native_fp4:
+            # Persistent E4M3 out= buffer: avoids the per-call allocation
+            # inside FlashInfer and keeps graph-replay addresses explicit.
+            nvfp4_out = self._nvfp4_static_rows_buffer(
+                self._nvfp4_o_e4m3_buffers,
+                q.shape[0],
+                layer.tp_q_head_num,
+                layer.head_dim,
+                torch.float8_e4m3fn,
+            )
         o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q,
             kv_cache=kv_cache,
@@ -837,8 +1032,23 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-            out_dtype=self.q_data_type,  # model_runner.dtype
+            out=nvfp4_out,
+            out_dtype=(
+                torch.float8_e4m3fn if layer_uses_native_fp4 else self.q_data_type
+            ),
+            kv_cache_sf=kv_cache_block_scales,
         )
+        if layer_uses_native_fp4 and o.dtype != self.q_data_type:
+            # Convert into a persistent graph-safe output buffer.
+            o_cast = self._nvfp4_static_rows_buffer(
+                self._nvfp4_o_out_buffers,
+                o.shape[0],
+                layer.tp_q_head_num,
+                layer.head_dim,
+                self.q_data_type,
+            )
+            o_cast.copy_(o)
+            o = o_cast
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -852,9 +1062,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
-        cache_loc = forward_batch.out_cache_loc
+        layer_uses_native_fp4 = self._layer_uses_native_fp4(layer)
+        if layer_uses_native_fp4 and not forward_batch.forward_mode.is_target_verify():
+            raise RuntimeError(
+                "TRTLLM MHA with native FP4 KV cache supports decode only; "
+                "use a separate prefill backend such as flashinfer or triton."
+            )
 
-        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
+        cache_loc = forward_batch.out_cache_loc
+        fused_nvfp4_q = None
+
+        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k, layer)
+        use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
 
         if use_fused_fp8_path:
             # Use fused FP8 quantization + KV cache write path
@@ -868,44 +1087,80 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             k = None
             v = None
         else:
-            # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
-                    k,
-                    v,
-                    layer.k_scale,
-                    layer.v_scale,
-                )
+                if layer_uses_native_fp4:
+                    q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+                    fused_nvfp4_q = self._nvfp4_static_rows_buffer(
+                        self._nvfp4_q_e4m3_buffers,
+                        q.shape[0],
+                        layer.tp_q_head_num,
+                        layer.head_dim,
+                        torch.float8_e4m3fn,
+                    )
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        *self._kv_write_scales(layer),
+                        fused_q_src=q,
+                        fused_q_dst=fused_nvfp4_q,
+                    )
+                else:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        *self._kv_write_scales(layer),
+                    )
 
         q_scale = 1.0
-        if self.data_type == torch.float8_e4m3fn and (
-            not self.is_xqa_impl or not forward_batch.forward_mode.is_target_verify()
+        if layer_uses_native_fp4:
+            q = (
+                fused_nvfp4_q
+                if fused_nvfp4_q is not None
+                else q.to(torch.float8_e4m3fn)
+            )
+        elif (
+            self._get_layer_kv_dtype(layer) == torch.float8_e4m3fn
+            and (
+                not self.is_xqa_impl
+                or not forward_batch.forward_mode.is_target_verify()
+            )
+            and not use_fused_qkv
         ):
             q = q.to(torch.float8_e4m3fn)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
-        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
 
-        if layer.tp_k_head_num == 1:
-            k_cache = canonicalize_stride(k_cache)
-        if layer.tp_v_head_num == 1:
-            v_cache = canonicalize_stride(v_cache)
-
-        kv_cache = (k_cache, v_cache)
+        if layer_uses_native_fp4:
+            kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
+        else:
+            k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            kv_cache = self._reshape_paged_kv_cache(
+                k_cache, v_cache, layer, layer.head_dim
+            )
+            kv_cache_block_scales = None
 
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
-        bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
+        if layer_uses_native_fp4:
+            k_scale, v_scale = self._get_nvfp4_bmm_scales(layer)
+            bmm1_scale = q_scale * k_scale * layer.scaling
+            bmm2_scale = v_scale
+        else:
+            bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
+        nvfp4_out = None
+        if layer_uses_native_fp4:
+            nvfp4_out = self._nvfp4_static_rows_buffer(
+                self._nvfp4_o_e4m3_buffers,
+                q.shape[0],
+                layer.tp_q_head_num,
+                layer.head_dim,
+                torch.float8_e4m3fn,
+            )
 
         if (
             forward_batch.forward_mode.is_target_verify()
@@ -923,7 +1178,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 window_left=layer.sliding_window_size,
                 sinks=attention_sink,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-                out_dtype=self.q_data_type,  # model_runner.dtype
+                out=nvfp4_out,
+                out_dtype=(
+                    torch.float8_e4m3fn if layer_uses_native_fp4 else self.q_data_type
+                ),
+                kv_cache_sf=kv_cache_block_scales,
                 q_len_per_req=self.forward_metadata.max_seq_len_q,
             )
         else:
@@ -945,6 +1204,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
                 out_dtype=self.q_data_type,  # model_runner.dtype
             )
+
+        if layer_uses_native_fp4 and o.dtype != self.q_data_type:
+            o_cast = self._nvfp4_static_rows_buffer(
+                self._nvfp4_o_out_buffers,
+                o.shape[0],
+                layer.tp_q_head_num,
+                layer.head_dim,
+                self.q_data_type,
+            )
+            o_cast.copy_(o)
+            o = o_cast
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

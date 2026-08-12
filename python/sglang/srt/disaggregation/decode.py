@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.utils import (
     _is_fake_transfer,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_swa_state_page_indices,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
@@ -71,7 +72,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
-    page_align_floor,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -1015,19 +1015,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ]
 
             def _swa_payload():
-                window_size = self.scheduler.sliding_window_size
-                window_start = max(0, seq_len - window_size)
-                window_start = page_align_floor(window_start, page_size)
-                window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, window_start:seq_len
-                ]
-                window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                        window_kv_indices_full
-                    )
-                )
-                return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), page_size
+                return get_swa_state_page_indices(
+                    self.req_to_token_pool.req_to_token,
+                    decode_req.req.req_pool_idx,
+                    seq_len,
+                    self.scheduler.sliding_window_size,
+                    page_size,
+                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa,
                 )
 
             def _dsa_payload():
@@ -1073,6 +1067,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if st == StateType.MAMBA:
                     state_indices.append(_mamba_payload())
                 elif st == StateType.SWA:
+                    state_indices.append(_swa_payload())
+                elif st == StateType.KV_SCALE:
+                    state_indices.append(_dsa_payload())
+                elif st == StateType.SWA_SCALE:
                     state_indices.append(_swa_payload())
                 elif st == StateType.DSA:
                     state_indices.append(_dsa_payload())

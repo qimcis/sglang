@@ -452,6 +452,11 @@ def get_draft_recurrent_hidden_state_spec(
     """Return hidden_states width/dtype carried between draft decode steps."""
     if model_runner.spec_algorithm.is_standalone():
         return None, None
+    if model_runner.spec_algorithm.is_frozen_kv_mtp():
+        return (
+            model_runner.model.backbone_hidden_size,
+            model_runner.model_config.dtype,
+        )
     return model_runner.model_config.spec_hidden_size, model_runner.model_config.dtype
 
 

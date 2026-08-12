@@ -2830,6 +2830,7 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            preserve_radix_miss_page_tail=(self.server_args.kv_cache_dtype == "nvfp4"),
         )
 
         if self.chunked_req is not None:

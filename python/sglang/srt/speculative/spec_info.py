@@ -150,9 +150,22 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.eagle_disaggregation import (
                 build_eagle_disagg_draft_input,
             )
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            draft_input_cls = EagleDraftInput
+            if self.is_frozen_kv_mtp():
+                from sglang.srt.speculative.frozen_kv_mtp_info import (
+                    FrozenKVMTPDraftInput,
+                )
+
+                draft_input_cls = FrozenKVMTPDraftInput
 
             return build_eagle_disagg_draft_input(
-                batch, server_args, last_tokens_tensor, future_map
+                batch,
+                server_args,
+                last_tokens_tensor,
+                future_map,
+                draft_input_cls,
             )
         return None
 

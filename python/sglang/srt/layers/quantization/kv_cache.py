@@ -49,14 +49,17 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         raise RuntimeError(f"{self.__class__.__name__}.apply should not be called.")
 
     def process_weights_after_loading(self, layer) -> None:
-        if layer.k_scale > 0.0 and layer.v_scale > 0.0:
+        k_scale_loaded = bool(layer.k_scale > 0.0)
+        v_scale_loaded = bool(layer.v_scale > 0.0)
+        layer._kv_scales_loaded_from_checkpoint = k_scale_loaded or v_scale_loaded
+        if k_scale_loaded and v_scale_loaded:
             # We prefer to use separate k_scale and v_scale if present
             k_scale = layer.k_scale.to("cpu").tolist()
             v_scale = layer.v_scale.to("cpu").tolist()
             if is_fp8_fnuz():
                 k_scale *= 2
                 v_scale *= 2
-        elif layer.k_scale < 0.0 and layer.v_scale < 0.0:
+        elif not k_scale_loaded and not v_scale_loaded:
             # If no scales were loaded (both scales are invalid negative
             # values), use the default value of 1.0
             k_scale = 1.0

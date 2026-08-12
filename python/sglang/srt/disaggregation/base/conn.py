@@ -17,6 +17,8 @@ if TYPE_CHECKING:
 class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
+    KV_SCALE = "kv_scale"
+    SWA_SCALE = "swa_scale"
     DSA = "dsa"
     MINIMAX_INDEX_K = "minimax_index_k"
     # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
@@ -24,6 +26,9 @@ class StateType(str, enum.Enum):
     SWA_RING = "swa_ring"
     # DeepSeek-V4 online C128 request-scoped state.
     C128_STATE = "c128_state"
+
+
+STATE_SCHEMA_VERSION = 1
 
 
 @dataclasses.dataclass

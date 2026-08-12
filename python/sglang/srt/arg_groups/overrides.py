@@ -609,7 +609,18 @@ def _llama4_overrides(server_args: Any, hf_config: Any) -> dict:
 def _gemma4_overrides(server_args: Any, hf_config: Any) -> dict:
     overrides: Dict[str, Any] = {}
     default_attention_backend = "trtllm_mha" if is_sm100_supported() else "triton"
-    if server_args.is_attention_backend_not_set():
+    if (
+        is_sm100_supported()
+        and server_args.kv_cache_dtype == "nvfp4"
+        and server_args.is_attention_backend_not_set()
+    ):
+        logger.info(
+            "Use FlashInfer prefill and TensorRT-LLM decode as the default "
+            "attention backends for Gemma4 NVFP4 KV cache"
+        )
+        overrides["prefill_attention_backend"] = "flashinfer"
+        overrides["decode_attention_backend"] = "trtllm_mha"
+    elif server_args.is_attention_backend_not_set():
         logger.info(
             f"Use {default_attention_backend} as default attention backend for Gemma4"
         )
@@ -1596,9 +1607,16 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
             raise ValueError(
                 "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
             )
-        if view.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "bf16", "auto"]:
+        if view.kv_cache_dtype not in [
+            "fp8_e4m3",
+            "fp4_e2m1",
+            "fp4_mx_block16",
+            "bf16",
+            "auto",
+        ]:
             raise ValueError(
-                "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, fp4_e2m1, bf16, or auto."
+                "TensorRT-LLM MLA backend only supports kv-cache-dtype of "
+                "fp8_e4m3, fp4_mx_block16 (or fp4_e2m1), bf16, or auto."
             )
     if (
         view.attention_backend == "tokenspeed_mla"

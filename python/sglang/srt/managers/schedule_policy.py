@@ -448,6 +448,7 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        preserve_radix_miss_page_tail: bool = False,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -538,6 +539,7 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+        self.preserve_radix_miss_page_tail = preserve_radix_miss_page_tail
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -650,6 +652,27 @@ class PrefillAdder:
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
+
+    def _radix_miss_page_tail_chunk_limit(self, req: Req) -> Optional[int]:
+        if (
+            not self.preserve_radix_miss_page_tail
+            or self.rem_chunk_tokens is None
+            or getattr(self.tree_cache, "disable", False)
+        ):
+            return None
+        total_tokens = len(req.full_untruncated_fill_ids)
+        prefix_tokens = len(req.prefix_indices)
+        remaining_tokens = total_tokens - prefix_tokens
+        final_tail_tokens = (total_tokens - 1) % self.page_size + 1
+        if (
+            remaining_tokens <= final_tail_tokens
+            or remaining_tokens > self.rem_chunk_tokens
+        ):
+            return None
+        chunk_limit = remaining_tokens - final_tail_tokens
+        if chunk_limit <= 0 or chunk_limit % self.page_size != 0:
+            raise RuntimeError("radix-miss page-tail chunk is not page-aligned")
+        return chunk_limit
 
     def budget_state(self):
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
@@ -795,6 +818,7 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
+        page_tail_chunk_limit = self._radix_miss_page_tail_chunk_limit(req)
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -811,6 +835,8 @@ class PrefillAdder:
                 if self.is_hybrid_swa:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
+            if page_tail_chunk_limit is not None:
+                _rem_tokens = min(_rem_tokens, page_tail_chunk_limit)
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
@@ -1057,6 +1083,16 @@ class PrefillAdder:
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
             )
+            page_tail_chunk_limit = self._radix_miss_page_tail_chunk_limit(req)
+            chunk_limit = page_tail_chunk_limit
+            if chunk_limit is None:
+                chunk_limit = self.rem_chunk_tokens
+            if (
+                chunk_limit is not None
+                and input_tokens > chunk_limit
+                and (has_chunked_req or self.new_chunked_req is not None)
+            ):
+                return AddReqResult.OTHER
 
             if (
                 self.rem_chunk_tokens is None
@@ -1078,7 +1114,7 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+            elif chunk_limit is None or input_tokens <= chunk_limit:
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
@@ -1098,7 +1134,7 @@ class PrefillAdder:
                 )
             else:
                 # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+                trunc_len = chunk_limit // self.page_size * self.page_size
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER

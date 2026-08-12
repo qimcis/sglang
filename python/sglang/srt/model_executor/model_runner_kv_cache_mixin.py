@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -20,6 +21,10 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    get_kv_cache_quant_method,
+    resolve_kv_cache_quant,
+)
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -40,7 +45,6 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
-    MHATokenToKVPoolFP4,
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
@@ -101,6 +105,20 @@ _is_hip = is_hip()
 
 
 class ModelRunnerKVCacheMixin:
+    def _build_fp4_quant_method(self: ModelRunner, num_layers: int):
+        if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            return None
+        quant_name = resolve_kv_cache_quant(self.server_args.kv_cache_dtype)
+        if quant_name is None:
+            return None
+        quant_method = get_kv_cache_quant_method(
+            quant_name,
+            num_layers=num_layers,
+            device=self.device,
+        )
+        quant_method.load_scales_from_model(self)
+        return quant_method
+
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
@@ -897,6 +915,25 @@ class ModelRunnerKVCacheMixin:
                 )
         else:
             if self.is_hybrid_swa:
+                full_quant_method = None
+                swa_quant_method = None
+                full_dtype = self.kv_cache_dtype
+                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                    assert (
+                        not enable_page_major
+                    ), "page-major KV layout is not supported with fp4 KV cache"
+                    if (
+                        self.server_args.kv_cache_dtype == "nvfp4"
+                        and os.environ.get("SGLANG_GEMMA4_HYBRID_KV_FP8_FULL") == "1"
+                    ):
+                        full_dtype = torch.float8_e4m3fn
+                    else:
+                        full_quant_method = self._build_fp4_quant_method(
+                            self.num_effective_layers
+                        )
+                    swa_quant_method = self._build_fp4_quant_method(
+                        self.num_effective_layers
+                    )
                 kwargs = {}
                 if self.is_hybrid_swa_compress:
                     kwargs = {
@@ -925,6 +962,9 @@ class ModelRunnerKVCacheMixin:
                         self.server_args.speculative_algorithm is not None
                     ),
                     token_to_kv_pool_class=mha_pool_class,
+                    full_quant_method=full_quant_method,
+                    swa_quant_method=swa_quant_method,
+                    full_dtype=full_dtype,
                     **kwargs,
                 )
             elif is_minimax_sparse(self.model_config.hf_config):
@@ -961,6 +1001,18 @@ class ModelRunnerKVCacheMixin:
                         "kv_lora_rank": self.model_config.kv_lora_rank,
                         "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
                     }
+                full_attention_layer_ids = (
+                    [0]
+                    if self.is_draft_worker
+                    else [
+                        i
+                        for i in config.full_attention_layer_ids
+                        if self.start_layer <= i < self.end_layer
+                    ]
+                )
+                quant_method = self._build_fp4_quant_method(
+                    len(full_attention_layer_ids)
+                )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,
@@ -970,15 +1022,7 @@ class ModelRunnerKVCacheMixin:
                     ),
                     head_dim=self.model_config.head_dim,
                     # if draft worker, we only need 1 attention layer's kv pool
-                    full_attention_layer_ids=(
-                        [0]
-                        if self.is_draft_worker
-                        else [
-                            i
-                            for i in config.full_attention_layer_ids
-                            if self.start_layer <= i < self.end_layer
-                        ]
-                    ),
+                    full_attention_layer_ids=full_attention_layer_ids,
                     device=self.device,
                     mamba_pool=self.req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,
@@ -988,6 +1032,7 @@ class ModelRunnerKVCacheMixin:
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
                     full_kv_pool_class=mha_pool_class,
+                    quant_method=quant_method,
                     **extra_args,
                 )
             else:
@@ -995,7 +1040,10 @@ class ModelRunnerKVCacheMixin:
                     assert (
                         not enable_page_major
                     ), "page-major KV layout is not supported with fp4 KV cache"
-                    self.token_to_kv_pool = MHATokenToKVPoolFP4(
+                    quant_method = self._build_fp4_quant_method(
+                        self.num_effective_layers
+                    )
+                    self.token_to_kv_pool = MHATokenToKVPool(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
@@ -1013,6 +1061,7 @@ class ModelRunnerKVCacheMixin:
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
                         ),
+                        quant_method=quant_method,
                     )
                 else:
                     pool_cls = (

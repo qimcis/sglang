@@ -31,6 +31,9 @@ class SWAKVPool(BaseSWAKVPool):
         full_attention_layer_ids: List[int],
         device: str,
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        full_quant_method=None,
+        swa_quant_method=None,
+        full_dtype: Optional[torch.dtype] = None,
         **kwargs,
     ):
         self.size = size
@@ -45,6 +48,7 @@ class SWAKVPool(BaseSWAKVPool):
         self.start_layer = 0
         self.page_size = page_size
         self.layer_transfer_counter = None
+        full_dtype = dtype if full_dtype is None else full_dtype
 
         kwargs["page_size"] = page_size
         kwargs["enable_memory_saver"] = False
@@ -57,20 +61,26 @@ class SWAKVPool(BaseSWAKVPool):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
+        swa_kwargs = dict(kwargs)
+        if swa_quant_method is not None:
+            swa_kwargs["quant_method"] = swa_quant_method
         self.swa_kv_pool = token_to_kv_pool_class(
             size=size_swa,
             dtype=dtype,
             layer_num=self.swa_layer_nums,
-            **kwargs,
+            **swa_kwargs,
         )
         kwargs.pop("swa_head_num", None)
         kwargs.pop("swa_head_dim", None)
         kwargs.pop("swa_v_head_dim", None)
+        full_kwargs = dict(kwargs)
+        if full_quant_method is not None:
+            full_kwargs["quant_method"] = full_quant_method
         self.full_kv_pool = token_to_kv_pool_class(
             size=size,
-            dtype=dtype,
+            dtype=full_dtype,
             layer_num=self.full_layer_nums,
-            **kwargs,
+            **full_kwargs,
         )
         # {layer_id: (index, is_swa_layer)}
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
@@ -114,12 +124,18 @@ class SWAKVPool(BaseSWAKVPool):
             full_kv_item_lens,
         )
 
+    def get_scale_buf_infos(self):
+        return self.full_kv_pool.get_scale_buf_infos()
+
     def get_state_buf_infos(self):
         swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens = (
             self.swa_kv_pool.get_contiguous_buf_infos()
         )
 
         return swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens
+
+    def get_state_scale_buf_infos(self):
+        return self.swa_kv_pool.get_scale_buf_infos()
 
     def get_key_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
@@ -145,6 +161,38 @@ class SWAKVPool(BaseSWAKVPool):
         else:
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
+    def get_raw_kv_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        pool = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
+        return pool.get_raw_kv_buffer(layer_id_pool)
+
+    def get_flashinfer_dequant_workspace_kv_buffer(self, layer, *args, **kwargs):
+        self._wait_for_layer(layer.layer_id)
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer.layer_id]
+        pool = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
+        current_loc = kwargs.get("current_loc")
+        if current_loc is not None:
+            loc, swa_loc, _ = unwrap_write_loc(current_loc)
+            kwargs["current_loc"] = swa_loc if is_swa_layer else loc
+        if is_swa_layer:
+            kwargs["kv_indices_mapper"] = self.translate_loc_from_full_to_swa
+            kwargs["sliding_window_size"] = layer.sliding_window_size
+        return pool.get_flashinfer_dequant_workspace_kv_buffer(
+            layer, *args, layer_id_override=layer_id_pool, **kwargs
+        )
+
+    def get_flashinfer_decode_dequant_workspace_kv_buffer(self, layer, *args, **kwargs):
+        self._wait_for_layer(layer.layer_id)
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer.layer_id]
+        pool = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
+        if is_swa_layer:
+            kwargs["kv_indices_mapper"] = self.translate_loc_from_full_to_swa
+            kwargs["sliding_window_size"] = layer.sliding_window_size
+        return pool.get_flashinfer_decode_dequant_workspace_kv_buffer(
+            layer, *args, layer_id_override=layer_id_pool, **kwargs
+        )
+
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
         assert self.full_to_swa_index_mapping is not None
         # -1 in kv_indices maps to -1 via the sentinel appended to the mapping.
@@ -158,6 +206,11 @@ class SWAKVPool(BaseSWAKVPool):
         cache_v: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
+        fused_q_src=None,
+        fused_q_dst=None,
+        fused_context_dst_rows=None,
+        fused_context_k_dst=None,
+        fused_context_v_dst=None,
     ):
         # loc_info bundles the full loc and the pre-translated SWA loc.
         loc, swa_loc, _ = unwrap_write_loc(loc_info)
@@ -168,23 +221,33 @@ class SWAKVPool(BaseSWAKVPool):
             # the attention backend; set_kv_buffer never translates internally.
             assert swa_loc is not None
             self.swa_kv_pool.set_kv_buffer(
-                None,
+                layer,
                 swa_loc,
                 cache_k,
                 cache_v,
                 k_scale,
                 v_scale,
                 layer_id_override=layer_id_pool,
+                fused_q_src=fused_q_src,
+                fused_q_dst=fused_q_dst,
+                fused_context_dst_rows=fused_context_dst_rows,
+                fused_context_k_dst=fused_context_k_dst,
+                fused_context_v_dst=fused_context_v_dst,
             )
         else:
             self.full_kv_pool.set_kv_buffer(
-                None,
+                layer,
                 loc,
                 cache_k,
                 cache_v,
                 k_scale,
                 v_scale,
                 layer_id_override=layer_id_pool,
+                fused_q_src=fused_q_src,
+                fused_q_dst=fused_q_dst,
+                fused_context_dst_rows=fused_context_dst_rows,
+                fused_context_k_dst=fused_context_k_dst,
+                fused_context_v_dst=fused_context_v_dst,
             )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
@@ -208,15 +271,15 @@ class SWAKVPool(BaseSWAKVPool):
                 filtered.append([])
                 continue
 
-            k_cpu = torch.cat([chunk[0] for chunk in layer_chunks], dim=0)
-            v_cpu = torch.cat([chunk[1] for chunk in layer_chunks], dim=0)
-            k_cpu = k_cpu[row_mask]
-            v_cpu = v_cpu[row_mask]
+            tensors = [
+                torch.cat([chunk[index] for chunk in layer_chunks], dim=0)[row_mask]
+                for index in range(len(layer_chunks[0]))
+            ]
 
             filtered_layer = []
-            for i in range(0, len(k_cpu), chunk_size):
+            for i in range(0, len(tensors[0]), chunk_size):
                 filtered_layer.append(
-                    [k_cpu[i : i + chunk_size], v_cpu[i : i + chunk_size]]
+                    [tensor[i : i + chunk_size] for tensor in tensors]
                 )
             filtered.append(filtered_layer)
         return filtered

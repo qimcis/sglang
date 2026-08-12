@@ -49,12 +49,20 @@ def frozen_kv_target_view(
     saved_spec_info = forward_batch.spec_info
     forward_batch.spec_info = None
     saved_backend_pool = draft_attn_backend.token_to_kv_pool
+    has_quant_method = hasattr(draft_attn_backend, "kv_cache_quant_method")
+    if has_quant_method:
+        saved_quant_method = draft_attn_backend.kv_cache_quant_method
+        draft_attn_backend.kv_cache_quant_method = (
+            kv_context.target_token_to_kv_pool.get_kv_cache_quant_method()
+        )
     draft_attn_backend.token_to_kv_pool = kv_context.target_token_to_kv_pool
     try:
         yield
     finally:
         forward_batch.spec_info = saved_spec_info
         draft_attn_backend.token_to_kv_pool = saved_backend_pool
+        if has_quant_method:
+            draft_attn_backend.kv_cache_quant_method = saved_quant_method
 
 
 @contextmanager
@@ -77,11 +85,19 @@ def target_kv_pool_view(
             "bind the frozen KV context first."
         )
     saved_backend_pool = draft_attn_backend.token_to_kv_pool
+    has_quant_method = hasattr(draft_attn_backend, "kv_cache_quant_method")
+    if has_quant_method:
+        saved_quant_method = draft_attn_backend.kv_cache_quant_method
+        draft_attn_backend.kv_cache_quant_method = (
+            kv_context.target_token_to_kv_pool.get_kv_cache_quant_method()
+        )
     draft_attn_backend.token_to_kv_pool = kv_context.target_token_to_kv_pool
     try:
         yield
     finally:
         draft_attn_backend.token_to_kv_pool = saved_backend_pool
+        if has_quant_method:
+            draft_attn_backend.kv_cache_quant_method = saved_quant_method
 
 
 def set_frozen_kv_positions(forward_batch: ForwardBatch, topk: int) -> None:

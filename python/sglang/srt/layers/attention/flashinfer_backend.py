@@ -9,6 +9,7 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
+import inspect
 import logging
 import os
 from dataclasses import dataclass
@@ -17,6 +18,8 @@ from functools import partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.dllm.config import DllmConfig
@@ -25,6 +28,9 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
+)
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    KVCacheAttentionAccessKind,
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -58,6 +64,245 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_NVFP4_FLASHINFER_PLAN_WORKSPACE_BYTES = 16 * 1024 * 1024
+_NVFP4_FLASHINFER_PREFILL_WORKSPACE_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _require_gemma4_context_flashinfer_api() -> None:
+    if os.environ.get("SGLANG_GEMMA4_TRTLLM_CONTEXT_PREFILL") != "1":
+        return
+    from flashinfer.prefill import trtllm_batch_context_with_kv_cache
+
+    if (
+        "multi_ctas_kv_counter_buffer"
+        not in inspect.signature(trtllm_batch_context_with_kv_cache).parameters
+    ):
+        raise RuntimeError(
+            "Gemma-4 TRTLLM context prefill requires the paired FlashInfer build "
+            "with multi_ctas_kv_counter_buffer support"
+        )
+
+
+@triton.jit
+def _gemma4_context_pack_qkv_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    dst_rows_ptr,
+    q_out_ptr,
+    k_out_ptr,
+    v_out_ptr,
+    cache_loc_ptr,
+    persistent_k_ptr,
+    persistent_v_ptr,
+    q_stride_row,
+    q_stride_head,
+    q_stride_dim,
+    k_stride_row,
+    k_stride_head,
+    k_stride_dim,
+    v_stride_row,
+    v_stride_head,
+    v_stride_dim,
+    persistent_k_stride_row,
+    persistent_k_stride_head,
+    persistent_k_stride_dim,
+    persistent_v_stride_row,
+    persistent_v_stride_head,
+    persistent_v_stride_dim,
+    k_inv_scale,
+    v_inv_scale,
+    q_elements,
+    kv_elements,
+    q_row_elements: tl.constexpr,
+    kv_row_elements: tl.constexpr,
+    head_dim: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    WRITE_PERSISTENT: tl.constexpr,
+):
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+    q_mask = offsets < q_elements
+    q_row = offsets // q_row_elements
+    q_feature = offsets - q_row * q_row_elements
+    q_head = q_feature // head_dim
+    q_dim = q_feature - q_head * head_dim
+    q_values = tl.load(
+        q_ptr + q_row * q_stride_row + q_head * q_stride_head + q_dim * q_stride_dim,
+        mask=q_mask,
+        other=0.0,
+    )
+    tl.store(q_out_ptr + offsets, q_values.to(tl.float8e4nv), mask=q_mask)
+
+    kv_mask = offsets < kv_elements
+    kv_row = offsets // kv_row_elements
+    kv_feature = offsets - kv_row * kv_row_elements
+    kv_head = kv_feature // head_dim
+    kv_dim = kv_feature - kv_head * head_dim
+    dst_row = tl.load(dst_rows_ptr + kv_row, mask=kv_mask, other=0).to(tl.int64)
+    dst_offset = dst_row * kv_row_elements + kv_feature
+    k_values = tl.load(
+        k_ptr + kv_row * k_stride_row + kv_head * k_stride_head + kv_dim * k_stride_dim,
+        mask=kv_mask,
+        other=0.0,
+    )
+    v_values = tl.load(
+        v_ptr + kv_row * v_stride_row + kv_head * v_stride_head + kv_dim * v_stride_dim,
+        mask=kv_mask,
+        other=0.0,
+    )
+    k_fp8 = (k_values * k_inv_scale).to(tl.float8e4nv)
+    v_fp8 = (v_values * v_inv_scale).to(tl.float8e4nv)
+    tl.store(k_out_ptr + dst_offset, k_fp8, mask=kv_mask)
+    tl.store(v_out_ptr + dst_offset, v_fp8, mask=kv_mask)
+
+    if WRITE_PERSISTENT:
+        cache_row = tl.load(cache_loc_ptr + kv_row, mask=kv_mask, other=0).to(tl.int64)
+        persistent_k_offset = (
+            cache_row * persistent_k_stride_row
+            + kv_head * persistent_k_stride_head
+            + kv_dim * persistent_k_stride_dim
+        )
+        persistent_v_offset = (
+            cache_row * persistent_v_stride_row
+            + kv_head * persistent_v_stride_head
+            + kv_dim * persistent_v_stride_dim
+        )
+        tl.store(persistent_k_ptr + persistent_k_offset, k_fp8, mask=kv_mask)
+        tl.store(persistent_v_ptr + persistent_v_offset, v_fp8, mask=kv_mask)
+
+
+def _gemma4_context_pack_qkv(
+    q,
+    k,
+    v,
+    dst_rows,
+    q_out,
+    k_out,
+    v_out,
+    *,
+    k_inv_scale=1.0,
+    v_inv_scale=1.0,
+    cache_loc=None,
+    persistent_k=None,
+    persistent_v=None,
+):
+    """One-launch E4M3 Q/K/V pack, optionally writing persistent FP8 K/V."""
+
+    if (
+        q.dtype != torch.bfloat16
+        or k.dtype != torch.bfloat16
+        or v.dtype != torch.bfloat16
+    ):
+        raise ValueError("Gemma-4 context pack requires BF16 Q/K/V")
+    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+        raise ValueError("Gemma-4 context pack requires rank-3 Q/K/V")
+    if k.shape != v.shape or q.shape[0] != k.shape[0]:
+        raise ValueError("Gemma-4 context pack Q/K/V row contract changed")
+    if q.shape[2] != k.shape[2]:
+        raise ValueError("Gemma-4 context pack requires equal Q/K head dimensions")
+    if dst_rows.ndim != 1 or dst_rows.numel() != k.shape[0]:
+        raise ValueError("Gemma-4 context destination-row contract changed")
+    if (
+        q_out.shape != q.shape
+        or k_out.shape[1:] != k.shape[1:]
+        or v_out.shape != k_out.shape
+    ):
+        raise ValueError("Gemma-4 context pack output shape contract changed")
+    if (
+        q_out.dtype != torch.float8_e4m3fn
+        or k_out.dtype != torch.float8_e4m3fn
+        or v_out.dtype != torch.float8_e4m3fn
+    ):
+        raise ValueError("Gemma-4 context pack outputs must be E4M3")
+    if (
+        not q_out.is_contiguous()
+        or not k_out.is_contiguous()
+        or not v_out.is_contiguous()
+    ):
+        raise ValueError("Gemma-4 context pack outputs must be contiguous")
+    if dst_rows.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Gemma-4 context destination rows must be int32 or int64")
+    has_persistent = cache_loc is not None
+    if has_persistent != (persistent_k is not None) or has_persistent != (
+        persistent_v is not None
+    ):
+        raise ValueError(
+            "cache_loc, persistent_k, and persistent_v must be provided together"
+        )
+    k_inv_scale = float(k_inv_scale)
+    v_inv_scale = float(v_inv_scale)
+    if not 0.0 < k_inv_scale < float("inf") or not 0.0 < v_inv_scale < float("inf"):
+        raise ValueError("Gemma-4 context pack inverse scales must be positive")
+    if has_persistent:
+        if cache_loc.ndim != 1 or cache_loc.numel() != k.shape[0]:
+            raise ValueError("Gemma-4 persistent cache locations must match K/V rows")
+        if cache_loc.dtype not in (torch.int32, torch.int64):
+            raise ValueError(
+                "Gemma-4 persistent cache locations must be int32 or int64"
+            )
+        if persistent_k.ndim != 3 or persistent_v.ndim != 3:
+            raise ValueError("Gemma-4 persistent FP8 caches must be rank 3")
+        if persistent_k.shape != persistent_v.shape:
+            raise ValueError("Gemma-4 persistent K/V cache shapes changed")
+        if persistent_k.shape[1:] != k.shape[1:]:
+            raise ValueError("Gemma-4 persistent K/V head shape changed")
+        if (
+            persistent_k.dtype != torch.float8_e4m3fn
+            or persistent_v.dtype != torch.float8_e4m3fn
+        ):
+            raise ValueError("Gemma-4 persistent caches must be E4M3")
+        if persistent_k.stride(-1) != 1 or persistent_v.stride(-1) != 1:
+            raise ValueError("Gemma-4 persistent caches require contiguous head dims")
+    else:
+        # Compile-time-disabled persistent arguments still need valid pointers.
+        cache_loc = dst_rows
+        persistent_k = k_out
+        persistent_v = v_out
+    q_elements = q.numel()
+    kv_elements = k.numel()
+    block_size = 2048
+    _gemma4_context_pack_qkv_kernel[
+        (triton.cdiv(max(q_elements, kv_elements), block_size),)
+    ](
+        q,
+        k,
+        v,
+        dst_rows,
+        q_out,
+        k_out,
+        v_out,
+        cache_loc,
+        persistent_k,
+        persistent_v,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        persistent_k.stride(0),
+        persistent_k.stride(1),
+        persistent_k.stride(2),
+        persistent_v.stride(0),
+        persistent_v.stride(1),
+        persistent_v.stride(2),
+        k_inv_scale,
+        v_inv_scale,
+        q_elements,
+        kv_elements,
+        q_row_elements=q.shape[1] * q.shape[2],
+        kv_row_elements=k.shape[1] * k.shape[2],
+        head_dim=k.shape[2],
+        BLOCK_SIZE=block_size,
+        WRITE_PERSISTENT=has_persistent,
+        num_warps=8,
+    )
+    return q_out
+
 
 def _cuda_graph_capture_max_bs(server_args, max_bs: int) -> int:
     """Pad max_bs to the alignment cuda-graph capture uses (see get_batch_sizes_to_capture)."""
@@ -69,6 +314,27 @@ def _cuda_graph_capture_max_bs(server_args, max_bs: int) -> int:
     if mul_base % get_parallel().attn_cp_size != 0:
         mul_base *= get_parallel().attn_cp_size
     return (max_bs + mul_base - 1) // mul_base * mul_base
+
+
+def _resize_nvfp4_decode_plan_workspaces(wrappers, float_workspace) -> None:
+    for wrapper in wrappers:
+        int_workspace = torch.empty(
+            _NVFP4_FLASHINFER_PLAN_WORKSPACE_BYTES,
+            dtype=torch.uint8,
+            device=float_workspace.device,
+        )
+        # FlashInfer mirrors this integer workspace into pinned host memory.
+        wrapper.reset_workspace_buffer(float_workspace, int_workspace)
+
+
+def _nvfp4_prefill_fixed_split_size(server_args) -> int:
+    split_size = server_args.chunked_prefill_size
+    if not isinstance(split_size, int) or split_size <= 0:
+        raise ValueError(
+            "NVFP4 FlashInfer prefill requires a positive chunked prefill size "
+            "for deterministic fixed-split attention."
+        )
+    return split_size
 
 
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
@@ -306,6 +572,7 @@ class FlashInferAttnBackend(AttentionBackend):
         init_new_workspace: bool = False,
     ):
         super().__init__()
+        _require_gemma4_context_flashinfer_api()
         self.prefill_backend = "fa2"
         self.decode_backend = "fa2"
 
@@ -321,9 +588,52 @@ class FlashInferAttnBackend(AttentionBackend):
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm_model = self.dllm_config is not None
 
+        self.kv_cache_quant_method = self.token_to_kv_pool.get_kv_cache_quant_method()
+        self.prefill_kv_access = self.kv_cache_quant_method.resolve_attention_access(
+            "prefill", "flashinfer"
+        )
+        self.decode_kv_access = self.kv_cache_quant_method.resolve_attention_access(
+            "decode", "flashinfer"
+        )
+        prefill_backend, decode_backend = (
+            model_runner.server_args.get_attention_backends()
+        )
+        if self.__class__ is FlashInferAttnBackend:
+            if prefill_backend == "flashinfer":
+                self._check_kv_attention_access("prefill", self.prefill_kv_access)
+            if decode_backend == "flashinfer":
+                self._check_kv_attention_access("decode", self.decode_kv_access)
+
+        self.prefill_uses_dequant_workspace = (
+            self.prefill_kv_access is not None
+            and self.prefill_kv_access.kind
+            == KVCacheAttentionAccessKind.DEQUANT_WORKSPACE
+        )
+        self.decode_uses_dequant_workspace = (
+            self.decode_kv_access is not None
+            and self.decode_kv_access.kind
+            == KVCacheAttentionAccessKind.DEQUANT_WORKSPACE
+        )
+        self.is_nvfp4_kvcache = any(
+            access is not None and access.scale_recipe == "nvfp4"
+            for access in (self.prefill_kv_access, self.decode_kv_access)
+        )
+        self.dq_page_tables = None
+        self.dq_paged_kernel_lens = None
+        self.cpu_req_pool_indices = None
+        # FP4 fake-quant prefill/decode exposes an FP8 workspace to FlashInfer.
+        self.flashinfer_kv_cache_dtype = (
+            torch.float8_e4m3fn
+            if (
+                self.prefill_uses_dequant_workspace
+                or self.decode_uses_dequant_workspace
+            )
+            else model_runner.kv_cache_dtype
+        )
+
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
-            kv_cache_dtype=model_runner.kv_cache_dtype,
+            kv_cache_dtype=self.flashinfer_kv_cache_dtype,
             num_attention_heads=model_runner.model_config.num_attention_heads
             // get_parallel().attn_tp_size,
             num_kv_heads=model_runner.model_config.get_num_kv_heads(
@@ -331,6 +641,8 @@ class FlashInferAttnBackend(AttentionBackend):
             ),
         )
         self.max_context_len = model_runner.model_config.context_len
+        self.page_size = model_runner.page_size
+        self.sliding_window_size = model_runner.sliding_window_size
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
         assert not (
@@ -379,6 +691,18 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.disable_cuda_graph_kv_split = True
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
+
+        if self.is_nvfp4_kvcache and self.prefill_uses_dequant_workspace:
+            # Fixed splits make prefix-reuse prefill invariant to query shape.
+            self.prefill_split_tile_size = _nvfp4_prefill_fixed_split_size(
+                model_runner.server_args
+            )
+            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(
+                max(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    _NVFP4_FLASHINFER_PREFILL_WORKSPACE_BYTES,
+                )
+            )
 
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
 
@@ -469,6 +793,11 @@ class FlashInferAttnBackend(AttentionBackend):
                     use_tensor_cores=self.decode_use_tensor_cores,
                 )
             )
+        if self.decode_uses_dequant_workspace:
+            # Increase the planning workspace for hybrid NVFP4 decode graphs.
+            _resize_nvfp4_decode_plan_workspaces(
+                self.decode_wrappers, self.workspace_buffer
+            )
 
         # Create indices updater
         if not skip_prefill:
@@ -489,6 +818,16 @@ class FlashInferAttnBackend(AttentionBackend):
         self.full_cg_prefill_wrappers: Optional[
             List[BatchPrefillWithPagedKVCacheWrapper]
         ] = None
+
+    def _check_kv_attention_access(self, phase: str, access) -> None:
+        if access is not None:
+            return
+        method_name = getattr(self.kv_cache_quant_method, "name", "unknown")
+        available = self.kv_cache_quant_method.describe_attention_accesses(phase)
+        raise ValueError(
+            f"KV cache method {method_name!r} does not support {phase} with "
+            f"flashinfer attention backend. Available {phase} accesses: {available}."
+        )
 
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[BaseSWAKVPool]:
@@ -674,6 +1013,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
         elif forward_mode.is_target_verify():
+            self._prepare_dequant_workspace_metadata_for_extend(
+                forward_batch, use_ragged=False
+            )
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -684,6 +1026,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+                custom_kv_indices=self.dq_page_tables,
+                custom_paged_kernel_lens=self.dq_paged_kernel_lens,
             )
         elif forward_mode.is_dllm_extend():
             self.indices_updater_prefill.update(
@@ -766,6 +1110,166 @@ class FlashInferAttnBackend(AttentionBackend):
                     self.cuda_graph_swa_out_cache_loc[:n]
                 )
 
+    def _prepare_dequant_workspace_metadata_for_extend(
+        self, forward_batch: ForwardBatch, use_ragged: bool = False
+    ):
+        """Prepare FlashInfer metadata for an FP4 dequant workspace.
+
+        Some FP4 recipes store packed KV but expose an FP8 workspace to
+        FlashInfer prefill. This builds the workspace page table, exact paged
+        lengths, and CPU request ids needed to populate that workspace before
+        the prefill kernel runs.
+        """
+        self.dq_page_tables = None
+        self.dq_paged_kernel_lens = None
+        self.cpu_req_pool_indices = None
+        is_target_verify = forward_batch.forward_mode.is_target_verify()
+        if not (
+            self.prefill_uses_dequant_workspace
+            and (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                or is_target_verify
+            )
+        ):
+            return
+
+        # Ragged prefill handles current-chunk K/V with raw tensors, so the
+        # paged side only contains cached prefix lengths. Non-ragged prefill
+        # uses the dequant workspace for prefix + current chunk, so it needs
+        # full sequence lengths. These CPU length containers may arrive as
+        # Python lists or CPU tensors depending on the metadata builder.
+        if is_target_verify:
+            prefix_lens_cpu = (
+                forward_batch.seq_lens_cpu
+                if forward_batch.seq_lens_cpu is not None
+                else forward_batch.seq_lens
+            )
+            prefix_lens = [int(value) for value in prefix_lens_cpu]
+            verify_width = int(forward_batch.spec_info.num_tokens_per_req)
+            forward_batch.extend_prefix_lens_cpu = prefix_lens
+            forward_batch.extend_seq_lens_cpu = [verify_width] * len(prefix_lens)
+            full_paged_seq_lens = [
+                prefix_len + verify_width for prefix_len in prefix_lens
+            ]
+        else:
+            paged_seq_lens_cpu = (
+                forward_batch.extend_prefix_lens_cpu
+                if use_ragged
+                else (
+                    forward_batch.seq_lens_cpu
+                    if forward_batch.seq_lens_cpu is not None
+                    else forward_batch.seq_lens
+                )
+            )
+            raw_paged_seq_lens = (
+                paged_seq_lens_cpu
+                if isinstance(paged_seq_lens_cpu, list)
+                else paged_seq_lens_cpu.tolist()
+            )
+            full_paged_seq_lens = [int(seq_len) for seq_len in raw_paged_seq_lens]
+            prefix_lens = [int(value) for value in forward_batch.extend_prefix_lens_cpu]
+
+        wrapper_paged_seq_lens = [full_paged_seq_lens]
+        if self.use_sliding_window_kv_pool:
+            assert self.sliding_window_size is not None
+            if use_ragged:
+                swa_paged_seq_lens = [
+                    min(prefix_len, self.sliding_window_size)
+                    for prefix_len in prefix_lens
+                ]
+            else:
+                swa_paged_seq_lens = [
+                    min(
+                        seq_len,
+                        self.sliding_window_size + seq_len - prefix_len,
+                    )
+                    for seq_len, prefix_len in zip(full_paged_seq_lens, prefix_lens)
+                ]
+            # Wrapper 0 is SWA and wrapper 1 is full attention.
+            wrapper_paged_seq_lens = [swa_paged_seq_lens, full_paged_seq_lens]
+
+        # Workspace population consumes these host values immediately.
+        self.cpu_req_pool_indices = forward_batch.req_pool_indices.cpu()
+
+        device = forward_batch.req_pool_indices.device
+        req_to_token = self.req_to_token_pool.req_to_token
+        req_pool_indices = [int(index) for index in self.cpu_req_pool_indices]
+        self.dq_page_tables = []
+        self.dq_paged_kernel_lens = []
+        for wrapper_id, paged_seq_lens in enumerate(wrapper_paged_seq_lens):
+            self.dq_paged_kernel_lens.append(
+                torch.tensor(paged_seq_lens, dtype=torch.int32, device=device)
+            )
+            swa_pool = getattr(self, "_swa_kv_pool", None)
+            if (
+                wrapper_id == 1
+                and swa_pool is not None
+                and not swa_pool.full_kv_pool.is_quantized_kv_cache
+            ):
+                self.dq_page_tables.append(None)
+                continue
+            if sum(paged_seq_lens) <= 0:
+                self.dq_page_tables.append(None)
+                continue
+            indices = []
+            for req_idx, seq_end, paged_seq_len in zip(
+                req_pool_indices, full_paged_seq_lens, paged_seq_lens
+            ):
+                if paged_seq_len <= 0:
+                    continue
+                page_indices = req_to_token[req_idx, seq_end - paged_seq_len : seq_end]
+                if wrapper_id == 0 and swa_pool is not None:
+                    page_indices = swa_pool.translate_loc_from_full_to_swa(page_indices)
+                if torch.any(page_indices < 0):
+                    raise RuntimeError(
+                        "FP4 dequant workspace page table contains an unallocated "
+                        "cache index."
+                    )
+                indices.append(page_indices.to(device=device, dtype=torch.int32))
+            # FlashInfer reserves a 256-entry tail in its normal index buffers.
+            # Keep the same shape contract while pointing unused entries at the
+            # valid dummy row instead of beyond the dequant workspace.
+            indices.append(torch.zeros(256, dtype=torch.int32, device=device))
+            self.dq_page_tables.append(torch.cat(indices))
+
+    def _hybrid_quantized_pool_layer(self, layer: RadixAttention) -> bool:
+        # Full-attention layers use FP8 while SWA layers use the FP4 workspace.
+        import os as _hybrid_os
+
+        if _hybrid_os.environ.get("SGLANG_GEMMA4_HYBRID_KV_FP8_FULL") != "1":
+            return True
+        pool = getattr(self, "_swa_kv_pool", None)
+        if pool is None or not hasattr(pool, "layers_mapping"):
+            return True
+        cache = getattr(self, "_hybrid_quantized_pool_layer_cache", None)
+        if cache is None:
+            cache = {}
+            self._hybrid_quantized_pool_layer_cache = cache
+        cached = cache.get(layer.layer_id)
+        if cached is None:
+            _, is_swa = pool.layers_mapping[layer.layer_id]
+            cached = bool(is_swa)
+            cache[layer.layer_id] = cached
+        return cached
+
+    def _hybrid_prefill_layer_uses_dequant(self, layer: RadixAttention) -> bool:
+        if not self.prefill_uses_dequant_workspace:
+            return False
+        return self._hybrid_quantized_pool_layer(layer)
+
+    def _hybrid_decode_layer_uses_dequant(self, layer: RadixAttention) -> bool:
+        if not self.decode_uses_dequant_workspace:
+            return False
+        return self._hybrid_quantized_pool_layer(layer)
+
+    def _kv_write_scales(self, layer: RadixAttention):
+        if (
+            self.kv_cache_quant_method.needs_global_scale()
+            and self._hybrid_quantized_pool_layer(layer)
+        ):
+            return None, None
+        return layer.k_scale, layer.v_scale
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -790,6 +1294,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
             )
         elif forward_batch.forward_mode.is_target_verify():
+            self._prepare_dequant_workspace_metadata_for_extend(
+                forward_batch, use_ragged=False
+            )
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -800,6 +1307,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
+                custom_kv_indices=self.dq_page_tables,
+                custom_paged_kernel_lens=self.dq_paged_kernel_lens,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_verify,
@@ -825,6 +1334,10 @@ class FlashInferAttnBackend(AttentionBackend):
                     not self.enable_deterministic
                     and not is_in_tc_piecewise_cuda_graph()
                     and not self.use_paged
+                    and not (
+                        self.prefill_uses_dequant_workspace
+                        and self.use_sliding_window_kv_pool
+                    )
                 )
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
@@ -833,6 +1346,10 @@ class FlashInferAttnBackend(AttentionBackend):
             if self.enable_mis:
                 # Use new backend-specific implementation
                 multi_item_params = self._process_multi_item_scoring(forward_batch)
+
+            self._prepare_dequant_workspace_metadata_for_extend(
+                forward_batch, use_ragged
+            )
 
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -848,6 +1365,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
                 extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
+                custom_kv_indices=self.dq_page_tables,
+                custom_paged_kernel_lens=self.dq_paged_kernel_lens,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -1096,7 +1615,755 @@ class FlashInferAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def _gemma4_prefix_context_route_supported(
+        self, q, k, v, layer, forward_batch, save_kv_cache
+    ):
+        # Validate the route before writing cache state or using allocator mappings.
+        if os.environ.get("SGLANG_GEMMA4_TRTLLM_CONTEXT_PREFIX") != "1":
+            return False
+        if os.environ.get("SGLANG_GEMMA4_TRTLLM_CONTEXT_PREFILL") != "1":
+            return False
+        if os.environ.get("SGLANG_GEMMA4_FUSED_CONTEXT_H256") != "1":
+            return False
+        if (
+            k is None
+            or v is None
+            or not save_kv_cache
+            or layer.is_cross_attention
+            or forward_batch.forward_mode != ForwardMode.EXTEND
+            or forward_batch.extend_prefix_lens_cpu is None
+            or forward_batch.extend_seq_lens_cpu is None
+            or getattr(forward_batch, "req_pool_indices", None) is None
+            or getattr(forward_batch, "out_cache_loc", None) is None
+            or is_in_tc_piecewise_cuda_graph()
+        ):
+            return False
+        try:
+            prefix_lens = [int(value) for value in forward_batch.extend_prefix_lens_cpu]
+            extend_lens = [int(value) for value in forward_batch.extend_seq_lens_cpu]
+        except (TypeError, ValueError):
+            return False
+        if (
+            not prefix_lens
+            or len(prefix_lens) != len(extend_lens)
+            or not any(prefix_lens)
+            or any(value < 0 for value in prefix_lens)
+            or any(value <= 0 for value in extend_lens)
+        ):
+            return False
+        total_rows = sum(extend_lens)
+        batch = len(prefix_lens)
+        if self.page_size != 16 or getattr(self.forward_metadata, "use_ragged", True):
+            return False
+        multi_item = getattr(self.forward_metadata, "multi_item_params", None)
+        if multi_item is not None and multi_item.is_enabled():
+            return False
+        if layer.logit_cap != 0.0 or layer.attn_type == AttentionType.ENCODER_ONLY:
+            return False
+        shape = (
+            layer.tp_q_head_num,
+            layer.tp_k_head_num,
+            layer.tp_v_head_num,
+            layer.head_dim,
+        )
+        if shape not in ((16, 8, 8, 256), (16, 2, 2, 512)):
+            return False
+        if (
+            q.dtype != torch.bfloat16
+            or k.dtype != torch.bfloat16
+            or v.dtype != torch.bfloat16
+            or not q.is_cuda
+            or q.device != k.device
+            or q.device != v.device
+            or q.numel() != total_rows * shape[0] * shape[3]
+            or k.numel() != total_rows * shape[1] * shape[3]
+            or v.numel() != total_rows * shape[2] * shape[3]
+        ):
+            return False
+        req_pool_indices = forward_batch.req_pool_indices
+        cache_loc = forward_batch.out_cache_loc
+        if (
+            req_pool_indices.ndim != 1
+            or req_pool_indices.numel() != batch
+            or req_pool_indices.device != q.device
+            or req_pool_indices.dtype not in (torch.int32, torch.int64)
+            or cache_loc.ndim != 1
+            or cache_loc.numel() != total_rows
+            or cache_loc.device != q.device
+            or cache_loc.dtype not in (torch.int32, torch.int64)
+        ):
+            return False
+        total_lens = [
+            prefix + extension for prefix, extension in zip(prefix_lens, extend_lens)
+        ]
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None:
+            try:
+                observed_total_lens = [int(value) for value in seq_lens_cpu]
+            except (TypeError, ValueError):
+                return False
+            if observed_total_lens != total_lens:
+                return False
+        req_to_token = getattr(self.req_to_token_pool, "req_to_token", None)
+        if (
+            req_to_token is None
+            or req_to_token.ndim != 2
+            or req_to_token.device != q.device
+            or req_to_token.dtype not in (torch.int32, torch.int64)
+            or max(total_lens) > req_to_token.shape[1]
+        ):
+            return False
+        pool = self.token_to_kv_pool
+        if pool.__class__.__name__ != "SWAKVPool":
+            return False
+        full_pool = getattr(pool, "full_kv_pool", None)
+        swa_pool = getattr(pool, "swa_kv_pool", None)
+        if (
+            full_pool is None
+            or swa_pool is None
+            or getattr(full_pool, "kv_cache_layout", None) != "nhd"
+            or getattr(full_pool, "page_size", None) != 16
+            or getattr(full_pool, "dtype", None) != torch.float8_e4m3fn
+            or getattr(swa_pool, "page_size", None) != 16
+            or not getattr(swa_pool, "is_quantized_kv_cache", False)
+            or getattr(pool, "full_to_swa_index_mapping", None) is None
+            or getattr(self.forward_metadata, "swa_out_cache_loc", None) is None
+            or self.forward_metadata.swa_out_cache_loc.numel() != total_rows
+        ):
+            return False
+        layer_uses_nvfp4 = self._hybrid_prefill_layer_uses_dequant(layer)
+        if shape[-1] == 256:
+            if not layer_uses_nvfp4 or layer.sliding_window_size != 1023:
+                return False
+            quant_method = getattr(swa_pool, "quant_method", None)
+            if (
+                quant_method is None
+                or quant_method.__class__.__name__ != "NVFP4KVCacheMethod"
+                or not getattr(quant_method, "_interleave_v_scales", False)
+                or getattr(swa_pool, "dq_k_buffer", None) is None
+                or getattr(swa_pool, "dq_v_buffer", None) is None
+            ):
+                return False
+        elif layer_uses_nvfp4 or layer.sliding_window_size != -1:
+            return False
+        return True
+
+    def _gemma4_prefix_context_plan(self, forward_batch):
+        # One metadata object represents one forward.  Cache geometry and the
+        # allocator-derived physical table there so all 30 layers reuse it,
+        # while a later forward always rebuilds mappings even for equal lengths.
+        cached = getattr(self.forward_metadata, "_gemma4_prefix_context_plan_v16", None)
+        if cached is not None:
+            return cached
+        import torch as _torch
+
+        prefix_cpu = _torch.as_tensor(
+            forward_batch.extend_prefix_lens_cpu, dtype=_torch.int64, device="cpu"
+        )
+        q_cpu = _torch.as_tensor(
+            forward_batch.extend_seq_lens_cpu, dtype=_torch.int64, device="cpu"
+        )
+        if (
+            prefix_cpu.ndim != 1
+            or q_cpu.ndim != 1
+            or prefix_cpu.numel() == 0
+            or prefix_cpu.shape != q_cpu.shape
+            or bool(_torch.any(prefix_cpu < 0).item())
+            or bool(_torch.any(q_cpu <= 0).item())
+        ):
+            raise ValueError("invalid Gemma-4 prefix context lengths")
+        page_size = 16
+        batch = int(q_cpu.numel())
+        retained_cpu = _torch.minimum(prefix_cpu, _torch.full_like(prefix_cpu, 1023))
+        swa_kv_cpu = retained_cpu + q_cpu
+        full_kv_cpu = prefix_cpu + q_cpu
+        q_cum_cpu = _torch.cat(
+            (_torch.zeros(1, dtype=_torch.int64), _torch.cumsum(q_cpu, dim=0))
+        )
+        swa_kv_cum_cpu = _torch.cat(
+            (
+                _torch.zeros(1, dtype=_torch.int64),
+                _torch.cumsum(swa_kv_cpu, dim=0),
+            )
+        )
+        full_kv_cum_cpu = _torch.cat(
+            (
+                _torch.zeros(1, dtype=_torch.int64),
+                _torch.cumsum(full_kv_cpu, dim=0),
+            )
+        )
+        swa_pages_cpu = _torch.div(
+            swa_kv_cpu + page_size - 1, page_size, rounding_mode="floor"
+        )
+        swa_page_starts_cpu = _torch.cumsum(swa_pages_cpu, dim=0) - swa_pages_cpu
+        max_swa_pages = int(swa_pages_cpu.max().item())
+        swa_page_offsets_cpu = _torch.arange(max_swa_pages, dtype=_torch.int64)
+        swa_block_tables_cpu = (
+            swa_page_starts_cpu[:, None] + swa_page_offsets_cpu[None, :]
+        ).masked_fill(swa_page_offsets_cpu[None, :] >= swa_pages_cpu[:, None], 0)
+
+        total_prefix = int(retained_cpu.sum().item())
+        if total_prefix:
+            prefix_flat_cpu = _torch.arange(total_prefix, dtype=_torch.int64)
+            retained_cum_cpu = _torch.cumsum(retained_cpu, dim=0)
+            prefix_request_cpu = _torch.bucketize(
+                prefix_flat_cpu, retained_cum_cpu, right=True
+            )
+            retained_start_cpu = retained_cum_cpu - retained_cpu
+            prefix_within_cpu = prefix_flat_cpu - retained_start_cpu[prefix_request_cpu]
+            prefix_logical_cpu = (prefix_cpu - retained_cpu)[
+                prefix_request_cpu
+            ] + prefix_within_cpu
+            prefix_dst_cpu = (
+                swa_page_starts_cpu[prefix_request_cpu] * page_size + prefix_within_cpu
+            )
+        else:
+            prefix_request_cpu = _torch.empty(0, dtype=_torch.int64)
+            prefix_logical_cpu = _torch.empty(0, dtype=_torch.int64)
+            prefix_dst_cpu = _torch.empty(0, dtype=_torch.int64)
+
+        total_q = int(q_cum_cpu[-1].item())
+        q_flat_cpu = _torch.arange(total_q, dtype=_torch.int64)
+        q_request_cpu = _torch.bucketize(q_flat_cpu, q_cum_cpu[1:], right=True)
+        q_within_cpu = q_flat_cpu - q_cum_cpu[q_request_cpu]
+        current_dst_cpu = (
+            swa_page_starts_cpu[q_request_cpu] * page_size
+            + retained_cpu[q_request_cpu]
+            + q_within_cpu
+        )
+
+        device = forward_batch.req_pool_indices.device
+        prefix_request = prefix_request_cpu.to(device=device)
+        prefix_logical = prefix_logical_cpu.to(device=device)
+        req_rows = forward_batch.req_pool_indices.to(dtype=_torch.int64)
+        req_to_token = self.req_to_token_pool.req_to_token
+        if total_prefix:
+            prefix_full_slots = req_to_token[
+                req_rows[prefix_request], prefix_logical
+            ].to(dtype=_torch.int64)
+        else:
+            prefix_full_slots = _torch.empty(0, dtype=_torch.int64, device=device)
+
+        full_pages_cpu = _torch.div(
+            full_kv_cpu + page_size - 1, page_size, rounding_mode="floor"
+        )
+        max_full_pages = int(full_pages_cpu.max().item())
+        full_page_positions = (
+            _torch.arange(max_full_pages, dtype=_torch.int64, device=device) * page_size
+        )
+        full_kv = full_kv_cpu.to(device=device, dtype=_torch.int64)
+        valid_full_pages = full_page_positions[None, :] < full_kv[:, None]
+        safe_positions = _torch.minimum(
+            full_page_positions[None, :], full_kv[:, None] - 1
+        )
+        full_page_slots = req_to_token[req_rows[:, None], safe_positions].to(
+            dtype=_torch.int64
+        )
+        full_block_tables = _torch.where(
+            valid_full_pages,
+            full_page_slots // page_size,
+            _torch.zeros((), dtype=_torch.int64, device=device),
+        ).to(dtype=_torch.int32)
+
+        plan = {
+            "batch": batch,
+            "total_q": total_q,
+            "cum_q": q_cum_cpu.to(device=device, dtype=_torch.int32),
+            "max_q_len": int(q_cpu.max().item()),
+            "swa_seq_lens": swa_kv_cpu.to(device=device, dtype=_torch.int32),
+            "swa_cum_kv": swa_kv_cum_cpu.to(device=device, dtype=_torch.int32),
+            "swa_max_kv_len": int(swa_kv_cpu.max().item()),
+            "swa_block_tables": swa_block_tables_cpu.to(
+                device=device, dtype=_torch.int32
+            ),
+            "swa_padded_rows": int((swa_pages_cpu.sum() * page_size).item()),
+            "prefix_full_slots": prefix_full_slots,
+            "prefix_dst_rows": prefix_dst_cpu.to(device=device),
+            "current_dst_rows": current_dst_cpu.to(device=device),
+            "full_seq_lens": full_kv.to(dtype=_torch.int32),
+            "full_cum_kv": full_kv_cum_cpu.to(device=device, dtype=_torch.int32),
+            "full_max_kv_len": int(full_kv_cpu.max().item()),
+            "full_block_tables": full_block_tables,
+        }
+        self.forward_metadata._gemma4_prefix_context_plan_v16 = plan
+        return plan
+
+    def _gemma4_trtllm_prefix_context_prefill(
+        self, q, k, v, layer, forward_batch, cache_loc
+    ):
+        # H256 uses bounded scratch while H512 reads persistent allocator pages.
+        from flashinfer.prefill import trtllm_batch_context_with_kv_cache
+
+        pool = self.token_to_kv_pool
+        plan = self._gemma4_prefix_context_plan(forward_batch)
+        workspace, counter = self._gemma4_context_runtime_buffers(layer)
+        total = plan["total_q"]
+        q_rows = q.view(total, layer.tp_q_head_num, layer.head_dim)
+        k_rows = k.view(total, layer.tp_k_head_num, layer.head_dim)
+        v_rows = v.view(total, layer.tp_v_head_num, layer.head_dim)
+        # K/V entries are placeholders because each layer path owns its storage.
+        _, _, q_fp8 = self._gemma4_context_pack_buffers(layer, 16, total, 16)
+
+        if self._hybrid_prefill_layer_uses_dequant(layer):
+            swa_pool = pool.swa_kv_pool
+            dq_k, dq_v = swa_pool.get_dequant_workspace()
+            ws_k = dq_k.view(-1, layer.tp_k_head_num, layer.head_dim)[
+                : plan["swa_padded_rows"]
+            ]
+            ws_v = dq_v.view(-1, layer.tp_v_head_num, layer.head_dim)[
+                : plan["swa_padded_rows"]
+            ]
+            if (
+                ws_k.shape[0] != plan["swa_padded_rows"]
+                or ws_v.shape[0] != plan["swa_padded_rows"]
+            ):
+                raise RuntimeError("Gemma-4 prefix scratch capacity is insufficient")
+            # Clear P16 rows so stale values cannot cross forwards.
+            ws_k.zero_()
+            ws_v.zero_()
+            pool.set_kv_buffer(
+                layer,
+                KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                k_rows,
+                v_rows,
+                *self._kv_write_scales(layer),
+                fused_q_src=q_rows,
+                fused_q_dst=q_fp8,
+                fused_context_dst_rows=plan["current_dst_rows"],
+                fused_context_k_dst=ws_k,
+                fused_context_v_dst=ws_v,
+            )
+            prefix_full_slots = plan["prefix_full_slots"]
+            if prefix_full_slots.numel():
+                prefix_swa_slots = pool.translate_loc_from_full_to_swa(
+                    prefix_full_slots
+                ).to(dtype=torch.int64)
+                k_fp4, v_fp4, k_scales, v_scales = pool.get_raw_kv_buffer(
+                    layer.layer_id
+                )
+                quant_method = swa_pool.quant_method
+                prefix_k, prefix_v = quant_method.dequantize_prev_kv(
+                    k_fp4[prefix_swa_slots],
+                    quant_method.get_scale_rows(k_scales, prefix_swa_slots, 16),
+                    v_fp4[prefix_swa_slots],
+                    quant_method.get_scale_rows(
+                        v_scales, prefix_swa_slots, 16, is_value=True
+                    ),
+                    layer.layer_id,
+                )
+                ws_k[plan["prefix_dst_rows"]] = prefix_k
+                ws_v[plan["prefix_dst_rows"]] = prefix_v
+            num_pages = plan["swa_padded_rows"] // 16
+            kv_cache = (
+                ws_k.view(num_pages, 16, layer.tp_k_head_num, layer.head_dim).permute(
+                    0, 2, 1, 3
+                ),
+                ws_v.view(num_pages, 16, layer.tp_v_head_num, layer.head_dim).permute(
+                    0, 2, 1, 3
+                ),
+            )
+            block_tables = plan["swa_block_tables"]
+            seq_lens = plan["swa_seq_lens"]
+            cum_kv = plan["swa_cum_kv"]
+            max_kv_len = plan["swa_max_kv_len"]
+            bmm1_scale = 1.0 * 1.0 * layer.scaling
+            bmm2_scale = 1.0
+        else:
+            k_cache, v_cache = pool.get_kv_buffer(layer.layer_id)
+            k_scale = layer.k_scale_float
+            v_scale = layer.v_scale_float
+            if not k_scale > 0.0 or not v_scale > 0.0:
+                raise ValueError("Gemma-4 full-attention FP8 scales must be positive")
+            context_q = _gemma4_context_pack_qkv(
+                q_rows,
+                k_rows,
+                v_rows,
+                cache_loc,
+                q_fp8,
+                k_cache,
+                v_cache,
+                k_inv_scale=1.0 / k_scale,
+                v_inv_scale=1.0 / v_scale,
+            )
+            if k_cache.shape[0] % 16 or v_cache.shape != k_cache.shape:
+                raise RuntimeError("Gemma-4 full FP8 pool is not P16-compatible")
+            num_pages = k_cache.shape[0] // 16
+            kv_cache = (
+                k_cache.view(
+                    num_pages, 16, layer.tp_k_head_num, layer.head_dim
+                ).permute(0, 2, 1, 3),
+                v_cache.view(
+                    num_pages, 16, layer.tp_v_head_num, layer.head_dim
+                ).permute(0, 2, 1, 3),
+            )
+            q_fp8 = context_q
+            block_tables = plan["full_block_tables"]
+            seq_lens = plan["full_seq_lens"]
+            cum_kv = plan["full_cum_kv"]
+            max_kv_len = plan["full_max_kv_len"]
+            bmm1_scale = 1.0 * k_scale * layer.scaling
+            bmm2_scale = v_scale
+
+        output = trtllm_batch_context_with_kv_cache(
+            query=q_fp8,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_q_len=plan["max_q_len"],
+            max_kv_len=max_kv_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            batch_size=plan["batch"],
+            cum_seq_lens_q=plan["cum_q"],
+            cum_seq_lens_kv=cum_kv,
+            window_left=layer.sliding_window_size,
+            out_dtype=q.dtype,
+            multi_ctas_kv_counter_buffer=counter,
+        )
+        return output.view(-1, layer.tp_q_head_num * layer.head_dim)
+
     @debug_kernel_api
+    def _gemma4_context_route_supported(
+        self, q, k, v, layer, forward_batch, save_kv_cache
+    ):
+        # This eager-only route requires CPU extend metadata and stable scratch pointers.
+        if os.environ.get("SGLANG_GEMMA4_TRTLLM_CONTEXT_PREFILL") != "1":
+            return False
+        if (
+            k is None
+            or v is None
+            or not save_kv_cache
+            or layer.is_cross_attention
+            or forward_batch.forward_mode != ForwardMode.EXTEND
+            or forward_batch.extend_prefix_lens_cpu is None
+            or forward_batch.extend_seq_lens_cpu is None
+            or is_in_tc_piecewise_cuda_graph()
+        ):
+            return False
+        if any(forward_batch.extend_prefix_lens_cpu):
+            return False
+        if self.page_size != 16 or getattr(self.forward_metadata, "use_ragged", True):
+            return False
+        multi_item = getattr(self.forward_metadata, "multi_item_params", None)
+        if multi_item is not None and multi_item.is_enabled():
+            return False
+        if layer.logit_cap != 0.0 or layer.attn_type == AttentionType.ENCODER_ONLY:
+            return False
+        shape = (
+            layer.tp_q_head_num,
+            layer.tp_k_head_num,
+            layer.tp_v_head_num,
+            layer.head_dim,
+        )
+        if shape not in ((16, 8, 8, 256), (16, 2, 2, 512)):
+            return False
+        # Reject incompatible tensors before entering the pack path.
+        if (
+            q.dtype != torch.bfloat16
+            or k.dtype != torch.bfloat16
+            or v.dtype != torch.bfloat16
+            or not q.is_cuda
+            or q.device != k.device
+            or q.device != v.device
+        ):
+            return False
+        try:
+            total_rows = sum(map(int, forward_batch.extend_seq_lens_cpu))
+        except (TypeError, ValueError):
+            return False
+        if (
+            total_rows <= 0
+            or len(forward_batch.extend_prefix_lens_cpu)
+            != len(forward_batch.extend_seq_lens_cpu)
+            or q.numel() != total_rows * shape[0] * shape[3]
+            or k.numel() != total_rows * shape[1] * shape[3]
+            or v.numel() != total_rows * shape[2] * shape[3]
+        ):
+            return False
+        layer_uses_nvfp4 = self._hybrid_prefill_layer_uses_dequant(layer)
+        if shape[-1] == 256:
+            if not layer_uses_nvfp4 or layer.sliding_window_size != 1023:
+                return False
+        elif layer_uses_nvfp4 or layer.sliding_window_size != -1:
+            return False
+        pool = self.token_to_kv_pool
+        if pool.__class__.__name__ != "SWAKVPool":
+            return False
+        full_pool = getattr(pool, "full_kv_pool", None)
+        swa_pool = getattr(pool, "swa_kv_pool", None)
+        if (
+            full_pool is None
+            or swa_pool is None
+            or getattr(full_pool, "kv_cache_layout", None) != "nhd"
+            or getattr(full_pool, "page_size", None) != 16
+            or getattr(full_pool, "dtype", None) != torch.float8_e4m3fn
+            or not getattr(swa_pool, "is_quantized_kv_cache", False)
+        ):
+            return False
+        return True
+
+    def _gemma4_context_row_plan(self, forward_batch, page_size):
+        # Cache a vectorized CPU row plan for layers with matching geometry.
+        import torch as _torch
+
+        seq_lens_cpu = _torch.as_tensor(
+            forward_batch.extend_seq_lens_cpu, dtype=_torch.int64, device="cpu"
+        )
+        if seq_lens_cpu.ndim != 1 or seq_lens_cpu.numel() == 0:
+            raise ValueError("Gemma-4 context prefill requires sequence lengths")
+        if bool(_torch.any(seq_lens_cpu <= 0).item()):
+            raise ValueError(
+                "Gemma-4 context prefill requires positive sequence lengths"
+            )
+        if page_size not in (16, 64):
+            raise ValueError(f"unsupported Gemma-4 context page size: {page_size}")
+        plan_key = (int(page_size), seq_lens_cpu.numpy().tobytes())
+        plans = getattr(self, "_gemma4_context_plans", None)
+        if plans is None:
+            plans = {}
+            self._gemma4_context_plans = plans
+        cached = plans.get(plan_key)
+        if cached is not None:
+            return cached
+
+        pages_per_seq = _torch.div(
+            seq_lens_cpu + page_size - 1, page_size, rounding_mode="floor"
+        )
+        page_starts = _torch.cumsum(pages_per_seq, dim=0) - pages_per_seq
+        cumulative_tokens = _torch.cat(
+            (_torch.zeros(1, dtype=_torch.int64), _torch.cumsum(seq_lens_cpu, dim=0))
+        )
+        total = int(cumulative_tokens[-1].item())
+        token_rows = _torch.arange(total, dtype=_torch.int64, device="cpu")
+        request_rows = _torch.bucketize(token_rows, cumulative_tokens[1:], right=True)
+        dst_rows_cpu = (
+            page_starts[request_rows] * page_size
+            + token_rows
+            - cumulative_tokens[request_rows]
+        )
+        max_pages = int(pages_per_seq.max().item())
+        page_offsets = _torch.arange(max_pages, dtype=_torch.int64, device="cpu")
+        block_tables_cpu = page_starts[:, None] + page_offsets[None, :]
+        block_tables_cpu = block_tables_cpu.masked_fill(
+            page_offsets[None, :] >= pages_per_seq[:, None], 0
+        )
+        padded_rows = int((pages_per_seq.sum() * page_size).item())
+        device = self.token_to_kv_pool.device
+        dst = dst_rows_cpu.to(device=device, dtype=_torch.int64)
+        block_tables = block_tables_cpu.to(device=device, dtype=_torch.int32)
+        seq_lens = seq_lens_cpu.to(device=device, dtype=_torch.int32)
+        cum = cumulative_tokens.to(device=device, dtype=_torch.int32)
+        plan = {
+            "dst_rows": dst,
+            "block_tables": block_tables,
+            "seq_lens": seq_lens,
+            "cum": cum,
+            "padded_rows": padded_rows,
+            "max_q_len": int(seq_lens_cpu.max().item()),
+            "batch": int(seq_lens_cpu.numel()),
+        }
+        if len(plans) >= 16:
+            plans.pop(next(iter(plans)))
+        plans[plan_key] = plan
+        return plan
+
+    def _gemma4_context_runtime_buffers(self, layer):
+        # Reuse the backend's existing 2 GiB FlashInfer workspace instead of
+        # allocating a second one. The counter is sized once from the request
+        # pool's configured maximum batch and remains pointer-stable.
+        import torch as _torch
+
+        workspace = self.workspace_buffer
+        required_workspace_bytes = 2 * 1024 * 1024 * 1024
+        expected_device = _torch.device(self.token_to_kv_pool.device)
+        if (
+            workspace.device.type != expected_device.type
+            or (
+                expected_device.index is not None
+                and workspace.device.index != expected_device.index
+            )
+            or workspace.numel() * workspace.element_size() < required_workspace_bytes
+        ):
+            raise ValueError(
+                "Gemma-4 context requires the existing 2 GiB GPU workspace"
+            )
+        if not hasattr(self, "_gemma4_context_counter"):
+            device = workspace.device
+            sm_count = _torch.cuda.get_device_properties(device).multi_processor_count
+            max_batch = int(self.req_to_token_pool.size)
+            counter_bytes = (
+                (max(max_batch * layer.tp_q_head_num, sm_count) + 7) // 8 * 8
+            ) * 4
+            self._gemma4_context_counter = _torch.zeros(
+                counter_bytes, dtype=_torch.int8, device=device
+            )
+        return workspace, self._gemma4_context_counter
+
+    def _gemma4_context_pack_buffers(
+        self, layer, padded_rows, total_rows, context_page_size
+    ):
+        # Append-only capacity cache for the SWA temporary K/V and fused Q
+        # output. Full-attention layers never replace these buffers.
+        import torch as _torch
+
+        key = (
+            layer.tp_q_head_num,
+            layer.tp_k_head_num,
+            layer.head_dim,
+            context_page_size,
+        )
+        cache = getattr(self, "_gemma4_context_pack_cache", None)
+        if cache is None:
+            cache = {}
+            self._gemma4_context_pack_cache = cache
+        entry = cache.get(key)
+        if (
+            entry is None
+            or entry[0].shape[0] < padded_rows
+            or entry[2].shape[0] < total_rows
+        ):
+            device = self.token_to_kv_pool.device
+            # Initialize page tails because context kernels may read before masking.
+            ws_k = _torch.zeros(
+                padded_rows,
+                layer.tp_k_head_num,
+                layer.head_dim,
+                dtype=_torch.float8_e4m3fn,
+                device=device,
+            )
+            ws_v = _torch.zeros_like(ws_k)
+            q_fp8 = _torch.empty(
+                total_rows,
+                layer.tp_q_head_num,
+                layer.head_dim,
+                dtype=_torch.float8_e4m3fn,
+                device=device,
+            )
+            entry = (ws_k, ws_v, q_fp8)
+            cache[key] = entry
+        return (
+            entry[0][:padded_rows],
+            entry[1][:padded_rows],
+            entry[2][:total_rows],
+        )
+
+    def _gemma4_trtllm_context_prefill(self, q, k, v, layer, forward_batch, cache_loc):
+        # Run FP8 TRTLLM-Gen context prefill.
+        from flashinfer.prefill import trtllm_batch_context_with_kv_cache
+
+        pool = self.token_to_kv_pool
+        workspace, counter = self._gemma4_context_runtime_buffers(layer)
+        layer_uses_nvfp4 = self._hybrid_prefill_layer_uses_dequant(layer)
+        context_page_size = self.page_size if layer_uses_nvfp4 else 64
+        if layer_uses_nvfp4 and context_page_size != 16:
+            raise ValueError("Gemma-4 NVFP4 context requires the shipped P16 kernel")
+        plan = self._gemma4_context_row_plan(forward_batch, context_page_size)
+        q_rows = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        total = plan["dst_rows"].numel()
+        k_rows = k.view(total, layer.tp_k_head_num, layer.head_dim)
+        v_rows = v.view(total, layer.tp_v_head_num, layer.head_dim)
+        ws_k, ws_v, q_fp8 = self._gemma4_context_pack_buffers(
+            layer, plan["padded_rows"], total, context_page_size
+        )
+        if layer_uses_nvfp4:
+            # Use the fused store only when explicitly enabled.
+            if os.environ.get("SGLANG_GEMMA4_FUSED_CONTEXT_H256") == "1":
+                # Write persistent NVFP4 K/V and FP8 context Q/K/V in one launch.
+                pool.set_kv_buffer(
+                    layer,
+                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    k_rows,
+                    v_rows,
+                    *self._kv_write_scales(layer),
+                    fused_q_src=q_rows,
+                    fused_q_dst=q_fp8,
+                    fused_context_dst_rows=plan["dst_rows"],
+                    fused_context_k_dst=ws_k,
+                    fused_context_v_dst=ws_v,
+                )
+                context_q = q_fp8
+                bmm1_scale = 1.0 * 1.0 * layer.scaling
+                bmm2_scale = 1.0
+            else:
+                # SWA layer: one Triton launch converts Q and packs live K/V into
+                # the page-aligned E4M3 workspace. The persistent NVFP4 append
+                # remains the future-decode cache write.
+                pool.set_kv_buffer(
+                    layer,
+                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    k,
+                    v,
+                    *self._kv_write_scales(layer),
+                )
+                context_q = _gemma4_context_pack_qkv(
+                    q_rows,
+                    k_rows,
+                    v_rows,
+                    plan["dst_rows"],
+                    q_fp8,
+                    ws_k,
+                    ws_v,
+                )
+                bmm1_scale = 1.0 * 1.0 * layer.scaling
+                bmm2_scale = 1.0
+        else:
+            # Full-attention layer: the same launch converts Q, packs scaled
+            # live K/V into request-aligned P64 context pages, and writes the
+            # persistent allocator-backed P16 FP8 cache for future decode.
+            k_cache, v_cache = pool.get_kv_buffer(layer.layer_id)
+            k_scale = layer.k_scale_float
+            v_scale = layer.v_scale_float
+            if not k_scale > 0.0 or not v_scale > 0.0:
+                raise ValueError("Gemma-4 full-attention FP8 scales must be positive")
+            context_q = _gemma4_context_pack_qkv(
+                q_rows,
+                k_rows,
+                v_rows,
+                plan["dst_rows"],
+                q_fp8,
+                ws_k,
+                ws_v,
+                k_inv_scale=1.0 / k_scale,
+                v_inv_scale=1.0 / v_scale,
+                cache_loc=cache_loc,
+                persistent_k=k_cache,
+                persistent_v=v_cache,
+            )
+            bmm1_scale = 1.0 * k_scale * layer.scaling
+            bmm2_scale = v_scale
+        num_pages = plan["padded_rows"] // context_page_size
+        k_pool = (
+            ws_k[: plan["padded_rows"]]
+            .view(num_pages, context_page_size, layer.tp_k_head_num, layer.head_dim)
+            .permute(0, 2, 1, 3)
+        )
+        v_pool = (
+            ws_v[: plan["padded_rows"]]
+            .view(num_pages, context_page_size, layer.tp_v_head_num, layer.head_dim)
+            .permute(0, 2, 1, 3)
+        )
+        kv_cache = (k_pool, v_pool)
+        block_tables = plan["block_tables"]
+        o = trtllm_batch_context_with_kv_cache(
+            query=context_q,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace,
+            block_tables=block_tables,
+            seq_lens=plan["seq_lens"],
+            max_q_len=plan["max_q_len"],
+            max_kv_len=plan["max_q_len"],
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            batch_size=plan["batch"],
+            cum_seq_lens_q=plan["cum"],
+            cum_seq_lens_kv=plan["cum"],
+            window_left=layer.sliding_window_size,
+            out_dtype=q.dtype,
+            multi_ctas_kv_counter_buffer=counter,
+        )
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1118,18 +2385,80 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
-        if not self.forward_metadata.use_ragged:
-            if k is not None:
+
+        layer_uses_dequant_workspace = self._hybrid_prefill_layer_uses_dequant(layer)
+        assert not (
+            layer_uses_dequant_workspace and layer.is_cross_attention
+        ), "FP4 dequant KV cache is not supported for cross-attention"
+
+        # Use a separate guarded route for continuation prefill.
+        if self._gemma4_prefix_context_route_supported(
+            q, k, v, layer, forward_batch, save_kv_cache
+        ):
+            return self._gemma4_trtllm_prefix_context_prefill(
+                q, k, v, layer, forward_batch, cache_loc
+            )
+
+        # Unsupported zero-prefix requests retain the standard FlashInfer path.
+        if self._gemma4_context_route_supported(
+            q, k, v, layer, forward_batch, save_kv_cache
+        ):
+            return self._gemma4_trtllm_context_prefill(
+                q, k, v, layer, forward_batch, cache_loc
+            )
+
+        # We perform dequant for chunk prefill/cache reuse.
+        pool = self.token_to_kv_pool
+        quantized_kv_stored = False
+        quantized_write_loc = None
+        # Full-attention layers use FP8 without a dequant workspace.
+        if layer_uses_dequant_workspace:
+            wrapper_idx = self._get_wrapper_idx(layer)
+            workspace_page_table = (
+                self.dq_page_tables[wrapper_idx]
+                if self.dq_page_tables is not None
+                else None
+            )
+            if not self.forward_metadata.use_ragged and k is not None and save_kv_cache:
                 assert v is not None
-                if save_kv_cache:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
-                        k,
-                        v,
-                        layer.k_scale,
-                        layer.v_scale,
-                    )
+                quantized_write_loc = KVWriteLoc(
+                    cache_loc, self.forward_metadata.swa_out_cache_loc
+                )
+                pool.set_kv_buffer(
+                    layer,
+                    quantized_write_loc,
+                    k,
+                    v,
+                    *self._kv_write_scales(layer),
+                )
+                quantized_kv_stored = True
+            kv_cache = pool.get_flashinfer_dequant_workspace_kv_buffer(
+                layer,
+                self.req_to_token_pool.req_to_token,
+                self.cpu_req_pool_indices,
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+                self.page_size,
+                prepare_workspace=workspace_page_table is not None,
+                use_ragged=self.forward_metadata.use_ragged,
+                k_cur=k,
+                v_cur=v,
+                current_loc=quantized_write_loc,
+            )
+        else:
+            kv_cache = pool.get_kv_buffer(layer.layer_id)
+
+        # use paged attention
+        if not self.forward_metadata.use_ragged:
+            if k is not None and save_kv_cache and not quantized_kv_stored:
+                assert v is not None
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    k,
+                    v,
+                    *self._kv_write_scales(layer),
+                )
 
             causal = (
                 not layer.is_cross_attention
@@ -1137,7 +2466,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                kv_cache,
                 causal=causal,
                 sm_scale=layer.scaling,
                 # Disable sliding window attention for multi-item scoring:
@@ -1156,8 +2485,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 ),
                 logits_soft_cap=logits_soft_cap,
                 # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
+                # NVFP4 workspace values have already been dequantized with their
+                # global scales; applying them again would double-scale K/V.
+                k_scale=(1.0 if layer_uses_dequant_workspace else layer.k_scale_float),
+                v_scale=(1.0 if layer_uses_dequant_workspace else layer.v_scale_float),
             )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
@@ -1165,6 +2496,9 @@ class FlashInferAttnBackend(AttentionBackend):
             # previously cached context without re-materializing KV tensors (e.g., the
             # IQuestLoopCoder path uses token_to_kv_pool as the KV source).
             if k is None and v is None:
+                assert (
+                    not layer_uses_dequant_workspace
+                ), "KV cache must be provided for ragged attention when using FP4 dequant KV cache"
                 k = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
                 v = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
             causal = True
@@ -1209,7 +2543,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    kv_cache,
                     causal=False,
                     sm_scale=layer.scaling,
                     window_left=swa_window_left,
@@ -1224,8 +2558,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
                     k,
                     v,
-                    layer.k_scale,
-                    layer.v_scale,
+                    *self._kv_write_scales(layer),
                 )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -1257,19 +2590,35 @@ class FlashInferAttnBackend(AttentionBackend):
                     KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
                     k,
                     v,
-                    layer.k_scale,
-                    layer.v_scale,
+                    *self._kv_write_scales(layer),
                 )
+
+        layer_uses_dequant_workspace = self._hybrid_decode_layer_uses_dequant(layer)
+        if layer_uses_dequant_workspace:
+            kv_cache = (
+                self.token_to_kv_pool.get_flashinfer_decode_dequant_workspace_kv_buffer(
+                    layer,
+                    self.req_to_token_pool.req_to_token,
+                    forward_batch.req_pool_indices,
+                    (
+                        forward_batch.seq_lens_cpu
+                        if forward_batch.seq_lens_cpu is not None
+                        else forward_batch.seq_lens
+                    ),
+                )
+            )
+        else:
+            kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
         # Call the wrapped function
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            kv_cache,
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
             # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
+            k_scale=(1.0 if layer_uses_dequant_workspace else layer.k_scale_float),
+            v_scale=(1.0 if layer_uses_dequant_workspace else layer.v_scale_float),
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -1296,7 +2645,18 @@ class FlashInferIndicesUpdaterDecode:
             get_parallel().attn_tp_size
         )
         self.head_dim = model_runner.model_config.head_dim
-        self.data_type = model_runner.kv_cache_dtype
+        self.wrapper_num_qo_heads = [self.num_qo_heads] * attn_backend.num_wrappers
+        self.wrapper_num_kv_heads = [self.num_kv_heads] * attn_backend.num_wrappers
+        self.wrapper_head_dim = [self.head_dim] * attn_backend.num_wrappers
+        if attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
+            # Wrapper 0 serves SWA and wrapper 1 serves full attention.
+            self.wrapper_num_kv_heads[0] = (
+                model_runner.model_config.get_swa_num_kv_heads(
+                    get_parallel().attn_tp_size
+                )
+            )
+            self.wrapper_head_dim[0] = model_runner.model_config.swa_head_dim
+        self.data_type = attn_backend.flashinfer_kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
@@ -1355,6 +2715,7 @@ class FlashInferIndicesUpdaterDecode:
             seq_lens_cpu,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+            wrapper_id=0,
         )
 
     def update_sliding_window(
@@ -1407,6 +2768,7 @@ class FlashInferIndicesUpdaterDecode:
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=disable_split_kv,
+                wrapper_id=wrapper_id,
             )
 
     def update_cross_attention(
@@ -1446,6 +2808,7 @@ class FlashInferIndicesUpdaterDecode:
                 seq_lens_cpu=kv_lens_cpu,
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=disable_split_kv,
+                wrapper_id=wrapper_id,
             )
 
     def call_begin_forward(
@@ -1461,6 +2824,7 @@ class FlashInferIndicesUpdaterDecode:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        wrapper_id: int = 0,
     ):
         if spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
             bs = len(req_pool_indices)
@@ -1487,6 +2851,10 @@ class FlashInferIndicesUpdaterDecode:
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
+
+        num_qo_heads = self.wrapper_num_qo_heads[wrapper_id]
+        num_kv_heads = self.wrapper_num_kv_heads[wrapper_id]
+        head_dim = self.wrapper_head_dim[wrapper_id]
 
         if use_sliding_window_kv_pool:
             assert self._swa_kv_pool is not None
@@ -1518,9 +2886,9 @@ class FlashInferIndicesUpdaterDecode:
                 kv_indptr,
                 kv_indices,
                 self.kv_last_page_len[:bs],
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
                 1,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
@@ -1537,9 +2905,9 @@ class FlashInferIndicesUpdaterDecode:
                 kv_indptr,
                 kv_indices,
                 self.kv_last_page_len[:bs],
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
                 1,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
@@ -1564,7 +2932,18 @@ class FlashInferIndicesUpdaterPrefill:
             get_parallel().attn_tp_size
         )
         self.head_dim = model_runner.model_config.head_dim
-        self.data_type = model_runner.kv_cache_dtype
+        self.wrapper_num_qo_heads = [self.num_qo_heads] * attn_backend.num_wrappers
+        self.wrapper_num_kv_heads = [self.num_kv_heads] * attn_backend.num_wrappers
+        self.wrapper_head_dim = [self.head_dim] * attn_backend.num_wrappers
+        if attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
+            # Wrapper 0 serves SWA and wrapper 1 serves full attention.
+            self.wrapper_num_kv_heads[0] = (
+                model_runner.model_config.get_swa_num_kv_heads(
+                    get_parallel().attn_tp_size
+                )
+            )
+            self.wrapper_head_dim[0] = model_runner.model_config.swa_head_dim
+        self.data_type = attn_backend.flashinfer_kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
@@ -1600,6 +2979,8 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
+        custom_kv_indices: Optional[List[Optional[torch.Tensor]]] = None,
+        custom_paged_kernel_lens: Optional[List[torch.Tensor]] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -1619,7 +3000,15 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
+        custom_kv_indices: Optional[List[Optional[torch.Tensor]]] = None,
+        custom_paged_kernel_lens: Optional[List[torch.Tensor]] = None,
     ):
+        custom_indices = custom_kv_indices[0] if custom_kv_indices is not None else None
+        custom_lens = (
+            custom_paged_kernel_lens[0]
+            if custom_paged_kernel_lens is not None
+            else None
+        )
         if use_ragged:
             assert prefix_lens is not None
             paged_kernel_lens = prefix_lens
@@ -1648,6 +3037,8 @@ class FlashInferIndicesUpdaterPrefill:
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
             seq_lens_cpu=seq_lens_cpu,
+            custom_kv_indices=custom_indices,
+            custom_paged_kernel_lens=custom_lens,
         )
 
     def update_sliding_window(
@@ -1665,7 +3056,17 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
+        custom_kv_indices: Optional[List[Optional[torch.Tensor]]] = None,
+        custom_paged_kernel_lens: Optional[List[torch.Tensor]] = None,
     ):
+        if custom_kv_indices is not None and len(custom_kv_indices) != 2:
+            raise RuntimeError(
+                "Hybrid NVFP4 prefill requires one page table per wrapper."
+            )
+        if custom_paged_kernel_lens is not None and len(custom_paged_kernel_lens) != 2:
+            raise RuntimeError(
+                "Hybrid NVFP4 prefill requires one length set per wrapper."
+            )
         if prefix_lens is None:
             num_accept_tokens = getattr(spec_info, "num_accept_tokens", None)
             prefix_lens = (
@@ -1710,6 +3111,14 @@ class FlashInferIndicesUpdaterPrefill:
             use_sliding_window_kv_pool = (
                 wrapper_id == 0 and self._swa_kv_pool is not None
             )
+            wrapper_custom_indices = (
+                custom_kv_indices[wrapper_id] if custom_kv_indices is not None else None
+            )
+            wrapper_custom_lens = (
+                custom_paged_kernel_lens[wrapper_id]
+                if custom_paged_kernel_lens is not None
+                else None
+            )
 
             self.call_begin_forward(
                 self.prefill_wrapper_ragged,
@@ -1728,6 +3137,9 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
+                custom_kv_indices=wrapper_custom_indices,
+                custom_paged_kernel_lens=wrapper_custom_lens,
+                wrapper_id=wrapper_id,
             )
 
     def _build_swa_prefix_custom_mask(
@@ -1786,7 +3198,15 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
+        custom_kv_indices: Optional[List[Optional[torch.Tensor]]] = None,
+        custom_paged_kernel_lens: Optional[List[torch.Tensor]] = None,
     ):
+        if custom_kv_indices is not None and any(
+            indices is not None for indices in custom_kv_indices
+        ):
+            raise RuntimeError(
+                "NVFP4 custom KV indices are not supported for cross-attention."
+            )
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # normal attention
@@ -1817,6 +3237,7 @@ class FlashInferIndicesUpdaterPrefill:
                 cross_attention_custom_mask=(
                     cross_attention_custom_mask if wrapper_id == 1 else None
                 ),
+                wrapper_id=wrapper_id,
             )
 
     def call_begin_forward(
@@ -1838,28 +3259,49 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         seq_lens_cpu: Optional[torch.Tensor] = None,
+        custom_kv_indices: Optional[torch.Tensor] = None,
+        custom_paged_kernel_lens: Optional[torch.Tensor] = None,
+        wrapper_id: int = 0,
     ):
+        wrapper_num_qo_heads = getattr(
+            self, "wrapper_num_qo_heads", [self.num_qo_heads]
+        )[wrapper_id]
+        wrapper_num_kv_heads = getattr(
+            self, "wrapper_num_kv_heads", [self.num_kv_heads]
+        )[wrapper_id]
+        wrapper_head_dim = getattr(self, "wrapper_head_dim", [self.head_dim])[
+            wrapper_id
+        ]
         bs = len(seq_lens)
         if spec_info is None:
             assert prefix_lens is not None
             assert len(seq_lens) == len(req_pool_indices)
             # Normal extend
-            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
+            # custom_kv_indices uses exact dq_paged_kernel_lens so FlashInfer causal
+            # offsets are based on real token counts, not page-aligned padding.
+            if custom_kv_indices is not None and custom_paged_kernel_lens is not None:
+                kv_indptr[1 : bs + 1] = torch.cumsum(custom_paged_kernel_lens, dim=0)
+            else:
+                kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
-            kv_indices = torch.empty(
-                paged_kernel_lens_sum + 256,
-                dtype=torch.int32,
-                device=req_pool_indices.device,
-            )
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                kv_start_idx,
-                kv_indices,
-                self.req_to_token.shape[1],
-            )
+
+            if custom_kv_indices is not None:
+                kv_indices = custom_kv_indices
+            else:
+                kv_indices = torch.empty(
+                    paged_kernel_lens_sum + 256,
+                    dtype=torch.int32,
+                    device=req_pool_indices.device,
+                )
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    kv_indptr,
+                    kv_start_idx,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
 
@@ -1885,19 +3327,24 @@ class FlashInferIndicesUpdaterPrefill:
                         self.req_to_token,
                     )
                 )
+            if custom_kv_indices is not None and custom_paged_kernel_lens is not None:
+                kv_indptr[0] = 0
+                kv_indptr[1 : bs + 1] = torch.cumsum(custom_paged_kernel_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                kv_indices = custom_kv_indices
 
         # extend part
         if use_ragged:
             wrapper_ragged.begin_forward(
                 qo_indptr,
                 qo_indptr,
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
+                wrapper_num_qo_heads,
+                wrapper_num_kv_heads,
+                wrapper_head_dim,
                 q_data_type=self.q_data_type,
             )
 
-        if use_sliding_window_kv_pool:
+        if use_sliding_window_kv_pool and custom_kv_indices is None:
             assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = (
@@ -1962,9 +3409,9 @@ class FlashInferIndicesUpdaterPrefill:
             kv_indptr,
             kv_indices,
             self.kv_last_page_len[:bs],
-            self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
+            wrapper_num_qo_heads,
+            wrapper_num_kv_heads,
+            wrapper_head_dim,
             1,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,

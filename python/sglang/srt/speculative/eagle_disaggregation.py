@@ -19,6 +19,7 @@ def build_eagle_disagg_draft_input(
     server_args: ServerArgs,
     last_tokens_tensor: torch.Tensor,
     future_map: FutureMap,
+    draft_input_cls: type[EagleDraftInput] = EagleDraftInput,
 ) -> EagleDraftInput:
     num_states = server_args.speculative_eagle_topk
     if server_args.enable_multi_layer_eagle:
@@ -51,7 +52,7 @@ def build_eagle_disagg_draft_input(
         [req.hidden_states_tensor for req in batch.reqs], dim=0
     ).to(batch.device)
 
-    spec_info = EagleDraftInput(
+    spec_info = draft_input_cls(
         topk_p=topk_p,
         topk_index=topk_index,
         hidden_states=hidden_states,

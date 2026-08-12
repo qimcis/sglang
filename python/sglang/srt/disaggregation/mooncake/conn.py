@@ -14,7 +14,12 @@ import numpy as np
 import numpy.typing as npt
 from prometheus_client import Counter
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import (
+    STATE_SCHEMA_VERSION,
+    KVArgs,
+    KVPoll,
+    StateType,
+)
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
@@ -123,6 +128,8 @@ class KVArgsRegisterInfo:
     # for mamba state different tp slice transfer
     dst_state_item_lens: List[List[int]]
     dst_state_dim_per_tensor: List[List[int]]
+    dst_state_schema_version: Optional[int]
+    dst_state_types: List[str]
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -144,6 +151,16 @@ class KVArgsRegisterInfo:
             ),
             dst_state_dim_per_tensor=(
                 unpack_int_lists(msg[11], "I") if len(msg) > 11 else []
+            ),
+            dst_state_schema_version=(
+                int(msg[14].decode("ascii"))
+                if len(msg) > 14 and msg[14] != b""
+                else None
+            ),
+            dst_state_types=(
+                msg[15].decode("ascii").split(",")
+                if len(msg) > 15 and msg[15] != b""
+                else []
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 12),
@@ -933,6 +950,31 @@ class MooncakeKVManager(CommonKVManager):
     ):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
+        if self.server_args.kv_cache_dtype == "nvfp4":
+            local_state_types = [state_type.value for state_type in state_types]
+            if target_rank_registration_info is None or (
+                target_rank_registration_info.dst_state_schema_version
+                != STATE_SCHEMA_VERSION
+                or target_rank_registration_info.dst_state_types != local_state_types
+            ):
+                logger.error(
+                    "NVFP4 PD state schema mismatch for session %s: "
+                    "prefill version/types=%s/%s, decode version/types=%s/%s",
+                    req.mooncake_session_id,
+                    STATE_SCHEMA_VERSION,
+                    local_state_types,
+                    (
+                        target_rank_registration_info.dst_state_schema_version
+                        if target_rank_registration_info is not None
+                        else None
+                    ),
+                    (
+                        target_rank_registration_info.dst_state_types
+                        if target_rank_registration_info is not None
+                        else None
+                    ),
+                )
+                return 1
         for i, st in enumerate(state_types):
             indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
@@ -1004,6 +1046,8 @@ class MooncakeKVManager(CommonKVManager):
                     )
             elif st in (
                 StateType.SWA,
+                StateType.KV_SCALE,
+                StateType.SWA_SCALE,
                 StateType.DSA,
                 StateType.SWA_RING,
                 StateType.C128_STATE,
@@ -1017,6 +1061,20 @@ class MooncakeKVManager(CommonKVManager):
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
+                if st in (StateType.KV_SCALE, StateType.SWA_SCALE) and (
+                    len(src_data_ptrs) != len(dst_data_ptrs)
+                    or src_item_lens != dst_item_lens
+                ):
+                    logger.error(
+                        "%s transfer layout mismatch: prefill buffers/items=%s/%s, "
+                        "decode buffers/items=%s/%s",
+                        st.upper(),
+                        len(src_data_ptrs),
+                        src_item_lens,
+                        len(dst_data_ptrs),
+                        dst_item_lens,
+                    )
+                    return 1
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
                 if (
@@ -1030,11 +1088,19 @@ class MooncakeKVManager(CommonKVManager):
                     # truncating silently misaligns rows and corrupts KV.
                     # Paged SWA/DSA tolerate a 1-page drift -> keep the
                     # lenient truncation below.
-                    if st in (StateType.SWA_RING, StateType.C128_STATE):
-                        raise RuntimeError(
-                            f"{st.upper()} state index length mismatch: "
-                            f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
+                    if st in (
+                        StateType.KV_SCALE,
+                        StateType.SWA_SCALE,
+                        StateType.SWA_RING,
+                        StateType.C128_STATE,
+                    ):
+                        logger.error(
+                            "%s state index length mismatch: prefill=%s, dst=%s",
+                            st.upper(),
+                            len(src_indices),
+                            len(dst_indices_local),
                         )
+                        return 1
                     logger.warning(
                         f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"
                     )
@@ -1376,8 +1442,9 @@ class MooncakeKVManager(CommonKVManager):
                             break
 
                         if kv_chunk.is_last_chunk:
+                            ret = 0
                             if kv_chunk.state_indices:
-                                self.maybe_send_extra(
+                                ret = self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
                                     executor,
@@ -1385,11 +1452,21 @@ class MooncakeKVManager(CommonKVManager):
                                 )
 
                             # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
+                            aux_ret = self.send_aux(
                                 req,
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
+                            ret = ret or aux_ret
+                            if ret != 0:
+                                with self.session_lock:
+                                    self.session_failures[req.mooncake_session_id] += 1
+                                    self.failed_sessions.add(req.mooncake_session_id)
+                                self.record_failure(
+                                    req.room,
+                                    "Failed to send state or auxiliary data to "
+                                    f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
+                                )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
@@ -1874,6 +1951,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         packed_state_dim_per_tensor,
                         packed_staging_base_ptr,
                         staging_total_size_str,
+                        str(STATE_SCHEMA_VERSION).encode("ascii"),
+                        ",".join(
+                            state_type.value
+                            for state_type in self.kv_mgr.kv_args.state_types
+                        ).encode("ascii"),
                     ]
                 )
 

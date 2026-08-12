@@ -57,6 +57,24 @@ def get_dsv4_c128_state_indices(
     return np.array([page], dtype=np.int32)
 
 
+def get_swa_state_page_indices(
+    req_to_token: torch.Tensor,
+    req_pool_idx: int,
+    seq_len: int,
+    window_size: int,
+    page_size: int,
+    translate_loc_from_full_to_swa,
+) -> np.ndarray:
+    """Return ordered physical SWA pages for the page-aligned active window."""
+    from sglang.srt.mem_cache.common import kv_to_page_indices
+
+    window_start = max(0, seq_len - window_size)
+    window_start = (window_start // page_size) * page_size
+    full_indices = req_to_token[req_pool_idx, window_start:seq_len]
+    swa_indices = translate_loc_from_full_to_swa(full_indices)
+    return kv_to_page_indices(swa_indices.cpu().numpy(), page_size)
+
+
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
@@ -680,6 +698,24 @@ def setup_state_kv_args(
     kv_args.state_item_lens = []
     kv_args.state_dim_per_tensor = []
 
+    kv_quant_method = (
+        token_to_kv_pool.get_kv_cache_quant_method()
+        if hasattr(token_to_kv_pool, "get_kv_cache_quant_method")
+        else None
+    )
+    transfer_nvfp4_scales = getattr(kv_quant_method, "name", None) == "nvfp4"
+
+    if transfer_nvfp4_scales and hasattr(token_to_kv_pool, "get_scale_buf_infos"):
+        scale_ptrs, scale_lens, scale_item_lens = token_to_kv_pool.get_scale_buf_infos()
+        if scale_ptrs:
+            append_state_component(
+                kv_args,
+                StateType.KV_SCALE,
+                scale_ptrs,
+                scale_lens,
+                scale_item_lens,
+            )
+
     if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         if token_to_kv_pool.index_kv_pool is not None:
             raise NotImplementedError(
@@ -698,6 +734,20 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
             )
+            if transfer_nvfp4_scales and hasattr(
+                token_to_kv_pool, "get_state_scale_buf_infos"
+            ):
+                scale_ptrs, scale_lens, scale_item_lens = (
+                    token_to_kv_pool.get_state_scale_buf_infos()
+                )
+                if scale_ptrs:
+                    append_state_component(
+                        kv_args,
+                        StateType.SWA_SCALE,
+                        scale_ptrs,
+                        scale_lens,
+                        scale_item_lens,
+                    )
             # unified_kv: the SWA ring lives in the unified buffers (no separate
             # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.
             if getattr(token_to_kv_pool, "_unified_kv", False) and hasattr(

@@ -561,10 +561,21 @@ class ServerArgs:
             help=(
                 'Data type for kv cache storage. "auto" will use model data type. '
                 '"bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and '
-                '"fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only '
-                "mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+"
+                '"fp8_e4m3" are supported for CUDA 11.8+. "nvfp4" selects '
+                'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
+                "selects the MX-style block-size-16 FP4 E2M1 KV cache "
+                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
             ),
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
+            choices=[
+                "auto",
+                "fp8_e5m2",
+                "fp8_e4m3",
+                "bf16",
+                "bfloat16",
+                "nvfp4",
+                "fp4_mx_block16",
+                "fp4_e2m1",
+            ],
             resolvable=True,
         ),
     ] = "auto"
@@ -2770,6 +2781,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
+        self._handle_kv4_speculative_compatibility()
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
         self._validate_cutedsl_a2a_token_budget()
@@ -4133,13 +4145,24 @@ class ServerArgs:
             # (arg_groups/overrides.py: _gemma4_overrides).
             prefill_backend, decode_backend = self._resolved_attention_backends()
             accepted_backends = ("trtllm_mha", "triton", "ascend", "intel_xpu")
+            accepted_gemma4_backends = accepted_backends + (
+                ("flashinfer",) if self.kv_cache_dtype == "nvfp4" else ()
+            )
             assert (
-                prefill_backend in accepted_backends
-                and decode_backend in accepted_backends
+                prefill_backend in accepted_gemma4_backends
+                and decode_backend in accepted_gemma4_backends
             ), (
-                "Gemma4 only supports trtllm_mha, triton, or intel_xpu attention backend, "
+                "Gemma4 only supports flashinfer for NVFP4, and "
+                "trtllm_mha, triton, ascend, or intel_xpu attention backends otherwise; "
                 f"got prefill={prefill_backend}, decode={decode_backend}"
             )
+            if (
+                self.kv_cache_dtype == "nvfp4"
+                and getattr(hf_config.text_config, "num_kv_shared_layers", 0) > 0
+            ):
+                raise ValueError(
+                    "--kv-cache-dtype=nvfp4 does not yet support Gemma4 KV-shared layers."
+                )
 
             # The quantization/moe_runner_backend resolution moved to the override
             # registry (arg_groups/overrides.py: _gemma4_overrides).
@@ -4494,7 +4517,7 @@ class ServerArgs:
         """Check FP4 KV cache compatibility with the attention backend"""
         from sglang.srt.arg_groups.overrides import resolved_view
 
-        if self.kv_cache_dtype != "fp4_e2m1":
+        if self.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16", "fp4_e2m1"):
             return
 
         use_mla_backend = self.use_mla_backend()
@@ -4502,6 +4525,57 @@ class ServerArgs:
         attention_backend = resolved_view(self).attention_backend
 
         if is_cuda():
+            if self.kv_cache_dtype == "nvfp4" and use_mla_backend:
+                raise ValueError(
+                    "--kv-cache-dtype=nvfp4 is currently supported only for MHA models. "
+                    "Use --kv-cache-dtype=fp4_mx_block16 for MLA models."
+                )
+            if self.kv_cache_dtype == "nvfp4" and not (
+                is_sm100_supported() or is_sm120_supported()
+            ):
+                raise RuntimeError(
+                    "--kv-cache-dtype=nvfp4 requires Blackwell SM100 or SM120. "
+                    "Use --kv-cache-dtype=fp4_mx_block16 for the block-size-16 FP4 recipe."
+                )
+            if self.kv_cache_dtype == "nvfp4" and self.disaggregation_mode != "null":
+                if self.disaggregation_transfer_backend != "mooncake":
+                    raise ValueError(
+                        "NVFP4 PD disaggregation currently supports only the "
+                        "Mooncake transfer backend."
+                    )
+                if self.tp_size != 1 or self.attn_cp_size != 1 or self.dcp_size != 1:
+                    raise ValueError(
+                        "NVFP4 PD disaggregation is qualified only for TP1 "
+                        "without attention/decode context parallelism."
+                    )
+                if self.pp_size != 1:
+                    raise ValueError(
+                        "NVFP4 PD disaggregation is qualified only for PP1."
+                    )
+                if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+                    raise ValueError(
+                        "NVFP4 PD disaggregation does not support the staging "
+                        "buffer path."
+                    )
+            if self.kv_cache_dtype == "nvfp4" and not use_mla_backend:
+                if prefill_backend != "flashinfer" or decode_backend not in (
+                    "flashinfer",
+                    "trtllm_mha",
+                ):
+                    raise ValueError(
+                        "--kv-cache-dtype=nvfp4 requires "
+                        "--prefill-attention-backend=flashinfer and "
+                        "--decode-attention-backend=flashinfer or trtllm_mha "
+                        "for MHA models."
+                    )
+                if (
+                    self.cuda_graph_config is not None
+                    and self.cuda_graph_config.prefill.backend == Backend.FULL
+                ):
+                    raise ValueError(
+                        "--kv-cache-dtype=nvfp4 does not yet support full prefill CUDA graphs."
+                    )
+                return
             if (
                 prefill_backend != decode_backend and prefill_backend != "fa4"
             ):  # Take care of prefill=fa4 later
@@ -4536,9 +4610,9 @@ class ServerArgs:
                     if use_mla_backend:  # !FA4 + MLA
                         KV4_ATTENTION_MLA_BACKEND_CHOICES = [
                             "cutlass_mla",
+                            "flashmla",
                             "flashinfer",
                             "trtllm_mla",
-                            "flashmla",
                         ]
                         assert attention_backend in KV4_ATTENTION_MLA_BACKEND_CHOICES, (
                             f"KV4 MLA expects attention_backend to be one of "
@@ -4557,6 +4631,19 @@ class ServerArgs:
                         )
         else:
             raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
+
+    def _handle_kv4_speculative_compatibility(self):
+        """Allow only speculative decoding that reuses the target KV cache."""
+        if (
+            self.kv_cache_dtype == "nvfp4"
+            and is_cuda()
+            and not self.use_mla_backend()
+            and self.speculative_algorithm not in (None, "FROZEN_KV_MTP")
+        ):
+            raise ValueError(
+                "--kv-cache-dtype=nvfp4 supports only FROZEN_KV_MTP "
+                "speculative decoding."
+            )
 
     def _handle_page_size(self):
         # Moved to the resolution pipeline (arg_groups/overrides.py:
@@ -5261,11 +5348,11 @@ class ServerArgs:
                 "Other prefill-only workloads may be supported in a future change once "
                 "their attention paths stop reading or writing the paged KV cache."
             )
-        if self.kv_cache_dtype == "fp4_e2m1":
+        if self.kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
             raise ValueError(
                 "--prefill-only-disable-kv-cache does not currently support "
-                "--kv-cache-dtype=fp4_e2m1 because the FP4 pool uses a separate "
-                "allocation path."
+                "--kv-cache-dtype=nvfp4 or --kv-cache-dtype=fp4_mx_block16 because "
+                "the FP4 pool uses a separate allocation path."
             )
 
         # Structural preconditions for the FA backend's fa_skip_kv_cache path,

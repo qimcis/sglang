@@ -16,6 +16,7 @@ import zmq
 from aiohttp import web
 
 from sglang.srt.disaggregation.base.conn import (
+    STATE_SCHEMA_VERSION,
     BaseKVBootstrapServer,
     BaseKVManager,
     BaseKVReceiver,
@@ -75,6 +76,8 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
+    state_schema_version: Optional[int] = None
+    state_types: Optional[List[str]] = None
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -94,6 +97,16 @@ class PrefillServerInfo:
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
+        self.state_schema_version = (
+            int(self.state_schema_version)
+            if self.state_schema_version is not None
+            else None
+        )
+        self.state_types = (
+            [str(state_type) for state_type in self.state_types]
+            if self.state_types is not None
+            else None
+        )
 
 
 @dataclasses.dataclass
@@ -116,7 +129,7 @@ class CommonKVManager(BaseKVManager):
     ):
         self.kv_args = args
         self.kv_item_lens_sum = sum(args.kv_item_lens)
-        self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
+        self.state_item_lens_sums = [sum(comp) for comp in args.state_item_lens]
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
@@ -273,6 +286,37 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
+        if self.server_args.kv_cache_dtype == "nvfp4":
+            if self.attn_tp_size != 1 or info.attn_tp_size != 1:
+                raise RuntimeError(
+                    "NVFP4 PD disaggregation is qualified only for equal TP1 "
+                    f"endpoints, got prefill TP{info.attn_tp_size} and decode "
+                    f"TP{self.attn_tp_size}."
+                )
+            if (
+                self.attn_cp_size != 1
+                or info.attn_cp_size != 1
+                or self.pp_size != 1
+                or info.pp_size != 1
+            ):
+                raise RuntimeError(
+                    "NVFP4 PD disaggregation requires CP1/PP1 endpoints, got "
+                    f"prefill CP{info.attn_cp_size}/PP{info.pp_size} and decode "
+                    f"CP{self.attn_cp_size}/PP{self.pp_size}."
+                )
+            local_state_types = [
+                state_type.value for state_type in self.kv_args.state_types
+            ]
+            if (
+                info.state_schema_version != STATE_SCHEMA_VERSION
+                or info.state_types != local_state_types
+            ):
+                raise RuntimeError(
+                    "NVFP4 PD state schema mismatch: "
+                    f"prefill version/types={info.state_schema_version}/{info.state_types}, "
+                    f"decode version/types={STATE_SCHEMA_VERSION}/{local_state_types}."
+                )
+
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
@@ -419,6 +463,10 @@ class CommonKVManager(BaseKVManager):
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
+            "state_schema_version": STATE_SCHEMA_VERSION,
+            "state_types": [
+                state_type.value for state_type in self.kv_args.state_types
+            ],
             "load_balance_method": self.server_args.load_balance_method,
         }
 
@@ -780,7 +828,7 @@ class CommonKVSender(BaseKVSender):
         self.conclude_state: Optional[KVPoll] = None
         self._transfer_metric = KVTransferMetric()
         self._transfer_num_kv_indices = 0
-        self._transfer_num_state_indices = 0
+        self._transfer_num_state_indices = [0 for _ in self.kv_mgr.state_item_lens_sums]
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None
@@ -844,8 +892,12 @@ class CommonKVSender(BaseKVSender):
 
     def get_transfer_metric(self) -> KVTransferMetric:
         total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
-        total_bytes += (
-            self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
+        total_bytes += sum(
+            count * item_lens_sum
+            for count, item_lens_sum in zip(
+                self._transfer_num_state_indices,
+                self.kv_mgr.state_item_lens_sums,
+            )
         )
         self._transfer_metric.transfer_total_bytes = total_bytes
         return self._transfer_metric
@@ -857,9 +909,13 @@ class CommonKVSender(BaseKVSender):
     ):
         self._transfer_num_kv_indices += len(kv_indices)
         if state_indices:
-            for component_indices in state_indices:
+            if len(self._transfer_num_state_indices) < len(state_indices):
+                self._transfer_num_state_indices.extend(
+                    [0] * (len(state_indices) - len(self._transfer_num_state_indices))
+                )
+            for i, component_indices in enumerate(state_indices):
                 if component_indices is not None:
-                    self._transfer_num_state_indices += len(component_indices)
+                    self._transfer_num_state_indices[i] += len(component_indices)
 
     def _prepare_send_indices(
         self,
@@ -1230,6 +1286,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dp_size = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
+        self.state_schema_version: Optional[int] = None
+        self.state_types: Optional[List[str]] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
@@ -1268,7 +1326,15 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.app.router.add_get("/health", self._handle_health_check)
 
     async def _handle_health_check(self, request):
-        return web.Response(text="OK", status=200)
+        if self._is_ready():
+            return web.Response(text="OK", status=200)
+        return web.Response(
+            text=(
+                "Prefill server not fully registered yet "
+                f"({self._registered_count} workers registered)."
+            ),
+            status=503,
+        )
 
     async def _handle_route(self, request: web.Request):
         method = request.method
@@ -1297,6 +1363,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        state_schema_version = data.get("state_schema_version")
+        state_types = data.get("state_types")
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1316,6 +1384,39 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
 
+        if kv_cache_dtype == "nvfp4" and (
+            state_schema_version != STATE_SCHEMA_VERSION
+            or not isinstance(state_types, list)
+        ):
+            return web.Response(
+                text="NVFP4 prefill worker is missing the required state schema.",
+                status=400,
+            )
+        normalized_state_schema_version = (
+            int(state_schema_version) if state_schema_version is not None else None
+        )
+        normalized_state_types = (
+            [str(state_type) for state_type in state_types]
+            if state_types is not None
+            else None
+        )
+        if (
+            self.state_schema_version is not None
+            and normalized_state_schema_version is not None
+            and self.state_schema_version != normalized_state_schema_version
+        ) or (
+            self.state_types is not None
+            and normalized_state_types is not None
+            and self.state_types != normalized_state_types
+        ):
+            return web.Response(
+                text="State schema mismatch across prefill workers.", status=400
+            )
+        if self.state_schema_version is None:
+            self.state_schema_version = normalized_state_schema_version
+        if self.state_types is None:
+            self.state_types = normalized_state_types
+
         if self.follow_bootstrap_room is None:
             load_balance_method = data.get(
                 "load_balance_method", "follow_bootstrap_room"
@@ -1333,12 +1434,14 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             cp_group_table = dp_group_table.setdefault(attn_cp_rank, {})
             tp_group_table = cp_group_table.setdefault(attn_tp_rank, {})
 
+            is_new_rank = pp_rank not in tp_group_table
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
             )
 
-            self._registered_count += 1
+            if is_new_rank:
+                self._registered_count += 1
 
         expected = self.dp_size * self.attn_cp_size * self.attn_tp_size * self.pp_size
         logger.debug(
@@ -1385,8 +1488,16 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
+                state_schema_version=self.state_schema_version,
+                state_types=self.state_types,
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
+            response = dataclasses.asdict(info)
+            if self.kv_cache_dtype != "nvfp4":
+                # Preserve compatibility with peers whose PrefillServerInfo
+                # predates state-schema negotiation.
+                response.pop("state_schema_version")
+                response.pop("state_types")
+            return web.json_response(response, status=200)
 
         if not self._is_ready():
             return web.Response(
