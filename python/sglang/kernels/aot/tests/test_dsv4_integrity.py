@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.dsv4_kv_integrity import (
     DSV4Component,
     DSV4ComponentDescriptor,
     DSV4IntegrityDomain,
+    DSV4IntegrityError,
     DSV4KVIntegrityManager,
     DSV4TransferGroup,
 )
@@ -385,3 +386,104 @@ def test_request_table_write_is_trusted_but_first_consumer_mapping_is_not():
     )
     assert sanitized.item() == 0
     assert manager.failure_status[1].item() & (1 << 4)
+
+
+def _complete_manager():
+    specs = (
+        (DSV4Component.SWA_KV, 0, DSV4TransferGroup.SWA, 584),
+        (DSV4Component.C4_ATTENTION_KV, 4, DSV4TransferGroup.KV, 584),
+        (DSV4Component.C128_ATTENTION_KV, 128, DSV4TransferGroup.KV, 584),
+        (DSV4Component.C4_INDEXER_KV, 4, DSV4TransferGroup.KV, 132),
+        (DSV4Component.C4_ATTENTION_STATE, 4, DSV4TransferGroup.SWA, 256),
+        (DSV4Component.C4_INDEXER_STATE, 4, DSV4TransferGroup.SWA, 256),
+        (
+            DSV4Component.C128_ATTENTION_STATE,
+            128,
+            DSV4TransferGroup.C128_STATE,
+            256,
+        ),
+    )
+    descriptors = []
+    for component, ratio, group, item_nbytes in specs:
+        buffer = torch.arange(
+            8 * item_nbytes, dtype=torch.uint8, device="cuda"
+        ).reshape(8, item_nbytes)
+        descriptors.append(
+            DSV4ComponentDescriptor(
+                component,
+                0,
+                ratio,
+                group,
+                1,
+                item_nbytes,
+                8,
+                buffer,
+            )
+        )
+
+    manager = DSV4KVIntegrityManager(
+        descriptors,
+        request_capacity=4,
+        max_context_len=4,
+        full_page_size=1,
+        swa_page_size=1,
+    )
+    manager.register_requests([1], [1])
+    page = torch.tensor([[1]], dtype=torch.int32, device="cuda")
+    logical = torch.tensor([[0]], dtype=torch.int64, device="cuda")
+    request = torch.tensor([1], dtype=torch.int64, device="cuda")
+    for domain in (DSV4IntegrityDomain.FULL, DSV4IntegrityDomain.SWA):
+        manager.bump_allocations(domain, page)
+        assert (
+            manager.bind_pages(domain, page, logical, request, slot_page_size=1).item()
+            == 1
+        )
+    for descriptor in descriptors:
+        manager.refresh_pages(descriptor, page)
+    return manager, descriptors, page, logical, request
+
+
+@pytest.mark.parametrize("component", list(DSV4Component))
+def test_every_dsv4_component_bit_flip_fails_closed(component):
+    manager, descriptors, page, logical, request = _complete_manager()
+    descriptor = next(d for d in descriptors if d.component == component)
+
+    assert (
+        manager.validate_pages(
+            descriptor, page, logical, request, slot_page_size=1
+        ).item()
+        == 1
+    )
+    descriptor.buffer[1, 0] ^= 1
+    assert (
+        manager.validate_pages(
+            descriptor, page, logical, request, slot_page_size=1
+        ).item()
+        == 0
+    )
+    assert manager.failure_status[1].item() & (1 << 2)
+    with pytest.raises(DSV4IntegrityError, match="rejected KV state"):
+        manager.assert_clean()
+
+
+def test_bit_flip_during_cuda_graph_replay_fails_closed():
+    state = _state()
+    slots, logical, reqs, _ = _bind(state)
+    assert _validate(state, slots, logical, reqs).item() == 1
+    state[-1].zero_()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        protected_slots = _validate(state, slots, logical, reqs)
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert protected_slots.item() == 1
+
+    state[0][1, 0] ^= 1
+    state[-1].zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert protected_slots.item() == 0
+    assert state[-1][1].item() & (1 << 2)

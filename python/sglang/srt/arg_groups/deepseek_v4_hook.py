@@ -277,10 +277,10 @@ def validate_deepseek_v4_kv_integrity(server_args: ServerArgs) -> None:
             raise ValueError(
                 "protected DSV4 prefill requires --moe-a2a-backend megamoe"
             )
-    elif cfg.moe_runner_backend != "flashinfer_trtllm_routed":
+    elif cfg.moe_runner_backend != "flashinfer_mxfp4":
         raise ValueError(
-            "protected DSV4 NVFP4 decode requires "
-            "--moe-runner-backend flashinfer_trtllm_routed"
+            "protected DSV4 Flash decode requires "
+            "--moe-runner-backend flashinfer_mxfp4"
         )
 
     logger.info("DeepSeek-V4 KV integrity enabled for the audited SM100 Mooncake path")
