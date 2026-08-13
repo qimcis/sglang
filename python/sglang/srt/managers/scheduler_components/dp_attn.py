@@ -177,7 +177,7 @@ class MLPSyncBatchInfo:
                 dtype=tp_active_ranks.dtype,
                 device=tp_active_ranks.device,
             )
-        tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
+        tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor.clone()
 
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
