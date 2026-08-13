@@ -129,11 +129,12 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 except ValueError as e:
                     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
+                    error_message = f"Grammar accept_token failed for req {req.rid} with token {req.output_ids[-1]}: {e}"
+                    logger.error("%s", error_message)
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
                     # Use to_finish (not finished_reason) so that process_batch_result_prebuilt
                     # handles the release via update_finish_state -> release_kv_cache in one place.
-                    error_message = f"Grammar accept_token failed for req {req.rid} with token {req.output_ids[-1]}: {e}"
                     req.to_finish = FINISH_ABORT(
                         error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )

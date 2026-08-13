@@ -2644,7 +2644,25 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
-                req.time_stats.set_decode_prealloc_queue_entry_time()
+                # Record decode pod KV pool state at request admission for
+                # weight gap reconstruction (see decode-weight-tracing spec).
+                # Attributes are placed on the decode_prepare trace span
+                # (not the root span) because root_span is None in the
+                # scheduler process — OTel Spans cannot be pickled across
+                # the tokenizer→scheduler IPC boundary.
+                pool_attrs = None
+                if req.time_stats.trace_ctx.tracing_enable:
+                    pool = self.pool_stats_observer.get_pool_stats()
+                    pool_attrs = {
+                        "kv_pool.used_tokens": pool.full_num_used,
+                        "kv_pool.available_tokens": pool.full_available_size,
+                        "kv_pool.num_running": (
+                            len(self.running_batch.reqs) if self.running_batch else 0
+                        ),
+                    }
+                req.time_stats.set_decode_prealloc_queue_entry_time(
+                    trace_attrs=pool_attrs,
+                )
             else:
                 req.time_stats.set_retract_time()
         else:

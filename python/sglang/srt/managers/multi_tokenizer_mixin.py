@@ -399,12 +399,23 @@ class MultiHttpWorkerDetokenizerMixin:
     def multi_http_worker_event_loop(self: DetokenizerManager):
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
+        import time
+
         # Watchdog wiring mirrors DetokenizerManager.event_loop: the watchdog is
         # paused while waiting for input and fed once per processed message.
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = sock_recv(self.recv_from_scheduler)
+            t0 = time.perf_counter()
             output = self._request_dispatcher(recv_obj)
+            if getattr(self, "_batches_total", None) is not None:
+                self._batches_total.inc()
+                if hasattr(recv_obj, "rids"):
+                    self._batch_size.observe(len(recv_obj.rids))
+                else:
+                    self._batch_size.observe(1)
+                self._decode_seconds.observe(time.perf_counter() - t0)
+
             if output is not None:
                 # Fan out the output back to the originating tokenizer worker(s).
                 # In multi-detokenizer mode the upstream MultiDetokenizerRouter may

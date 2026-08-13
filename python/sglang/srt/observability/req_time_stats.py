@@ -986,15 +986,15 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         )
         self.trace_slice(stage, self.prefill_transfer_queue_entry_time, ts)
 
-    def set_decode_prealloc_queue_entry_time(self, ts=None):
+    def set_decode_prealloc_queue_entry_time(self, ts=None, trace_attrs=None):
         ts = ts or time.perf_counter()
         self.decode_prealloc_queue_entry_time = ts
 
         stage = RequestStage.DECODE_PREPARE
         self.observe_per_stage_req_latency(stage, ts - self.scheduler_recv_time)
-        self.trace_slice(stage, self.scheduler_recv_time, ts)
+        self.trace_slice(stage, self.scheduler_recv_time, ts, attrs=trace_attrs)
 
-    def set_decode_transfer_queue_entry_time(self, ts=None):
+    def set_decode_transfer_queue_entry_time(self, ts=None, trace_attrs=None):
         ts = ts or time.perf_counter()
         self.decode_transfer_queue_entry_time = ts
 
@@ -1002,7 +1002,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.observe_per_stage_req_latency(
             stage, ts - self.decode_prealloc_queue_entry_time
         )
-        self.trace_slice(stage, self.decode_prealloc_queue_entry_time, ts)
+        self.trace_slice(
+            stage, self.decode_prealloc_queue_entry_time, ts, attrs=trace_attrs
+        )
 
         if self.enable_metrics and self.bootstrap_done_time > 0:
             bootstrap_ms = (

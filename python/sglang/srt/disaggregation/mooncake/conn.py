@@ -1527,6 +1527,7 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         while True:
+            kv_chunk = None
             try:
                 kv_chunk: TransferKVChunk = queue.get()
                 if self.enable_trace:
@@ -1828,10 +1829,57 @@ class MooncakeKVManager(CommonKVManager):
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
             except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
-                raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+                room = kv_chunk.room if kv_chunk is not None else None
+                logger.exception(
+                    "Transfer worker failed for room=%s on bootstrap_port=%s; "
+                    "failing the request and continuing",
+                    room,
+                    self.bootstrap_port,
                 )
+                if room is None:
+                    continue
+
+                transfer_infos = list(self.transfer_infos.get(room, {}).values())
+                try:
+                    try:
+                        self.record_failure(
+                            room,
+                            f"Prefill transfer worker raised an unexpected exception: {e}",
+                        )
+                        self.update_status(room, KVPoll.Failed)
+                    except Exception:
+                        logger.exception(
+                            "Failed to record transfer worker failure for room=%s", room
+                        )
+                    prefill_unique_rank = (
+                        self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+                        + self.pp_rank * self.attn_cp_size
+                        + self.attn_cp_rank
+                    )
+                    for failed_req in transfer_infos:
+                        if failed_req.is_dummy:
+                            continue
+                        try:
+                            self.sync_status_to_decode_endpoint(
+                                failed_req.endpoint,
+                                failed_req.dst_port,
+                                failed_req.room,
+                                KVPoll.Failed,
+                                prefill_unique_rank,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to notify decode of transfer failure for room=%s",
+                                room,
+                            )
+                finally:
+                    self.transfer_infos.pop(room, None)
+                    self.req_to_decode_prefix_len.pop(room, None)
+                    if self.enable_staging:
+                        for key in list(self._staging_ctx.prefetch_requested):
+                            if key[0] == room:
+                                self._staging_ctx.prefetch_requested.discard(key)
+                        self._staging_ctx.prefetched_rooms.discard(room)
 
     def start_prefill_thread(self):
         def bootstrap_thread():

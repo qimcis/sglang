@@ -1298,7 +1298,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
-            decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+            decode_req.req.time_stats.set_decode_transfer_queue_entry_time(
+                trace_attrs={
+                    "kv.allocated_tokens": int(decode_req.req.kv.kv_allocated_len),
+                },
+            )
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -2156,6 +2160,15 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
             self.process_decode_queue()
 
+            need_grammar_sync = (
+                self.last_batch
+                and not self.last_batch.spec_algorithm.is_none()
+                and self.last_batch.grammar_needs_sync()
+                and len(self.result_queue) > 0
+            )
+            if need_grammar_sync:
+                pop_and_process()
+
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
                 running_batch=self.running_batch
@@ -2184,7 +2197,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and not need_grammar_sync:
                     pop_and_process()
             elif batch is None:
                 self.on_idle()

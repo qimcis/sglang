@@ -703,9 +703,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
             start_cpu_monitor_thread("tokenizer")
+            from prometheus_client import Gauge
 
-        if self.server_args.gc_warning_threshold_secs > 0.0:
-            configure_gc_warning(self.server_args.gc_warning_threshold_secs)
+            self._last_receive_gauge = Gauge(
+                name="sglang:tokenizer_last_receive_tstamp_seconds",
+                documentation="Unix timestamp of the most recent message from the detokenizer. PromQL: time() - this gauge = seconds since pipeline last produced output.",
+                multiprocess_mode="mostrecent",
+            )
+
+        if (
+            self.server_args.gc_warning_threshold_secs > 0.0
+            or self.server_args.enable_metrics
+        ):
+            configure_gc_warning(
+                warn_threshold_secs=self.server_args.gc_warning_threshold_secs,
+                enable_metrics=self.server_args.enable_metrics,
+            )
         self.soft_watchdog = Watchdog.create(
             debug_name="TokenizerManager",
             watchdog_timeout=self.server_args.soft_watchdog_timeout,
@@ -2183,6 +2196,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = real_time()
+            if hasattr(self, "_last_receive_gauge"):
+                self._last_receive_gauge.set(self.last_receive_tstamp)
             self.soft_watchdog.feed()
 
     async def _handle_batch_output(
@@ -2726,7 +2741,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # We should batch all top-k tokens in all positions.
         ret = []
         for i in range(len(token_logprobs_val)):
-            if token_logprobs_val[i]:
+            if token_logprobs_val[i] is not None:
                 ret.append(
                     self.detokenize_logprob_tokens(
                         token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
