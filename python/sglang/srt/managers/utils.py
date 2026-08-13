@@ -55,6 +55,7 @@ class GenerationBatchResult:
     accept_length_per_req_cpu: Optional[List[int]] = None
     dllm_algo_state: Optional[List[Any]] = None
     can_run_cuda_graph: bool = False
+    kv_integrity_status: Optional[torch.Tensor] = None
 
     # PP skip output comm: True when output send/recv was skipped and
     # next_token_ids are placeholder zeros. Used by process_batch_result_prefill
@@ -149,6 +150,8 @@ class GenerationBatchResult:
                 self.logits_output.hidden_states
             )
         self.next_token_ids = _async_d2h(self.next_token_ids)
+        if self.kv_integrity_status is not None:
+            self.kv_integrity_status = _async_d2h(self.kv_integrity_status)
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)

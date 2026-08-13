@@ -480,6 +480,53 @@ void segment_packbits(
 /*
  * From csrc/kvcacheio
  */
+at::Tensor dsv4_page_digests(const at::Tensor buffer, const at::Tensor page_indices, int64_t seed);
+
+void dsv4_bind_pages(
+    const at::Tensor slots,
+    const at::Tensor logical_pages,
+    const at::Tensor request_indices,
+    const at::Tensor generations,
+    at::Tensor expected_pages,
+    at::Tensor expected_generations,
+    at::Tensor expected_valid,
+    at::Tensor output,
+    at::Tensor failure_status,
+    int64_t slot_page_size,
+    int64_t invalid_value,
+    bool install_missing);
+
+void dsv4_validate_pages(
+    const at::Tensor buffer,
+    const at::Tensor slots,
+    const at::Tensor logical_pages,
+    const at::Tensor request_indices,
+    const at::Tensor digests,
+    const at::Tensor component_valid,
+    at::Tensor validation_state,
+    at::Tensor validation_failure,
+    at::Tensor validation_pages,
+    at::Tensor validation_count,
+    const at::Tensor generations,
+    const at::Tensor expected_pages,
+    const at::Tensor expected_generations,
+    const at::Tensor expected_valid,
+    at::Tensor output,
+    at::Tensor failure_status,
+    int64_t seed,
+    int64_t slot_page_size,
+    int64_t invalid_value,
+    bool allow_missing_digest);
+
+void dsv4_refresh_slots(
+    const at::Tensor buffer,
+    at::Tensor digests,
+    at::Tensor valid,
+    at::Tensor dirty,
+    const at::Tensor slots,
+    int64_t seed,
+    int64_t slot_page_size);
+
 void transfer_kv_per_layer(
     const at::Tensor src_k,
     at::Tensor dst_k,

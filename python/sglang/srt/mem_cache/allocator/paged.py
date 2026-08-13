@@ -124,6 +124,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+        self.integrity_allocation_callback = None
 
         # Pre-warm the torch.unique HIP kernel used in free(). When a request
         # finishes with a prompt that already exists in the radix tree (e.g.
@@ -161,6 +162,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         out_pages = self.free_pages[:num_pages]
         self.free_pages = self.free_pages[num_pages:]
+        if self.integrity_allocation_callback is not None and out_pages.numel():
+            self.integrity_allocation_callback(out_pages)
 
         out_indices = (
             out_pages[:, None] * self.page_size
@@ -202,6 +205,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
+        allocated_pages = self.free_pages[:num_new_pages]
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
@@ -220,6 +224,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             assert len(torch.unique(out_indices)) == len(out_indices)
 
         self.free_pages = self.free_pages[num_new_pages:]
+        if self.integrity_allocation_callback is not None and allocated_pages.numel():
+            self.integrity_allocation_callback(allocated_pages)
         return out_indices
 
     def alloc_decode(
@@ -248,6 +254,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
+        allocated_pages = self.free_pages[:num_new_pages]
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
         alloc_decode_kernel[(bs,)](
             seq_lens,
@@ -262,6 +269,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             assert len(torch.unique(out_indices)) == len(out_indices)
 
         self.free_pages = self.free_pages[num_new_pages:]
+        if self.integrity_allocation_callback is not None and allocated_pages.numel():
+            self.integrity_allocation_callback(allocated_pages)
         return out_indices
 
     def free(self, free_index: torch.Tensor):

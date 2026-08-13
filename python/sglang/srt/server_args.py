@@ -3273,6 +3273,11 @@ class ServerArgs:
     kv_canary_sweep_interval: A[
         int, "Every N forward steps, run a full-pool sweep.", NS("observability")
     ] = 0
+    enable_dsv4_kv_integrity: A[
+        bool,
+        "Enable fail-closed DeepSeek-V4 KV and compression-state integrity protection.",
+        NS("observability"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Dynamic batch tokenizer
@@ -5047,11 +5052,23 @@ class ServerArgs:
 
         self.uses_mamba_radix_cache = False
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
+            if self.enable_dsv4_kv_integrity:
+                raise ValueError(
+                    "--enable-dsv4-kv-integrity requires a locally resolved "
+                    "DeepseekV4ForCausalLM model configuration"
+                )
             self._resolved_overrides = []
             return
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+
+        if self.enable_dsv4_kv_integrity and model_arch != "DeepseekV4ForCausalLM":
+            raise ValueError(
+                "--enable-dsv4-kv-integrity is only supported for "
+                "DeepseekV4ForCausalLM, "
+                f"got {model_arch}"
+            )
 
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
             raise ValueError(
@@ -5289,11 +5306,13 @@ class ServerArgs:
         ]:
             from sglang.srt.arg_groups.deepseek_v4_hook import (
                 validate_deepseek_v4_cp,
+                validate_deepseek_v4_kv_integrity,
                 validate_deepseek_v4_mega_moe_token_budget,
             )
 
             validate_deepseek_v4_cp(self)
             validate_deepseek_v4_mega_moe_token_budget(self)
+            validate_deepseek_v4_kv_integrity(self)
 
             # The SM120 marlin fallback moved to the resolution pipeline
             # (arg_groups/overrides.py: _deepseek_v4_sm120_moe), invoked here

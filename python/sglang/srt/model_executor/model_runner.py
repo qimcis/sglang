@@ -257,6 +257,7 @@ class ModelRunnerOutput:
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
+    kv_integrity_status: Optional[torch.Tensor] = None
 
 
 class ModelRunner:
@@ -1560,7 +1561,13 @@ class ModelRunner:
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
-                return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+                return ModelRunnerOutput(
+                    logits_output=ret,
+                    can_run_graph=can_run_graph,
+                    kv_integrity_status=self._snapshot_kv_integrity_status(
+                        forward_batch
+                    ),
+                )
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns
@@ -1621,7 +1628,11 @@ class ModelRunner:
             ):
                 forward_batch.post_forward_mlp_sync_batch(ret)
 
-            return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+            return ModelRunnerOutput(
+                logits_output=ret,
+                can_run_graph=can_run_graph,
+                kv_integrity_status=self._snapshot_kv_integrity_status(forward_batch),
+            )
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
@@ -1979,3 +1990,14 @@ class ModelRunner:
             load_format=load_format,
         )
         self.load_config = load_config
+
+    def _snapshot_kv_integrity_status(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[torch.Tensor]:
+        integrity = getattr(self.token_to_kv_pool, "kv_integrity", None)
+        if integrity is None:
+            return None
+        reqs = forward_batch.req_pool_indices.to(
+            device=integrity.failure_status.device, dtype=torch.long
+        )
+        return integrity.failure_status.index_select(0, reqs)

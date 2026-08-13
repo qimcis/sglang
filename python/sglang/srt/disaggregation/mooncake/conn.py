@@ -4,6 +4,7 @@ import concurrent.futures
 import dataclasses
 import logging
 import os
+import secrets
 import struct
 import threading
 import time
@@ -12,6 +13,7 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
+import torch
 import zmq
 from prometheus_client import Counter
 
@@ -86,6 +88,7 @@ class TransferInfo:
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
+    transfer_nonce: Optional[int] = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -117,6 +120,11 @@ class TransferInfo:
             dst_device_kv_indices=(
                 np.frombuffer(msg[9], dtype=np.int32)
                 if len(msg) > 9 and msg[9] != b""
+                else None
+            ),
+            transfer_nonce=(
+                int.from_bytes(msg[10], "little")
+                if len(msg) > 10 and len(msg[10]) == 8
                 else None
             ),
         )
@@ -190,6 +198,7 @@ class KVArgsRegisterInfo:
 
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+    DSV4_INTEGRITY_HEADER = b"DSV4_KV_INTEGRITY"
 
     def __init__(
         self,
@@ -199,6 +208,17 @@ class MooncakeKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.dsv4_integrity = getattr(args, "dsv4_integrity_pool", None)
+        self._integrity_lock = threading.Lock()
+        self._integrity_condition = threading.Condition(self._integrity_lock)
+        self._integrity_source_indices = {}
+        self._integrity_destination_indices = {}
+        self._integrity_nonces = {}
+        self._integrity_verified_ranks = defaultdict(set)
+        self._integrity_seen_manifests = defaultdict(set)
+        self._integrity_pending_success_ranks = defaultdict(set)
+        self._integrity_inflight_rooms = set()
+        self._integrity_cancelled_rooms = set()
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -1103,6 +1123,382 @@ class MooncakeKVManager(CommonKVManager):
             is_ipv6=na.is_ipv6,
         )
 
+    def _integrity_indices_from_state(self, kv_indices, state_indices):
+        from sglang.srt.mem_cache.dsv4_kv_integrity import DSV4TransferGroup
+
+        result = {
+            DSV4TransferGroup.KV: np.asarray(kv_indices, dtype=np.int32),
+            DSV4TransferGroup.SWA: np.empty(0, dtype=np.int32),
+            DSV4TransferGroup.C128_STATE: np.empty(0, dtype=np.int32),
+        }
+        for i, state_type in enumerate(getattr(self.kv_args, "state_types", [])):
+            values = (
+                state_indices[i] if state_indices and i < len(state_indices) else None
+            )
+            if values is None:
+                continue
+            if state_type == StateType.SWA:
+                result[DSV4TransferGroup.SWA] = np.asarray(values, dtype=np.int32)
+            elif state_type == StateType.C128_STATE:
+                result[DSV4TransferGroup.C128_STATE] = np.asarray(
+                    values, dtype=np.int32
+                )
+        return result
+
+    def register_integrity_destination(
+        self,
+        room: int,
+        nonce: int,
+        kv_indices,
+        state_indices,
+        *,
+        decode_prefix_len: int,
+        request_seq_len: int,
+        request_index: int,
+    ) -> None:
+        if self.dsv4_integrity is None:
+            return
+        groups = self._integrity_indices_from_state(kv_indices, state_indices)
+        from sglang.srt.mem_cache.dsv4_kv_integrity import DSV4TransferGroup
+
+        if not 0 < nonce <= 0xFFFFFFFFFFFFFFFF:
+            raise RuntimeError("invalid protected DSV4 transfer nonce")
+        if not 0 < request_index < self.dsv4_integrity.request_capacity:
+            raise RuntimeError(
+                "protected DSV4 destination request index is out of range"
+            )
+        if (
+            decode_prefix_len < 0
+            or request_seq_len < decode_prefix_len
+            or request_seq_len > self.dsv4_integrity.max_context_len
+        ):
+            raise RuntimeError("invalid protected DSV4 logical transfer range")
+        if decode_prefix_len % self.dsv4_integrity.full_page_size:
+            raise RuntimeError("protected DSV4 prefix must be page aligned")
+        transferred_tokens = request_seq_len - decode_prefix_len
+        expected_kv_pages = (
+            transferred_tokens + self.dsv4_integrity.full_page_size - 1
+        ) // self.dsv4_integrity.full_page_size
+        if len(groups[DSV4TransferGroup.KV]) != expected_kv_pages:
+            raise RuntimeError("protected DSV4 destination page count mismatch")
+        logical_starts = {
+            DSV4TransferGroup.KV: decode_prefix_len
+            // self.dsv4_integrity.full_page_size,
+            DSV4TransferGroup.SWA: max(
+                0,
+                (request_seq_len + self.dsv4_integrity.swa_page_size - 1)
+                // self.dsv4_integrity.swa_page_size
+                - len(groups[DSV4TransferGroup.SWA]),
+            ),
+            DSV4TransferGroup.C128_STATE: 0,
+        }
+        request_epoch = int(self.dsv4_integrity.request_epochs[request_index].item())
+        if request_epoch <= 0:
+            raise RuntimeError("protected DSV4 destination request epoch is missing")
+        with self._integrity_lock:
+            if room in self._integrity_nonces:
+                raise RuntimeError("duplicate DSV4 integrity room registration")
+            self._integrity_nonces[room] = nonce
+            self._integrity_destination_indices[room] = (
+                groups,
+                logical_starts,
+                request_index,
+                request_epoch,
+            )
+
+    def record_integrity_source_chunk(
+        self,
+        room: int,
+        kv_indices,
+        state_indices,
+        *,
+        index_slice: slice,
+        is_last_chunk: bool,
+        num_kv_tokens: Optional[int],
+        request_index: Optional[int],
+        request_epoch: Optional[int],
+    ) -> None:
+        if self.dsv4_integrity is None:
+            return
+        if request_index is None or request_epoch is None:
+            raise RuntimeError("protected DSV4 source request identity is missing")
+        from sglang.srt.mem_cache.dsv4_kv_integrity import DSV4TransferGroup
+
+        start = int(index_slice.start or 0)
+        stop = int(index_slice.stop or start)
+        if index_slice.step not in (None, 1) or start < 0 or stop < start:
+            raise RuntimeError("invalid protected DSV4 chunk slice")
+        if stop - start != len(kv_indices):
+            raise RuntimeError("protected DSV4 chunk slice length mismatch")
+        token_count = int(num_kv_tokens or 0)
+        if token_count < 0:
+            raise RuntimeError("protected DSV4 chunk token count is negative")
+        values = np.asarray(kv_indices, dtype=np.int32).copy()
+        with self._integrity_lock:
+            current = self._integrity_source_indices.setdefault(
+                room,
+                {
+                    DSV4TransferGroup.KV: {},
+                    "num_kv_tokens": {},
+                    DSV4TransferGroup.SWA: np.empty(0, dtype=np.int32),
+                    DSV4TransferGroup.C128_STATE: np.empty(0, dtype=np.int32),
+                    "final_state_recorded": False,
+                    "request_index": int(request_index),
+                    "request_epoch": int(request_epoch),
+                },
+            )
+            if current["request_index"] != int(request_index) or current[
+                "request_epoch"
+            ] != int(request_epoch):
+                raise RuntimeError("protected DSV4 source request identity changed")
+            key = (start, stop)
+            previous = current[DSV4TransferGroup.KV].get(key)
+            if previous is not None:
+                if (
+                    not np.array_equal(previous, values)
+                    or current["num_kv_tokens"][key] != token_count
+                ):
+                    raise RuntimeError("protected DSV4 retry changed source pages")
+            else:
+                for old_start, old_stop in current[DSV4TransferGroup.KV]:
+                    if max(start, old_start) < min(stop, old_stop):
+                        raise RuntimeError("overlapping protected DSV4 source chunks")
+                current[DSV4TransferGroup.KV][key] = values
+                current["num_kv_tokens"][key] = token_count
+            if is_last_chunk:
+                final_groups = self._integrity_indices_from_state([], state_indices)
+                for group in (
+                    DSV4TransferGroup.SWA,
+                    DSV4TransferGroup.C128_STATE,
+                ):
+                    previous_state = current[group]
+                    new_state = final_groups[group]
+                    if current["final_state_recorded"] and not np.array_equal(
+                        previous_state, new_state
+                    ):
+                        raise RuntimeError(
+                            "protected DSV4 retry changed source state pages"
+                        )
+                    current[group] = new_state
+                current["final_state_recorded"] = True
+
+    def _validate_integrity_source_mappings(
+        self, groups, logical_starts, request_index: int
+    ) -> None:
+        request_indices = torch.tensor(
+            [request_index],
+            dtype=torch.int64,
+            device=self.dsv4_integrity.failure_status.device,
+        )
+        for group, raw_pages in groups.items():
+            pages = torch.as_tensor(
+                raw_pages,
+                dtype=torch.int32,
+                device=self.dsv4_integrity.failure_status.device,
+            ).reshape(1, -1)
+            logical_start = logical_starts[group]
+            logical_pages = torch.arange(
+                logical_start,
+                logical_start + pages.shape[1],
+                dtype=torch.int64,
+                device=pages.device,
+            ).reshape_as(pages)
+            self.dsv4_integrity.verify_mapping(
+                self.dsv4_integrity.domain_for_group(group),
+                pages,
+                logical_pages,
+                request_indices,
+                slot_page_size=1,
+            )
+        self.dsv4_integrity.assert_request_clean(request_index)
+
+    def send_integrity_manifest(self, req: TransferInfo, prefill_rank: int) -> None:
+        if self.dsv4_integrity is None:
+            return
+        if req.transfer_nonce is None:
+            raise RuntimeError("protected DSV4 transfer is missing its nonce")
+        from sglang.srt.mem_cache.dsv4_kv_integrity import DSV4TransferGroup
+
+        with self._integrity_lock:
+            raw = self._integrity_source_indices.get(req.room)
+            if raw is None:
+                raise RuntimeError("protected DSV4 transfer has no source index record")
+            groups = {
+                DSV4TransferGroup.KV: {
+                    key: value.copy()
+                    for key, value in raw[DSV4TransferGroup.KV].items()
+                },
+                "num_kv_tokens": dict(raw["num_kv_tokens"]),
+                DSV4TransferGroup.SWA: raw[DSV4TransferGroup.SWA].copy(),
+                DSV4TransferGroup.C128_STATE: raw[DSV4TransferGroup.C128_STATE].copy(),
+                "final_state_recorded": raw["final_state_recorded"],
+                "request_index": raw["request_index"],
+                "request_epoch": raw["request_epoch"],
+            }
+        request_index = int(groups.pop("request_index"))
+        request_epoch = int(groups.pop("request_epoch"))
+        if not 0 < request_index < self.dsv4_integrity.request_capacity:
+            raise RuntimeError("protected DSV4 source request index is out of range")
+        current_epoch = int(self.dsv4_integrity.request_epochs[request_index].item())
+        if current_epoch != request_epoch:
+            raise RuntimeError("protected DSV4 source request slot was reused")
+        self.dsv4_integrity.assert_request_clean(request_index)
+        chunks = groups[DSV4TransferGroup.KV]
+        ordered_keys = sorted(chunks)
+        cursor = 0
+        for start, stop in ordered_keys:
+            if start != cursor:
+                raise RuntimeError("protected DSV4 source chunks are incomplete")
+            cursor = stop
+        groups[DSV4TransferGroup.KV] = (
+            np.concatenate([chunks[key] for key in ordered_keys])
+            if ordered_keys
+            else np.empty(0, dtype=np.int32)
+        )
+        transferred_tokens = sum(groups["num_kv_tokens"].values())
+        groups.pop("num_kv_tokens")
+        if not groups.pop("final_state_recorded"):
+            raise RuntimeError("protected DSV4 transfer is missing final state")
+        expected_kv_pages = (
+            transferred_tokens + self.dsv4_integrity.full_page_size - 1
+        ) // self.dsv4_integrity.full_page_size
+        if len(groups[DSV4TransferGroup.KV]) != expected_kv_pages:
+            raise RuntimeError("protected DSV4 source page count mismatch")
+        seq_len = int(req.decode_prefix_len or 0) + transferred_tokens
+        if (req.decode_prefix_len or 0) % self.dsv4_integrity.full_page_size:
+            raise RuntimeError("protected DSV4 prefix must be page aligned")
+        logical_starts = {
+            DSV4TransferGroup.KV: int(req.decode_prefix_len or 0)
+            // self.dsv4_integrity.full_page_size,
+            DSV4TransferGroup.SWA: max(
+                0,
+                (seq_len + self.dsv4_integrity.swa_page_size - 1)
+                // self.dsv4_integrity.swa_page_size
+                - len(groups[DSV4TransferGroup.SWA]),
+            ),
+            DSV4TransferGroup.C128_STATE: 0,
+        }
+        self._validate_integrity_source_mappings(groups, logical_starts, request_index)
+        manifest = self.dsv4_integrity.build_manifest(
+            bootstrap_room=req.room,
+            transfer_nonce=req.transfer_nonce,
+            indices_by_group=groups,
+            logical_starts=logical_starts,
+        ).to_bytes()
+        na = NetworkAddress(req.endpoint, req.dst_port)
+        self._send_multipart_locked(
+            na.to_tcp(),
+            [
+                self.DSV4_INTEGRITY_HEADER,
+                str(req.room).encode("ascii"),
+                str(prefill_rank).encode("ascii"),
+                req.transfer_nonce.to_bytes(8, "little"),
+                manifest,
+            ],
+            is_ipv6=na.is_ipv6,
+        )
+
+    def _handle_integrity_manifest(self, msg: List[bytes]) -> None:
+        if self.dsv4_integrity is None:
+            return
+        from sglang.srt.mem_cache.dsv4_kv_integrity import DSV4TransferManifest
+
+        if len(msg) != 5 or len(msg[3]) != 8:
+            raise RuntimeError("malformed protected DSV4 manifest envelope")
+        room = int(msg[1].decode("ascii"))
+        prefill_rank = int(msg[2].decode("ascii"))
+        nonce = int.from_bytes(msg[3], "little")
+        with self._integrity_lock:
+            expected_nonce = self._integrity_nonces.get(room)
+            destination = self._integrity_destination_indices.get(room)
+            manifest_key = (prefill_rank, nonce)
+            if (
+                expected_nonce is None
+                or destination is None
+                or room in self._integrity_cancelled_rooms
+            ):
+                raise RuntimeError("manifest arrived for an unknown DSV4 transfer")
+            if manifest_key in self._integrity_seen_manifests[room]:
+                raise RuntimeError("duplicate protected DSV4 manifest")
+            self._integrity_seen_manifests[room].add(manifest_key)
+            self._integrity_inflight_rooms.add(room)
+        if nonce != expected_nonce:
+            with self._integrity_condition:
+                self._integrity_inflight_rooms.discard(room)
+                self._integrity_condition.notify_all()
+            raise RuntimeError("protected DSV4 manifest nonce mismatch")
+        try:
+            manifest = DSV4TransferManifest.from_bytes(msg[4])
+            groups, logical_starts, request_index, request_epoch = destination
+            current_epoch = int(
+                self.dsv4_integrity.request_epochs[request_index].item()
+            )
+            if current_epoch != request_epoch:
+                raise RuntimeError("protected DSV4 destination request slot was reused")
+            self.dsv4_integrity.verify_and_install(
+                manifest,
+                bootstrap_room=room,
+                transfer_nonce=nonce,
+                indices_by_group=groups,
+                logical_starts=logical_starts,
+                request_index=request_index,
+            )
+            accept_pending = False
+            with self._integrity_condition:
+                if room in self._integrity_cancelled_rooms:
+                    raise RuntimeError("protected DSV4 transfer was cancelled")
+                if (
+                    self._integrity_nonces.get(room) != nonce
+                    or self._integrity_destination_indices.get(room) is not destination
+                ):
+                    raise RuntimeError("protected DSV4 transfer lifecycle changed")
+                current_epoch = int(
+                    self.dsv4_integrity.request_epochs[request_index].item()
+                )
+                if current_epoch != request_epoch:
+                    raise RuntimeError(
+                        "protected DSV4 destination request slot was reused"
+                    )
+                self._integrity_verified_ranks[room].add(prefill_rank)
+                if prefill_rank in self._integrity_pending_success_ranks.get(
+                    room, set()
+                ):
+                    self._integrity_pending_success_ranks[room].discard(prefill_rank)
+                    accept_pending = True
+        finally:
+            with self._integrity_condition:
+                self._integrity_inflight_rooms.discard(room)
+                self._integrity_condition.notify_all()
+        if accept_pending:
+            self._accept_prefill_success(room, prefill_rank)
+
+    def _accept_prefill_success(self, room: int, prefill_rank: int) -> None:
+        if room not in self.request_status:
+            return
+        self.prefill_response_tracker[room].add(prefill_rank)
+        expected = self.required_prefill_response_num_table[room]
+        if len(self.prefill_response_tracker[room]) != expected:
+            return
+        if self.enable_staging:
+            handler = self._staging_handler
+            if handler.is_staging_room(room):
+                handler.submit_last_scatter_async(room)
+            self._chunk_writer_counts.pop(room, None)
+        self.update_status(room, KVPoll.Success)
+
+    def clear_integrity_room(self, room: int) -> None:
+        with self._integrity_condition:
+            self._integrity_cancelled_rooms.add(room)
+            while room in self._integrity_inflight_rooms:
+                self._integrity_condition.wait()
+            self._integrity_source_indices.pop(room, None)
+            self._integrity_destination_indices.pop(room, None)
+            self._integrity_nonces.pop(room, None)
+            self._integrity_verified_ranks.pop(room, None)
+            self._integrity_seen_manifests.pop(room, None)
+            self._integrity_pending_success_ranks.pop(room, None)
+            self._integrity_cancelled_rooms.discard(room)
+
     def _handle_aux_data(self, msg: List[bytes]):
         """Handle AUX_DATA messages received by the decode thread."""
         room = int(msg[1].decode("ascii"))
@@ -1773,6 +2169,19 @@ class MooncakeKVManager(CommonKVManager):
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
+                            if ret == 0:
+                                try:
+                                    self.send_integrity_manifest(
+                                        req, prefill_unique_rank
+                                    )
+                                except Exception as exc:
+                                    logger.exception(
+                                        "Protected DSV4 manifest generation failed "
+                                        "for room %s",
+                                        req.room,
+                                    )
+                                    self.record_failure(req.room, str(exc))
+                                    ret = -1
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
@@ -1999,6 +2408,22 @@ class MooncakeKVManager(CommonKVManager):
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
                     continue
+                if msg[0] == MooncakeKVManager.DSV4_INTEGRITY_HEADER:
+                    try:
+                        self._handle_integrity_manifest(msg)
+                    except Exception as exc:
+                        try:
+                            room = int(msg[1].decode("ascii"))
+                        except (IndexError, UnicodeDecodeError, ValueError):
+                            room = -1
+                        logger.exception(
+                            "Protected DSV4 manifest verification failed for room %s",
+                            room,
+                        )
+                        if room >= 0 and room in self.request_status:
+                            self.record_failure(room, str(exc))
+                            self.update_status(room, KVPoll.Failed)
+                    continue
 
                 # Staging: prefill notifies a chunk written to staging buffer
                 if msg[0] == b"CHUNK_READY":
@@ -2040,20 +2465,25 @@ class MooncakeKVManager(CommonKVManager):
 
                 if status == KVPoll.Success:
                     if bootstrap_room in self.request_status:
-                        self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
-                        expected_response_num = (
-                            self.required_prefill_response_num_table[bootstrap_room]
-                        )
-                        arrived_response_num = len(
-                            self.prefill_response_tracker[bootstrap_room]
-                        )
-                        if arrived_response_num == expected_response_num:
-                            if self.enable_staging:
-                                handler = self._staging_handler
-                                if handler.is_staging_room(bootstrap_room):
-                                    handler.submit_last_scatter_async(bootstrap_room)
-                                self._chunk_writer_counts.pop(bootstrap_room, None)
-                            self.update_status(bootstrap_room, KVPoll.Success)
+                        if self.dsv4_integrity is not None:
+                            with self._integrity_lock:
+                                verified = (
+                                    prefill_rank
+                                    in self._integrity_verified_ranks.get(
+                                        bootstrap_room, set()
+                                    )
+                                )
+                                if not verified:
+                                    self._integrity_pending_success_ranks[
+                                        bootstrap_room
+                                    ].add(prefill_rank)
+                            if not verified:
+                                # The manifest and status use separate messages;
+                                # either is allowed to arrive first.
+                                continue
+                        self._accept_prefill_success(bootstrap_room, prefill_rank)
+                        if self.check_status(bootstrap_room) == KVPoll.Success:
+                            continue
                 elif status == KVPoll.Failed:
                     self.record_failure(
                         bootstrap_room,
@@ -2074,9 +2504,22 @@ class MooncakeKVManager(CommonKVManager):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        integrity_request_index: Optional[int] = None,
+        integrity_request_epoch: Optional[int] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
+
+        self.record_integrity_source_chunk(
+            bootstrap_room,
+            kv_indices,
+            state_indices,
+            index_slice=index_slice,
+            is_last_chunk=is_last_chunk,
+            num_kv_tokens=num_kv_tokens,
+            request_index=integrity_request_index,
+            request_epoch=integrity_request_epoch,
+        )
 
         if (
             bootstrap_room not in self.request_status
@@ -2185,7 +2628,27 @@ class MooncakeKVSender(CommonKVSender):
         )
         self.conclude_state = None
         self.init_time = time.time()
+        self.integrity_request_index = None
+        self.integrity_request_epoch = None
         self._init_trace_ctx()
+
+    def set_integrity_request(self, request_index: int) -> None:
+        if self.kv_mgr.dsv4_integrity is None:
+            return
+        if not 0 < request_index < self.kv_mgr.dsv4_integrity.request_capacity:
+            raise RuntimeError("protected DSV4 source request index is out of range")
+        request_epoch = int(
+            self.kv_mgr.dsv4_integrity.request_epochs[request_index].item()
+        )
+        if request_epoch <= 0:
+            raise RuntimeError("protected DSV4 source request epoch is not initialized")
+        if self.integrity_request_index is not None and (
+            self.integrity_request_index != request_index
+            or self.integrity_request_epoch != request_epoch
+        ):
+            raise RuntimeError("protected DSV4 sender request identity changed")
+        self.integrity_request_index = request_index
+        self.integrity_request_epoch = request_epoch
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
@@ -2208,6 +2671,8 @@ class MooncakeKVSender(CommonKVSender):
                 False,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                integrity_request_index=self.integrity_request_index,
+                integrity_request_epoch=self.integrity_request_epoch,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -2219,6 +2684,8 @@ class MooncakeKVSender(CommonKVSender):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                integrity_request_index=self.integrity_request_index,
+                integrity_request_epoch=self.integrity_request_epoch,
             )
         self._record_transfer_indices(kv_indices, state_indices)
 
@@ -2273,6 +2740,10 @@ class MooncakeKVSender(CommonKVSender):
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
 
+    def clear(self):
+        super().clear()
+        self.kv_mgr.clear_integrity_room(self.bootstrap_room)
+
 
 class MooncakeKVReceiver(CommonKVReceiver):
     def __init__(
@@ -2283,6 +2754,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
     ):
         self.session_id = mgr.get_session_id()
         self.init_time = None
+        self.transfer_nonce = (
+            secrets.randbits(64) or 1 if mgr.dsv4_integrity is not None else None
+        )
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
     def _register_kv_args(self) -> bool:
@@ -2376,6 +2850,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        request_index: Optional[int] = None,
+        request_seq_len: Optional[int] = None,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
@@ -2384,6 +2860,21 @@ class MooncakeKVReceiver(CommonKVReceiver):
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
+
+        if self.transfer_nonce is not None:
+            if request_index is None or request_seq_len is None:
+                raise RuntimeError(
+                    "protected DSV4 metadata requires request index and sequence length"
+                )
+            self.kv_mgr.register_integrity_destination(
+                self.bootstrap_room,
+                self.transfer_nonce,
+                kv_indices,
+                state_indices,
+                decode_prefix_len=int(decode_prefix_len or 0),
+                request_seq_len=int(request_seq_len),
+                request_index=int(request_index),
+            )
 
         self.chunk_staging_infos = []
         if (
@@ -2417,6 +2908,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             (
                                 np.asarray(device_kv_indices, dtype=np.int32).tobytes()
                                 if not is_dummy and device_kv_indices is not None
+                                else b""
+                            ),
+                            (
+                                self.transfer_nonce.to_bytes(8, "little")
+                                if not is_dummy and self.transfer_nonce is not None
                                 else b""
                             ),
                         ]
@@ -2459,6 +2955,10 @@ class MooncakeKVReceiver(CommonKVReceiver):
         raise KVTransferError(
             self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
         )
+
+    def clear(self):
+        super().clear()
+        self.kv_mgr.clear_integrity_room(self.bootstrap_room)
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):

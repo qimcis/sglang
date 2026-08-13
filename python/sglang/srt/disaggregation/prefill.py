@@ -262,6 +262,10 @@ class PrefillBootstrapQueue:
                 self.token_to_kv_pool.compression_ratios
             )
 
+        kv_args.dsv4_integrity_pool = getattr(
+            self.token_to_kv_pool, "kv_integrity", None
+        )
+
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,
@@ -1244,6 +1248,11 @@ class SchedulerDisaggregationPrefillMixin:
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
+        set_integrity_request = getattr(
+            req.disagg_kv_sender, "set_integrity_request", None
+        )
+        if callable(set_integrity_request):
+            set_integrity_request(int(req.req_pool_idx))
         req.disagg_kv_sender.send(
             page_indices,
             state_indices,

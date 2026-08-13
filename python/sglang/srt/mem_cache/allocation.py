@@ -82,6 +82,21 @@ def write_cache_indices(
             out_cache_loc,
             req_to_token_pool.req_to_token.shape[1],
         )
+        if req_to_token_pool.has_write_callbacks:
+            pt = 0
+            for i in range(req_pool_indices_cpu.shape[0]):
+                req_idx = int(req_pool_indices_cpu[i].item())
+                prefix_len = int(prefix_lens_cpu[i].item())
+                seq_len = int(seq_lens_cpu[i].item())
+                extend_len = int(extend_lens_cpu[i].item())
+                req_to_token_pool.notify_write(
+                    (req_idx, slice(0, prefix_len)), prefix_tensors[i]
+                )
+                req_to_token_pool.notify_write(
+                    (req_idx, slice(prefix_len, seq_len)),
+                    out_cache_loc[pt : pt + extend_len],
+                )
+                pt += extend_len
     else:
         pt = 0
         for i in range(req_pool_indices_cpu.shape[0]):

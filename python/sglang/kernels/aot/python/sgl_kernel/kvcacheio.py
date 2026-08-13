@@ -10,6 +10,102 @@ def is_hip() -> bool:
 _is_hip = is_hip()
 
 
+def dsv4_page_digests(
+    buffer: torch.Tensor, page_indices: torch.Tensor, seed: int
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.dsv4_page_digests.default(buffer, page_indices, seed)
+
+
+def dsv4_bind_pages(
+    slots: torch.Tensor,
+    logical_pages: torch.Tensor,
+    request_indices: torch.Tensor,
+    generations: torch.Tensor,
+    expected_pages: torch.Tensor,
+    expected_generations: torch.Tensor,
+    expected_valid: torch.Tensor,
+    output: torch.Tensor,
+    failure_status: torch.Tensor,
+    slot_page_size: int,
+    invalid_value: int,
+    install_missing: bool,
+) -> None:
+    torch.ops.sgl_kernel.dsv4_bind_pages.default(
+        slots,
+        logical_pages,
+        request_indices,
+        generations,
+        expected_pages,
+        expected_generations,
+        expected_valid,
+        output,
+        failure_status,
+        slot_page_size,
+        invalid_value,
+        install_missing,
+    )
+
+
+def dsv4_validate_pages(
+    buffer: torch.Tensor,
+    slots: torch.Tensor,
+    logical_pages: torch.Tensor,
+    request_indices: torch.Tensor,
+    digests: torch.Tensor,
+    component_valid: torch.Tensor,
+    validation_state: torch.Tensor,
+    validation_failure: torch.Tensor,
+    validation_pages: torch.Tensor,
+    validation_count: torch.Tensor,
+    generations: torch.Tensor,
+    expected_pages: torch.Tensor,
+    expected_generations: torch.Tensor,
+    expected_valid: torch.Tensor,
+    output: torch.Tensor,
+    failure_status: torch.Tensor,
+    seed: int,
+    slot_page_size: int,
+    invalid_value: int,
+    allow_missing_digest: bool = False,
+) -> None:
+    torch.ops.sgl_kernel.dsv4_validate_pages.default(
+        buffer,
+        slots,
+        logical_pages,
+        request_indices,
+        digests,
+        component_valid,
+        validation_state,
+        validation_failure,
+        validation_pages,
+        validation_count,
+        generations,
+        expected_pages,
+        expected_generations,
+        expected_valid,
+        output,
+        failure_status,
+        seed,
+        slot_page_size,
+        invalid_value,
+        allow_missing_digest,
+    )
+
+
+def dsv4_refresh_slots(
+    buffer: torch.Tensor,
+    digests: torch.Tensor,
+    valid: torch.Tensor,
+    dirty: torch.Tensor,
+    slots: torch.Tensor,
+    seed: int,
+    slot_page_size: int,
+) -> None:
+    torch.ops.sgl_kernel.dsv4_refresh_slots.default(
+        buffer, digests, valid, dirty, slots, seed, slot_page_size
+    )
+
+
 def transfer_kv_per_layer(
     src_k: torch.Tensor,
     dst_k: torch.Tensor,

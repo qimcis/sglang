@@ -305,6 +305,9 @@ class DecodeHiCacheTransferMixin:
             ),
             decode_req.hicache_restored_kv_indices,
         )
+        integrity = getattr(self.token_to_kv_pool, "kv_integrity", None)
+        if integrity is not None:
+            integrity.assert_request_clean(int(decode_req.req.req_pool_idx))
         decode_req.req.prefix_indices = torch.cat(
             [prefix_match.prefix_indices, decode_req.hicache_restored_kv_indices]
         )

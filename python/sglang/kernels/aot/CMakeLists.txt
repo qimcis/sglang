@@ -274,6 +274,7 @@ set(SOURCES
     "csrc/infllm_v2/max_pooling.cu"
 
     "csrc/kvcacheio/transfer.cu"
+    "csrc/kvcacheio/dsv4_integrity.cu"
     "csrc/mamba/causal_conv1d.cu"
     "csrc/memory/weak_ref_tensor.cpp"
 

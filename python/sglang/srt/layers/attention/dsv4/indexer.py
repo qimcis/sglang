@@ -483,6 +483,8 @@ class C4IndexerBackendMixin:
         forward_batch: ForwardBatch,
         indexer_metadata: PagedIndexerMetadata,
     ) -> bool:
+        if self.token_to_kv_pool.kv_integrity is not None:
+            return False
         if not envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.get():
             return False
         # This path calls CUDA DeepGEMM and assumes the CUDA FP8+FP32 packed
@@ -763,6 +765,35 @@ class C4IndexerBackendMixin:
                 plan=nonpaged_plan,
             )
         else:
+            integrity = token_to_kv_pool.kv_integrity
+            if integrity is not None:
+                from sglang.srt.mem_cache.dsv4_kv_integrity import DSV4Component
+
+                descriptor = integrity.descriptor(
+                    DSV4Component.C4_INDEXER_KV, c4_indexer.layer_id
+                )
+                logical = (
+                    torch.arange(
+                        page_table.shape[1],
+                        dtype=torch.int64,
+                        device=page_table.device,
+                    )
+                    .view(1, -1)
+                    .expand_as(page_table)
+                )
+                page_count = torch.div(
+                    c4_seq_lens.to(torch.int64) + indexer_metadata.c4_page_size - 1,
+                    indexer_metadata.c4_page_size,
+                    rounding_mode="floor",
+                ).view(-1, 1)
+                logical = torch.where(logical < page_count, logical, -1).contiguous()
+                page_table = integrity.validate_pages(
+                    descriptor,
+                    page_table.contiguous(),
+                    logical,
+                    core_metadata.req_pool_indices_repeated[:query_rows],
+                    slot_page_size=1,
+                )
             c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
                 layer_id=c4_indexer.layer_id,
             )
@@ -803,6 +834,8 @@ class C4IndexerBackendMixin:
             ]
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
+        elif token_to_kv_pool.kv_integrity is not None:
+            raw_indices = torch.empty_like(c4_sparse_page_indices)
 
         if (
             envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
@@ -825,7 +858,9 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and (
+            raw_indices is None or token_to_kv_pool.kv_integrity is not None
+        ):
             topk_transform_512_v2(
                 logits,
                 c4_seq_lens,

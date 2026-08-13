@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import struct
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -61,6 +63,134 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
+
+
+class _DSV4HostIntegritySidecars:
+    """CPU integrity metadata for one DSV4 HiCache sub-pool."""
+
+    def __init__(self, pool_name, manager, descriptors, num_host_pages):
+        self.pool_name = str(pool_name)
+        self.manager = manager
+        self.descriptors = tuple(descriptors or ())
+        if manager is None:
+            if self.descriptors:
+                raise ValueError("DSV4 host descriptors require an integrity manager")
+            self.enabled = False
+            return
+        if not self.descriptors:
+            raise ValueError(f"{pool_name} is missing DSV4 integrity descriptors")
+        self.enabled = True
+        shape = (num_host_pages, len(self.descriptors))
+        self.digest = torch.zeros(shape, dtype=torch.int64)
+        self.source_generation = torch.zeros(shape, dtype=torch.int64)
+        self.valid = torch.zeros(shape, dtype=torch.uint8)
+        self.root = torch.zeros(shape, dtype=torch.int64)
+
+    def clear(self) -> None:
+        if self.enabled:
+            self.valid.zero_()
+
+    def invalidate(self, host_pages: torch.Tensor) -> None:
+        if not self.enabled or host_pages.numel() == 0:
+            return
+        rows = host_pages.to(dtype=torch.int64, device="cpu").reshape(-1)
+        if bool(((rows < 0) | (rows >= self.valid.shape[0])).any().item()):
+            raise RuntimeError("DSV4 HiCache host page is out of range")
+        self.valid.index_fill_(0, torch.unique(rows), 0)
+
+    def _root(self, host_page: int, layer: int, digest: int, generation: int) -> int:
+        descriptor = self.descriptors[layer]
+        payload = self.pool_name.encode("utf-8") + struct.pack(
+            "<iiqqq",
+            int(descriptor.component),
+            descriptor.layer_id,
+            host_page,
+            digest,
+            generation,
+        )
+        value = int.from_bytes(
+            hashlib.blake2b(payload, digest_size=8).digest(), "little"
+        )
+        return value if value < (1 << 63) else value - (1 << 64)
+
+    def backup(self, host_pages: torch.Tensor, device_pages: torch.Tensor) -> None:
+        if not self.enabled or host_pages.numel() == 0:
+            return
+        host_rows = host_pages.to(torch.int64).cpu().tolist()
+        device_rows = device_pages.to(torch.int64)
+        if len(host_rows) != device_rows.numel():
+            raise RuntimeError("DSV4 HiCache integrity index length mismatch")
+        if any(row < 0 or row >= self.valid.shape[0] for row in host_rows):
+            raise RuntimeError("DSV4 HiCache host page is out of range")
+        if host_rows:
+            self.valid.index_fill_(0, torch.tensor(host_rows, dtype=torch.int64), 0)
+        for layer, descriptor in enumerate(self.descriptors):
+            sidecar = self.manager.sidecars[descriptor.identity]
+            space = self.manager.address_spaces[
+                self.manager.domain_for_group(descriptor.transfer_group)
+            ]
+            pages = device_rows.to(sidecar.digest.device)
+            if bool(((pages <= 0) | (pages >= descriptor.capacity)).any().item()):
+                raise RuntimeError("DSV4 HiCache backup page is out of range")
+            digests = sidecar.digest.index_select(0, pages).cpu().tolist()
+            generations = space.generation.index_select(0, pages).cpu().tolist()
+            valid = sidecar.valid.index_select(0, pages).cpu().tolist()
+            for host_page, digest, generation, is_valid in zip(
+                host_rows, digests, generations, valid
+            ):
+                if not is_valid or not generation:
+                    raise RuntimeError("DSV4 HiCache backup encountered untagged data")
+                self.digest[host_page, layer] = digest
+                self.source_generation[host_page, layer] = generation
+                self.root[host_page, layer] = self._root(
+                    host_page, layer, digest, generation
+                )
+                self.valid[host_page, layer] = 1
+
+    def expected_for_restore(
+        self, layer: int, host_pages: torch.Tensor
+    ) -> torch.Tensor | None:
+        if not self.enabled or host_pages.numel() == 0:
+            return None
+        rows = host_pages.to(torch.int64).cpu().tolist()
+        if any(row < 0 or row >= self.valid.shape[0] for row in rows):
+            raise RuntimeError("DSV4 HiCache host page is out of range")
+        values = []
+        for host_page in rows:
+            if not self.valid[host_page, layer]:
+                raise RuntimeError("DSV4 HiCache restore metadata is missing")
+            digest = int(self.digest[host_page, layer].item())
+            generation = int(self.source_generation[host_page, layer].item())
+            expected_root = self._root(host_page, layer, digest, generation)
+            if int(self.root[host_page, layer].item()) != expected_root:
+                raise RuntimeError("DSV4 HiCache metadata checksum mismatch")
+            values.append(digest)
+        return torch.tensor(values, dtype=torch.int64)
+
+    def verify_restore(
+        self,
+        layer: int,
+        expected: torch.Tensor | None,
+        device_pages: torch.Tensor,
+    ) -> None:
+        if expected is None:
+            return
+        from sglang.srt.mem_cache.dsv4_kv_integrity import (
+            component_seed,
+            compute_page_digests,
+        )
+
+        descriptor = self.descriptors[layer]
+        pages = device_pages.to(
+            device=descriptor.buffer.device, dtype=torch.int32
+        ).contiguous()
+        actual = compute_page_digests(
+            descriptor.buffer, pages, seed=component_seed(descriptor)
+        )
+        expected_device = expected.to(actual.device)
+        if not torch.equal(actual, expected_device):
+            raise RuntimeError("DSV4 HiCache restored data digest mismatch")
+        self.manager.sidecars[descriptor.identity].install(pages, actual)
 
 
 class MambaPoolHost(HostKVCache):
@@ -738,6 +868,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         pin_memory: bool = True,
         allocator_type: str = "default",
+        integrity_manager=None,
+        integrity_descriptors=None,
     ):
         self.pool_name = pool_name
         self.layer_num = len(device_buffers)
@@ -755,6 +887,15 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.start_layer = 0
         self.end_layer = self.layer_num
         self.lock = threading.RLock()
+        self.integrity = _DSV4HostIntegritySidecars(
+            pool_name,
+            integrity_manager,
+            integrity_descriptors,
+            num_host_pages,
+        )
+        if self.integrity.enabled and len(self.integrity.descriptors) != self.layer_num:
+            raise ValueError(f"{pool_name} integrity descriptor count mismatch")
+        self._integrity_allocation_peers = [self]
 
         self.device_buffers = device_buffers
         self.gpu_device = device_buffers[0].device if device_buffers else device
@@ -885,6 +1026,21 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
         self.release_slots = []
         self.num_release_slots = 0
+        self.integrity.clear()
+
+    def set_integrity_allocation_peers(self, peers) -> None:
+        self._integrity_allocation_peers = list(dict.fromkeys(peers))
+
+    def invalidate_integrity_indices(self, indices: torch.Tensor) -> None:
+        if indices is None or indices.numel() == 0:
+            return
+        if indices.numel() % self.slot_page_size:
+            raise RuntimeError("protected DSV4 HiCache allocation must be page aligned")
+        self.integrity.invalidate(self._to_page_indices(indices))
+
+    def _invalidate_integrity_allocation(self, indices: torch.Tensor) -> None:
+        for peer in self._integrity_allocation_peers:
+            peer.invalidate_integrity_indices(indices)
 
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
@@ -902,6 +1058,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        self._invalidate_integrity_allocation(select_index)
         return select_index
 
     @synchronized
@@ -923,6 +1080,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             host_indices.numel() % self.slot_page_size != 0
             or device_indices.numel() % self.slot_page_size != 0
         ):
+            if self.integrity.enabled:
+                raise RuntimeError("protected DSV4 HiCache requires whole-page backup")
             # Whole C4 pages can use the normal HiCache page-row copy below.
             # Token-granular DSV4 C4 copy needs this helper because a token is
             # not one contiguous byte range in the paged row:
@@ -986,6 +1145,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(
                 f"Unsupported V4 paged host layout/backend: {self.layout}/{io_backend}"
             )
+        self.integrity.backup(host_rows, device_rows)
 
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
@@ -996,6 +1156,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             host_indices.numel() % self.slot_page_size != 0
             or device_indices.numel() % self.slot_page_size != 0
         ):
+            if self.integrity.enabled:
+                raise RuntimeError("protected DSV4 HiCache requires whole-page restore")
             # Same DSV4 C4 layout issue as backup: this is token-granular
             # preload, so it cannot use the normal HiCache page-row copy.
             transfer_cache_dsv4_mla(
@@ -1007,6 +1169,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             return
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
+        expected = self.integrity.expected_for_restore(layer_id, host_rows)
 
         if io_backend == "kernel" and self.layout == "layer_first":
             transfer_kv_per_layer_mla(
@@ -1047,6 +1210,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(
                 f"Unsupported V4 paged host layout/backend: {self.layout}/{io_backend}"
             )
+        self.integrity.verify_restore(layer_id, expected, device_rows)
 
     def get_data_page(self, index, flat=True):
         index = int(index) // self.slot_page_size
@@ -1129,6 +1293,8 @@ class DeepSeekV4StateHostPool(HostKVCache):
         device: str = "cpu",
         pin_memory: bool = True,
         allocator_type: str = "default",
+        integrity_manager=None,
+        integrity_descriptors=None,
     ):
         if any(pool is None for pool in state_pools):
             raise ValueError(f"{pool_name} state_pools must not contain None")
@@ -1148,6 +1314,14 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.start_layer = 0
         self.end_layer = self.layer_num
         self.lock = threading.RLock()
+        self.integrity = _DSV4HostIntegritySidecars(
+            pool_name,
+            integrity_manager,
+            integrity_descriptors,
+            num_host_pages,
+        )
+        if self.integrity.enabled and len(self.integrity.descriptors) != self.layer_num:
+            raise ValueError(f"{pool_name} integrity descriptor count mismatch")
 
         self.ring_size = 0
         self.state_page_bytes = 0
@@ -1295,7 +1469,12 @@ class DeepSeekV4StateHostPool(HostKVCache):
         return self.kv_buffer if isinstance(self.kv_buffer, list) else [self.kv_buffer]
 
     def clear(self):
-        pass
+        self.integrity.clear()
+
+    def invalidate_integrity_indices(self, indices: torch.Tensor) -> None:
+        if indices is None or indices.numel() == 0:
+            return
+        self.integrity.invalidate(self._to_page_indices(indices))
 
     def available_size(self):
         raise NotImplementedError(
@@ -1372,6 +1551,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             raise ValueError(
                 f"Unsupported V4 state host layout/backend: {self.layout}/{io_backend}"
             )
+        self.integrity.backup(host_rows, device_rows)
 
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
@@ -1380,6 +1560,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             return
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
+        expected = self.integrity.expected_for_restore(layer_id, host_rows)
         if io_backend == "kernel" and self.layout == "layer_first":
             transfer_kv_per_layer_mla(
                 src=self.data_refs[layer_id],
@@ -1419,6 +1600,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             raise ValueError(
                 f"Unsupported V4 state host layout/backend: {self.layout}/{io_backend}"
             )
+        self.integrity.verify_restore(layer_id, expected, device_rows)
 
     def get_data_page(self, index, flat=True):
         index = int(index) // self.swa_page_size
@@ -1537,6 +1719,10 @@ class HostPoolGroup:
         ]
         self.can_use_write_back_jit = all(child_write_back_jit)
         self.supports_per_pool_backup_indices = any(child_write_back_jit)
+        self._integrity_anchor_allocation_peers = []
+
+    def set_integrity_anchor_allocation_peers(self, peers) -> None:
+        self._integrity_anchor_allocation_peers = list(dict.fromkeys(peers))
 
     @property
     def kv_buffer(self):
@@ -1586,7 +1772,11 @@ class HostPoolGroup:
         return self.anchor_entry.host_pool.available_size()
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        return self.anchor_entry.host_pool.alloc(need_size)
+        indices = self.anchor_entry.host_pool.alloc(need_size)
+        if indices is not None:
+            for peer in self._integrity_anchor_allocation_peers:
+                peer.invalidate_integrity_indices(indices)
+        return indices
 
     def free(self, indices: torch.Tensor) -> int:
         return self.anchor_entry.host_pool.free(indices)

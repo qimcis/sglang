@@ -97,6 +97,18 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = []
 
         self._kvcache = kvcache
+        integrity = getattr(kvcache, "kv_integrity", None)
+        if integrity is not None and page_size > 1:
+            from sglang.srt.mem_cache.dsv4_kv_integrity import DSV4IntegrityDomain
+
+            self.full_attn_allocator.integrity_allocation_callback = (
+                lambda pages: integrity.bump_allocations(
+                    DSV4IntegrityDomain.FULL, pages
+                )
+            )
+            self.swa_attn_allocator.integrity_allocation_callback = (
+                lambda pages: integrity.bump_allocations(DSV4IntegrityDomain.SWA, pages)
+            )
         self.clear()
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
 

@@ -193,3 +193,94 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         f"dp_size={server_args.dp_size}, moe_dense_tp_size={server_args.moe_dense_tp_size}, "
         f"attn_cp_size={server_args.attn_cp_size}, ep_size={server_args.ep_size}, tp_size={server_args.tp_size}"
     )
+
+
+def validate_deepseek_v4_kv_integrity(server_args: ServerArgs) -> None:
+    """Fail closed when the audited DSV4 integrity contract is not met."""
+    if not server_args.enable_dsv4_kv_integrity:
+        return
+
+    import torch
+
+    from sglang.srt.utils.common import is_sm100_supported
+
+    # This hook runs before declarations are materialized. Read the resolved
+    # view so cookbook `auto` defaults are validated as their runtime values.
+    cfg = server_args._resolved()
+
+    failures = []
+    cuda_version = tuple(
+        int(part) for part in (torch.version.cuda or "0.0").split(".")[:2]
+    )
+    if (
+        cfg.device != "cuda"
+        or not is_sm100_supported()
+        or torch.cuda.get_device_capability() != (10, 0)
+        or cuda_version < (12, 8)
+    ):
+        failures.append("NVIDIA B200 (SM100) with CUDA 12.8+ is required")
+    if cfg.disaggregation_mode not in ("prefill", "decode"):
+        failures.append("Mooncake PD prefill/decode mode is required")
+    if cfg.disaggregation_transfer_backend != "mooncake":
+        failures.append("--disaggregation-transfer-backend mooncake is required")
+    if cfg.pp_size != 1:
+        failures.append("pipeline parallelism is not audited")
+    if cfg.attn_cp_size != 1:
+        failures.append("attention context parallelism is not audited")
+    if cfg.speculative_algorithm is not None:
+        failures.append("speculative decoding is not audited")
+    if cfg.enable_hisparse:
+        failures.append("HiSparse is not audited")
+    if cfg.enable_deepseek_v4_fp4_indexer:
+        failures.append("the FP4 indexer is not audited")
+    if cfg.hicache_storage_backend is not None:
+        failures.append("HiCache L3 storage is not audited; use L2 host cache only")
+    if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+        failures.append("the disaggregation staging buffer is not audited")
+    if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+        failures.append("online C128 compression is not audited")
+    if cfg.page_size != 256:
+        failures.append("the protected DSV4 layout requires --page-size 256")
+    if cfg.attention_backend != "dsv4":
+        failures.append(
+            "the protected attention path requires --attention-backend dsv4"
+        )
+    if cfg.dsa_topk_backend != "sgl-kernel":
+        failures.append(
+            "the protected C4 indexer requires --dsa-topk-backend sgl-kernel"
+        )
+    if (
+        envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+        or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+        or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+    ):
+        failures.append("the protected C4 indexer requires DeepGEMM")
+
+    # Failure state is rank-local in this first audited topology. Do not claim
+    # TP/DPA support until publication consensus has dedicated validation.
+    if cfg.tp_size != 1 or cfg.dp_size != 1:
+        failures.append(
+            "the audited topology requires --tp-size 1 --dp-size 1 "
+            f"(got tp={cfg.tp_size}, dp={cfg.dp_size})"
+        )
+
+    if failures:
+        raise ValueError(
+            "--enable-dsv4-kv-integrity rejected this configuration: "
+            + "; ".join(failures)
+        )
+
+    # Preserve the cookbook fast paths. The attention backend remains `dsv4`;
+    # role-specific MoE defaults are validated instead of silently falling back.
+    if cfg.disaggregation_mode == "prefill":
+        if cfg.moe_a2a_backend != "megamoe":
+            raise ValueError(
+                "protected DSV4 prefill requires --moe-a2a-backend megamoe"
+            )
+    elif cfg.moe_runner_backend != "flashinfer_trtllm_routed":
+        raise ValueError(
+            "protected DSV4 NVFP4 decode requires "
+            "--moe-runner-backend flashinfer_trtllm_routed"
+        )
+
+    logger.info("DeepSeek-V4 KV integrity enabled for the audited SM100 Mooncake path")

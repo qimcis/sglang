@@ -351,6 +351,7 @@ def build_deepseek_v4_hicache_stack(
     c128_layer_mapping = {}
     c4_state_local_layers = []
     c4_state_global_layers = []
+    c128_global_layers = []
     for local_layer_id, layer_item in enumerate(
         kvcache.layer_mapping[kvcache.start_layer : kvcache.end_layer]
     ):
@@ -361,6 +362,15 @@ def build_deepseek_v4_hicache_stack(
             c4_state_global_layers.append(global_layer_id)
         elif layer_item.compress_ratio == 128:
             c128_layer_mapping[local_layer_id] = layer_item.compress_layer_id
+            c128_global_layers.append(global_layer_id)
+
+    integrity = getattr(kvcache, "kv_integrity", None)
+    from sglang.srt.mem_cache.dsv4_kv_integrity import DSV4Component
+
+    def integrity_descriptors(component, layer_ids):
+        if integrity is None:
+            return None
+        return [integrity.descriptor(component, layer_id) for layer_id in layer_ids]
 
     c4_state_mapping = {
         layer_id: local_id for local_id, layer_id in enumerate(c4_state_local_layers)
@@ -386,6 +396,8 @@ def build_deepseek_v4_hicache_stack(
             is_anchor=True,
         ),
     ]
+    full_integrity_host_pools = []
+    swa_integrity_host_pools = []
 
     if not is_unified_kv:
         swa_host_pool = DeepSeekV4PagedHostPool(
@@ -396,6 +408,11 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=kvcache.swa_page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=_get_allocator_type(server_args),
+            integrity_manager=integrity,
+            integrity_descriptors=integrity_descriptors(
+                DSV4Component.SWA_KV,
+                range(kvcache.start_layer, kvcache.end_layer),
+            ),
         )
         swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
         entries.append(
@@ -411,6 +428,7 @@ def build_deepseek_v4_hicache_stack(
                 device_free_fn=swa_attn_allocator.free,
             )
         )
+        swa_integrity_host_pools.append(swa_host_pool)
 
     if c4_layer_mapping:
         c4_device_buffers, c4_item_bytes = _dsv4_compressed_region_buffers(kvcache, 4)
@@ -422,6 +440,10 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=_get_allocator_type(server_args),
+            integrity_manager=integrity,
+            integrity_descriptors=integrity_descriptors(
+                DSV4Component.C4_ATTENTION_KV, c4_state_global_layers
+            ),
         )
         c4_indexer_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER),
@@ -434,6 +456,10 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=_get_allocator_type(server_args),
+            integrity_manager=integrity,
+            integrity_descriptors=integrity_descriptors(
+                DSV4Component.C4_INDEXER_KV, c4_state_global_layers
+            ),
         )
         entries.extend(
             [
@@ -453,6 +479,7 @@ def build_deepseek_v4_hicache_stack(
                 ),
             ]
         )
+        full_integrity_host_pools.extend([c4_host_pool, c4_indexer_host_pool])
 
         if not is_unified_kv:
             c4_state_host_pool = DeepSeekV4StateHostPool(
@@ -465,6 +492,10 @@ def build_deepseek_v4_hicache_stack(
                 swa_page_size=kvcache.swa_page_size,
                 layout=server_args.hicache_mem_layout,
                 allocator_type=_get_allocator_type(server_args),
+                integrity_manager=integrity,
+                integrity_descriptors=integrity_descriptors(
+                    DSV4Component.C4_ATTENTION_STATE, c4_state_global_layers
+                ),
             )
             c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
                 pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
@@ -476,6 +507,10 @@ def build_deepseek_v4_hicache_stack(
                 swa_page_size=kvcache.swa_page_size,
                 layout=server_args.hicache_mem_layout,
                 allocator_type=_get_allocator_type(server_args),
+                integrity_manager=integrity,
+                integrity_descriptors=integrity_descriptors(
+                    DSV4Component.C4_INDEXER_STATE, c4_state_global_layers
+                ),
             )
             entries.extend(
                 [
@@ -495,6 +530,9 @@ def build_deepseek_v4_hicache_stack(
                     ),
                 ]
             )
+            swa_integrity_host_pools.extend(
+                [c4_state_host_pool, c4_indexer_state_host_pool]
+            )
 
     if c128_layer_mapping:
         c128_device_buffers, c128_item_bytes = _dsv4_compressed_region_buffers(
@@ -508,6 +546,10 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=_get_allocator_type(server_args),
+            integrity_manager=integrity,
+            integrity_descriptors=integrity_descriptors(
+                DSV4Component.C128_ATTENTION_KV, c128_global_layers
+            ),
         )
         # C128 state pool is intentionally not registered with hicache.
         # page_size=256 % 128 == 0, so state pool is not consumed on load.
@@ -522,8 +564,13 @@ def build_deepseek_v4_hicache_stack(
                 ),
             ]
         )
+        full_integrity_host_pools.append(c128_host_pool)
 
     host_pool_group = HostPoolGroup(entries)
+    if integrity is not None:
+        host_pool_group.set_integrity_anchor_allocation_peers(full_integrity_host_pools)
+        if not is_unified_kv:
+            swa_host_pool.set_integrity_allocation_peers(swa_integrity_host_pools)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
         host_pool_group,

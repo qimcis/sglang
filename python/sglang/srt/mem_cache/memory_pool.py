@@ -281,9 +281,31 @@ class ReqToTokenPool:
             )
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
+        self._allocation_callbacks = []
+        self._write_callbacks = []
+
+    def register_allocation_callback(self, callback) -> None:
+        """Register a lifecycle hook invoked only for newly assigned req slots."""
+        if callback not in self._allocation_callbacks:
+            self._allocation_callbacks.append(callback)
+
+    def register_write_callback(self, callback) -> None:
+        """Register a hook invoked after trusted request-table writes."""
+        if callback not in self._write_callbacks:
+            self._write_callbacks.append(callback)
+
+    def notify_write(self, indices, values) -> None:
+        """Notify hooks for a table write performed by an external kernel."""
+        for callback in self._write_callbacks:
+            callback(indices, values)
+
+    @property
+    def has_write_callbacks(self) -> bool:
+        return bool(self._write_callbacks)
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
+        self.notify_write(indices, values)
 
     def available_size(self):
         return len(self.free_slots)
@@ -309,11 +331,19 @@ class ReqToTokenPool:
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
         offset = 0
+        allocated_indices = []
+        allocated_generations = []
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
                 self.req_generation[r.req_pool_idx] += 1
+                allocated_indices.append(r.req_pool_idx)
+                allocated_generations.append(
+                    int(self.req_generation[r.req_pool_idx].item())
+                )
                 offset += 1
+        for callback in self._allocation_callbacks:
+            callback(allocated_indices, allocated_generations)
         return [r.req_pool_idx for r in reqs]
 
     def free(self, req: Req):

@@ -275,6 +275,25 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/kvcacheio
    */
+  m.def("dsv4_page_digests(Tensor buffer, Tensor page_indices, int seed) -> Tensor");
+  m.impl("dsv4_page_digests", torch::kCUDA, &dsv4_page_digests);
+  m.def(
+      "dsv4_bind_pages(Tensor slots, Tensor logical_pages, Tensor request_indices, Tensor generations, "
+      "Tensor! expected_pages, Tensor! expected_generations, Tensor! expected_valid, Tensor! output, "
+      "Tensor! failure_status, int slot_page_size, int invalid_value, bool install_missing) -> ()");
+  m.impl("dsv4_bind_pages", torch::kCUDA, &dsv4_bind_pages);
+  m.def(
+      "dsv4_validate_pages(Tensor buffer, Tensor slots, Tensor logical_pages, Tensor request_indices, "
+      "Tensor digests, Tensor component_valid, Tensor! validation_state, Tensor! validation_failure, "
+      "Tensor! validation_pages, Tensor! validation_count, Tensor generations, Tensor expected_pages, "
+      "Tensor expected_generations, Tensor expected_valid, Tensor! output, Tensor! failure_status, "
+      "int seed, int slot_page_size, int invalid_value, bool allow_missing_digest) -> ()");
+  m.impl("dsv4_validate_pages", torch::kCUDA, &dsv4_validate_pages);
+  m.def(
+      "dsv4_refresh_slots(Tensor buffer, Tensor! digests, Tensor! valid, Tensor! dirty, Tensor slots, int seed, int "
+      "slot_page_size) -> ()");
+  m.impl("dsv4_refresh_slots", torch::kCUDA, &dsv4_refresh_slots);
+
   m.def(
       "transfer_kv_per_layer(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
       "dst_indices, int item_size, int block_quota, int num_warps_per_block) -> ()");

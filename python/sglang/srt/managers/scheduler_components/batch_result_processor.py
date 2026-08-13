@@ -93,6 +93,27 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
 
+    def _kv_integrity_failures(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> List[int]:
+        status = result.kv_integrity_status
+        if status is None:
+            return [0] * len(batch.reqs)
+        if status.is_cuda:
+            status = status.cpu()
+        values = status.reshape(-1).tolist()
+        if len(values) < len(batch.reqs):
+            raise RuntimeError("DSV4 integrity status is shorter than the batch")
+        return [int(value) for value in values[: len(batch.reqs)]]
+
+    @staticmethod
+    def _mark_kv_integrity_failure(req: Req, status: int) -> None:
+        req.set_finish_with_abort(
+            "DeepSeek-V4 KV integrity validation failed "
+            f"(status=0x{status:08x}); no sampled token was published"
+        )
+        req.update_finish_state(0)
+
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
@@ -220,6 +241,7 @@ class SchedulerBatchResultProcessor:
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
+            integrity_failures = self._kv_integrity_failures(batch, result)
             self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
 
             self._validate_pp_skip_output_comm(batch, result)
@@ -258,6 +280,13 @@ class SchedulerBatchResultProcessor:
                     # Decode req in a mixed batch, or a retracted req. Keep an
                     # aborted middle chunk in the chunked branch long enough to
                     # drain its accounting without streaming it.
+                    continue
+
+                if integrity_failures[i]:
+                    self._mark_kv_integrity_failure(req, integrity_failures[i])
+                    req.skip_radix_cache_insert = True
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    req.time_stats.set_completion_time()
                     continue
 
                 if req.inflight_middle_chunks <= 0:
@@ -840,6 +869,7 @@ class SchedulerBatchResultProcessor:
             )
 
         self.token_to_kv_pool_allocator.free_group_begin()
+        integrity_failures = self._kv_integrity_failures(batch, result)
 
         for i, req in enumerate(batch.reqs):
             req: Req
@@ -849,6 +879,14 @@ class SchedulerBatchResultProcessor:
             ):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
+                continue
+
+            if integrity_failures[i]:
+                self._mark_kv_integrity_failure(req, integrity_failures[i])
+                req.skip_radix_cache_insert = True
+                self._handle_finish_state_updated_req(
+                    req, batch, result, i, logits_output
+                )
                 continue
 
             # next_token_id is a per-req list: 1 token for non-spec, the verified

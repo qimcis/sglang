@@ -151,9 +151,28 @@ class DecodeReqToTokenPool:
         # here: HybridMambaDecodeReqToTokenPool borrows this __init__ while
         # inheriting ReqToTokenPool.alloc, which bumps it.
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
+        self._allocation_callbacks = []
+        self._write_callbacks = []
+
+    def register_allocation_callback(self, callback) -> None:
+        if callback not in self._allocation_callbacks:
+            self._allocation_callbacks.append(callback)
+
+    def register_write_callback(self, callback) -> None:
+        if callback not in self._write_callbacks:
+            self._write_callbacks.append(callback)
+
+    def notify_write(self, indices, values) -> None:
+        for callback in self._write_callbacks:
+            callback(indices, values)
+
+    @property
+    def has_write_callbacks(self) -> bool:
+        return bool(self._write_callbacks)
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
+        self.notify_write(indices, values)
 
     def available_size(self):
         return len(self.free_slots)
@@ -176,11 +195,19 @@ class DecodeReqToTokenPool:
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
         offset = 0
+        allocated_indices = []
+        allocated_generations = []
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
                 self.req_generation[r.req_pool_idx] += 1
+                allocated_indices.append(r.req_pool_idx)
+                allocated_generations.append(
+                    int(self.req_generation[r.req_pool_idx].item())
+                )
                 offset += 1
+        for callback in self._allocation_callbacks:
+            callback(allocated_indices, allocated_generations)
         return [r.req_pool_idx for r in reqs]
 
     def free(self, req: Req):
@@ -488,6 +515,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
+        kv_args.dsv4_integrity_pool = getattr(
+            self.token_to_kv_pool, "kv_integrity", None
+        )
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,
@@ -1273,6 +1303,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         "the Mooncake backend"
                     )
             metadata_kwargs = {"decode_prefix_len": total_prefix_len}
+            if getattr(self.kv_manager, "dsv4_integrity", None) is not None:
+                metadata_kwargs.update(
+                    request_index=int(decode_req.req.req_pool_idx),
+                    request_seq_len=int(origin_input_len),
+                )
             if device_page_indices is not None:
                 metadata_kwargs["device_kv_indices"] = device_page_indices
             if (
