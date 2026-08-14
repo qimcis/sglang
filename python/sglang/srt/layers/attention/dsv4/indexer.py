@@ -483,10 +483,7 @@ class C4IndexerBackendMixin:
         forward_batch: ForwardBatch,
         indexer_metadata: PagedIndexerMetadata,
     ) -> bool:
-        if (
-            self.token_to_kv_pool.kv_integrity is not None
-            and self._integrity_validate_consumers
-        ):
+        if self.token_to_kv_pool.kv_integrity is not None:
             return False
         if not envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.get():
             return False

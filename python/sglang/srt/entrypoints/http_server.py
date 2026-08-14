@@ -660,9 +660,13 @@ async def health_generate(request: Request) -> Response:
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
-    if (
-        not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()
-        and request.url.path == "/health"
+    protected_pd_decode = (
+        _global_state.tokenizer_manager.server_args.enable_dsv4_kv_integrity
+        and _global_state.tokenizer_manager.server_args.disaggregation_mode
+        == DisaggregationMode.DECODE.value
+    )
+    if request.url.path == "/health" and (
+        not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get() or protected_pd_decode
     ):
         return Response(status_code=200)
 
