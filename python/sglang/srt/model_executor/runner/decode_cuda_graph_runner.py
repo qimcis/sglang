@@ -1202,13 +1202,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.forward_mode.is_target_verify()
             and self.model_runner.spec_algorithm.is_dflash_family()
         )
-        # Exception: breakable-graph verify replays (captured forward metadata)
-        # re-read req_to_token *during* replay, so the pre-replay snapshot is
-        # too early -- record the event after replay instead.
-        read_done_post_replay = (
-            publish_read_done
-            and forward_batch.forward_mode.is_target_verify()
-            and self.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+        # Consumers that re-read shared metadata during replay need the WAR
+        # event published after replay, including protected DSV4 sidecars.
+        read_done_post_replay = publish_read_done and (
+            (
+                forward_batch.forward_mode.is_target_verify()
+                and self.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+            )
+            or self.model_runner.server_args.enable_dsv4_kv_integrity
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)

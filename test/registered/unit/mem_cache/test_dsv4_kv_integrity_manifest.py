@@ -99,6 +99,94 @@ def test_layout_fingerprint_binds_component_geometry():
     assert layout_fingerprint([descriptor]) != layout_fingerprint([changed])
 
 
+def test_layout_fingerprint_allows_heterogeneous_pd_capacities():
+    descriptor = DSV4ComponentDescriptor(
+        component=DSV4Component.SWA_KV,
+        layer_id=0,
+        compress_ratio=0,
+        transfer_group=DSV4TransferGroup.SWA,
+        page_size=256,
+        item_nbytes=16,
+        capacity=2,
+        buffer=torch.zeros((2, 16), dtype=torch.uint8),
+    )
+    larger = dataclasses.replace(
+        descriptor,
+        capacity=8,
+        buffer=torch.zeros((8, 16), dtype=torch.uint8),
+    )
+    assert layout_fingerprint([descriptor]) == layout_fingerprint([larger])
+
+
+def test_manifest_rejects_out_of_bounds_destination_before_hashing():
+    descriptors = (
+        DSV4ComponentDescriptor(
+            component=DSV4Component.C4_ATTENTION_KV,
+            layer_id=0,
+            compress_ratio=4,
+            transfer_group=DSV4TransferGroup.KV,
+            page_size=64,
+            item_nbytes=16,
+            capacity=4,
+            buffer=torch.zeros((4, 16), dtype=torch.uint8),
+        ),
+        DSV4ComponentDescriptor(
+            component=DSV4Component.SWA_KV,
+            layer_id=0,
+            compress_ratio=0,
+            transfer_group=DSV4TransferGroup.SWA,
+            page_size=2,
+            item_nbytes=16,
+            capacity=4,
+            buffer=torch.zeros((4, 16), dtype=torch.uint8),
+        ),
+        DSV4ComponentDescriptor(
+            component=DSV4Component.C128_ATTENTION_STATE,
+            layer_id=0,
+            compress_ratio=128,
+            transfer_group=DSV4TransferGroup.C128_STATE,
+            page_size=128,
+            item_nbytes=16,
+            capacity=4,
+            buffer=torch.zeros((4, 16), dtype=torch.uint8),
+        ),
+    )
+    manager = DSV4KVIntegrityManager(
+        descriptors,
+        request_capacity=4,
+        max_context_len=16,
+        full_page_size=4,
+        swa_page_size=2,
+    )
+    manifest = DSV4TransferManifest(
+        bootstrap_room=123,
+        transfer_nonce=456,
+        layout_digest=manager.layout_digest,
+        entries=(
+            DSV4ManifestEntry(
+                component=DSV4Component.C4_ATTENTION_KV,
+                layer_id=0,
+                compress_ratio=4,
+                transfer_group=DSV4TransferGroup.KV,
+                page_size=64,
+                item_nbytes=16,
+                logical_start=0,
+                logical_count=1,
+                digests=(0,),
+            ),
+        ),
+    )
+    with pytest.raises(DSV4ManifestError, match="destination pages"):
+        manager.verify_and_install(
+            manifest,
+            bootstrap_room=123,
+            transfer_nonce=456,
+            indices_by_group={DSV4TransferGroup.KV: [4]},
+            logical_starts={DSV4TransferGroup.KV: 0},
+            request_index=1,
+        )
+
+
 def test_causal_swa_logical_pages_follow_newest_to_oldest_index_order():
     logical = causal_swa_logical_pages(
         torch.tensor([200, 2]),
@@ -107,6 +195,16 @@ def test_causal_swa_logical_pages_follow_newest_to_oldest_index_order():
         page_size=128,
     )
     assert logical.tolist() == [[1, 1, 1, 1], [0, 0, -1, -1]]
+
+
+def test_causal_swa_logical_pages_use_physical_storage_page_size():
+    logical = causal_swa_logical_pages(
+        torch.tensor([256, 257]),
+        torch.tensor([128, 128]),
+        width=4,
+        page_size=256,
+    )
+    assert logical.tolist() == [[0, 0, 0, 0], [1, 0, 0, 0]]
 
 
 class _RecordingManager(DSV4KVIntegrityManager):

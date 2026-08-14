@@ -625,7 +625,7 @@ class DeepseekV4AttnBackend(
             metadata.seq_lens_casual,
             metadata.swa_topk_lengths,
             width=swa_width,
-            page_size=self.swa_page_size,
+            page_size=swa_descriptor.page_size,
         )
         protected_swa = integrity.verify_mapping(
             DSV4IntegrityDomain.SWA,
@@ -1669,7 +1669,7 @@ class DeepseekV4AttnBackend(
             reqs = core.req_pool_indices_repeated[: swa_loc.shape[0]]
             logical = torch.div(
                 core.positions_casual[: swa_loc.shape[0]].to(torch.int64),
-                self.swa_page_size,
+                descriptor.page_size,
                 rounding_mode="floor",
             ).reshape_as(swa_loc)
             swa_loc = integrity.validate_pages(
@@ -1786,7 +1786,7 @@ class DeepseekV4AttnBackend(
                     core_attn_metadata.seq_lens_casual[: q.shape[0]],
                     swa_topk_lengths,
                     width=swa_page_indices.shape[1],
-                    page_size=self.swa_page_size,
+                    page_size=swa_descriptor.page_size,
                 )
                 swa_page_indices = integrity.validate_pages(
                     swa_descriptor,

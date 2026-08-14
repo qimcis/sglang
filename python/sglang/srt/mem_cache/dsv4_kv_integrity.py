@@ -99,14 +99,13 @@ def layout_fingerprint(
         d.validate()
         h.update(
             struct.pack(
-                "<B3xihHIIQ",
+                "<B3xihHII",
                 int(d.component),
                 d.layer_id,
                 d.compress_ratio,
                 int(d.transfer_group),
                 d.page_size,
                 d.item_nbytes,
-                d.capacity,
             )
         )
     return h.digest()
@@ -1060,6 +1059,10 @@ class DSV4KVIntegrityManager:
             ).reshape(-1)
             if pages.numel() == 0:
                 continue
+            if bool(torch.any((pages <= 0) | (pages >= descriptor.capacity)).item()):
+                raise DSV4IntegrityError(
+                    f"DSV4 source pages are out of bounds for {descriptor.identity}"
+                )
             digests = compute_page_digests(
                 descriptor.buffer, pages, seed=component_seed(descriptor)
             ).cpu()
@@ -1134,6 +1137,15 @@ class DSV4KVIntegrityManager:
                 raise DSV4ManifestError("manifest logical range mismatch")
             if entry.logical_start != int(logical_starts[descriptor.transfer_group]):
                 raise DSV4ManifestError("manifest logical start mismatch")
+            space = self.address_spaces[
+                self.domain_for_group(descriptor.transfer_group)
+            ]
+            if entry.logical_start + entry.logical_count > space.logical_capacity:
+                raise DSV4ManifestError("manifest logical range is out of bounds")
+            if bool(torch.any((pages <= 0) | (pages >= descriptor.capacity)).item()):
+                raise DSV4ManifestError(
+                    f"manifest destination pages are out of bounds for {identity}"
+                )
             actual = compute_page_digests(
                 descriptor.buffer, pages, seed=component_seed(descriptor)
             )
