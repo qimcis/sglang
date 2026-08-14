@@ -158,8 +158,8 @@ class Qwen38MlpBf16FusedKernel:
         tiled_mma1 = sm100_utils.make_trivial_tiled_mma(
             self.ab_dtype,
             self.ab_dtype,
-            utils.LayoutEnum.RowMajor,
-            utils.LayoutEnum.RowMajor,
+            utils.LayoutEnum.ROW_MAJOR,
+            utils.LayoutEnum.ROW_MAJOR,
             self.acc_dtype,
             self.cta_group,
             mma_tiler_mn1,
@@ -167,8 +167,8 @@ class Qwen38MlpBf16FusedKernel:
         tiled_mma2 = sm100_utils.make_trivial_tiled_mma(
             self.ab_dtype,
             self.ab_dtype,
-            utils.LayoutEnum.RowMajor,
-            utils.LayoutEnum.RowMajor,
+            utils.LayoutEnum.ROW_MAJOR,
+            utils.LayoutEnum.ROW_MAJOR,
             self.acc_dtype,
             self.cta_group,
             mma_tiler_mn2,
@@ -456,7 +456,7 @@ class Qwen38MlpBf16FusedKernel:
         tiled_copy_t2r = cute.nvgpu.tcgen05.make_tmem_copy(
             sm100_utils.get_tmem_load_op(
                 (self.cta_m, self.cta_n_down, self.cta_k),
-                utils.LayoutEnum.RowMajor,
+                utils.LayoutEnum.ROW_MAJOR,
                 self.c_dtype,
                 self.acc_dtype,
                 (self.cta_m, self.cta_n_down),
@@ -594,8 +594,8 @@ class Qwen38MlpNvfp4FusedKernel:
         # GEMM2: M=cta_m, N=K_per_CTA, K=I_per_CTA
         tiled_mma1 = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.ab_dtype,
-            utils.LayoutEnum.RowMajor,
-            utils.LayoutEnum.RowMajor,
+            utils.LayoutEnum.ROW_MAJOR,
+            utils.LayoutEnum.ROW_MAJOR,
             self.sf_dtype,
             self.sf_vec_size,
             self.cta_group,
@@ -603,8 +603,8 @@ class Qwen38MlpNvfp4FusedKernel:
         )
         tiled_mma2 = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.ab_dtype,
-            utils.LayoutEnum.RowMajor,
-            utils.LayoutEnum.RowMajor,
+            utils.LayoutEnum.ROW_MAJOR,
+            utils.LayoutEnum.ROW_MAJOR,
             self.sf_dtype,
             self.sf_vec_size,
             self.cta_group,
@@ -1006,7 +1006,7 @@ class Qwen38MlpNvfp4FusedKernel:
         tiled_copy_t2r = cute.nvgpu.tcgen05.make_tmem_copy(
             sm100_utils.get_tmem_load_op(
                 (self.cta_m, self.cta_n, self.cta_k),
-                utils.LayoutEnum.RowMajor,
+                utils.LayoutEnum.ROW_MAJOR,
                 cutlass.BFloat16,
                 cutlass.Float32,
                 (self.cta_m, self.cta_n),

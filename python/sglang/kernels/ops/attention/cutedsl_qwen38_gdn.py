@@ -126,8 +126,8 @@ def _define_gdn_megakernels():
         tiled_mma_qkvz = sm100_utils.make_trivial_tiled_mma(
             cutlass.BFloat16,
             cutlass.BFloat16,
-            utils.LayoutEnum.RowMajor,
-            utils.LayoutEnum.RowMajor,
+            utils.LayoutEnum.ROW_MAJOR,
+            utils.LayoutEnum.ROW_MAJOR,
             cutlass.Float32,
             tcgen05.CtaGroup.ONE,
             prologue_mma_tiler_qkvz,
@@ -135,8 +135,8 @@ def _define_gdn_megakernels():
         tiled_mma_ba = sm100_utils.make_trivial_tiled_mma(
             cutlass.BFloat16,
             cutlass.BFloat16,
-            utils.LayoutEnum.RowMajor,
-            utils.LayoutEnum.RowMajor,
+            utils.LayoutEnum.ROW_MAJOR,
+            utils.LayoutEnum.ROW_MAJOR,
             cutlass.Float32,
             tcgen05.CtaGroup.ONE,
             prologue_mma_tiler_ba,
