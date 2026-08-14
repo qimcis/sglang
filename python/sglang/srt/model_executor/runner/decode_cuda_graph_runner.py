@@ -417,6 +417,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raise Exception(
                 f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+        integrity = getattr(model_runner.token_to_kv_pool, "kv_integrity", None)
+        if integrity is not None:
+            integrity.failure_status.zero_()
 
     def _build_ragged_verify_token_buckets(self) -> list[int]:
         buckets = sorted({bs * self.captured_req_width for bs in self.capture_bs})

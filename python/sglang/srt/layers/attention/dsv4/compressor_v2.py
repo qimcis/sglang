@@ -166,100 +166,6 @@ class CompressorBackendMixin:
             assert head_dim == 128
 
         plan = self._get_paged_compress_metadata(compress_ratio)
-        integrity = self.token_to_kv_pool.kv_integrity
-        state_descriptor = None
-        output_descriptor = None
-        integrity_written_slots = None
-        if integrity is not None:
-            from sglang.srt.mem_cache.dsv4_kv_integrity import (
-                DSV4Component,
-                DSV4IntegrityError,
-            )
-
-            if is_indexer:
-                state_component = DSV4Component.C4_INDEXER_STATE
-                output_component = DSV4Component.C4_INDEXER_KV
-            elif compress_ratio == 4:
-                state_component = DSV4Component.C4_ATTENTION_STATE
-                output_component = DSV4Component.C4_ATTENTION_KV
-            else:
-                state_component = DSV4Component.C128_ATTENTION_STATE
-                output_component = DSV4Component.C128_ATTENTION_KV
-            state_descriptor = integrity.descriptor(state_component, layer_id)
-            output_descriptor = integrity.descriptor(output_component, layer_id)
-            core = self.forward_metadata.core_metadata
-            plan = integrity.protect_compressor_plan(
-                state_descriptor,
-                plan,
-                core.req_pool_indices_repeated,
-                core.positions_casual,
-            )
-
-            plan_raw = plan[1].view(torch.int32).reshape(-1, 4)
-            seq_lens = plan_raw[:, 0].to(torch.int64)
-            valid = seq_lens >= 0
-            if plan.is_decode:
-                if out_loc.numel() != seq_lens.numel():
-                    raise DSV4IntegrityError(
-                        "DSV4 decode compressor output geometry mismatch"
-                    )
-                if core.req_pool_indices_repeated.numel() < seq_lens.numel():
-                    raise DSV4IntegrityError(
-                        "DSV4 decode compressor request geometry mismatch"
-                    )
-                selected_out_loc = out_loc.reshape(-1)
-                reqs = core.req_pool_indices_repeated[: seq_lens.numel()]
-                safe_ragged = None
-            else:
-                ragged = torch.bitwise_and(plan_raw[:, 1].to(torch.int64), 0xFFFF)
-                if out_loc.numel() != core.req_pool_indices_repeated.numel():
-                    raise DSV4IntegrityError(
-                        "DSV4 prefill compressor token geometry mismatch"
-                    )
-                if seq_lens.numel() == 0:
-                    safe_ragged = ragged
-                    selected_out_loc = out_loc[:0]
-                    reqs = core.req_pool_indices_repeated[:0]
-                else:
-                    if out_loc.numel() == 0:
-                        raise DSV4IntegrityError(
-                            "DSV4 prefill compressor plan has no token rows"
-                        )
-                    safe_ragged = torch.where(valid, ragged, 0).clamp(
-                        max=out_loc.numel() - 1
-                    )
-                    selected_out_loc = out_loc[safe_ragged]
-                    reqs = core.req_pool_indices_repeated[safe_ragged]
-            logical = torch.where(
-                (selected_out_loc > 0) & valid,
-                torch.div(
-                    torch.clamp(seq_lens - 1, min=0),
-                    self.token_to_kv_pool.page_size,
-                    rounding_mode="floor",
-                ),
-                -1,
-            ).contiguous()
-            protected_out_loc = integrity.validate_pages(
-                output_descriptor,
-                selected_out_loc.contiguous(),
-                logical.contiguous(),
-                reqs,
-                slot_page_size=output_descriptor.page_size,
-                invalid_value=(output_descriptor.capacity - 1)
-                * output_descriptor.page_size,
-                allow_missing_digest=True,
-            )
-            # Keep the refresh geometry static during decode graph capture.
-            # The refresh kernel ignores zero slots, so padding can remain in
-            # the captured tensor without dynamic boolean indexing.
-            integrity_written_slots = torch.where(valid, protected_out_loc, 0)
-            if plan.is_decode:
-                out_loc = protected_out_loc.reshape_as(out_loc)
-            elif seq_lens.numel() != 0:
-                flat_out_loc = out_loc.reshape(-1).clone()
-                updates = torch.where(valid, protected_out_loc - selected_out_loc, 0)
-                flat_out_loc.scatter_add_(0, safe_ragged, updates)
-                out_loc = flat_out_loc.reshape_as(out_loc)
         is_online = _use_online_compress(compress_ratio)
         if is_online:
             kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
@@ -279,9 +185,6 @@ class CompressorBackendMixin:
             head_dim=head_dim,
             is_online=is_online,
         )
-        if state_descriptor is not None:
-            integrity.refresh_compressor_writes(state_descriptor, plan)
-
         # Step 2: norm + rope + store
         compress_norm_rope_store(
             kv_compressed,
@@ -295,12 +198,6 @@ class CompressorBackendMixin:
             use_fp4=use_fp4_indexer,
             bf16_store=bf16_store,
         )
-        if output_descriptor is not None and integrity_written_slots is not None:
-            integrity.refresh_written_slots(
-                output_descriptor,
-                integrity_written_slots,
-                slot_page_size=output_descriptor.page_size,
-            )
 
     def forward_unified(
         self,

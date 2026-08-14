@@ -29,6 +29,7 @@ def _host_sidecars():
     component_sidecar = SimpleNamespace(
         digest=torch.tensor([0, 11, 22, 33], dtype=torch.int64),
         valid=torch.tensor([0, 1, 1, 1], dtype=torch.uint8),
+        refresh=lambda pages: None,
     )
     address_space = SimpleNamespace(
         generation=torch.tensor([0, 4, 5, 6], dtype=torch.int64)

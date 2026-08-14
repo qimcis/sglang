@@ -132,6 +132,9 @@ class _DSV4HostIntegritySidecars:
             pages = device_rows.to(sidecar.digest.device)
             if bool(((pages <= 0) | (pages >= descriptor.capacity)).any().item()):
                 raise RuntimeError("DSV4 HiCache backup page is out of range")
+            # Hash once at the host-cache trust boundary. Runtime writes no
+            # longer maintain every component digest after every layer.
+            sidecar.refresh(pages)
             digests = sidecar.digest.index_select(0, pages).cpu().tolist()
             generations = space.generation.index_select(0, pages).cpu().tolist()
             valid = sidecar.valid.index_select(0, pages).cpu().tolist()

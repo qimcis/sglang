@@ -1094,7 +1094,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.swa_kv_pool.set_key_buffer(
             self._swa_local_layer_id(layer_id), loc, cache_nope_fp8_rope_bf16_pack
         )
-        self._refresh_integrity_slots("SWA_KV", layer_id, loc)
 
     def get_extra_key_page_size(self, layer_id: int) -> int:
         _, _, compress_kv_pool = self.layer_mapping[layer_id]
@@ -1118,12 +1117,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         compress_kv_pool.set_key_buffer(
             compress_layer_id, loc, cache_nope_fp8_rope_bf16_pack
         )
-        component = (
-            "C4_ATTENTION_KV"
-            if self.layer_mapping[layer_id].compress_ratio == 4
-            else "C128_ATTENTION_KV"
-        )
-        self._refresh_integrity_slots(component, layer_id, loc)
 
     def get_index_k_page_size(self) -> int:
         return self.c4_indexer_kv_pool.page_size
@@ -1165,7 +1158,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c4_indexer_kv_pool.set_index_k_scale_buffer(
             compress_layer_id, loc, index_k, index_k_scale
         )
-        self._refresh_integrity_slots("C4_INDEXER_KV", layer_id, loc)
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
@@ -1188,7 +1180,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.swa_kv_pool.set_key_buffer(
             self._swa_local_layer_id(layer_id), swa_loc, cache_nope_fp8_rope_bf16_pack
         )
-        self._refresh_integrity_slots("SWA_KV", layer_id, swa_loc)
 
     def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:
         self.wait_layer_transfer(layer_id)
@@ -1203,7 +1194,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         result = self.swa_kv_pool.set_key_buffer_fused(
             self._swa_local_layer_id(layer_id), swa_loc, cache_k
         )
-        self._refresh_integrity_slots("SWA_KV", layer_id, swa_loc)
         return result
 
     def set_swa_key_buffer_radix_fused_norm_rope(
@@ -1226,7 +1216,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             kvcache=self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)],
             page_size=self.swa_kv_pool.page_size,
         )
-        self._refresh_integrity_slots("SWA_KV", layer_id, swa_loc)
 
     def set_extra_key_buffer_fused(
         self,
@@ -1237,12 +1226,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         result = compress_kv_pool.set_key_buffer_fused(compress_layer_id, loc, cache_k)
-        component = (
-            "C4_ATTENTION_KV"
-            if self.layer_mapping[layer_id].compress_ratio == 4
-            else "C128_ATTENTION_KV"
-        )
-        self._refresh_integrity_slots(component, layer_id, loc)
         return result
 
     def set_index_k_fused(
@@ -1256,48 +1239,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         result = self.c4_indexer_kv_pool.set_index_fused(
             compress_layer_id, loc, cache_k
         )
-        self._refresh_integrity_slots("C4_INDEXER_KV", layer_id, loc)
         return result
-
-    def _refresh_integrity_slots(
-        self, component_name: str, layer_id: int, slots: torch.Tensor
-    ) -> None:
-        if self.kv_integrity is None or slots.numel() == 0:
-            return
-        from sglang.srt.mem_cache.dsv4_kv_integrity import DSV4Component
-
-        descriptor = self.kv_integrity.descriptor(
-            DSV4Component[component_name], layer_id
-        )
-        self.kv_integrity.refresh_written_slots(
-            descriptor, slots, slot_page_size=descriptor.page_size
-        )
-
-    def refresh_integrity_state_slots(
-        self, component_name: str, layer_id: int, state_slots: torch.Tensor
-    ) -> None:
-        if self.kv_integrity is None or state_slots.numel() == 0:
-            return
-        from sglang.srt.mem_cache.dsv4_kv_integrity import DSV4Component
-
-        descriptor = self.kv_integrity.descriptor(
-            DSV4Component[component_name], layer_id
-        )
-        self.kv_integrity.refresh_written_slots(
-            descriptor, state_slots, slot_page_size=descriptor.page_size
-        )
-
-    def refresh_integrity_pages(
-        self, component_name: str, layer_id: int, pages: torch.Tensor
-    ) -> None:
-        if self.kv_integrity is None:
-            return
-        from sglang.srt.mem_cache.dsv4_kv_integrity import DSV4Component
-
-        descriptor = self.kv_integrity.descriptor(
-            DSV4Component[component_name], layer_id
-        )
-        self.kv_integrity.refresh_pages(descriptor, pages)
 
     def set_index_k_fp4(
         self,

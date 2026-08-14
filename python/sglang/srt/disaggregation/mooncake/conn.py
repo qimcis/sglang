@@ -1296,6 +1296,8 @@ class MooncakeKVManager(CommonKVManager):
                 dtype=torch.int32,
                 device=self.dsv4_integrity.failure_status.device,
             ).reshape(1, -1)
+            if pages.numel() == 0:
+                continue
             logical_start = logical_starts[group]
             logical_pages = torch.arange(
                 logical_start,

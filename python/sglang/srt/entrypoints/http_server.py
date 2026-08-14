@@ -2286,6 +2286,16 @@ def _execute_server_warmup(server_args: ServerArgs):
             if not envs.SGLANG_RUST_SERVER.get():
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
+        elif (
+            server_args.enable_dsv4_kv_integrity
+            and server_args.disaggregation_mode == "decode"
+        ):
+            logger.info(
+                "Skipping synthetic PD decode warmup: protected DSV4 decode "
+                "requires an authenticated transfer manifest."
+            )
+            if not envs.SGLANG_RUST_SERVER.get():
+                _global_state.tokenizer_manager.server_status = ServerStatus.Up
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
             status_codes = asyncio.run(

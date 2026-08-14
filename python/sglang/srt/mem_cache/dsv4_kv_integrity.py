@@ -2,9 +2,12 @@
 
 The protected layout contains seven independently addressed component types.
 This module owns their stable identity, the strict Mooncake wire manifest and
-the per-physical-page digest sidecars used by the decode consumers.  CUDA byte
-hashing lives in :mod:`sgl_kernel.kvcacheio`; protocol parsing deliberately has
-no CUDA dependency so malformed-message tests can run on CPU.
+the per-physical-page digest sidecars used at transfer admission. Decode checks
+the admitted request mapping and allocation generation once per shared address
+space when forward metadata is built; it does not re-hash every component in
+every layer. CUDA byte hashing lives in :mod:`sgl_kernel.kvcacheio`; protocol
+parsing deliberately has no CUDA dependency so malformed-message tests can run
+on CPU.
 """
 
 from __future__ import annotations
@@ -868,9 +871,29 @@ class DSV4KVIntegrityManager:
         plan,
         request_indices_repeated: torch.Tensor,
         positions: torch.Tensor,
+        *,
+        validate_bytes: bool = True,
     ):
         """Validate state reads and sanitize state writes in one plan copy."""
         domain = self.domain_for_group(descriptor.transfer_group)
+
+        def validate_state(slots, logical, requests, *, slot_page_size):
+            if validate_bytes:
+                return self.validate_pages(
+                    descriptor,
+                    slots,
+                    logical,
+                    requests,
+                    slot_page_size=slot_page_size,
+                )
+            return self.verify_mapping(
+                domain,
+                slots,
+                logical,
+                requests,
+                slot_page_size=slot_page_size,
+            )
+
         if plan.is_decode:
             plan_d = plan[1].clone()
             raw = plan_d.view(torch.int32).reshape(-1, 4)
@@ -903,8 +926,7 @@ class DSV4KVIntegrityManager:
             if descriptor.transfer_group == DSV4TransferGroup.C128_STATE:
                 logical_1 = torch.where(consumes_state, 0, -1)
             raw[:, 2].copy_(
-                self.validate_pages(
-                    descriptor,
+                validate_state(
                     raw[:, 2].contiguous(),
                     logical_0.contiguous(),
                     reqs,
@@ -914,8 +936,7 @@ class DSV4KVIntegrityManager:
                 )
             )
             raw[:, 3].copy_(
-                self.validate_pages(
-                    descriptor,
+                validate_state(
                     raw[:, 3].contiguous(),
                     logical_1.contiguous(),
                     reqs,
@@ -977,8 +998,7 @@ class DSV4KVIntegrityManager:
             logical_0.fill_(-1)
             logical_1 = torch.where(reads_page_1, 0, -1)
         raw_c[:, 2].copy_(
-            self.validate_pages(
-                descriptor,
+            validate_state(
                 raw_c[:, 2].contiguous(),
                 logical_0.contiguous(),
                 reqs_c,
@@ -988,8 +1008,7 @@ class DSV4KVIntegrityManager:
             )
         )
         raw_c[:, 3].copy_(
-            self.validate_pages(
-                descriptor,
+            validate_state(
                 raw_c[:, 3].contiguous(),
                 logical_1.contiguous(),
                 reqs_c,
@@ -1176,6 +1195,8 @@ class DSV4KVIntegrityManager:
             pages = torch.as_tensor(
                 raw_pages, dtype=torch.int32, device=self.failure_status.device
             ).reshape(1, -1)
+            if pages.numel() == 0:
+                continue
             logical_start = int(logical_starts[group])
             logical = torch.arange(
                 logical_start,

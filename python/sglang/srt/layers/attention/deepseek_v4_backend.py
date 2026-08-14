@@ -397,6 +397,7 @@ class DSV4Metadata:
     # reused across every layer in the chunk. Reset to ``None`` when graph
     # metadata is refreshed so replay rebuilds it from the live batch.
     sparse_prefill_cache: Optional[SparsePrefillChunkCache] = None
+    integrity_protected: bool = False
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -410,6 +411,7 @@ class DSV4Metadata:
             self.c128_compress_metadata, src=other.c128_compress_metadata
         )
         self.sparse_prefill_cache = None
+        self.integrity_protected = other.integrity_protected
 
     def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
@@ -429,6 +431,7 @@ class DSV4Metadata:
                 src=static_metadata.c128_compress_metadata,
             )
         self.sparse_prefill_cache = None
+        self.integrity_protected = static_metadata.integrity_protected
 
 
 @dataclass
@@ -525,6 +528,9 @@ class DeepseekV4AttnBackend(
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self._integrity_validate_consumers = (
+            model_runner.server_args.disaggregation_mode != "prefill"
+        )
         if self.token_to_kv_pool.kv_integrity is not None:
             self.token_to_kv_pool.kv_integrity.attach_request_pool(
                 model_runner.req_to_token_pool
@@ -585,9 +591,9 @@ class DeepseekV4AttnBackend(
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
 
-    def _integrity_bind_core_mappings(self, metadata: DSV4AttnMetadata) -> None:
+    def _integrity_protect_core_mappings(self, metadata: DSV4AttnMetadata) -> None:
         integrity = self.token_to_kv_pool.kv_integrity
-        if integrity is None:
+        if integrity is None or not self._integrity_validate_consumers:
             return
         from sglang.srt.mem_cache.dsv4_kv_integrity import (
             DSV4Component,
@@ -617,6 +623,20 @@ class DeepseekV4AttnBackend(
         )
         metadata.page_table.copy_(protected_table)
 
+        output_logical = torch.div(
+            metadata.positions_casual.to(torch.int64),
+            self.page_size,
+            rounding_mode="floor",
+        ).contiguous()
+        metadata.raw_out_loc.copy_(
+            integrity.verify_mapping(
+                DSV4IntegrityDomain.FULL,
+                metadata.raw_out_loc.contiguous(),
+                output_logical,
+                reqs,
+                slot_page_size=self.page_size,
+            )
+        )
         swa_descriptor = integrity.descriptor(
             DSV4Component.SWA_KV, self.token_to_kv_pool._stage_start
         )
@@ -636,14 +656,44 @@ class DeepseekV4AttnBackend(
         )
         metadata.swa_page_indices.copy_(protected_swa)
 
-        state_pages = reqs.view(-1, 1).to(torch.int32)
-        integrity.verify_mapping(
-            DSV4IntegrityDomain.C128_STATE,
-            state_pages,
-            torch.zeros_like(state_pages, dtype=torch.int64),
-            reqs,
-            slot_page_size=1,
-        )
+    def _integrity_protect_forward_metadata(self, metadata) -> None:
+        integrity = self.token_to_kv_pool.kv_integrity
+        if (
+            integrity is None
+            or not self._integrity_validate_consumers
+            or not isinstance(metadata, DSV4Metadata)
+            or metadata.integrity_protected
+        ):
+            return
+
+        from sglang.srt.mem_cache.dsv4_kv_integrity import DSV4Component
+
+        core = metadata.core_attn_metadata
+
+        def representative(component: DSV4Component):
+            return next(
+                descriptor
+                for descriptor in integrity.descriptors
+                if descriptor.component == component
+            )
+
+        if metadata.c4_compress_metadata is not None:
+            metadata.c4_compress_metadata = integrity.protect_compressor_plan(
+                representative(DSV4Component.C4_ATTENTION_STATE),
+                metadata.c4_compress_metadata,
+                core.req_pool_indices_repeated,
+                core.positions_casual,
+                validate_bytes=False,
+            )
+        if metadata.c128_compress_metadata is not None:
+            metadata.c128_compress_metadata = integrity.protect_compressor_plan(
+                representative(DSV4Component.C128_ATTENTION_STATE),
+                metadata.c128_compress_metadata,
+                core.req_pool_indices_repeated,
+                core.positions_casual,
+                validate_bytes=False,
+            )
+        metadata.integrity_protected = True
 
     def _resolve_verify_layout(
         self,
@@ -1173,6 +1223,8 @@ class DeepseekV4AttnBackend(
                 raw_metadata=self.forward_metadata,
             )
 
+        self._integrity_protect_forward_metadata(self.forward_metadata)
+
         # Compute the SWA KV-store write target once per forward and cache it on
         # the metadata for every layer's store. This is recorded inside the cuda
         # graph, so replay re-reads the live out_cache_loc buffer (spec-v2 and DP
@@ -1202,6 +1254,33 @@ class DeepseekV4AttnBackend(
                     torch.int32
                 )
             )
+            integrity = self.token_to_kv_pool.kv_integrity
+            if (
+                integrity is not None
+                and self._integrity_validate_consumers
+                and not forward_batch.forward_mode.is_idle()
+            ):
+                from sglang.srt.mem_cache.dsv4_kv_integrity import DSV4IntegrityDomain
+
+                core = metadata.core_attn_metadata
+                count = core.swa_out_cache_loc.shape[0]
+                reqs = (
+                    core.req_pool_indices_repeated[:count].to(torch.int64).contiguous()
+                )
+                logical = torch.div(
+                    core.positions_casual[:count].to(torch.int64),
+                    integrity.swa_page_size,
+                    rounding_mode="floor",
+                ).contiguous()
+                core.swa_out_cache_loc.copy_(
+                    integrity.verify_mapping(
+                        DSV4IntegrityDomain.SWA,
+                        core.swa_out_cache_loc.contiguous(),
+                        logical,
+                        reqs,
+                        slot_page_size=integrity.swa_page_size,
+                    )
+                )
 
             if self.is_dspark_draft and forward_batch.forward_mode.is_target_verify():
                 block_size = int(forward_batch.spec_info.draft_token_num)
@@ -1531,6 +1610,7 @@ class DeepseekV4AttnBackend(
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
 
+        self._integrity_protect_forward_metadata(metadata)
         return metadata
 
     def init_forward_metadata_for_breakable_cuda_graph_capture(
@@ -1660,27 +1740,6 @@ class DeepseekV4AttnBackend(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
-        integrity = self.token_to_kv_pool.kv_integrity
-        if integrity is not None:
-            from sglang.srt.mem_cache.dsv4_kv_integrity import DSV4Component
-
-            core = self.forward_metadata.core_attn_metadata
-            descriptor = integrity.descriptor(DSV4Component.SWA_KV, layer_id)
-            reqs = core.req_pool_indices_repeated[: swa_loc.shape[0]]
-            logical = torch.div(
-                core.positions_casual[: swa_loc.shape[0]].to(torch.int64),
-                descriptor.page_size,
-                rounding_mode="floor",
-            ).reshape_as(swa_loc)
-            swa_loc = integrity.validate_pages(
-                descriptor,
-                swa_loc.contiguous(),
-                logical.contiguous(),
-                reqs,
-                slot_page_size=descriptor.page_size,
-                invalid_value=(descriptor.capacity - 1) * descriptor.page_size,
-                allow_missing_digest=True,
-            )
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
                 layer_id=layer_id,
@@ -1768,86 +1827,6 @@ class DeepseekV4AttnBackend(
             swa_topk_lengths = match_num_queries(swa_topk_lengths, value=1)
             extra_indices = match_num_queries(extra_indices, value=-1)
             extra_topk_lengths = match_num_queries(extra_topk_lengths, value=1)
-
-            integrity = token_to_kv_pool.kv_integrity
-            if integrity is not None:
-                from sglang.srt.mem_cache.dsv4_kv_integrity import (
-                    DSV4Component,
-                    causal_swa_logical_pages,
-                )
-
-                reqs = (
-                    core_attn_metadata.req_pool_indices_repeated[: q.shape[0]]
-                    .to(torch.int64)
-                    .contiguous()
-                )
-                swa_descriptor = integrity.descriptor(DSV4Component.SWA_KV, layer_id)
-                swa_logical = causal_swa_logical_pages(
-                    core_attn_metadata.seq_lens_casual[: q.shape[0]],
-                    swa_topk_lengths,
-                    width=swa_page_indices.shape[1],
-                    page_size=swa_descriptor.page_size,
-                )
-                swa_page_indices = integrity.validate_pages(
-                    swa_descriptor,
-                    swa_page_indices.contiguous(),
-                    swa_logical,
-                    reqs,
-                    slot_page_size=swa_descriptor.page_size,
-                )
-
-                if compress_ratio == 4:
-                    descriptor = integrity.descriptor(
-                        DSV4Component.C4_ATTENTION_KV, layer_id
-                    )
-                    raw = match_num_queries(
-                        core_attn_metadata.c4_sparse_raw_indices, value=-1
-                    )
-                    logical = torch.where(
-                        raw >= 0,
-                        torch.div(
-                            raw.to(torch.int64),
-                            descriptor.page_size,
-                            rounding_mode="floor",
-                        ),
-                        -1,
-                    ).contiguous()
-                    extra_indices = integrity.validate_pages(
-                        descriptor,
-                        extra_indices.contiguous(),
-                        logical,
-                        reqs,
-                        slot_page_size=descriptor.page_size,
-                    )
-                elif compress_ratio == 128:
-                    descriptor = integrity.descriptor(
-                        DSV4Component.C128_ATTENTION_KV, layer_id
-                    )
-                    columns = (
-                        torch.arange(
-                            extra_indices.shape[1],
-                            dtype=torch.int64,
-                            device=extra_indices.device,
-                        )
-                        .view(1, -1)
-                        .expand_as(extra_indices)
-                    )
-                    logical = torch.where(
-                        extra_indices >= 0,
-                        torch.div(
-                            columns,
-                            descriptor.page_size,
-                            rounding_mode="floor",
-                        ),
-                        -1,
-                    ).contiguous()
-                    extra_indices = integrity.validate_pages(
-                        descriptor,
-                        extra_indices.contiguous(),
-                        logical,
-                        reqs,
-                        slot_page_size=descriptor.page_size,
-                    )
 
             if q.ndim == 3:
                 q = q.unsqueeze(1)
@@ -2169,8 +2148,8 @@ class DeepseekV4AttnBackend(
             c4_sparse_topk=self.c4_topk,
         )
 
+        self._integrity_protect_core_mappings(core_attn_metadata)
         if need_compress:
-            self._integrity_bind_core_mappings(core_attn_metadata)
             core_attn_metadata.init_compression_metadata()
             core_attn_metadata.init_flashmla_related(
                 is_prefill=is_prefill,
