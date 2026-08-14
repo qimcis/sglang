@@ -39,7 +39,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.srt.utils import is_blackwell_supported
+from sglang.srt.utils import is_blackwell_supported, is_sm100_supported
 from sglang.srt.utils.common import direct_register_custom_op
 
 logger = logging.getLogger(__name__)
@@ -989,6 +989,6 @@ def cutedsl_qwen38_gdn(
 def use_cutedsl_qwen38_gdn(m: int) -> bool:
     if m <= 0:
         return False
-    if not is_blackwell_supported():
+    if not is_sm100_supported():
         return False
     return True
