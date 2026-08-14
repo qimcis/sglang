@@ -58,6 +58,7 @@ __global__ void flash_c128_online_decode_v2(const __grid_constant__ Compress128O
   PDLWaitPrimary<kUsePDL>();
 
   const auto plan = params.plan_d[batch_id];
+  if (plan.seq_len == 0) return;
   const auto pos_in_chunk = (plan.seq_len - 1) % 128;
 
   const auto kv_score_buffer = static_cast<BufferFloat*>(params.kv_score_buffer);
@@ -600,7 +601,17 @@ struct OnlineDecodePlanParams {
 __global__ void plan_c128_online_decode_kernel(const OnlineDecodePlanParams params) {
   const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= params.batch_size) return;
-  const auto seq_len = static_cast<uint32_t>(params.seq_lens[idx]);
+  const auto raw_seq_len = params.seq_lens[idx];
+  if (raw_seq_len <= 0) {
+    params.plan_d[idx] = DecodePlan{
+        .seq_len = 0,
+        .write_loc = 0,
+        .read_page_0 = 0,
+        .read_page_1 = 0,
+    };
+    return;
+  }
+  const auto seq_len = static_cast<uint32_t>(raw_seq_len);
   const auto rid = params.req_pool_indices[idx];
   const int32_t slot = static_cast<int32_t>(rid) + params.state_slot_offset;
   params.plan_d[idx] = DecodePlan{

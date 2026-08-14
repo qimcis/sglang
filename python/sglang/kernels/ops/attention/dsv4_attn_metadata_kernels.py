@@ -254,7 +254,10 @@ class BuildPageTablePositions:
         max_seq_len: int,
         page_size: int,
         swa_window: int,
+        integrity_args=None,
     ) -> PageTablePositionsResult:
+        if integrity_args is not None:
+            raise ValueError("DSV4 integrity metadata validation requires CUDA")
         return build_page_table_positions(
             req_to_token=req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
@@ -274,6 +277,7 @@ class BuildPageTablePositions:
         max_seq_len: int,
         page_size: int,
         swa_window: int,
+        integrity_args=None,
     ) -> PageTablePositionsResult:
         return build_page_table_positions_triton(
             req_to_token=req_to_token,
@@ -282,6 +286,7 @@ class BuildPageTablePositions:
             max_seq_len=max_seq_len,
             page_size=page_size,
             swa_window=swa_window,
+            integrity_args=integrity_args,
         )
 
 
@@ -318,28 +323,100 @@ def _page_table_positions_kernel(
     positions_out_ptr,
     page_table_ptr,
     topk_out_ptr,
+    generations_ptr,
+    request_epochs_ptr,
+    expected_tags_ptr,
+    failure_status_ptr,
     rt_stride,
     num_pages,
+    max_seq_len,
     page_size,
     swa_window,
+    physical_capacity: tl.constexpr,
+    request_capacity: tl.constexpr,
+    logical_capacity: tl.constexpr,
+    mapping_seed,
+    PROTECT: tl.constexpr,
     BLOCK_P: tl.constexpr,
 ):
     row = tl.program_id(0)
-    seq_len = tl.load(seq_lens_ptr + row).to(tl.int32)
+    raw_seq_len = tl.load(seq_lens_ptr + row).to(tl.int32)
+    trusted_seq_limit = tl.minimum(max_seq_len, rt_stride)
+    seq_len = tl.maximum(0, tl.minimum(raw_seq_len, trusted_seq_limit))
     tl.store(seq_lens_out_ptr + row, seq_len)
-    tl.store(positions_out_ptr + row, seq_len - 1)
+    tl.store(positions_out_ptr + row, tl.maximum(seq_len - 1, 0))
     tl.store(topk_out_ptr + row, tl.minimum(seq_len, swa_window))
 
     rp = tl.load(req_pool_ptr + row).to(tl.int64)
-    base = req_to_token_ptr + rp * rt_stride
+    if PROTECT:
+        safe_rp = tl.where((rp > 0) & (rp < request_capacity), rp, 0)
+    else:
+        safe_rp = rp
+    base = req_to_token_ptr + safe_rp * rt_stride
     out_base = page_table_ptr + row.to(tl.int64) * num_pages
     for p0 in range(0, num_pages, BLOCK_P):
         p = p0 + tl.arange(0, BLOCK_P)
+        page_start = p.to(tl.int64) * page_size
         pmask = p < num_pages
-        tok = tl.load(base + p.to(tl.int64) * page_size, mask=pmask, other=0).to(
-            tl.int32
-        )
-        tl.store(out_base + p, tok // page_size, mask=pmask)
+        load_mask = pmask & (page_start < max_seq_len) & (page_start < rt_stride)
+        tok = tl.load(base + page_start, mask=load_mask, other=0).to(tl.int32)
+        page = tok // page_size
+        if PROTECT:
+            live = load_mask & (page_start < seq_len)
+            request_in_range = (rp > 0) & (rp < request_capacity)
+            page_in_range = (page > 0) & (page < physical_capacity)
+            logical_in_range = p < logical_capacity
+            safe_request = tl.where(request_in_range, rp, 0)
+            safe_page = tl.where(page_in_range, page, 0)
+            safe_logical = tl.where(logical_in_range, p, 0)
+            generation = tl.load(generations_ptr + safe_page)
+            request_epoch = tl.load(request_epochs_ptr + safe_request)
+            expected_tag = tl.load(
+                expected_tags_ptr
+                + safe_request * logical_capacity
+                + safe_logical.to(tl.int64)
+            ).to(tl.uint64)
+
+            value = mapping_seed.to(tl.uint64) ^ 0x445356344D415032
+            value ^= safe_request.to(tl.uint64) * 0x9E3779B97F4A7C15
+            value ^= request_epoch.to(tl.uint64) * 0xBF58476D1CE4E5B9
+            value ^= safe_logical.to(tl.uint64) * 0x94D049BB133111EB
+            value ^= safe_page.to(tl.uint64) * 0xD6E8FEB86659FD93
+            value ^= generation.to(tl.uint64) * 0xA0761D6478BD642F
+            value ^= value >> 30
+            value *= 0xBF58476D1CE4E5B9
+            value ^= value >> 27
+            value *= 0x94D049BB133111EB
+            actual_tag = value ^ (value >> 31)
+            actual_tag = tl.where(actual_tag == 0, 1, actual_tag)
+
+            failure = tl.where(request_in_range, 0, 1 << 6)
+            failure = tl.where(
+                request_in_range & (~page_in_range | ~logical_in_range),
+                1 << 0,
+                failure,
+            )
+            valid_geometry = request_in_range & page_in_range & logical_in_range
+            failure = tl.where(
+                valid_geometry & ((generation == 0) | (request_epoch == 0)),
+                1 << 5,
+                failure,
+            )
+            live_identity = valid_geometry & (generation != 0) & (request_epoch != 0)
+            failure = tl.where(live_identity & (expected_tag == 0), 1 << 3, failure)
+            failure = tl.where(
+                live_identity & (expected_tag != 0) & (expected_tag != actual_tag),
+                1 << 4,
+                failure,
+            )
+            report = live & request_in_range & (failure != 0)
+            tl.atomic_or(
+                failure_status_ptr + safe_request + tl.zeros_like(failure).to(tl.int64),
+                failure.to(tl.int32),
+                mask=report,
+            )
+            page = tl.where(live & (failure != 0), 0, page)
+        tl.store(out_base + p, page, mask=pmask)
 
 
 def build_page_table_positions_triton(
@@ -350,6 +427,7 @@ def build_page_table_positions_triton(
     max_seq_len: int,
     page_size: int,
     swa_window: int,
+    integrity_args=None,
 ) -> PageTablePositionsResult:
     num_q = seq_lens_casual.shape[0]
     num_pages = (max_seq_len + page_size - 1) // page_size
@@ -359,6 +437,19 @@ def build_page_table_positions_triton(
     positions_out = torch.empty(num_q, dtype=torch.int32, device=device)
     page_table = torch.empty((num_q, num_pages), dtype=torch.int32, device=device)
     topk_out = torch.empty(num_q, dtype=torch.int32, device=device)
+    protect = integrity_args is not None
+    if protect:
+        generations = integrity_args["full_generations"]
+        request_epochs = integrity_args["request_epochs"]
+        expected_tags = integrity_args["full_tags"]
+        failure_status = integrity_args["failure_status"]
+        mapping_seed = integrity_args["full_seed"]
+    else:
+        generations = req_to_token
+        request_epochs = req_to_token
+        expected_tags = req_to_token
+        failure_status = req_to_token
+        mapping_seed = 0
     BLOCK_P = 256
     _page_table_positions_kernel[(num_q,)](
         req_to_token,
@@ -368,10 +459,20 @@ def build_page_table_positions_triton(
         positions_out,
         page_table,
         topk_out,
+        generations,
+        request_epochs,
+        expected_tags,
+        failure_status,
         req_to_token.stride(0),
         num_pages,
+        max_seq_len,
         page_size,
         swa_window,
+        physical_capacity=generations.numel() if protect else 0,
+        request_capacity=request_epochs.numel() if protect else 0,
+        logical_capacity=expected_tags.shape[1] if protect else 0,
+        mapping_seed=mapping_seed,
+        PROTECT=protect,
         BLOCK_P=BLOCK_P,
     )
     return PageTablePositionsResult(
@@ -399,7 +500,10 @@ class BuildCausalSwaPageIndices:
         seq_lens_casual: torch.Tensor,
         swa_window: int,
         page_index_aligned_size: int,
+        integrity_args=None,
     ) -> torch.Tensor:
+        if integrity_args is not None:
+            raise ValueError("DSV4 integrity metadata validation requires CUDA")
         return build_causal_swa_page_indices(
             req_to_token=req_to_token,
             full_to_swa_mapping=full_to_swa_mapping,
@@ -419,6 +523,7 @@ class BuildCausalSwaPageIndices:
         seq_lens_casual: torch.Tensor,
         swa_window: int,
         page_index_aligned_size: int,
+        integrity_args=None,
     ) -> torch.Tensor:
         return build_causal_swa_page_indices_triton(
             req_to_token=req_to_token,
@@ -427,6 +532,7 @@ class BuildCausalSwaPageIndices:
             seq_lens_casual=seq_lens_casual,
             swa_window=swa_window,
             page_index_aligned_size=page_index_aligned_size,
+            integrity_args=integrity_args,
         )
 
 
@@ -470,26 +576,158 @@ def _causal_swa_page_indices_kernel(
     req_pool_ptr,
     seq_lens_ptr,
     out_ptr,
+    full_generations_ptr,
+    swa_generations_ptr,
+    request_epochs_ptr,
+    full_tags_ptr,
+    swa_tags_ptr,
+    failure_status_ptr,
     rt_stride,
+    full_to_swa_capacity,
     swa_window,
     padded_width,
+    full_page_size: tl.constexpr,
+    swa_page_size: tl.constexpr,
+    full_physical_capacity: tl.constexpr,
+    swa_physical_capacity: tl.constexpr,
+    request_capacity: tl.constexpr,
+    full_logical_capacity: tl.constexpr,
+    swa_logical_capacity: tl.constexpr,
+    full_seed,
+    swa_seed,
+    PROTECT: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     row = tl.program_id(0)
-    pos = tl.load(seq_lens_ptr + row).to(tl.int64) - 1
+    raw_seq_len = tl.load(seq_lens_ptr + row).to(tl.int64)
+    seq_len = tl.maximum(0, tl.minimum(raw_seq_len, rt_stride))
+    pos = tl.maximum(seq_len - 1, 0)
     rp = tl.load(req_pool_ptr + row).to(tl.int64)
-    base = req_to_token_ptr + rp * rt_stride
+    if PROTECT:
+        safe_rp = tl.where((rp > 0) & (rp < request_capacity), rp, 0)
+    else:
+        safe_rp = rp
+    base = req_to_token_ptr + safe_rp * rt_stride
     out_base = out_ptr + row.to(tl.int64) * padded_width
 
     for k0 in range(0, padded_width, BLOCK_K):
         k = k0 + tl.arange(0, BLOCK_K)
         kmask = k < padded_width
         off = pos - k.to(tl.int64)
-        valid = (k < swa_window) & (off >= 0) & kmask
+        valid = (
+            (seq_len > 0) & (k < swa_window) & (off >= 0) & (off < rt_stride) & kmask
+        )
         full_loc = tl.load(base + tl.where(valid, off, 0), mask=valid, other=-1).to(
             tl.int64
         )
-        swa = tl.load(full_to_swa_ptr + full_loc, mask=valid, other=-1).to(tl.int32)
+        safe_full_loc = tl.where(
+            valid & (full_loc >= 0) & (full_loc < full_to_swa_capacity),
+            full_loc,
+            0,
+        )
+        swa = tl.load(
+            full_to_swa_ptr + safe_full_loc,
+            mask=valid,
+            other=-1,
+        ).to(tl.int32)
+        if PROTECT:
+            request_in_range = (rp > 0) & (rp < request_capacity)
+            full_page = full_loc // full_page_size
+            swa_page = swa // swa_page_size
+            full_logical = off // full_page_size
+            swa_logical = off // swa_page_size
+            full_page_in_range = (full_page > 0) & (full_page < full_physical_capacity)
+            swa_page_in_range = (swa_page > 0) & (swa_page < swa_physical_capacity)
+            full_logical_in_range = (full_logical >= 0) & (
+                full_logical < full_logical_capacity
+            )
+            swa_logical_in_range = (swa_logical >= 0) & (
+                swa_logical < swa_logical_capacity
+            )
+            full_loc_in_range = (full_loc >= 0) & (full_loc < full_to_swa_capacity)
+            safe_request = tl.where(request_in_range, rp, 0)
+            safe_full_page = tl.where(full_page_in_range, full_page, 0)
+            safe_swa_page = tl.where(swa_page_in_range, swa_page, 0)
+            safe_full_logical = tl.where(full_logical_in_range, full_logical, 0)
+            safe_swa_logical = tl.where(swa_logical_in_range, swa_logical, 0)
+            request_epoch = tl.load(request_epochs_ptr + safe_request)
+            full_generation = tl.load(full_generations_ptr + safe_full_page)
+            swa_generation = tl.load(swa_generations_ptr + safe_swa_page)
+            full_expected = tl.load(
+                full_tags_ptr + safe_request * full_logical_capacity + safe_full_logical
+            ).to(tl.uint64)
+            swa_expected = tl.load(
+                swa_tags_ptr + safe_request * swa_logical_capacity + safe_swa_logical
+            ).to(tl.uint64)
+
+            full_value = full_seed.to(tl.uint64) ^ 0x445356344D415032
+            full_value ^= safe_request.to(tl.uint64) * 0x9E3779B97F4A7C15
+            full_value ^= request_epoch.to(tl.uint64) * 0xBF58476D1CE4E5B9
+            full_value ^= safe_full_logical.to(tl.uint64) * 0x94D049BB133111EB
+            full_value ^= safe_full_page.to(tl.uint64) * 0xD6E8FEB86659FD93
+            full_value ^= full_generation.to(tl.uint64) * 0xA0761D6478BD642F
+            full_value ^= full_value >> 30
+            full_value *= 0xBF58476D1CE4E5B9
+            full_value ^= full_value >> 27
+            full_value *= 0x94D049BB133111EB
+            full_actual = full_value ^ (full_value >> 31)
+            full_actual = tl.where(full_actual == 0, 1, full_actual)
+
+            swa_value = swa_seed.to(tl.uint64) ^ 0x445356344D415032
+            swa_value ^= safe_request.to(tl.uint64) * 0x9E3779B97F4A7C15
+            swa_value ^= request_epoch.to(tl.uint64) * 0xBF58476D1CE4E5B9
+            swa_value ^= safe_swa_logical.to(tl.uint64) * 0x94D049BB133111EB
+            swa_value ^= safe_swa_page.to(tl.uint64) * 0xD6E8FEB86659FD93
+            swa_value ^= swa_generation.to(tl.uint64) * 0xA0761D6478BD642F
+            swa_value ^= swa_value >> 30
+            swa_value *= 0xBF58476D1CE4E5B9
+            swa_value ^= swa_value >> 27
+            swa_value *= 0x94D049BB133111EB
+            swa_actual = swa_value ^ (swa_value >> 31)
+            swa_actual = tl.where(swa_actual == 0, 1, swa_actual)
+
+            full_geometry = (
+                request_in_range
+                & full_loc_in_range
+                & full_page_in_range
+                & full_logical_in_range
+            )
+            swa_geometry = request_in_range & swa_page_in_range & swa_logical_in_range
+            failure = tl.where(request_in_range, 0, 1 << 6)
+            failure = tl.where(
+                request_in_range & (~full_geometry | ~swa_geometry),
+                1 << 0,
+                failure,
+            )
+            generations_valid = (
+                (request_epoch != 0) & (full_generation != 0) & (swa_generation != 0)
+            )
+            failure = tl.where(
+                full_geometry & swa_geometry & ~generations_valid,
+                1 << 5,
+                failure,
+            )
+            identity_valid = full_geometry & swa_geometry & generations_valid
+            failure = tl.where(
+                identity_valid & ((full_expected == 0) | (swa_expected == 0)),
+                1 << 3,
+                failure,
+            )
+            failure = tl.where(
+                identity_valid
+                & (full_expected != 0)
+                & (swa_expected != 0)
+                & ((full_expected != full_actual) | (swa_expected != swa_actual)),
+                1 << 4,
+                failure,
+            )
+            report = valid & request_in_range & (failure != 0)
+            tl.atomic_or(
+                failure_status_ptr + safe_request + tl.zeros_like(failure).to(tl.int64),
+                failure.to(tl.int32),
+                mask=report,
+            )
+            swa = tl.where(valid & (failure != 0), 0, swa)
         tl.store(out_base + k, tl.where(valid, swa, -1), mask=kmask)
 
 
@@ -501,6 +739,7 @@ def build_causal_swa_page_indices_triton(
     seq_lens_casual: torch.Tensor,
     swa_window: int,
     page_index_aligned_size: int,
+    integrity_args=None,
 ) -> torch.Tensor:
     num_qo_tokens = seq_lens_casual.size(0)
     padded_width = (
@@ -511,6 +750,29 @@ def build_causal_swa_page_indices_triton(
         dtype=torch.int32,
         device=seq_lens_casual.device,
     )
+    protect = integrity_args is not None
+    if protect:
+        full_generations = integrity_args["full_generations"]
+        swa_generations = integrity_args["swa_generations"]
+        request_epochs = integrity_args["request_epochs"]
+        full_tags = integrity_args["full_tags"]
+        swa_tags = integrity_args["swa_tags"]
+        failure_status = integrity_args["failure_status"]
+        full_seed = integrity_args["full_seed"]
+        swa_seed = integrity_args["swa_seed"]
+        full_page_size = integrity_args["full_page_size"]
+        swa_page_size = integrity_args["swa_page_size"]
+    else:
+        full_generations = req_to_token
+        swa_generations = req_to_token
+        request_epochs = req_to_token
+        full_tags = req_to_token
+        swa_tags = req_to_token
+        failure_status = req_to_token
+        full_seed = 0
+        swa_seed = 0
+        full_page_size = 1
+        swa_page_size = 1
     BLOCK_K = 256
     _causal_swa_page_indices_kernel[(num_qo_tokens,)](
         req_to_token,
@@ -518,9 +780,26 @@ def build_causal_swa_page_indices_triton(
         req_pool_indices_repeated,
         seq_lens_casual,
         out,
+        full_generations,
+        swa_generations,
+        request_epochs,
+        full_tags,
+        swa_tags,
+        failure_status,
         req_to_token.stride(0),
+        full_to_swa_mapping.numel(),
         swa_window,
         padded_width,
+        full_page_size=full_page_size,
+        swa_page_size=swa_page_size,
+        full_physical_capacity=full_generations.numel() if protect else 0,
+        swa_physical_capacity=swa_generations.numel() if protect else 0,
+        request_capacity=request_epochs.numel() if protect else 0,
+        full_logical_capacity=full_tags.shape[1] if protect else 0,
+        swa_logical_capacity=swa_tags.shape[1] if protect else 0,
+        full_seed=full_seed,
+        swa_seed=swa_seed,
+        PROTECT=protect,
         BLOCK_K=BLOCK_K,
     )
     return out

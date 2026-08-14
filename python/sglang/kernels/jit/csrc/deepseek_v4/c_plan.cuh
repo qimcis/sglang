@@ -323,6 +323,16 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
 __global__ void plan_compress_decode_kernel(const DecodeParams params) {
   const auto idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= params.batch_size) return;
+  const auto seq_len = static_cast<int32_t>(params.seq_ptr[idx]);
+  if (seq_len <= 0) {
+    params.plan_d[idx] = {
+        .seq_len = 0,
+        .write_loc = 0,
+        .read_page_0 = 0,
+        .read_page_1 = 0,
+    };
+    return;
+  }
   const auto rid = params.rid_ptr[idx];
   const auto mapping = params.r2t_ptr + rid * params.stride_r2t;
   const auto compute_loc = [&](int32_t swa_loc) {
@@ -333,7 +343,6 @@ __global__ void plan_compress_decode_kernel(const DecodeParams params) {
   const auto compute_c128_loc = [&](int64_t rid, int32_t position) {
     return static_cast<int32_t>(rid * params.ring_size + position % params.ring_size);
   };
-  const auto seq_len = static_cast<int32_t>(params.seq_ptr[idx]);
   const auto position_1 = static_cast<int32_t>(seq_len - 1);
   const auto position_0 = max(position_1 - params.compress_ratio, 0);
   int32_t write_loc;
@@ -407,6 +416,16 @@ __global__ void plan_compress_prefill_legacy_kernel(const Prefill1ParamsLegacy p
 __global__ void plan_compress_decode_legacy_kernel(const DecodeParamsLegacy params) {
   const auto idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= params.batch_size) return;
+  const auto seq_len = static_cast<int32_t>(params.seq_ptr[idx]);
+  if (seq_len <= 0) {
+    params.plan_d[idx] = {
+        .seq_len = 0,
+        .write_loc = 0,
+        .read_page_0 = 0,
+        .read_page_1 = 0,
+    };
+    return;
+  }
   /// Per-request ring buffer slot translation:
   /// - c4:   page = rid * 2 + (position / 4) % 2; slot = page * 4 + position % 4
   /// - c128: page = rid;                          slot = rid * 128 + position % 128
@@ -419,7 +438,6 @@ __global__ void plan_compress_decode_legacy_kernel(const DecodeParamsLegacy para
     return legacy_compute_page(rid, position) * params.compress_ratio + remainder;
   };
   const auto rid = static_cast<int32_t>(params.rid_ptr[idx]);
-  const auto seq_len = static_cast<int32_t>(params.seq_ptr[idx]);
   const auto position_1 = seq_len - 1;
   const auto position_0 = max(position_1 - params.compress_ratio, 0);
   const int32_t write_loc = legacy_compute_loc(rid, position_1);

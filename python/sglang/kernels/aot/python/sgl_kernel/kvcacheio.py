@@ -16,16 +16,26 @@ def dsv4_page_digests(
     return torch.ops.sgl_kernel.dsv4_page_digests.default(buffer, page_indices, seed)
 
 
+def dsv4_batched_page_digests(
+    descriptors: torch.Tensor,
+    page_indices: torch.Tensor,
+    group_offsets: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.dsv4_batched_page_digests.default(
+        descriptors, page_indices, group_offsets
+    )
+
+
 def dsv4_bind_pages(
     slots: torch.Tensor,
     logical_pages: torch.Tensor,
     request_indices: torch.Tensor,
     generations: torch.Tensor,
-    expected_pages: torch.Tensor,
-    expected_generations: torch.Tensor,
-    expected_valid: torch.Tensor,
+    request_epochs: torch.Tensor,
+    expected_tags: torch.Tensor,
     output: torch.Tensor,
     failure_status: torch.Tensor,
+    mapping_seed: int,
     slot_page_size: int,
     invalid_value: int,
     install_missing: bool,
@@ -35,14 +45,54 @@ def dsv4_bind_pages(
         logical_pages,
         request_indices,
         generations,
-        expected_pages,
-        expected_generations,
-        expected_valid,
+        request_epochs,
+        expected_tags,
         output,
         failure_status,
+        mapping_seed,
         slot_page_size,
         invalid_value,
         install_missing,
+    )
+
+
+def dsv4_validate_core_mappings(
+    full_slots: torch.Tensor,
+    full_logical: torch.Tensor,
+    out_slots: torch.Tensor,
+    out_logical: torch.Tensor,
+    swa_slots: torch.Tensor,
+    swa_logical: torch.Tensor,
+    request_indices: torch.Tensor,
+    full_generations: torch.Tensor,
+    swa_generations: torch.Tensor,
+    request_epochs: torch.Tensor,
+    full_tags: torch.Tensor,
+    swa_tags: torch.Tensor,
+    failure_status: torch.Tensor,
+    full_seed: int,
+    swa_seed: int,
+    full_page_size: int,
+    swa_page_size: int,
+) -> None:
+    torch.ops.sgl_kernel.dsv4_validate_core_mappings.default(
+        full_slots,
+        full_logical,
+        out_slots,
+        out_logical,
+        swa_slots,
+        swa_logical,
+        request_indices,
+        full_generations,
+        swa_generations,
+        request_epochs,
+        full_tags,
+        swa_tags,
+        failure_status,
+        full_seed,
+        swa_seed,
+        full_page_size,
+        swa_page_size,
     )
 
 
@@ -58,12 +108,12 @@ def dsv4_validate_pages(
     validation_pages: torch.Tensor,
     validation_count: torch.Tensor,
     generations: torch.Tensor,
-    expected_pages: torch.Tensor,
-    expected_generations: torch.Tensor,
-    expected_valid: torch.Tensor,
+    request_epochs: torch.Tensor,
+    expected_tags: torch.Tensor,
     output: torch.Tensor,
     failure_status: torch.Tensor,
     seed: int,
+    mapping_seed: int,
     slot_page_size: int,
     invalid_value: int,
     allow_missing_digest: bool = False,
@@ -80,12 +130,12 @@ def dsv4_validate_pages(
         validation_pages,
         validation_count,
         generations,
-        expected_pages,
-        expected_generations,
-        expected_valid,
+        request_epochs,
+        expected_tags,
         output,
         failure_status,
         seed,
+        mapping_seed,
         slot_page_size,
         invalid_value,
         allow_missing_digest,

@@ -277,17 +277,25 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def("dsv4_page_digests(Tensor buffer, Tensor page_indices, int seed) -> Tensor");
   m.impl("dsv4_page_digests", torch::kCUDA, &dsv4_page_digests);
+  m.def("dsv4_batched_page_digests(Tensor descriptors, Tensor page_indices, Tensor group_offsets) -> Tensor");
+  m.impl("dsv4_batched_page_digests", torch::kCUDA, &dsv4_batched_page_digests);
   m.def(
       "dsv4_bind_pages(Tensor slots, Tensor logical_pages, Tensor request_indices, Tensor generations, "
-      "Tensor! expected_pages, Tensor! expected_generations, Tensor! expected_valid, Tensor! output, "
-      "Tensor! failure_status, int slot_page_size, int invalid_value, bool install_missing) -> ()");
+      "Tensor request_epochs, Tensor! expected_tags, Tensor! output, Tensor! failure_status, int mapping_seed, "
+      "int slot_page_size, int invalid_value, bool install_missing) -> ()");
   m.impl("dsv4_bind_pages", torch::kCUDA, &dsv4_bind_pages);
+  m.def(
+      "dsv4_validate_core_mappings(Tensor! full_slots, Tensor full_logical, Tensor! out_slots, Tensor out_logical, "
+      "Tensor! swa_slots, Tensor swa_logical, Tensor request_indices, Tensor full_generations, "
+      "Tensor swa_generations, Tensor request_epochs, Tensor full_tags, Tensor swa_tags, Tensor! failure_status, "
+      "int full_seed, int swa_seed, int full_page_size, int swa_page_size) -> ()");
+  m.impl("dsv4_validate_core_mappings", torch::kCUDA, &dsv4_validate_core_mappings);
   m.def(
       "dsv4_validate_pages(Tensor buffer, Tensor slots, Tensor logical_pages, Tensor request_indices, "
       "Tensor digests, Tensor component_valid, Tensor! validation_state, Tensor! validation_failure, "
-      "Tensor! validation_pages, Tensor! validation_count, Tensor generations, Tensor expected_pages, "
-      "Tensor expected_generations, Tensor expected_valid, Tensor! output, Tensor! failure_status, "
-      "int seed, int slot_page_size, int invalid_value, bool allow_missing_digest) -> ()");
+      "Tensor! validation_pages, Tensor! validation_count, Tensor generations, Tensor request_epochs, "
+      "Tensor expected_tags, Tensor! output, Tensor! failure_status, "
+      "int seed, int mapping_seed, int slot_page_size, int invalid_value, bool allow_missing_digest) -> ()");
   m.impl("dsv4_validate_pages", torch::kCUDA, &dsv4_validate_pages);
   m.def(
       "dsv4_refresh_slots(Tensor buffer, Tensor! digests, Tensor! valid, Tensor! dirty, Tensor slots, int seed, int "

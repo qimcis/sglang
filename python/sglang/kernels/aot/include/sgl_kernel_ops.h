@@ -481,20 +481,41 @@ void segment_packbits(
  * From csrc/kvcacheio
  */
 at::Tensor dsv4_page_digests(const at::Tensor buffer, const at::Tensor page_indices, int64_t seed);
+at::Tensor
+dsv4_batched_page_digests(const at::Tensor descriptors, const at::Tensor page_indices, const at::Tensor group_offsets);
 
 void dsv4_bind_pages(
     const at::Tensor slots,
     const at::Tensor logical_pages,
     const at::Tensor request_indices,
     const at::Tensor generations,
-    at::Tensor expected_pages,
-    at::Tensor expected_generations,
-    at::Tensor expected_valid,
+    const at::Tensor request_epochs,
+    at::Tensor expected_tags,
     at::Tensor output,
     at::Tensor failure_status,
+    int64_t mapping_seed,
     int64_t slot_page_size,
     int64_t invalid_value,
     bool install_missing);
+
+void dsv4_validate_core_mappings(
+    at::Tensor full_slots,
+    const at::Tensor full_logical,
+    at::Tensor out_slots,
+    const at::Tensor out_logical,
+    at::Tensor swa_slots,
+    const at::Tensor swa_logical,
+    const at::Tensor request_indices,
+    const at::Tensor full_generations,
+    const at::Tensor swa_generations,
+    const at::Tensor request_epochs,
+    const at::Tensor full_tags,
+    const at::Tensor swa_tags,
+    at::Tensor failure_status,
+    int64_t full_seed,
+    int64_t swa_seed,
+    int64_t full_page_size,
+    int64_t swa_page_size);
 
 void dsv4_validate_pages(
     const at::Tensor buffer,
@@ -508,12 +529,12 @@ void dsv4_validate_pages(
     at::Tensor validation_pages,
     at::Tensor validation_count,
     const at::Tensor generations,
-    const at::Tensor expected_pages,
-    const at::Tensor expected_generations,
-    const at::Tensor expected_valid,
+    const at::Tensor request_epochs,
+    const at::Tensor expected_tags,
     at::Tensor output,
     at::Tensor failure_status,
     int64_t seed,
+    int64_t mapping_seed,
     int64_t slot_page_size,
     int64_t invalid_value,
     bool allow_missing_digest);

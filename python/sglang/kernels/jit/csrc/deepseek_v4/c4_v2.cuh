@@ -265,7 +265,9 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
   const int64_t split_offset = global_sid * Trait::kTileDim;
   if (global_bid >= params.batch_size) return;
 
+  PDLWaitPrimary<kUsePDL>();
   const auto plan = params.plan_d[global_bid];
+  if (plan.seq_len == 0) return;
   const auto kv_input = static_cast<const InputFloat*>(params.kv_input) + split_offset;
   const auto kv_output = static_cast<OutFloat*>(params.kv_output) + split_offset;
   const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
@@ -277,7 +279,6 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
   const auto kv_buf_1 = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
   const auto kv_dst = kv_buffer + plan.write_loc * Trait::kElementSize;
 
-  PDLWaitPrimary<kUsePDL>();
   c4_write_decode<Trait, BufferFloat, InputFloat>(kv_dst, kv_src);
   if (plan.seq_len % 4 == 0) {
     const auto need_overlap = plan.seq_len > 4;
@@ -298,6 +299,7 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
   const int64_t split_offset = global_sid * Trait::kTileDim;
   if (global_pid >= params.num_compress) return;
 
+  PDLWaitPrimary<kUsePDL>();
   const auto plan = params.plan_c[global_pid];
   const auto kv_input = static_cast<const InputFloat*>(params.kv_input) + split_offset;
   const auto kv_output = static_cast<OutFloat*>(params.kv_output) + split_offset;
@@ -311,7 +313,6 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
   const auto kv_buf_0 = kv_buffer + plan.read_page_0 * Trait::kPageElementSize;
   const auto kv_buf_1 = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
   const bool need_overlap = plan.seq_len > 4;
-  PDLWaitPrimary<kUsePDL>();
   c4_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(
       kv_buf_0, kv_buf_1, kv_src, kv_out, score_bias, need_overlap, plan.buffer_len);
 }
@@ -331,6 +332,7 @@ WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParam
   const int64_t split_offset = global_sid * (Trait::kTileDim * 4);
   if (global_pid >= params.num_write) return;
 
+  PDLWaitPrimary<kUsePDL>();
   const auto plan = params.plan_w[global_pid];
   const auto kv_input = static_cast<const InputFloat*>(params.kv_input) + split_offset;
   const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
@@ -341,7 +343,6 @@ WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParam
   const auto kv_buf = kv_buffer + plan.write_loc * Trait::kElementSize;
   const auto gmem_input = tile::Memory<StorageInput>::warp();
 
-  PDLWaitPrimary<kUsePDL>();
   StorageInput data[4];
 #pragma unroll
   for (int32_t i = 0; i < 4; ++i) {

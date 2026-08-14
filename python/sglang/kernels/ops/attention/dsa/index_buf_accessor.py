@@ -179,6 +179,8 @@ class GetKAndS:
         # which only matches the layout produced when the rest of the indexer
         # is on the page_size=64 preshuffle path. Otherwise fall back to the
         # triton implementation (which works on the page_size=1 legacy layout).
+        if kwargs.get("integrity_args") is not None:
+            return cls.triton(*args, **kwargs)
         if _use_aiter_preshuffle:
             return cls.aiter(*args, **kwargs)
         return cls.triton(*args, **kwargs)
@@ -234,6 +236,7 @@ class GetKAndS:
         seq_len_tensor: torch.Tensor,
         seq_len_sum: int,
         max_seq_len: int,
+        integrity_args=None,
     ):
         """
         Triton implementation for gathering both K and S data from paged buffer in a single call.
@@ -253,6 +256,7 @@ class GetKAndS:
             max_seq_len=max_seq_len,
             page_size=pool.page_size,
             index_head_dim=pool.index_head_dim,
+            integrity_args=integrity_args,
         )
 
 
@@ -570,6 +574,7 @@ def _get_k_and_s_triton(
     max_seq_len: int,
     page_size: int,
     index_head_dim: int,
+    integrity_args=None,
 ):
     """
     Fused gather of both K (key) and S (scale) data from paged buffer using Triton.
@@ -609,18 +614,50 @@ def _get_k_and_s_triton(
     while seq_num_pow2 < seq_num:
         seq_num_pow2 *= 2
 
+    protect = integrity_args is not None
+    if protect:
+        request_indices = integrity_args["request_indices"]
+        generations = integrity_args["generations"]
+        request_epochs = integrity_args["request_epochs"]
+        expected_tags = integrity_args["expected_tags"]
+        failure_status = integrity_args["failure_status"]
+        mapping_seed = integrity_args["mapping_seed"]
+        if request_indices.numel() != seq_num:
+            raise ValueError("protected K/S gather requires one request per sequence")
+        if expected_tags.shape[0] != request_epochs.numel():
+            raise ValueError("protected K/S gather request sidecar mismatch")
+    else:
+        request_indices = page_indices
+        generations = page_indices
+        request_epochs = page_indices
+        expected_tags = page_indices
+        failure_status = page_indices
+        mapping_seed = 0
+
     _get_k_and_s_triton_kernel[grid](
         buf_ptr=buf,
         page_indices_ptr=page_indices,
+        request_indices_ptr=request_indices,
+        generations_ptr=generations,
+        request_epochs_ptr=request_epochs,
+        expected_tags_ptr=expected_tags,
+        failure_status_ptr=failure_status,
         k_out_ptr=k_out,
         s_out_ptr=s_out,
         seq_len_ptr=seq_lens,
         seq_len_num_pow=seq_num_pow2,
+        seq_len_sum=seq_len_sum,
+        max_seq_len=max_seq_len,
         page_size=page_size,
         buf_numel_per_page=buf_numel_per_page,
         index_head_dim=index_head_dim,
         s_offset_in_page=s_offset_in_page,
         page_indice_batch_offset=page_indice_batch_offset,
+        physical_capacity=generations.numel() if protect else 0,
+        request_capacity=request_epochs.numel() if protect else 0,
+        logical_capacity=expected_tags.shape[1] if protect else 0,
+        mapping_seed=mapping_seed,
+        PROTECT=protect,
         BLOCK_SIZE=BLOCK_SIZE,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
     )
@@ -632,15 +669,27 @@ def _get_k_and_s_triton(
 def _get_k_and_s_triton_kernel(
     buf_ptr,
     page_indices_ptr,
+    request_indices_ptr,
+    generations_ptr,
+    request_epochs_ptr,
+    expected_tags_ptr,
+    failure_status_ptr,
     k_out_ptr,
     s_out_ptr,
     seq_len_ptr,
     seq_len_num_pow: tl.constexpr,
+    seq_len_sum,
+    max_seq_len,
     page_size: tl.constexpr,
     buf_numel_per_page: tl.constexpr,
     index_head_dim: tl.constexpr,
     s_offset_in_page: tl.constexpr,
     page_indice_batch_offset,
+    physical_capacity: tl.constexpr,
+    request_capacity: tl.constexpr,
+    logical_capacity: tl.constexpr,
+    mapping_seed,
+    PROTECT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
@@ -658,16 +707,25 @@ def _get_k_and_s_triton_kernel(
     token_ids = block_token_start + token_ids_in_block
     k_offsets = thread_idx * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
 
-    seq_len = tl.load(seq_len_ptr + batch_id)
+    raw_seq_len = tl.load(seq_len_ptr + batch_id)
+    seq_len = tl.maximum(0, tl.minimum(raw_seq_len, max_seq_len))
     # Grid axis 1 spans the batch-max seq len; fully-masked blocks store nothing.
     if block_token_start >= seq_len:
         return
-    token_valid_mask = token_ids < seq_len
-
     pre_batch_idx = tl.arange(0, seq_len_num_pow)
     mask_pre_batch_idx = pre_batch_idx < batch_id
-    prev_seq_lens = tl.load(seq_len_ptr + pre_batch_idx, mask=mask_pre_batch_idx)
-    batch_token_offset = tl.sum(prev_seq_lens)
+    prev_seq_lens = tl.load(
+        seq_len_ptr + pre_batch_idx, mask=mask_pre_batch_idx, other=0
+    )
+    prev_seq_lens = tl.maximum(0, tl.minimum(prev_seq_lens, max_seq_len))
+    batch_token_offset = tl.sum(prev_seq_lens.to(tl.int64))
+    dst_token_ids = batch_token_offset + token_ids.to(tl.int64)
+    token_valid_mask = (
+        (token_ids < seq_len)
+        & (token_ids < max_seq_len)
+        & (dst_token_ids >= 0)
+        & (dst_token_ids < seq_len_sum)
+    )
 
     # Batch calculate the page index and in-page offset of each token.
     page_idx = token_ids // page_size
@@ -677,7 +735,69 @@ def _get_k_and_s_triton_kernel(
     page_index = tl.load(
         page_indices_ptr + page_idx + page_indices_base,
         mask=token_valid_mask & page_idx_valid_mask,
+        other=0,
     )
+
+    if PROTECT:
+        request = tl.load(request_indices_ptr + batch_id)
+        request_in_range = (request > 0) & (request < request_capacity)
+        page_in_range = (page_index > 0) & (page_index < physical_capacity)
+        logical_in_range = page_idx < logical_capacity
+        safe_request = tl.where(request_in_range, request, 0)
+        safe_page = tl.where(page_in_range, page_index, 0)
+        safe_logical = tl.where(logical_in_range, page_idx, 0)
+        generation = tl.load(generations_ptr + safe_page)
+        request_epoch = tl.load(request_epochs_ptr + safe_request)
+        expected_tag = tl.load(
+            expected_tags_ptr + safe_request * logical_capacity + safe_logical
+        ).to(tl.uint64)
+
+        value = mapping_seed.to(tl.uint64) ^ 0x445356344D415032
+        value ^= safe_request.to(tl.uint64) * 0x9E3779B97F4A7C15
+        value ^= request_epoch.to(tl.uint64) * 0xBF58476D1CE4E5B9
+        value ^= safe_logical.to(tl.uint64) * 0x94D049BB133111EB
+        value ^= safe_page.to(tl.uint64) * 0xD6E8FEB86659FD93
+        value ^= generation.to(tl.uint64) * 0xA0761D6478BD642F
+        value ^= value >> 30
+        value *= 0xBF58476D1CE4E5B9
+        value ^= value >> 27
+        value *= 0x94D049BB133111EB
+        actual_tag = value ^ (value >> 31)
+        actual_tag = tl.where(actual_tag == 0, 1, actual_tag)
+
+        failure = tl.where(request_in_range, 0, 1 << 6)
+        failure = tl.where(
+            request_in_range & (~page_in_range | ~logical_in_range),
+            1 << 0,
+            failure,
+        )
+        valid_geometry = request_in_range & page_in_range & logical_in_range
+        failure = tl.where(
+            valid_geometry & ((generation == 0) | (request_epoch == 0)),
+            1 << 5,
+            failure,
+        )
+        live_identity = valid_geometry & (generation != 0) & (request_epoch != 0)
+        failure = tl.where(live_identity & (expected_tag == 0), 1 << 3, failure)
+        failure = tl.where(
+            live_identity & (expected_tag != 0) & (expected_tag != actual_tag),
+            1 << 4,
+            failure,
+        )
+        mapping_valid = failure == 0
+        report_failure = (
+            token_valid_mask
+            & page_idx_valid_mask
+            & (token_offset_in_page == 0)
+            & request_in_range
+            & (failure != 0)
+        )
+        tl.atomic_or(
+            failure_status_ptr + safe_request + tl.zeros_like(failure).to(tl.int64),
+            failure.to(tl.int32),
+            mask=report_failure,
+        )
+        page_index = tl.where(mapping_valid, page_index, 0)
 
     # ===== Load K data =====
     # The address calculation logic for K: page_index * total number of elements in a single page + K offset of the token within the page.
@@ -691,7 +811,7 @@ def _get_k_and_s_triton_kernel(
     k_data = tl.load(k_load_addr, mask=k_mask, other=0)
 
     # Store K to output
-    k_dst_token_offset = batch_token_offset + token_ids
+    k_dst_token_offset = dst_token_ids
     k_dst_base_offset = k_dst_token_offset * index_head_dim
     k_store_addr = k_out_ptr + k_dst_base_offset[:, None] + k_offsets[None, :]
     tl.store(k_store_addr, k_data, mask=k_mask)
@@ -707,7 +827,7 @@ def _get_k_and_s_triton_kernel(
     s_data = tl.load(s_load_addr, mask=s_mask, other=0)
 
     # Store S to output
-    s_dst_token_offset = batch_token_offset + token_ids
+    s_dst_token_offset = dst_token_ids
     s_dst_base_offset = s_dst_token_offset * 4
     s_store_addr = s_out_ptr + s_dst_base_offset[:, None] + s_offsets[None, :]
     tl.store(s_store_addr, s_data, mask=s_mask)

@@ -288,7 +288,9 @@ C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodePara
   const int64_t split_offset = global_sid * Trait::kTileDim;
   if (global_bid >= params.batch_size) return;
 
+  PDLWaitPrimary<kUsePDL>();
   const auto plan = params.plan_d[global_bid];
+  if (plan.seq_len == 0) return;
   const auto kv_input = static_cast<const InputFloat*>(params.kv_input) + split_offset;
   const auto kv_output = static_cast<OutFloat*>(params.kv_output) + split_offset;
   const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
@@ -299,7 +301,6 @@ C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodePara
   const auto kv_buf = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
   const auto kv_dst = kv_buffer + plan.write_loc * Trait::kElementSize;
 
-  PDLWaitPrimary<kUsePDL>();
   // the write warp must match the load warp in the following `c128_forward`
   if (warp_id == kNumWarps - 1) {
     c128_write_decode<Trait, BufferFloat, InputFloat>(kv_dst, kv_src);
@@ -320,6 +321,7 @@ C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillPa
   const int64_t split_offset = global_sid * Trait::kTileDim;
   if (global_pid >= params.num_compress) return;
 
+  PDLWaitPrimary<kUsePDL>();
   const auto plan = params.plan_c[global_pid];
   const auto kv_input = static_cast<const InputFloat*>(params.kv_input) + split_offset;
   const auto kv_output = static_cast<OutFloat*>(params.kv_output) + split_offset;
@@ -331,7 +333,6 @@ C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillPa
   // Compact output: one row per compress plan, indexed by `global_pid`.
   const auto kv_out = kv_output + global_pid * Trait::kHeadDim;
   const auto kv_buf = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
-  PDLWaitPrimary<kUsePDL>();
   c128_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(kv_buf, kv_src, kv_out, score_bias, plan.buffer_len);
 }
 
@@ -350,6 +351,7 @@ WRITE_KERNEL void write_c128_prefill(const __grid_constant__ Compress128PrefillP
   const int64_t split_offset = global_sid * (Trait::kTileDim * 2);
   if (global_pid >= params.num_write) return;
 
+  PDLWaitPrimary<kUsePDL>();
   const auto plan = params.plan_w[global_pid];
   const auto kv_input = static_cast<const InputFloat*>(params.kv_input) + split_offset;
   const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
@@ -360,7 +362,6 @@ WRITE_KERNEL void write_c128_prefill(const __grid_constant__ Compress128PrefillP
   const auto kv_buf = kv_buffer + plan.write_loc * Trait::kElementSize;
   const auto gmem_input = tile::Memory<StorageInput>::warp();
 
-  PDLWaitPrimary<kUsePDL>();
   StorageInput data[2];
 #pragma unroll
   for (int32_t i = 0; i < 2; ++i) {

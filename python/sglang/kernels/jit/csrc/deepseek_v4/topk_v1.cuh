@@ -27,6 +27,8 @@ struct TopKParams {
   int32_t* __restrict__ raw_indices;  // optional: output raw abs position indices before page transform
   const int64_t score_stride;
   const int64_t page_table_stride;
+  uint32_t score_width;
+  uint32_t page_table_width;
   uint32_t page_bits;
 };
 
@@ -231,18 +233,25 @@ template <bool kUsePDL>
 __global__ void topk_transform_kernel(const __grid_constant__ TopKParams params) {
   const auto &[
     scores, seq_lens, page_table, page_indices, raw_indices, // pointers
-    score_stride, page_table_stride, page_bits // sizes
+    score_stride, page_table_stride, score_width, page_table_width, page_bits // sizes
   ] = params;
   const uint32_t work_id = blockIdx.x;
 
-  /// NOTE: dangerous prefetch seq_len before PDL wait
-  const uint32_t seq_len = seq_lens[work_id];
   const auto score_ptr = scores + work_id * score_stride;
   const auto page_ptr = page_table + work_id * page_table_stride;
   const auto indices_ptr = page_indices + work_id * kTopK;
   const auto raw_indices_ptr = raw_indices != nullptr ? raw_indices + work_id * kTopK : nullptr;
 
   device::PDLWaitPrimary<kUsePDL>();
+  const int32_t raw_seq_len = seq_lens[work_id];
+  const uint64_t score_capacity = static_cast<uint64_t>(score_width);
+  const uint64_t page_capacity = static_cast<uint64_t>(page_table_width) << page_bits;
+  const uint64_t input_capacity = score_capacity < page_capacity ? score_capacity : page_capacity;
+  const uint32_t seq_len =
+      raw_seq_len <= 0 ? 0
+                       : static_cast<uint32_t>(
+                             static_cast<uint64_t>(raw_seq_len) < input_capacity ? static_cast<uint64_t>(raw_seq_len)
+                                                                                 : input_capacity);
 
   if (seq_len <= kTopK) {
     naive_transform(score_ptr, page_ptr, indices_ptr, raw_indices_ptr, seq_len, page_bits);
@@ -285,12 +294,14 @@ struct TopKKernel {
       const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
+    auto L = SymbolicSize{"score_width"};
     auto S = SymbolicSize{"score_stride"};
+    auto W = SymbolicSize{"page_table_width"};
     auto P = SymbolicSize{"page_table_stride"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({B, -1})  // strided scores
+    TensorMatcher({B, L})  // strided scores
         .with_strides({S, 1})
         .with_dtype<float>()
         .with_device(device)
@@ -299,7 +310,7 @@ struct TopKKernel {
         .with_dtype<int32_t>()
         .with_device(device)
         .verify(seq_lens);
-    TensorMatcher({B, -1})  // strided page table
+    TensorMatcher({B, W})  // strided page table
         .with_strides({P, 1})
         .with_dtype<int32_t>()
         .with_device(device)
@@ -329,6 +340,8 @@ struct TopKKernel {
         .raw_indices = raw_indices_ptr,
         .score_stride = S.unwrap(),
         .page_table_stride = P.unwrap(),
+        .score_width = static_cast<uint32_t>(L.unwrap()),
+        .page_table_width = static_cast<uint32_t>(W.unwrap()),
         .page_bits = page_bits,
     };
     constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);  // align up a little

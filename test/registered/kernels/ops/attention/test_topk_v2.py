@@ -29,7 +29,11 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2, topk_transform_512_v2
+from sglang.kernels.ops.attention.dsv4.topk import (
+    plan_topk_v2,
+    topk_transform_512,
+    topk_transform_512_v2,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -163,6 +167,85 @@ def _run_raw(scores, seq_lens, page_table, k):
     torch.cuda.synchronize()
     raw_cpu = raw.cpu().tolist()
     return [[v for v in raw_cpu[i] if v != -1] for i in range(batch)]
+
+
+@pytest.mark.parametrize("version", [1, 2])
+@torch.inference_mode()
+def test_topk_clamps_invalid_lengths(version: int) -> None:
+    """DP idle rows and corrupt lengths must not escape either kernel's inputs."""
+    batch, width, k = 4, 1024, 512
+    device = "cuda"
+    score_storage = torch.randn(batch, width + 16, dtype=torch.float32, device=device)
+    scores = score_storage[:, :width]
+    seq_lens = torch.tensor(
+        [-1, 0, width, torch.iinfo(torch.int32).max],
+        dtype=torch.int32,
+        device=device,
+    )
+    # Intentionally expose only 512 positions through the page table. Positive
+    # lengths must be capped by both score and page-table capacity.
+    page_width = k // PAGE_SIZE
+    page_storage = torch.full(
+        (batch, page_width + 2), -1, dtype=torch.int32, device=device
+    )
+    page_storage[:, :page_width] = torch.arange(
+        page_width, dtype=torch.int32, device=device
+    )
+    page_table = page_storage[:, :page_width]
+    out = torch.full((batch, k), -2, dtype=torch.int32, device=device)
+    raw = torch.full_like(out, -2)
+
+    if version == 1:
+        topk_transform_512(scores, seq_lens, page_table, out, PAGE_SIZE, raw)
+    else:
+        metadata = plan_topk_v2(seq_lens)
+        topk_transform_512_v2(
+            scores, seq_lens, page_table, out, PAGE_SIZE, metadata, raw
+        )
+    torch.cuda.synchronize()
+
+    assert torch.all(out[:2] == -1)
+    assert torch.all(raw[:2] == -1)
+    expected = torch.arange(k, dtype=torch.int32, device=device)
+    assert torch.equal(out[2], expected)
+    assert torch.equal(out[3], expected)
+    assert torch.equal(raw[2], expected)
+    assert torch.equal(raw[3], expected)
+
+
+@torch.inference_mode()
+def test_topk_v2_cluster_plan_clamps_stale_oversized_lengths() -> None:
+    """A stale cluster plan must not race the bounded main-kernel path."""
+    batch, width, k = 16, 65537, 512
+    score_storage = torch.randn(batch, width + 19, dtype=torch.float32, device="cuda")
+    scores = score_storage[:, :width]
+    seq_lens = torch.full(
+        (batch,), torch.iinfo(torch.int32).max, dtype=torch.int32, device="cuda"
+    )
+    seq_lens[0] = -1
+
+    page_width = k // PAGE_SIZE
+    page_storage = torch.full(
+        (batch, page_width + 2), -1, dtype=torch.int32, device="cuda"
+    )
+    page_storage[:, :page_width] = torch.arange(
+        page_width, dtype=torch.int32, device="cuda"
+    )
+    page_table = page_storage[:, :page_width]
+    out = torch.full((batch, k), -2, dtype=torch.int32, device="cuda")
+    raw = torch.full_like(out, -2)
+
+    metadata = plan_topk_v2(seq_lens)
+    metadata[0, 1] = torch.iinfo(torch.int32).max
+    metadata[1:, 0] = torch.iinfo(torch.int32).max
+    topk_transform_512_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata, raw)
+    torch.cuda.synchronize()
+
+    assert torch.all(out[0] == -1)
+    assert torch.all(raw[0] == -1)
+    expected = torch.arange(k, dtype=torch.int32, device="cuda")
+    assert torch.all(out[1:] == expected)
+    assert torch.all(raw[1:] == expected)
 
 
 @pytest.mark.parametrize("page_mode", ["identity", "perm"])

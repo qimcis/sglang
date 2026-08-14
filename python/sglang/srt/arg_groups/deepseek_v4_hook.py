@@ -256,11 +256,14 @@ def validate_deepseek_v4_kv_integrity(server_args: ServerArgs) -> None:
     ):
         failures.append("the protected C4 indexer requires DeepGEMM")
 
-    # Failure state is rank-local in this first audited topology. Do not claim
-    # TP/DPA support until publication consensus has dedicated validation.
-    if cfg.tp_size != 1 or cfg.dp_size != 1:
+    # Failure state and token publication are request-local. Plain TP would
+    # require cross-rank consensus, while full DPA keeps attention TP at one.
+    if (cfg.tp_size != 1 or cfg.dp_size != 1) and not (
+        cfg.enable_dp_attention and cfg.tp_size == cfg.dp_size
+    ):
         failures.append(
-            "the audited topology requires --tp-size 1 --dp-size 1 "
+            "the audited topology requires attention TP 1: either "
+            "--tp-size 1 --dp-size 1 or full DPA with matching TP/DP "
             f"(got tp={cfg.tp_size}, dp={cfg.dp_size})"
         )
 

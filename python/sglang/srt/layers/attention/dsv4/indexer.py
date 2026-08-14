@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
+    plan_topk_v2,
     topk_transform_512,
     topk_transform_512_v2,
 )
@@ -483,8 +484,6 @@ class C4IndexerBackendMixin:
         forward_batch: ForwardBatch,
         indexer_metadata: PagedIndexerMetadata,
     ) -> bool:
-        if self.token_to_kv_pool.kv_integrity is not None:
-            return False
         if not envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.get():
             return False
         # This path calls CUDA DeepGEMM and assumes the CUDA FP8+FP32 packed
@@ -591,6 +590,9 @@ class C4IndexerBackendMixin:
         max_seqlen_k = (final_c4_len + c4_page_size - 1) // c4_page_size * c4_page_size
         plan = NonPagedIndexerPlan(
             page_table=request_page_table,
+            request_indices=forward_batch.req_pool_indices[:1]
+            .to(torch.int64)
+            .contiguous(),
             gather_seq_lens=gather_seq_lens,
             ks=ks,
             ke=ke,
@@ -613,12 +615,31 @@ class C4IndexerBackendMixin:
     ) -> torch.Tensor:
         import deep_gemm
 
+        integrity_args = None
+        integrity = token_to_kv_pool.kv_integrity
+        if integrity is not None:
+            from sglang.srt.mem_cache.dsv4_kv_integrity import (
+                DSV4IntegrityDomain,
+                mapping_seed,
+            )
+
+            space = integrity.address_spaces[DSV4IntegrityDomain.FULL]
+            integrity_args = {
+                "request_indices": plan.request_indices,
+                "generations": space.generation,
+                "request_epochs": integrity.request_epochs,
+                "expected_tags": space.expected_tags,
+                "failure_status": integrity.failure_status,
+                "mapping_seed": mapping_seed(DSV4IntegrityDomain.FULL),
+            }
+
         k_u8, scale_u8 = token_to_kv_pool.get_index_k_scale_buffer(
             layer_id=c4_indexer.layer_id,
             seq_len_tensor=plan.gather_seq_lens,
             page_indices=plan.page_table,
             seq_len_sum=plan.seq_len_sum,
             max_seq_len=plan.max_seq_len,
+            integrity_args=integrity_args,
         )
         k_fp8 = k_u8.view(FP8_DTYPE)
         k_scale = scale_u8.view(torch.float32).squeeze(-1)
@@ -805,8 +826,6 @@ class C4IndexerBackendMixin:
             ]
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
-        elif token_to_kv_pool.kv_integrity is not None:
-            raw_indices = torch.empty_like(c4_sparse_page_indices)
 
         if (
             envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
@@ -829,14 +848,18 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+        elif envs.SGLANG_OPT_USE_TOPK_V2.get():
+            topk_metadata = indexer_metadata.topk_metadata
+            if topk_metadata.shape[0] != c4_seq_lens.shape[0] + 1:
+                topk_metadata = plan_topk_v2(c4_seq_lens)
             topk_transform_512_v2(
                 logits,
                 c4_seq_lens,
                 page_table,
                 c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
-                indexer_metadata.topk_metadata,
+                topk_metadata,
+                raw_indices,
             )
         else:
             topk_transform_512(

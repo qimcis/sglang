@@ -68,6 +68,9 @@ struct TopKLaunchParams {
   const PlanItem* __restrict__ metadata;  // [0]=GlobalMetadata, [1+i]=PlanItem
   int64_t score_stride;
   int64_t page_table_stride;
+  uint32_t score_width;
+  uint32_t page_table_width;
+  uint32_t batch_size;
   uint32_t topk;
   uint32_t page_bits;
   uint32_t cluster_floor;  // seq_len > this routes to the cluster path (batch-aware, host-set)
@@ -84,6 +87,13 @@ struct TopKLaunchParams {
   SGL_DEVICE int32_t* get_output_ptr(uint32_t batch_id) const {
     return page_indices + batch_id * static_cast<int64_t>(topk);
   }
+  SGL_DEVICE uint32_t bounded_seq_len(uint32_t seq_len) const {
+    const uint64_t score_capacity = static_cast<uint64_t>(score_width);
+    const uint64_t page_capacity = static_cast<uint64_t>(page_table_width) << page_bits;
+    const uint64_t input_capacity = score_capacity < page_capacity ? score_capacity : page_capacity;
+    return static_cast<uint32_t>(
+        static_cast<uint64_t>(seq_len) < input_capacity ? static_cast<uint64_t>(seq_len) : input_capacity);
+  }
   SGL_DEVICE TopKProblem problem(uint32_t batch_id, uint32_t seq_len) const {
     const auto k = static_cast<int64_t>(topk);
     return TopKProblem{
@@ -92,12 +102,13 @@ struct TopKLaunchParams {
         .raw_out = raw_indices != nullptr ? raw_indices + batch_id * k : nullptr,
         .page_table = page_table + batch_id * page_table_stride,
         .topk = topk,
-        .seq_len = seq_len,
+        .seq_len = bounded_seq_len(seq_len),
         .page_bits = page_bits,
     };
   }
   SGL_DEVICE TopKProblem problem(uint32_t batch_id) const {
-    return this->problem(batch_id, static_cast<uint32_t>(seq_lens[batch_id]));
+    const int32_t seq_len = seq_lens[batch_id];
+    return this->problem(batch_id, seq_len > 0 ? static_cast<uint32_t>(seq_len) : 0);
   }
 };
 
@@ -109,13 +120,15 @@ template <bool kPDL>
 CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
   __shared__ impl::MaxSmem<Cluster::Smem> smem;
-  const uint32_t num_cluster_items = params.global().num_cluster_items;
   device::PDLWaitPrimary<kPDL>();
+  const uint32_t num_cluster_items = min(params.global().num_cluster_items, params.batch_size);
   device::PDLTriggerSecondary<kPDL>();
 #pragma unroll 1
   for (uint32_t w = blockIdx.x; w < num_cluster_items; w += kNumPersistentClusters) {
     const auto it = params.item(w);
-    const auto problem = params.problem(it.batch_id, it.seq_len);
+    if (it.batch_id >= params.batch_size) continue;
+    const auto problem = params.problem(it.batch_id);
+    if (problem.seq_len <= params.cluster_threshold()) continue;
     Cluster::forward<false>(problem, &smem);
     __syncthreads();
   }
@@ -163,6 +176,7 @@ SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr) {
 template <bool kPDL, int kLevel>
 TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
+  device::PDLWaitPrimary<kPDL>();
   auto problem = params.problem(blockIdx.x);
   constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
@@ -204,6 +218,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
 template <bool kPDL>
 CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
+  device::PDLWaitPrimary<kPDL>();
   auto problem = params.problem(blockIdx.x);
   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
   if (problem.seq_len <= problem.topk) return trivial_transform<kPDL>(problem);
@@ -237,7 +252,7 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
 
 // --- Plan: choose cluster_threshold from the seq_len distribution -----------
 __global__ __launch_bounds__(kBlockSize, 1) void topk_plan(
-    const uint32_t* __restrict__ seq_lens,
+    const int32_t* __restrict__ seq_lens,
     PlanItem* __restrict__ metadata,  // [0]=GlobalMetadata, [1+i]=PlanItem
     const uint32_t batch_size,
     const uint32_t static_cluster_threshold) {
@@ -277,7 +292,8 @@ __global__ __launch_bounds__(kBlockSize, 1) void topk_plan(
     if (tx == 0) s_threshold = static_cluster_threshold;
   } else {
     for (uint32_t i = tx; i < batch_size; i += kBlockSize) {
-      const uint32_t sl = seq_lens[i];
+      const int32_t raw_sl = seq_lens[i];
+      const uint32_t sl = raw_sl > 0 ? static_cast<uint32_t>(raw_sl) : 0;
       uint32_t count = 0;
 #pragma unroll
       for (uint32_t j = 0; j < kNumCandidates; ++j) {
@@ -305,7 +321,8 @@ __global__ __launch_bounds__(kBlockSize, 1) void topk_plan(
   // Compact items with seq_len > threshold into metadata[1..N]: their batch ids
   // are the work list the persistent cluster pool fetches.
   for (uint32_t i = tx; i < batch_size; i += kBlockSize) {
-    const uint32_t sl = seq_lens[i];
+    const int32_t raw_sl = seq_lens[i];
+    const uint32_t sl = raw_sl > 0 ? static_cast<uint32_t>(raw_sl) : 0;
     if (sl > cluster_threshold) {
       const auto pos = atomicAdd(&s_count, 1);
       metadata[1 + pos] = {i, sl};
@@ -343,7 +360,7 @@ struct TopKKernel {
     const auto device = device_.unwrap();
     LaunchKernel(1, kBlockSize, device)(  //
         topk_plan,
-        static_cast<const uint32_t*>(seq_lens.data_ptr()),
+        static_cast<const int32_t*>(seq_lens.data_ptr()),
         static_cast<PlanItem*>(metadata.data_ptr()),
         batch_size,
         static_cluster_threshold);
@@ -362,6 +379,7 @@ struct TopKKernel {
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
     auto L = SymbolicSize{"max_seq_len"};
     auto S = SymbolicSize{"score_stride"};
+    auto W = SymbolicSize{"page_table_width"};
     auto P = SymbolicSize{"page_table_stride"};
     auto K = SymbolicSize{"topk"};
     auto device_ = SymbolicDevice{};
@@ -376,7 +394,7 @@ struct TopKKernel {
         .with_dtype<int32_t>()
         .with_device(device_)
         .verify(seq_lens);
-    TensorMatcher({B, -1})  // page_table
+    TensorMatcher({B, W})  // page_table
         .with_strides({P, 1})
         .with_dtype<int32_t>()
         .with_device(device_)
@@ -423,6 +441,9 @@ struct TopKKernel {
         .metadata = static_cast<const PlanItem*>(metadata.data_ptr()),
         .score_stride = S.unwrap(),
         .page_table_stride = P.unwrap(),
+        .score_width = static_cast<uint32_t>(L.unwrap()),
+        .page_table_width = static_cast<uint32_t>(W.unwrap()),
+        .batch_size = batch_size,
         .topk = topk,
         .page_bits = page_bits,
         .cluster_floor = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor,

@@ -137,6 +137,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             extend_seq_lens=torch.tensor([query_rows], dtype=torch.int32),
             extend_start_loc=torch.tensor([0], dtype=torch.int32),
             extend_num_tokens=query_rows,
+            req_pool_indices=torch.tensor([1], dtype=torch.int32),
         )
         metadata = SimpleNamespace(nonpaged_plan=None, c4_page_size=64)
         page_table = torch.tensor([[3, 1]], dtype=torch.int32).repeat(query_rows, 1)
@@ -182,6 +183,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             extend_seq_lens=torch.tensor([query_rows], dtype=torch.int32),
             extend_start_loc=torch.tensor([0], dtype=torch.int32),
             extend_num_tokens=query_rows,
+            req_pool_indices=torch.tensor([1], dtype=torch.int32),
         )
         metadata = SimpleNamespace(nonpaged_plan=None, c4_page_size=64)
         page_table = torch.zeros((query_rows, 1), dtype=torch.int32)
@@ -230,6 +232,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
                 extend_seq_lens=torch.tensor([query_rows], dtype=torch.int32),
                 extend_start_loc=torch.tensor([0], dtype=torch.int32),
                 extend_num_tokens=query_rows,
+                req_pool_indices=torch.tensor([1], dtype=torch.int32),
             )
             c4_seq_lens = torch.div(
                 torch.arange(1, query_rows + 1, dtype=torch.int32),
@@ -265,6 +268,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         query_rows = 4
         plan = NonPagedIndexerPlan(
             page_table=torch.tensor([[3, 1]], dtype=torch.int32),
+            request_indices=torch.tensor([1], dtype=torch.int64),
             gather_seq_lens=torch.tensor([65], dtype=torch.int32),
             ks=torch.zeros(query_rows, dtype=torch.int32),
             ke=torch.tensor([62, 63, 64, 65], dtype=torch.int32),
@@ -278,6 +282,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         k_u8 = torch.zeros((65, 128), dtype=torch.uint8)
         scale_u8 = torch.zeros((65, 4), dtype=torch.uint8)
         token_to_kv_pool = MagicMock()
+        token_to_kv_pool.kv_integrity = None
         token_to_kv_pool.get_index_k_scale_buffer.return_value = (k_u8, scale_u8)
         c4_indexer = SimpleNamespace(layer_id=17)
         expected = MagicMock(name="logits")
@@ -299,6 +304,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             page_indices=plan.page_table,
             seq_len_sum=65,
             max_seq_len=65,
+            integrity_args=None,
         )
         call = deep_gemm.fp8_mqa_logits.call_args
         torch.testing.assert_close(call.args[0], q_indexer[:query_rows])

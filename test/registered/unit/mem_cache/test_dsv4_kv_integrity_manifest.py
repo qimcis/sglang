@@ -384,6 +384,7 @@ def test_decode_validates_state_only_on_compression_boundary():
         [-1],
         [-1],
     ]
+    assert manager.validation_calls[2][1].tolist() == [2]
 
     manager.validation_calls.clear()
     manager.protect_compressor_plan(
@@ -395,6 +396,22 @@ def test_decode_validates_state_only_on_compression_boundary():
     assert [call[1].tolist() for call in manager.validation_calls[:2]] == [
         [1],
         [3],
+    ]
+    assert manager.validation_calls[2][1].tolist() == [3]
+
+
+def test_zero_length_decode_row_is_inactive_for_state_mapping():
+    manager = _RecordingManager()
+    manager.protect_compressor_plan(
+        _state_descriptor(4),
+        _DecodePlan(True, torch.tensor([[0, 0, 0, 0]], dtype=torch.int32)),
+        torch.tensor([1]),
+        torch.tensor([0]),
+    )
+    assert [call[1].tolist() for call in manager.validation_calls] == [
+        [-1],
+        [-1],
+        [-1],
     ]
 
 

@@ -371,7 +371,7 @@ class DSV4IntegritySidecar:
 
 
 class DSV4IntegrityAddressSpace:
-    """Allocation generations and per-request expected page mappings."""
+    """Allocation generations and compact per-request mapping tags."""
 
     def __init__(
         self,
@@ -388,19 +388,13 @@ class DSV4IntegrityAddressSpace:
         self.generation = torch.zeros(
             physical_capacity, dtype=torch.int64, device=device
         )
-        self.expected_page = torch.zeros(
-            (request_capacity, logical_capacity), dtype=torch.int32, device=device
-        )
-        self.expected_generation = torch.zeros(
+        self.expected_tags = torch.zeros(
             (request_capacity, logical_capacity), dtype=torch.int64, device=device
-        )
-        self.expected_valid = torch.zeros(
-            (request_capacity, logical_capacity), dtype=torch.int32, device=device
         )
 
     def clear_requests(self, request_indices: torch.Tensor) -> None:
         if request_indices.numel():
-            self.expected_valid.index_fill_(0, request_indices.to(torch.long), 0)
+            self.expected_tags.index_fill_(0, request_indices.to(torch.long), 0)
 
 
 def component_seed(descriptor: DSV4ComponentDescriptor) -> int:
@@ -411,6 +405,10 @@ def component_seed(descriptor: DSV4ComponentDescriptor) -> int:
         ^ (descriptor.compress_ratio * 0xC2B2AE3D)
     )
     return value & 0x7FFFFFFFFFFFFFFF
+
+
+def mapping_seed(domain: DSV4IntegrityDomain) -> int:
+    return (0x445356344D415032 ^ (int(domain) * 0x9E3779B1)) & 0x7FFFFFFFFFFFFFFF
 
 
 def causal_swa_logical_pages(
@@ -518,6 +516,27 @@ class DSV4KVIntegrityManager:
                 device=device,
             ),
         }
+        self._descriptor_rows = {
+            descriptor.identity: row for row, descriptor in enumerate(descriptors)
+        }
+        self._digest_descriptor_table = None
+        self._digest_stream = None
+        if device.type == "cuda":
+            self._digest_descriptor_table = torch.tensor(
+                [
+                    (
+                        descriptor.buffer.data_ptr(),
+                        descriptor.capacity,
+                        descriptor.item_nbytes,
+                        component_seed(descriptor),
+                        int(descriptor.transfer_group) - 1,
+                    )
+                    for descriptor in descriptors
+                ],
+                dtype=torch.int64,
+                device=device,
+            )
+            self._digest_stream = torch.cuda.Stream(device=device)
         self._req_pool = None
         self._full_to_swa_mapping = None
 
@@ -565,6 +584,47 @@ class DSV4KVIntegrityManager:
             error = DSV4ManifestError if destination else DSV4IntegrityError
             raise error(f"DSV4 {location} pages are out of bounds")
         return pages_by_group
+
+    def _batched_transfer_digests(
+        self, pages_by_group: Mapping[DSV4TransferGroup, torch.Tensor]
+    ) -> tuple[torch.Tensor, dict[DSV4TransferGroup, int], torch.cuda.Stream]:
+        if self._digest_descriptor_table is None or self._digest_stream is None:
+            raise DSV4IntegrityError("DSV4 batched digests require CUDA buffers")
+        try:
+            from sgl_kernel.kvcacheio import dsv4_batched_page_digests
+        except (ImportError, AttributeError) as exc:
+            raise DSV4IntegrityError(
+                "the batched sglang-kernel DSV4 integrity op is not installed"
+            ) from exc
+
+        groups = tuple(DSV4TransferGroup)
+        counts = {group: int(pages_by_group[group].numel()) for group in groups}
+        offsets = [0]
+        for group in groups:
+            offsets.append(offsets[-1] + counts[group])
+
+        current_stream = torch.cuda.current_stream(self.failure_status.device)
+        self._digest_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self._digest_stream):
+            # Allocate the launch-only inputs on the stream that consumes them.
+            # Otherwise their Python references can die on return while this
+            # asynchronous kernel is still reading storage owned by the caller's
+            # stream, allowing the caching allocator to recycle it prematurely.
+            flat_pages = torch.cat([pages_by_group[group] for group in groups])
+            group_offsets = torch.tensor(
+                offsets,
+                dtype=torch.int32,
+                device=self.failure_status.device,
+            )
+            digests = dsv4_batched_page_digests(
+                self._digest_descriptor_table, flat_pages, group_offsets
+            )
+            # Explicitly associate the launch-only inputs with the consuming
+            # stream so future refactors cannot reintroduce allocator reuse
+            # before the asynchronous kernel has finished reading them.
+            flat_pages.record_stream(self._digest_stream)
+            group_offsets.record_stream(self._digest_stream)
+        return digests, counts, self._digest_stream
 
     def attach_request_pool(self, req_pool) -> None:
         if self._req_pool is req_pool:
@@ -640,6 +700,7 @@ class DSV4KVIntegrityManager:
             from sgl_kernel.kvcacheio import (
                 dsv4_bind_pages,
                 dsv4_refresh_slots,
+                dsv4_validate_core_mappings,
                 dsv4_validate_pages,
             )
         except (ImportError, AttributeError) as exc:
@@ -648,6 +709,7 @@ class DSV4KVIntegrityManager:
             ) from exc
         return (
             dsv4_bind_pages,
+            dsv4_validate_core_mappings,
             dsv4_refresh_slots,
             dsv4_validate_pages,
         )
@@ -682,24 +744,32 @@ class DSV4KVIntegrityManager:
         *,
         slot_page_size: int,
         invalid_value: int = 0,
+        capture_refs: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Install an expected mapping once, then require exact reuse."""
-        bind, _, _ = self._ops()
+        bind, _, _, _ = self._ops()
         space = self.address_spaces[domain]
         self._check_mapping_inputs(domain, slots, logical_pages, request_indices)
         if slots.numel() == 0:
-            return slots.clone()
+            out = slots.clone()
+            if capture_refs is not None:
+                capture_refs.extend((slots, out))
+            return out
+        logical_pages_i64 = logical_pages.to(torch.int64)
+        request_indices_i64 = request_indices.to(torch.int64)
         out = torch.empty_like(slots)
+        if capture_refs is not None:
+            capture_refs.extend((slots, logical_pages_i64, request_indices_i64, out))
         bind(
             slots,
-            logical_pages.to(torch.int64),
-            request_indices.to(torch.int64),
+            logical_pages_i64,
+            request_indices_i64,
             space.generation,
-            space.expected_page,
-            space.expected_generation,
-            space.expected_valid,
+            self.request_epochs,
+            space.expected_tags,
             out,
             self.failure_status,
+            mapping_seed(domain),
             slot_page_size,
             invalid_value,
             True,
@@ -715,29 +785,110 @@ class DSV4KVIntegrityManager:
         *,
         slot_page_size: int,
         invalid_value: int = 0,
+        capture_refs: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Verify a mapping without learning missing request ownership."""
-        bind, _, _ = self._ops()
+        bind, _, _, _ = self._ops()
         space = self.address_spaces[domain]
         self._check_mapping_inputs(domain, slots, logical_pages, request_indices)
         if slots.numel() == 0:
-            return slots.clone()
+            out = slots.clone()
+            if capture_refs is not None:
+                capture_refs.extend((slots, out))
+            return out
+        logical_pages_i64 = logical_pages.to(torch.int64)
+        request_indices_i64 = request_indices.to(torch.int64)
         out = torch.empty_like(slots)
+        if capture_refs is not None:
+            capture_refs.extend((slots, logical_pages_i64, request_indices_i64, out))
         bind(
             slots,
-            logical_pages.to(torch.int64),
-            request_indices.to(torch.int64),
+            logical_pages_i64,
+            request_indices_i64,
             space.generation,
-            space.expected_page,
-            space.expected_generation,
-            space.expected_valid,
+            self.request_epochs,
+            space.expected_tags,
             out,
             self.failure_status,
+            mapping_seed(domain),
             slot_page_size,
             invalid_value,
             False,
         )
         return out
+
+    def verify_core_mappings(
+        self,
+        full_slots: torch.Tensor,
+        full_logical: torch.Tensor,
+        out_slots: torch.Tensor,
+        out_logical: torch.Tensor,
+        swa_slots: torch.Tensor,
+        swa_logical: torch.Tensor,
+        request_indices: torch.Tensor,
+        *,
+        capture_refs: list[torch.Tensor] | None = None,
+    ) -> None:
+        """Validate and sanitize the core FULL/SWA mapping consumers in one launch."""
+        if full_slots.ndim != 2 or swa_slots.ndim != 2:
+            raise DSV4IntegrityError("DSV4 core page tables must be two-dimensional")
+        if full_slots.shape != full_logical.shape:
+            raise DSV4IntegrityError("DSV4 FULL core mapping geometry mismatch")
+        if swa_slots.shape != swa_logical.shape:
+            raise DSV4IntegrityError("DSV4 SWA core mapping geometry mismatch")
+        if out_slots.shape != out_logical.shape:
+            raise DSV4IntegrityError("DSV4 output mapping geometry mismatch")
+        if request_indices.ndim != 1 or request_indices.numel() == 0:
+            raise DSV4IntegrityError("DSV4 core request geometry mismatch")
+        if (
+            full_slots.shape[0] != request_indices.numel()
+            or swa_slots.shape[0] != request_indices.numel()
+            or out_slots.numel() % request_indices.numel() != 0
+        ):
+            raise DSV4IntegrityError("DSV4 core mapping request geometry mismatch")
+        if full_slots.dtype != torch.int32 or swa_slots.dtype != torch.int32:
+            raise DSV4IntegrityError("DSV4 core page tables must be int32")
+        if out_slots.dtype not in (torch.int32, torch.int64):
+            raise DSV4IntegrityError("DSV4 output locations must be int32 or int64")
+
+        _, validate_core, _, _ = self._ops()
+        full = self.address_spaces[DSV4IntegrityDomain.FULL]
+        swa = self.address_spaces[DSV4IntegrityDomain.SWA]
+        full_logical_i64 = full_logical.to(torch.int64).contiguous()
+        out_logical_i64 = out_logical.to(torch.int64).contiguous()
+        swa_logical_i64 = swa_logical.to(torch.int64).contiguous()
+        request_indices_i64 = request_indices.to(torch.int64).contiguous()
+        if capture_refs is not None:
+            capture_refs.extend(
+                (
+                    full_slots,
+                    full_logical_i64,
+                    out_slots,
+                    out_logical_i64,
+                    swa_slots,
+                    swa_logical_i64,
+                    request_indices_i64,
+                )
+            )
+        validate_core(
+            full_slots,
+            full_logical_i64,
+            out_slots,
+            out_logical_i64,
+            swa_slots,
+            swa_logical_i64,
+            request_indices_i64,
+            full.generation,
+            swa.generation,
+            self.request_epochs,
+            full.expected_tags,
+            swa.expected_tags,
+            self.failure_status,
+            mapping_seed(DSV4IntegrityDomain.FULL),
+            mapping_seed(DSV4IntegrityDomain.SWA),
+            self.full_page_size,
+            self.swa_page_size,
+        )
 
     def replace_pages(
         self,
@@ -756,7 +907,7 @@ class DSV4KVIntegrityManager:
         space = self.address_spaces[domain]
         live = logical_pages >= 0
         req_matrix = request_indices.view(-1, 1).expand_as(logical_pages)
-        space.expected_valid[
+        space.expected_tags[
             req_matrix[live].to(torch.long), logical_pages[live].to(torch.long)
         ] = 0
         return self.bind_pages(
@@ -862,6 +1013,7 @@ class DSV4KVIntegrityManager:
         slot_page_size: int,
         invalid_value: int = 0,
         allow_missing_digest: bool = False,
+        capture_refs: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Fused mapping, generation and byte validation with sanitization."""
         if slots.shape != logical_pages.shape:
@@ -871,16 +1023,23 @@ class DSV4KVIntegrityManager:
         if slots.numel() == 0:
             if request_indices.numel() != 0:
                 raise DSV4IntegrityError("DSV4 empty validation has request rows")
-            return slots.clone()
-        _, _, validate = self._ops()
+            out = slots.clone()
+            if capture_refs is not None:
+                capture_refs.extend((slots, out))
+            return out
+        _, _, _, validate = self._ops()
         space = self.address_spaces[self.domain_for_group(descriptor.transfer_group)]
         sidecar = self.sidecars[descriptor.identity]
+        logical_pages_i64 = logical_pages.to(torch.int64)
+        request_indices_i64 = request_indices.to(torch.int64)
         out = torch.empty_like(slots)
+        if capture_refs is not None:
+            capture_refs.extend((slots, logical_pages_i64, request_indices_i64, out))
         validate(
             descriptor.buffer,
             slots,
-            logical_pages.to(torch.int64),
-            request_indices.to(torch.int64),
+            logical_pages_i64,
+            request_indices_i64,
             sidecar.digest,
             sidecar.valid,
             sidecar.validation_state,
@@ -888,12 +1047,12 @@ class DSV4KVIntegrityManager:
             sidecar.validation_pages,
             sidecar.validation_count,
             space.generation,
-            space.expected_page,
-            space.expected_generation,
-            space.expected_valid,
+            self.request_epochs,
+            space.expected_tags,
             out,
             self.failure_status,
             component_seed(descriptor),
+            mapping_seed(space.domain),
             slot_page_size,
             invalid_value,
             allow_missing_digest,
@@ -907,7 +1066,7 @@ class DSV4KVIntegrityManager:
         *,
         slot_page_size: int,
     ) -> None:
-        _, refresh_slots, _ = self._ops()
+        _, _, refresh_slots, _ = self._ops()
         sidecar = self.sidecars[descriptor.identity]
         refresh_slots(
             descriptor.buffer,
@@ -927,6 +1086,7 @@ class DSV4KVIntegrityManager:
         positions: torch.Tensor,
         *,
         validate_bytes: bool = True,
+        capture_refs: list[torch.Tensor] | None = None,
     ):
         """Validate state reads and sanitize state writes in one plan copy."""
         domain = self.domain_for_group(descriptor.transfer_group)
@@ -939,6 +1099,7 @@ class DSV4KVIntegrityManager:
                     logical,
                     requests,
                     slot_page_size=slot_page_size,
+                    capture_refs=capture_refs,
                 )
             return self.verify_mapping(
                 domain,
@@ -946,6 +1107,7 @@ class DSV4KVIntegrityManager:
                 logical,
                 requests,
                 slot_page_size=slot_page_size,
+                capture_refs=capture_refs,
             )
 
         if plan.is_decode:
@@ -954,8 +1116,18 @@ class DSV4KVIntegrityManager:
             count = raw.shape[0]
             reqs = request_indices_repeated[:count].to(torch.int64).contiguous()
             seq_lens = raw[:, 0].to(torch.int64)
+            writes_state = seq_lens > 0
             consumes_state = (seq_lens > 0) & (
                 seq_lens.remainder(descriptor.compress_ratio) == 0
+            )
+            logical_write = torch.where(
+                writes_state,
+                torch.div(
+                    seq_lens - 1,
+                    self.swa_page_size,
+                    rounding_mode="floor",
+                ),
+                -1,
             )
             logical_1 = torch.where(
                 consumes_state,
@@ -978,6 +1150,7 @@ class DSV4KVIntegrityManager:
                 -1,
             )
             if descriptor.transfer_group == DSV4TransferGroup.C128_STATE:
+                logical_write = torch.where(writes_state, 0, -1)
                 logical_1 = torch.where(consumes_state, 0, -1)
             raw[:, 2].copy_(
                 validate_state(
@@ -1003,10 +1176,11 @@ class DSV4KVIntegrityManager:
                 self.verify_mapping(
                     domain,
                     raw[:, 1].contiguous(),
-                    logical_1.contiguous(),
+                    logical_write.contiguous(),
                     reqs,
                     slot_page_size=descriptor.page_size,
                     invalid_value=(descriptor.capacity - 1) * descriptor.page_size,
+                    capture_refs=capture_refs,
                 )
             )
             return plan._replace(plan_d=plan_d)
@@ -1099,6 +1273,7 @@ class DSV4KVIntegrityManager:
                 reqs_w,
                 slot_page_size=descriptor.page_size,
                 invalid_value=(descriptor.capacity - 1) * descriptor.page_size,
+                capture_refs=capture_refs,
             )
         )
         return plan._replace(plan_c=plan_c, plan_w=plan_w)
@@ -1123,29 +1298,36 @@ class DSV4KVIntegrityManager:
         indices_by_group: Mapping[DSV4TransferGroup, Sequence[int] | torch.Tensor],
         logical_starts: Mapping[DSV4TransferGroup, int] | None = None,
     ) -> DSV4TransferManifest:
-        pending = []
         logical_starts = logical_starts or {}
         pages_by_group = self._prepare_transfer_pages(
             indices_by_group, destination=False
         )
-
-        for descriptor in self.descriptors:
-            pages = pages_by_group[descriptor.transfer_group]
-            if pages.numel() == 0:
-                continue
-            digests = compute_page_digests(
-                descriptor.buffer, pages, seed=component_seed(descriptor)
-            )
-            pending.append((descriptor, pages.numel(), digests))
-
-        # Launch every descriptor hash before crossing back to the host.  The
-        # manifest is a CPU wire object, so one bulk D2H copy is unavoidable;
-        # doing it here avoids a CUDA synchronization for every model layer.
-        host_digests = (
-            torch.cat([digests for _, _, digests in pending]).cpu()
-            if pending
-            else torch.empty(0, dtype=torch.int64)
+        digest_matrix, counts, digest_stream = self._batched_transfer_digests(
+            pages_by_group
         )
+        pending = [
+            (
+                descriptor,
+                counts[descriptor.transfer_group],
+                digest_matrix[
+                    self._descriptor_rows[descriptor.identity],
+                    : counts[descriptor.transfer_group],
+                ],
+            )
+            for descriptor in self.descriptors
+            if counts[descriptor.transfer_group]
+        ]
+
+        total_digests = sum(count for _, count, _ in pending)
+        host_digests = torch.empty(total_digests, dtype=torch.int64, pin_memory=True)
+        with torch.cuda.stream(digest_stream):
+            if pending:
+                host_digests.copy_(
+                    torch.cat([digests for _, _, digests in pending]),
+                    non_blocking=True,
+                )
+            complete = digest_stream.record_event()
+        complete.synchronize()
         entries = []
         offset = 0
         for descriptor, count, _ in pending:
@@ -1207,7 +1389,7 @@ class DSV4KVIntegrityManager:
             indices_by_group, destination=True
         )
 
-        installs = []
+        checked = []
         for identity, entry in entries.items():
             descriptor = self.by_identity[identity]
             if (
@@ -1227,38 +1409,49 @@ class DSV4KVIntegrityManager:
             ]
             if entry.logical_start + entry.logical_count > space.logical_capacity:
                 raise DSV4ManifestError("manifest logical range is out of bounds")
-            actual = compute_page_digests(
-                descriptor.buffer, pages, seed=component_seed(descriptor)
-            )
-            expected = torch.tensor(
-                [
-                    value if value < (1 << 63) else value - (1 << 64)
-                    for value in entry.digests
-                ],
-                dtype=torch.int64,
-            )
-            installs.append(
-                (identity, self.sidecars[identity], pages, actual, expected)
+            checked.append((identity, self.sidecars[identity], pages, entry))
+
+        digest_matrix, _, digest_stream = self._batched_transfer_digests(pages_by_group)
+        installs = []
+        actual_parts = []
+        expected_values = []
+        for identity, sidecar, pages, entry in checked:
+            row = self._descriptor_rows[identity]
+            actual = digest_matrix[row, : entry.logical_count]
+            installs.append((identity, sidecar, pages, actual))
+            actual_parts.append(actual)
+            expected_values.extend(
+                value if value < (1 << 63) else value - (1 << 64)
+                for value in entry.digests
             )
 
-        # Compare every destination component after one bulk synchronization.
-        # Keep the expected vector on CPU because it arrived over the wire and
-        # the comparison result is consumed by Python either way.
-        host_actual = (
-            torch.cat([actual for _, _, _, actual, _ in installs]).cpu()
-            if installs
-            else torch.empty(0, dtype=torch.int64)
-        )
-        host_expected = (
-            torch.cat([expected for _, _, _, _, expected in installs])
-            if installs
-            else torch.empty(0, dtype=torch.int64)
-        )
-        mismatch = torch.nonzero(host_actual != host_expected).flatten()
-        if mismatch.numel():
-            first = int(mismatch[0].item())
+        with torch.cuda.stream(digest_stream):
+            actual_flat = (
+                torch.cat(actual_parts)
+                if actual_parts
+                else torch.empty(
+                    0, dtype=torch.int64, device=self.failure_status.device
+                )
+            )
+            expected_flat = torch.tensor(
+                expected_values,
+                dtype=torch.int64,
+                device=self.failure_status.device,
+            )
+            mismatch_mask = actual_flat != expected_flat
+            mismatch_status = torch.any(mismatch_mask).to(torch.int32)
+            host_mismatch_status = torch.empty((), dtype=torch.int32, pin_memory=True)
+            host_mismatch_status.copy_(mismatch_status, non_blocking=True)
+            comparison_complete = digest_stream.record_event()
+        comparison_complete.synchronize()
+        if bool(host_mismatch_status.item()):
+            with torch.cuda.stream(digest_stream):
+                first_device = torch.nonzero(mismatch_mask, as_tuple=False)[0, 0]
+                mismatch_detail_complete = digest_stream.record_event()
+            mismatch_detail_complete.synchronize()
+            first = int(first_device.item())
             offset = 0
-            for identity, _, _, actual, _ in installs:
+            for identity, _, _, actual in installs:
                 if first < offset + actual.numel():
                     logical_item = first - offset
                     break
@@ -1273,8 +1466,13 @@ class DSV4KVIntegrityManager:
         # Install only after every component verifies, so partial manifests can
         # never leave a request looking protected.
         if self.maintain_runtime_sidecars:
-            for _, sidecar, pages, values, _ in installs:
-                sidecar._install_prevalidated(pages, values)
+            with torch.cuda.stream(digest_stream):
+                for _, sidecar, pages, values in installs:
+                    sidecar._install_prevalidated(pages, values)
+                installs_complete = digest_stream.record_event()
+            torch.cuda.current_stream(self.failure_status.device).wait_event(
+                installs_complete
+            )
         reqs = torch.full(
             (1,), request_index, dtype=torch.int64, device=self.failure_status.device
         )

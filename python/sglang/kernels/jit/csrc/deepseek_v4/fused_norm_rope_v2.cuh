@@ -88,6 +88,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
 
   if (work_id >= params.num_tokens) return;
 
+  PDLWaitPrimary<kUsePDL>();
   const auto input = static_cast<DType*>(params.input) + work_id * kHeadDim;
   int32_t position;
   int64_t out_loc;
@@ -98,7 +99,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
     out_loc = params.out_loc[plan.ragged_id];
   } else if constexpr (kMode == CompressDecode) {
     const auto plan = static_cast<const PlanD*>(params.handle)[work_id];
-    if (plan.seq_len % params.compress_ratio != 0) return;
+    if (plan.seq_len == 0 || plan.seq_len % params.compress_ratio != 0) return;
     position = plan.seq_len - params.compress_ratio;
     out_loc = params.out_loc[work_id];
   } else {
@@ -106,7 +107,6 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
   }
   const auto freqs_cis = params.freqs_cis + position * kRopeDim;
 
-  PDLWaitPrimary<kUsePDL>();
   Float4 data, freq;
 
   // part 1: norm
@@ -254,6 +254,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
 
   if (work_id >= params.num_tokens) return;
 
+  PDLWaitPrimary<kUsePDL>();
   const auto input = static_cast<DType*>(params.input) + work_id * kHeadDim;
   int32_t position;
   int64_t out_loc;
@@ -264,7 +265,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
     out_loc = params.out_loc[plan.ragged_id];
   } else if constexpr (kMode == CompressDecode) {
     const auto plan = static_cast<const PlanD*>(params.handle)[work_id];
-    if (plan.seq_len % params.compress_ratio != 0) return;
+    if (plan.seq_len == 0 || plan.seq_len % params.compress_ratio != 0) return;
     position = plan.seq_len - params.compress_ratio;
     out_loc = params.out_loc[work_id];
   } else {
@@ -272,7 +273,6 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
   }
   const auto freqs_cis = params.freqs_cis + position * kRopeDim;
 
-  PDLWaitPrimary<kUsePDL>();
   Float4 data, freq;
 
   {
@@ -408,6 +408,7 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
 
   if (work_id >= params.num_tokens) return;
 
+  PDLWaitPrimary<kUsePDL>();
   const auto input = static_cast<DType*>(params.input) + work_id * kHeadDim;
   int32_t position;
   int64_t out_loc;
@@ -418,7 +419,7 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
     out_loc = params.out_loc[plan.ragged_id];
   } else if constexpr (kMode == CompressDecode) {
     const auto plan = static_cast<const PlanD*>(params.handle)[work_id];
-    if (plan.seq_len % params.compress_ratio != 0) return;
+    if (plan.seq_len == 0 || plan.seq_len % params.compress_ratio != 0) return;
     position = plan.seq_len - params.compress_ratio;
     out_loc = params.out_loc[work_id];
   } else {
@@ -426,7 +427,6 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   }
   const auto freqs_cis = params.freqs_cis + position * kRopeDim;
 
-  PDLWaitPrimary<kUsePDL>();
   Float2 data, freq;
 
   // part 1: norm. Each thread owns one 2-elem pack (`tx`-th pack of input).

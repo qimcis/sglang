@@ -98,6 +98,7 @@ def copy_metadata(
 @dataclass
 class NonPagedIndexerPlan:
     page_table: torch.Tensor
+    request_indices: torch.Tensor
     gather_seq_lens: torch.Tensor
     ks: torch.Tensor
     ke: torch.Tensor
@@ -121,6 +122,7 @@ class PagedIndexerMetadata:
     )
 
     def __post_init__(self):
+        self.c4_seq_lens = self.c4_seq_lens.clamp(min=0, max=self.max_c4_seq_len)
         if (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
             or is_xpu()

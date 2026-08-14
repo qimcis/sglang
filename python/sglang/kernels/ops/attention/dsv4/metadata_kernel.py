@@ -32,10 +32,12 @@ def _init_compressed_attn_metadata_kernel(
         return
 
     seq_len = tl.load(seq_lens_ptr + batch_id)
-    position = tl.load(positions_ptr + batch_id)
+    active = seq_len > 0
+    seq_len = tl.maximum(seq_len, 0)
+    position = tl.where(active, tl.load(positions_ptr + batch_id), 0)
     raw_out_loc = tl.load(raw_out_loc_ptr + batch_id)
 
-    c4_should_compress = (seq_len % 4) == 0
+    c4_should_compress = active & ((seq_len % 4) == 0)
     c4_out_loc = tl.where(c4_should_compress, raw_out_loc // 4, 0)
     c4_positions = position & (~3)
     c4_seq_lens_raw = seq_len // 4
@@ -46,7 +48,7 @@ def _init_compressed_attn_metadata_kernel(
     tl.store(c4_seq_lens_raw_ptr + batch_id, c4_seq_lens_raw)
     tl.store(c4_seq_lens_clamp1_ptr + batch_id, c4_seq_lens_clamp1)
 
-    c128_should_compress = (seq_len % 128) == 0
+    c128_should_compress = active & ((seq_len % 128) == 0)
     c128_out_loc = tl.where(c128_should_compress, raw_out_loc // 128, 0)
     c128_positions = position & (~127)
     c128_seq_lens_raw = seq_len // 128
