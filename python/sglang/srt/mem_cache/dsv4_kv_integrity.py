@@ -606,11 +606,13 @@ class DSV4KVIntegrityManager:
         space = self.address_spaces[domain]
         if slots.shape != logical_pages.shape or slots.ndim not in (1, 2):
             raise DSV4IntegrityError("DSV4 mapping slot geometry mismatch")
-        if (
-            request_indices.ndim != 1
-            or request_indices.numel() == 0
-            or slots.numel() % request_indices.numel() != 0
-        ):
+        if request_indices.ndim != 1:
+            raise DSV4IntegrityError("DSV4 mapping request geometry mismatch")
+        if slots.numel() == 0:
+            if request_indices.numel() != 0:
+                raise DSV4IntegrityError("DSV4 empty mapping has request rows")
+            return
+        if request_indices.numel() == 0 or slots.numel() % request_indices.numel() != 0:
             raise DSV4IntegrityError("DSV4 mapping request geometry mismatch")
         if space.logical_capacity <= 0:
             raise DSV4IntegrityError("DSV4 mapping address space is empty")
@@ -629,6 +631,8 @@ class DSV4KVIntegrityManager:
         bind, _, _ = self._ops()
         space = self.address_spaces[domain]
         self._check_mapping_inputs(domain, slots, logical_pages, request_indices)
+        if slots.numel() == 0:
+            return slots.clone()
         out = torch.empty_like(slots)
         bind(
             slots,
@@ -660,6 +664,8 @@ class DSV4KVIntegrityManager:
         bind, _, _ = self._ops()
         space = self.address_spaces[domain]
         self._check_mapping_inputs(domain, slots, logical_pages, request_indices)
+        if slots.numel() == 0:
+            return slots.clone()
         out = torch.empty_like(slots)
         bind(
             slots,
@@ -689,6 +695,8 @@ class DSV4KVIntegrityManager:
     ) -> torch.Tensor:
         """Replace mappings from a trusted allocator or cache-table write."""
         self._check_mapping_inputs(domain, slots, logical_pages, request_indices)
+        if slots.numel() == 0:
+            return slots.clone()
         space = self.address_spaces[domain]
         live = logical_pages >= 0
         req_matrix = request_indices.view(-1, 1).expand_as(logical_pages)
@@ -800,6 +808,14 @@ class DSV4KVIntegrityManager:
         allow_missing_digest: bool = False,
     ) -> torch.Tensor:
         """Fused mapping, generation and byte validation with sanitization."""
+        if slots.shape != logical_pages.shape:
+            raise DSV4IntegrityError("DSV4 validation slot geometry mismatch")
+        if request_indices.ndim != 1:
+            raise DSV4IntegrityError("DSV4 validation request geometry mismatch")
+        if slots.numel() == 0:
+            if request_indices.numel() != 0:
+                raise DSV4IntegrityError("DSV4 empty validation has request rows")
+            return slots.clone()
         _, _, validate = self._ops()
         space = self.address_spaces[self.domain_for_group(descriptor.transfer_group)]
         sidecar = self.sidecars[descriptor.identity]

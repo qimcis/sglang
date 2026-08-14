@@ -385,6 +385,93 @@ def test_transfer_group_supports_heterogeneous_component_capacities():
     )
 
 
+def test_empty_compressor_mapping_is_a_noop():
+    buffer = torch.zeros((4, 16), dtype=torch.uint8, device="cuda")
+    descriptor = DSV4ComponentDescriptor(
+        DSV4Component.C4_ATTENTION_STATE,
+        0,
+        4,
+        DSV4TransferGroup.SWA,
+        8,
+        16,
+        4,
+        buffer,
+    )
+    manager = DSV4KVIntegrityManager(
+        (
+            DSV4ComponentDescriptor(
+                DSV4Component.C4_ATTENTION_KV,
+                0,
+                4,
+                DSV4TransferGroup.KV,
+                1,
+                16,
+                4,
+                buffer.clone(),
+            ),
+            descriptor,
+            DSV4ComponentDescriptor(
+                DSV4Component.C128_ATTENTION_STATE,
+                0,
+                128,
+                DSV4TransferGroup.C128_STATE,
+                1,
+                16,
+                4,
+                buffer.clone(),
+            ),
+        ),
+        request_capacity=4,
+        max_context_len=4,
+        full_page_size=1,
+        swa_page_size=1,
+    )
+    slots = torch.empty(0, dtype=torch.int32, device="cuda")
+    logical = torch.empty(0, dtype=torch.int64, device="cuda")
+    requests = torch.empty(0, dtype=torch.int64, device="cuda")
+
+    assert (
+        manager.bind_pages(
+            DSV4IntegrityDomain.SWA,
+            slots,
+            logical,
+            requests,
+            slot_page_size=2,
+        ).numel()
+        == 0
+    )
+    assert (
+        manager.verify_mapping(
+            DSV4IntegrityDomain.SWA,
+            slots,
+            logical,
+            requests,
+            slot_page_size=2,
+        ).numel()
+        == 0
+    )
+    assert (
+        manager.replace_pages(
+            DSV4IntegrityDomain.SWA,
+            slots,
+            logical,
+            requests,
+            slot_page_size=2,
+        ).numel()
+        == 0
+    )
+    assert (
+        manager.validate_pages(
+            descriptor,
+            slots,
+            logical,
+            requests,
+            slot_page_size=2,
+        ).numel()
+        == 0
+    )
+
+
 def test_request_table_write_is_trusted_but_first_consumer_mapping_is_not():
     buffers = [torch.zeros((4, 16), dtype=torch.uint8, device="cuda") for _ in range(3)]
     descriptors = [
