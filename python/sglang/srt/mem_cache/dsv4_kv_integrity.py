@@ -16,7 +16,7 @@ import dataclasses
 import enum
 import hashlib
 import struct
-from typing import Iterable, Mapping, Optional, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 import torch
 
@@ -336,6 +336,17 @@ class DSV4IntegritySidecar:
             return
         if bool(((pages < 0) | (pages >= self.descriptor.capacity)).any().item()):
             raise DSV4IntegrityError("sidecar page index is out of bounds")
+        self._install_prevalidated(pages, digests)
+
+    def _install_prevalidated(
+        self, page_indices: torch.Tensor, digests: torch.Tensor
+    ) -> None:
+        """Install values after the caller has validated the complete batch."""
+        pages = page_indices.to(device=self.digest.device, dtype=torch.long)
+        if pages.numel() != digests.numel():
+            raise DSV4IntegrityError("sidecar page/digest length mismatch")
+        if pages.numel() == 0:
+            return
         self.digest.index_copy_(0, pages, digests.to(torch.int64))
         self.valid.index_fill_(0, pages, 1)
 
@@ -512,6 +523,46 @@ class DSV4KVIntegrityManager:
         self, group: DSV4TransferGroup
     ) -> tuple[DSV4ComponentDescriptor, ...]:
         return tuple(d for d in self.descriptors if d.transfer_group == group)
+
+    def _prepare_transfer_pages(
+        self,
+        indices_by_group: Mapping[DSV4TransferGroup, Sequence[int] | torch.Tensor],
+        *,
+        destination: bool,
+    ) -> dict[DSV4TransferGroup, torch.Tensor]:
+        pages_by_group = {}
+        device_failures = []
+        for group in DSV4TransferGroup:
+            descriptors = self.descriptors_for_group(group)
+            if not descriptors:
+                continue
+            pages = torch.as_tensor(
+                indices_by_group.get(group, ()), dtype=torch.int32
+            ).reshape(-1)
+            if pages.numel():
+                capacity = min(d.capacity for d in descriptors)
+                invalid = torch.any((pages <= 0) | (pages >= capacity))
+                if pages.device.type == "cpu":
+                    if bool(invalid.item()):
+                        location = "destination" if destination else "source"
+                        error = DSV4ManifestError if destination else DSV4IntegrityError
+                        raise error(
+                            f"DSV4 {location} pages are out of bounds for {group.name}"
+                        )
+                else:
+                    device_failures.append(invalid)
+            pages_by_group[group] = pages.to(
+                device=descriptors[0].buffer.device, dtype=torch.int32
+            )
+
+        # Mooncake supplies CPU index arrays, so the common path validates
+        # without synchronizing CUDA.  Preserve one batched check for direct
+        # callers that already hold their indices on a device.
+        if device_failures and bool(torch.stack(device_failures).any().item()):
+            location = "destination" if destination else "source"
+            error = DSV4ManifestError if destination else DSV4IntegrityError
+            raise error(f"DSV4 {location} pages are out of bounds")
+        return pages_by_group
 
     def attach_request_pool(self, req_pool) -> None:
         if self._req_pool is req_pool:
@@ -1067,24 +1118,36 @@ class DSV4KVIntegrityManager:
         bootstrap_room: int,
         transfer_nonce: int,
         indices_by_group: Mapping[DSV4TransferGroup, Sequence[int] | torch.Tensor],
-        logical_starts: Optional[Mapping[DSV4TransferGroup, int]] = None,
+        logical_starts: Mapping[DSV4TransferGroup, int] | None = None,
     ) -> DSV4TransferManifest:
-        entries = []
+        pending = []
         logical_starts = logical_starts or {}
+        pages_by_group = self._prepare_transfer_pages(
+            indices_by_group, destination=False
+        )
+
         for descriptor in self.descriptors:
-            raw_indices = indices_by_group.get(descriptor.transfer_group, ())
-            pages = torch.as_tensor(
-                raw_indices, dtype=torch.int32, device=descriptor.buffer.device
-            ).reshape(-1)
+            pages = pages_by_group[descriptor.transfer_group]
             if pages.numel() == 0:
                 continue
-            if bool(torch.any((pages <= 0) | (pages >= descriptor.capacity)).item()):
-                raise DSV4IntegrityError(
-                    f"DSV4 source pages are out of bounds for {descriptor.identity}"
-                )
             digests = compute_page_digests(
                 descriptor.buffer, pages, seed=component_seed(descriptor)
-            ).cpu()
+            )
+            pending.append((descriptor, pages.numel(), digests))
+
+        # Launch every descriptor hash before crossing back to the host.  The
+        # manifest is a CPU wire object, so one bulk D2H copy is unavoidable;
+        # doing it here avoids a CUDA synchronization for every model layer.
+        host_digests = (
+            torch.cat([digests for _, _, digests in pending]).cpu()
+            if pending
+            else torch.empty(0, dtype=torch.int64)
+        )
+        entries = []
+        offset = 0
+        for descriptor, count, _ in pending:
+            digests = host_digests[offset : offset + count]
+            offset += count
             entries.append(
                 DSV4ManifestEntry(
                     component=descriptor.component,
@@ -1094,7 +1157,7 @@ class DSV4KVIntegrityManager:
                     page_size=descriptor.page_size,
                     item_nbytes=descriptor.item_nbytes,
                     logical_start=int(logical_starts.get(descriptor.transfer_group, 0)),
-                    logical_count=pages.numel(),
+                    logical_count=count,
                     digests=_unsigned_digest_values(digests),
                 )
             )
@@ -1137,6 +1200,10 @@ class DSV4KVIntegrityManager:
                 f"extra={sorted(extra)})"
             )
 
+        pages_by_group = self._prepare_transfer_pages(
+            indices_by_group, destination=True
+        )
+
         installs = []
         for identity, entry in entries.items():
             descriptor = self.by_identity[identity]
@@ -1147,11 +1214,7 @@ class DSV4KVIntegrityManager:
                 or entry.item_nbytes != descriptor.item_nbytes
             ):
                 raise DSV4ManifestError("manifest component geometry mismatch")
-            pages = torch.as_tensor(
-                indices_by_group[descriptor.transfer_group],
-                dtype=torch.int32,
-                device=descriptor.buffer.device,
-            ).reshape(-1)
+            pages = pages_by_group[descriptor.transfer_group]
             if pages.numel() != entry.logical_count:
                 raise DSV4ManifestError("manifest logical range mismatch")
             if entry.logical_start != int(logical_starts[descriptor.transfer_group]):
@@ -1161,10 +1224,6 @@ class DSV4KVIntegrityManager:
             ]
             if entry.logical_start + entry.logical_count > space.logical_capacity:
                 raise DSV4ManifestError("manifest logical range is out of bounds")
-            if bool(torch.any((pages <= 0) | (pages >= descriptor.capacity)).item()):
-                raise DSV4ManifestError(
-                    f"manifest destination pages are out of bounds for {identity}"
-                )
             actual = compute_page_digests(
                 descriptor.buffer, pages, seed=component_seed(descriptor)
             )
@@ -1174,20 +1233,44 @@ class DSV4KVIntegrityManager:
                     for value in entry.digests
                 ],
                 dtype=torch.int64,
-                device=actual.device,
             )
-            if not torch.equal(actual, expected):
-                mismatch = torch.nonzero(actual != expected).flatten()
-                first = int(mismatch[0].item()) if mismatch.numel() else -1
-                raise DSV4IntegrityError(
-                    f"DSV4 destination digest mismatch for {identity} at logical item {first}"
-                )
-            installs.append((self.sidecars[identity], pages, actual))
+            installs.append(
+                (identity, self.sidecars[identity], pages, actual, expected)
+            )
+
+        # Compare every destination component after one bulk synchronization.
+        # Keep the expected vector on CPU because it arrived over the wire and
+        # the comparison result is consumed by Python either way.
+        host_actual = (
+            torch.cat([actual for _, _, _, actual, _ in installs]).cpu()
+            if installs
+            else torch.empty(0, dtype=torch.int64)
+        )
+        host_expected = (
+            torch.cat([expected for _, _, _, _, expected in installs])
+            if installs
+            else torch.empty(0, dtype=torch.int64)
+        )
+        mismatch = torch.nonzero(host_actual != host_expected).flatten()
+        if mismatch.numel():
+            first = int(mismatch[0].item())
+            offset = 0
+            for identity, _, _, actual, _ in installs:
+                if first < offset + actual.numel():
+                    logical_item = first - offset
+                    break
+                offset += actual.numel()
+            else:
+                raise DSV4IntegrityError("DSV4 digest comparison size mismatch")
+            raise DSV4IntegrityError(
+                f"DSV4 destination digest mismatch for {identity} "
+                f"at logical item {logical_item}"
+            )
 
         # Install only after every component verifies, so partial manifests can
         # never leave a request looking protected.
-        for sidecar, pages, values in installs:
-            sidecar.install(pages, values)
+        for _, sidecar, pages, values, _ in installs:
+            sidecar._install_prevalidated(pages, values)
         reqs = torch.full(
             (1,), request_index, dtype=torch.int64, device=self.failure_status.device
         )
