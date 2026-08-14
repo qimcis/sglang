@@ -655,3 +655,19 @@ def test_bit_flip_during_cuda_graph_replay_fails_closed():
     torch.cuda.synchronize()
     assert protected_slots.item() == 0
     assert state[-1][1].item() & (1 << 2)
+
+
+def test_padded_slot_refresh_is_cuda_graph_safe():
+    manager, descriptors, _, _, _ = _complete_manager()
+    descriptor = descriptors[0]
+    slots = torch.tensor([1, 1, 1, 1], dtype=torch.int32, device="cuda")
+    valid = torch.tensor([True, False, True, False], device="cuda")
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_slots = torch.where(valid, slots, 0)
+        manager.refresh_written_slots(descriptor, graph_slots, slot_page_size=1)
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert manager.sidecars[descriptor.identity].valid[1].item() == 1

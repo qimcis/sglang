@@ -249,12 +249,17 @@ class CompressorBackendMixin:
                 * output_descriptor.page_size,
                 allow_missing_digest=True,
             )
-            integrity_written_slots = protected_out_loc[valid]
+            # Keep the refresh geometry static during decode graph capture.
+            # The refresh kernel ignores zero slots, so padding can remain in
+            # the captured tensor without dynamic boolean indexing.
+            integrity_written_slots = torch.where(valid, protected_out_loc, 0)
             if plan.is_decode:
                 out_loc = protected_out_loc.reshape_as(out_loc)
             elif seq_lens.numel() != 0:
-                out_loc = out_loc.clone()
-                out_loc[safe_ragged[valid]] = protected_out_loc[valid]
+                flat_out_loc = out_loc.reshape(-1).clone()
+                updates = torch.where(valid, protected_out_loc - selected_out_loc, 0)
+                flat_out_loc.scatter_add_(0, safe_ragged, updates)
+                out_loc = flat_out_loc.reshape_as(out_loc)
         is_online = _use_online_compress(compress_ratio)
         if is_online:
             kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
