@@ -261,7 +261,7 @@ def test_live_negative_slot_fails_instead_of_being_treated_as_padding():
     assert status[1].item() & (1 << 0)
 
 
-def test_request_slot_reuse_clears_mappings_status_and_bumps_state_generation():
+def test_request_slot_reuse_clears_kv_mappings_and_rebinds_state_generation():
     buffers = [torch.zeros((4, 16), dtype=torch.uint8, device="cuda") for _ in range(3)]
     descriptors = [
         DSV4ComponentDescriptor(
@@ -307,14 +307,27 @@ def test_request_slot_reuse_clears_mappings_status_and_bumps_state_generation():
         space.expected_valid[1].fill_(1)
     manager.register_requests([1], [1])
     assert manager.failure_status[1].item() == 0
-    assert all(
-        not space.expected_valid[1].any().item()
-        for space in manager.address_spaces.values()
+    assert (
+        not manager.address_spaces[DSV4IntegrityDomain.FULL]
+        .expected_valid[1]
+        .any()
+        .item()
     )
+    assert (
+        not manager.address_spaces[DSV4IntegrityDomain.SWA]
+        .expected_valid[1]
+        .any()
+        .item()
+    )
+    state_space = manager.address_spaces[DSV4IntegrityDomain.C128_STATE]
+    assert state_space.expected_valid[1, 0].item() == 1
+    assert state_space.expected_page[1, 0].item() == 1
     state_generation = manager.address_spaces[DSV4IntegrityDomain.C128_STATE].generation
     assert state_generation[1].item() == 1
+    assert state_space.expected_generation[1, 0].item() == 1
     manager.register_requests([1], [2])
     assert state_generation[1].item() == 2
+    assert state_space.expected_generation[1, 0].item() == 2
 
 
 def test_transfer_group_supports_heterogeneous_component_capacities():
