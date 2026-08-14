@@ -1437,14 +1437,17 @@ class MooncakeKVManager(CommonKVManager):
             )
             if current_epoch != request_epoch:
                 raise RuntimeError("protected DSV4 destination request slot was reused")
-            self.dsv4_integrity.verify_and_install(
-                manifest,
-                bootstrap_room=room,
-                transfer_nonce=nonce,
-                indices_by_group=groups,
-                logical_starts=logical_starts,
-                request_index=request_index,
-            )
+            # Mooncake receives manifests on a background thread, whose CUDA
+            # device defaults to 0 rather than this DP rank's local device.
+            with torch.cuda.device(self.dsv4_integrity.failure_status.device):
+                self.dsv4_integrity.verify_and_install(
+                    manifest,
+                    bootstrap_room=room,
+                    transfer_nonce=nonce,
+                    indices_by_group=groups,
+                    logical_starts=logical_starts,
+                    request_index=request_index,
+                )
             accept_pending = False
             with self._integrity_condition:
                 if room in self._integrity_cancelled_rooms:

@@ -1,5 +1,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
 
@@ -504,6 +505,7 @@ void check_same_device(const at::Tensor& reference, const at::Tensor& tensor, co
 }  // namespace
 
 at::Tensor dsv4_page_digests(const at::Tensor buffer, const at::Tensor page_indices, int64_t seed) {
+  const at::cuda::CUDAGuard device_guard(buffer.device());
   check_byte_matrix(buffer);
   CHECK_CUDA(page_indices);
   CHECK_CONTIGUOUS(page_indices);
@@ -512,7 +514,7 @@ at::Tensor dsv4_page_digests(const at::Tensor buffer, const at::Tensor page_indi
       page_indices.scalar_type() == at::kInt && page_indices.dim() == 1, "page_indices must be one-dimensional int32");
   auto output = at::empty(page_indices.sizes(), buffer.options().dtype(at::kLong));
   if (page_indices.numel() == 0) return output;
-  dsv4_page_digests_kernel<<<page_indices.numel(), kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+  dsv4_page_digests_kernel<<<page_indices.numel(), kThreads, 0, at::cuda::getCurrentCUDAStream(buffer.get_device())>>>(
       buffer.data_ptr<uint8_t>(),
       page_indices.data_ptr<int32_t>(),
       output.data_ptr<int64_t>(),
@@ -526,6 +528,7 @@ at::Tensor dsv4_page_digests(const at::Tensor buffer, const at::Tensor page_indi
 
 at::Tensor
 dsv4_batched_page_digests(const at::Tensor descriptors, const at::Tensor page_indices, const at::Tensor group_offsets) {
+  const at::cuda::CUDAGuard device_guard(descriptors.device());
   CHECK_CUDA(descriptors);
   CHECK_CUDA(page_indices);
   CHECK_CUDA(group_offsets);
@@ -545,7 +548,7 @@ dsv4_batched_page_digests(const at::Tensor descriptors, const at::Tensor page_in
   auto output = at::zeros({descriptors.size(0), page_indices.numel()}, descriptors.options().dtype(at::kLong));
   if (descriptors.size(0) == 0 || page_indices.numel() == 0) return output;
   const dim3 grid(page_indices.numel(), descriptors.size(0));
-  dsv4_batched_page_digests_kernel<<<grid, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+  dsv4_batched_page_digests_kernel<<<grid, kThreads, 0, at::cuda::getCurrentCUDAStream(descriptors.get_device())>>>(
       descriptors.data_ptr<int64_t>(),
       page_indices.data_ptr<int32_t>(),
       group_offsets.data_ptr<int32_t>(),
@@ -570,6 +573,7 @@ void dsv4_bind_pages(
     int64_t slot_page_size,
     int64_t invalid_value,
     bool install_missing) {
+  const at::cuda::CUDAGuard device_guard(slots.device());
   check_slots(slots);
   CHECK_CUDA(logical_pages);
   CHECK_CUDA(request_indices);
@@ -617,7 +621,7 @@ void dsv4_bind_pages(
   TORCH_CHECK(generations.numel() > 0 && slot_page_size > 0, "invalid mapping geometry");
   if (slots.numel() == 0) return;
   const int blocks = (slots.numel() + kThreads - 1) / kThreads;
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto stream = at::cuda::getCurrentCUDAStream(slots.get_device());
   if (slots.scalar_type() == at::kInt) {
     if (install_missing) {
       dsv4_bind_pages_kernel<int32_t><<<blocks, kThreads, 0, stream>>>(
@@ -718,6 +722,7 @@ void dsv4_validate_core_mappings(
     int64_t swa_seed,
     int64_t full_page_size,
     int64_t swa_page_size) {
+  const at::cuda::CUDAGuard device_guard(full_slots.device());
   check_slots(full_slots);
   check_slots(out_slots);
   check_slots(swa_slots);
@@ -776,7 +781,7 @@ void dsv4_validate_core_mappings(
   const int64_t total = full_slots.numel() + out_slots.numel() + swa_slots.numel();
   if (total == 0) return;
   const int blocks = (total + kThreads - 1) / kThreads;
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto stream = at::cuda::getCurrentCUDAStream(full_slots.get_device());
 #define LAUNCH_CORE_MAPPING(OutT)                                                 \
   dsv4_validate_core_mappings_kernel<OutT><<<blocks, kThreads, 0, stream>>>(      \
       full_slots.data_ptr<int32_t>(),                                             \
@@ -838,6 +843,7 @@ void dsv4_validate_pages(
     int64_t slot_page_size,
     int64_t invalid_value,
     bool allow_missing_digest) {
+  const at::cuda::CUDAGuard device_guard(buffer.device());
   check_byte_matrix(buffer);
   check_slots(slots);
   CHECK_CUDA(logical_pages);
@@ -915,7 +921,7 @@ void dsv4_validate_pages(
       "failure status shape mismatch");
   TORCH_CHECK(slot_page_size > 0, "slot_page_size must be positive");
   if (slots.numel() == 0) return;
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto stream = at::cuda::getCurrentCUDAStream(buffer.get_device());
   const int blocks = (slots.numel() + kThreads - 1) / kThreads;
   const int hash_blocks = std::min<int64_t>(slots.numel(), buffer.size(0));
   C10_CUDA_CHECK(cudaMemsetAsync(validation_count.data_ptr<int32_t>(), 0, sizeof(int32_t), stream));
@@ -1013,6 +1019,7 @@ void dsv4_refresh_slots(
     const at::Tensor slots,
     int64_t seed,
     int64_t slot_page_size) {
+  const at::cuda::CUDAGuard device_guard(buffer.device());
   check_byte_matrix(buffer);
   check_slots(slots);
   CHECK_CUDA(digests);
@@ -1032,7 +1039,7 @@ void dsv4_refresh_slots(
   TORCH_CHECK(slot_page_size > 0, "slot_page_size must be positive");
   if (slots.numel() == 0) return;
   const int blocks = (slots.numel() + kThreads - 1) / kThreads;
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto stream = at::cuda::getCurrentCUDAStream(buffer.get_device());
   if (slots.scalar_type() == at::kInt) {
     dsv4_mark_dirty_kernel<int32_t><<<blocks, kThreads, 0, stream>>>(
         slots.data_ptr<int32_t>(), dirty.data_ptr<int32_t>(), slots.numel(), dirty.numel(), slot_page_size);
