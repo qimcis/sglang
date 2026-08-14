@@ -52,10 +52,32 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
-    QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
+
+# Qwen3.8-27B CuTeDSL MLP megakernels — optional, SM100 only.
+try:
+    from sglang.kernels.ops.gemm.cutedsl_qwen38_mlp import (
+        cutedsl_qwen38_mlp_bf16,
+        cutedsl_qwen38_mlp_nvfp4,
+        use_cutedsl_qwen38_mlp,
+    )
+
+    _has_qwen38_mlp_megakernel = True
+except ImportError:
+    _has_qwen38_mlp_megakernel = False
+
+    def _qwen38_mlp_fallback(*args, **kwargs):
+        return None
+
+    cutedsl_qwen38_mlp_bf16 = _qwen38_mlp_fallback  # type: ignore[assignment]
+    cutedsl_qwen38_mlp_nvfp4 = _qwen38_mlp_fallback  # type: ignore[assignment]
+
+    def use_cutedsl_qwen38_mlp(m, k, n, dtype):  # type: ignore[no-redef]
+        return False
+
+
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
@@ -211,6 +233,43 @@ class Qwen2MoeMLP(nn.Module):
         self,
         x,
     ):
+        # --- CuTeDSL MLP megakernel fast path (SM100, Qwen3.8-27B only) ---
+        # Fuses gate_up (5120->34816) + SiLU + down (17408->5120) in 1 launch.
+        # BF16: 3->1 launches, saves M*34816*2B HBM. NVFP4: 2->1, saves M*17408*0.5B.
+        # Controlled by SGLANG_QWEN38_MLP_MEGAKERNEL_DISABLE (default on for SM100).
+        if (
+            _has_qwen38_mlp_megakernel
+            and not __import__("os")
+            .environ.get("SGLANG_QWEN38_MLP_MEGAKERNEL_DISABLE", "")
+            .lower()
+            in ("1", "true")
+            and x.shape[-1] == 5120
+            and self.gate_up_proj.output_size == 34816  # 2*17408
+            and self.down_proj.input_size == 17408
+        ):
+            try:
+                m = x.shape[0]
+                # Detect NVFP4 vs BF16 by weight dtype
+                is_nvfp4 = self.gate_up_proj.weight.dtype == torch.uint8
+                if is_nvfp4:
+                    if use_cutedsl_qwen38_mlp(m, 5120, 34816, torch.uint8):
+                        # NVFP4: need scales + alpha — gather from quant_config
+                        # For now, fall back to eager if scales not available via megakernel path
+                        # (full NVFP4 megakernel needs x_scale, w_scale, alpha — wired via quant_config)
+                        # TODO: wire NVFP4 scales through MergedColumnParallelLinear quant path
+                        pass
+                else:
+                    if use_cutedsl_qwen38_mlp(m, 5120, 34816, torch.bfloat16):
+                        w_gate_up = self.gate_up_proj.weight  # [34816, 5120]
+                        w_down = self.down_proj.weight  # [5120, 17408]
+                        return cutedsl_qwen38_mlp_bf16(x, w_gate_up, w_down)
+            except Exception as e:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    f"Qwen38 MLP megakernel failed, falling back to eager: {e}"
+                )
+
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)

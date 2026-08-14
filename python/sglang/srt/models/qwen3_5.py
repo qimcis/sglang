@@ -29,6 +29,36 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
+# Qwen3.8-27B CuTeDSL megakernels — optional, SM100 only, graceful fallback.
+try:
+    from sglang.kernels.ops.attention.cutedsl_qwen38_gdn import (
+        cutedsl_qwen38_gdn,
+        use_cutedsl_qwen38_gdn,
+    )
+
+    _has_qwen38_gdn_megakernel = True
+except ImportError:
+    _has_qwen38_gdn_megakernel = False
+
+    def _qwen38_gdn_fallback(*args, **kwargs):
+        return None
+
+    cutedsl_qwen38_gdn = _qwen38_gdn_fallback  # type: ignore[assignment]
+
+    def use_cutedsl_qwen38_gdn(m):  # type: ignore[no-redef]
+        return False
+
+
+try:
+    from sglang.kernels.ops.cutedsl_qwen38_persistent import (  # noqa: F401
+        cutedsl_qwen38_persistent_gdn_mlp,
+        cutedsl_qwen38_triple_gdn,
+    )
+
+    _has_qwen38_persistent = True
+except ImportError:
+    _has_qwen38_persistent = False
+
 # Configs
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5Config,
@@ -638,7 +668,50 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         1. Input projection
         2. Core attention (custom op)
         3. Output projection
+
+        On SM100 with Qwen3.8-27B geometry (hidden=5120, 48v/16k heads),
+        dispatches to the CuTeDSL GDN megakernel (1 launch, TMA+tcgen05.mma
+        prologue) when use_cutedsl_qwen38_gdn() is true. Falls back to the
+        eager 6-launch path otherwise. Controlled by SGLANG_QWEN38_GDN_MEGAKERNEL
+        (default on for SM100, off for SM90).
         """
+        # --- CuTeDSL GDN megakernel fast path (SM100, Qwen3.8-27B only) ---
+        if (
+            _has_qwen38_gdn_megakernel
+            and not get_bool_env_var("SGLANG_QWEN38_GDN_MEGAKERNEL_DISABLE", "false")
+            and self.hidden_size == 5120
+            and self.num_v_heads == 48
+            and self.num_k_heads == 16
+            and use_cutedsl_qwen38_gdn(hidden_states.shape[0])
+        ):
+            try:
+                # Gather weights for megakernel — all BF16 even on NVFP4 checkpoint
+                # (only MLP is NVFP4, GDN stays BF16).
+                w_qkvz = self.in_proj_qkvz.weight  # [16384, 5120]
+                w_ba = self.in_proj_ba.weight  # [96, 5120]
+                w_out = self.out_proj.weight  # [5120, 6144]
+                conv_w = self.conv1d.weight.squeeze(1)  # [10240, 4]
+                # GDN state from forward_batch
+                h0_source = getattr(forward_batch, "mamba_cache", None)
+                if h0_source is not None:
+                    h0_indices = getattr(forward_batch, "mamba_state_indices", None)
+                    if h0_indices is not None:
+                        return cutedsl_qwen38_gdn(
+                            x=hidden_states,
+                            w_qkvz=w_qkvz,
+                            w_ba=w_ba,
+                            w_out=w_out,
+                            conv_weight=conv_w,
+                            h0_source=h0_source,
+                            h0_indices=h0_indices,
+                            A_log=self.A_log,
+                            dt_bias=self.dt_bias,
+                        )
+            except Exception as e:
+                logger.warning(
+                    f"Qwen38 GDN megakernel failed, falling back to eager: {e}"
+                )
+
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
