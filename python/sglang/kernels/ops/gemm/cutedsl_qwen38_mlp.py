@@ -46,7 +46,7 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.srt.utils import is_sm100_supported
+from sglang.srt.utils import is_blackwell_supported
 from sglang.srt.utils.common import direct_register_custom_op
 
 logger = logging.getLogger(__name__)
@@ -1185,7 +1185,7 @@ def _mlp_nvfp4_run(
         return x_fp4.new_empty((0, QWEN38_HIDDEN), dtype=torch.bfloat16)
     out = torch.empty((m, QWEN38_HIDDEN), dtype=torch.bfloat16, device=x_fp4.device)
     # For now, dispatch to the fused kernel. Falls back to 2-launch on SM90.
-    if not is_sm100_supported():
+    if not is_blackwell_supported():
         # SM90 fallback: 2-launch via existing kernel
         from sglang.kernels.ops.quantization.fp4_utils import (
             get_fp4_gemm_runner_backend,
@@ -1304,7 +1304,7 @@ def use_cutedsl_qwen38_mlp(m: int, k: int, n: int, dtype: torch.dtype) -> bool:
     if m <= 0:
         return False
     if dtype == torch.bfloat16:
-        if not is_sm100_supported():
+        if not is_blackwell_supported():
             return False
         if k != QWEN38_HIDDEN:
             return False
@@ -1312,5 +1312,5 @@ def use_cutedsl_qwen38_mlp(m: int, k: int, n: int, dtype: torch.dtype) -> bool:
             return False
         return True
     if dtype == torch.uint8:  # FP4 packed
-        return is_sm100_supported()
+        return is_blackwell_supported()
     return False
