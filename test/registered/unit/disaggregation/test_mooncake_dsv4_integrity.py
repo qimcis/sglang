@@ -6,11 +6,24 @@ import pytest
 import torch
 
 from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.fake.conn import FakeKVReceiver
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.mem_cache.dsv4_kv_integrity import DSV4TransferGroup
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+def test_protected_pd_warmup_fake_receiver_accepts_integrity_metadata():
+    receiver = FakeKVReceiver(None, "fake")
+    receiver.send_metadata(
+        np.asarray([7], dtype=np.int32),
+        decode_prefix_len=0,
+        device_kv_indices=np.asarray([7], dtype=np.int32),
+        request_index=1,
+        request_seq_len=256,
+    )
+    assert receiver.has_sent_metadata
 
 
 def _manager():
