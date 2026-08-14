@@ -562,7 +562,7 @@ void dsv4_validate_pages(
           validation_count.numel() == 1 && validation_count.scalar_type() == at::kInt,
       "validation queue shape mismatch");
   TORCH_CHECK(
-      generations.scalar_type() == at::kLong && generations.dim() == 1 && generations.numel() == buffer.size(0),
+      generations.scalar_type() == at::kLong && generations.dim() == 1 && generations.numel() >= buffer.size(0),
       "generation capacity mismatch");
   TORCH_CHECK(
       logical_pages.scalar_type() == at::kLong && logical_pages.sizes() == slots.sizes(),

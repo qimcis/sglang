@@ -352,6 +352,7 @@ class DSV4IntegritySidecar:
 
     def invalidate(self, page_indices: torch.Tensor) -> None:
         pages = page_indices.to(device=self.digest.device, dtype=torch.long)
+        pages = pages[(pages >= 0) & (pages < self.descriptor.capacity)]
         if pages.numel():
             self.valid.index_fill_(0, pages, 0)
 
@@ -470,12 +471,14 @@ class DSV4KVIntegrityManager:
                 for descriptor in descriptors
                 if descriptor.transfer_group == group
             }
-            if len(capacities) != 1:
-                raise ValueError(
-                    f"DSV4 {group.name} components do not share an address space: "
-                    f"capacities={sorted(capacities)}"
-                )
-            return next(iter(capacities))
+            if not capacities:
+                raise ValueError(f"DSV4 {group.name} has no component descriptors")
+            # State buffers can contain more transfer-sized rows than their KV
+            # allocator exposes (for example C4 state versus SWA KV).  They still
+            # share page identities over the allocator's live prefix, so retain
+            # one generation domain sized for the largest component.  Unallocated
+            # tail entries remain generation zero and therefore fail closed.
+            return max(capacities)
 
         self.address_spaces = {
             DSV4IntegrityDomain.FULL: DSV4IntegrityAddressSpace(

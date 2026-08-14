@@ -317,6 +317,74 @@ def test_request_slot_reuse_clears_mappings_status_and_bumps_state_generation():
     assert state_generation[1].item() == 2
 
 
+def test_transfer_group_supports_heterogeneous_component_capacities():
+    specs = (
+        (DSV4Component.C4_ATTENTION_KV, DSV4TransferGroup.KV, 4),
+        (DSV4Component.SWA_KV, DSV4TransferGroup.SWA, 4),
+        (DSV4Component.C4_ATTENTION_STATE, DSV4TransferGroup.SWA, 8),
+        (
+            DSV4Component.C128_ATTENTION_STATE,
+            DSV4TransferGroup.C128_STATE,
+            4,
+        ),
+    )
+    descriptors = []
+    for component, group, capacity in specs:
+        buffer = torch.arange(capacity * 16, dtype=torch.uint8, device="cuda").reshape(
+            capacity, 16
+        )
+        descriptors.append(
+            DSV4ComponentDescriptor(
+                component,
+                0,
+                4 if component == DSV4Component.C4_ATTENTION_STATE else 0,
+                group,
+                1,
+                16,
+                capacity,
+                buffer,
+            )
+        )
+
+    manager = DSV4KVIntegrityManager(
+        descriptors,
+        request_capacity=4,
+        max_context_len=4,
+        full_page_size=1,
+        swa_page_size=1,
+    )
+    assert manager.address_spaces[DSV4IntegrityDomain.SWA].physical_capacity == 8
+
+    page = torch.tensor([[1]], dtype=torch.int32, device="cuda")
+    logical = torch.tensor([[0]], dtype=torch.int64, device="cuda")
+    request = torch.tensor([1], dtype=torch.int64, device="cuda")
+    manager.bump_allocations(DSV4IntegrityDomain.SWA, page)
+    manager.bind_pages(
+        DSV4IntegrityDomain.SWA,
+        page,
+        logical,
+        request,
+        slot_page_size=1,
+    )
+    for descriptor in descriptors:
+        if descriptor.transfer_group != DSV4TransferGroup.SWA:
+            continue
+        manager.refresh_pages(descriptor, page)
+        assert (
+            manager.validate_pages(
+                descriptor, page, logical, request, slot_page_size=1
+            ).item()
+            == 1
+        )
+
+    # A generation event in the larger state-only tail must not index the
+    # smaller SWA-KV sidecar out of bounds.
+    manager.bump_allocations(
+        DSV4IntegrityDomain.SWA,
+        torch.tensor([6], dtype=torch.int32, device="cuda"),
+    )
+
+
 def test_request_table_write_is_trusted_but_first_consumer_mapping_is_not():
     buffers = [torch.zeros((4, 16), dtype=torch.uint8, device="cuda") for _ in range(3)]
     descriptors = [
