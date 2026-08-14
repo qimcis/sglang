@@ -312,7 +312,7 @@ def _mlp_bf16_run(
     return out
 
 
-def _mlp_bf16_fake(x, w_gate_up, w_down):
+def _mlp_bf16_fake(x: torch.Tensor, w_gate_up: torch.Tensor, w_down: torch.Tensor) -> torch.Tensor:
     return x.new_empty((x.shape[0], QWEN38_HIDDEN), dtype=torch.bfloat16)
 
 
@@ -331,8 +331,8 @@ direct_register_custom_op(
 # is TODO — requires Float4E2M1FN warp MMA which is SM120-native.
 # ---------------------------------------------------------------------------
 def _mlp_nvfp4_run(
-    x_fp4, x_scale, w_gate_up_fp4, w_gate_up_scale, w_down_fp4, w_down_scale, alpha, output_scale,
-):
+    x_fp4: torch.Tensor, x_scale: torch.Tensor, w_gate_up_fp4: torch.Tensor, w_gate_up_scale: torch.Tensor, w_down_fp4: torch.Tensor, w_down_scale: torch.Tensor, alpha: torch.Tensor, output_scale: torch.Tensor,
+) -> torch.Tensor:
     """NVFP4 MLP — 1 launch SM120 (act in SMEM) or 2-launch fallback."""
     m = x_fp4.shape[0]
     if m == 0:
@@ -352,7 +352,7 @@ def _mlp_nvfp4_run(
         return x_fp4.new_empty((m, QWEN38_HIDDEN), dtype=torch.bfloat16)
 
 
-def _mlp_nvfp4_fake(x_fp4, x_scale, w_gate_up_fp4, w_gate_up_scale, w_down_fp4, w_down_scale, alpha, output_scale):
+def _mlp_nvfp4_fake(x_fp4: torch.Tensor, x_scale: torch.Tensor, w_gate_up_fp4: torch.Tensor, w_gate_up_scale: torch.Tensor, w_down_fp4: torch.Tensor, w_down_scale, alpha, output_scale):
     return x_fp4.new_empty((x_fp4.shape[0], QWEN38_HIDDEN), dtype=torch.bfloat16)
 
 

@@ -498,7 +498,7 @@ def cutedsl_qwen38_gdn_megakernel(
     compiled(w_qkvz_t, w_ba_t, w_out_t, conv_w_t, h0_source_t, h0_indices_t, A_log_t, dt_bias_t, x_t, out_t, stream)
     return out
 
-def _gdn_megakernel_fake(x, w_qkvz, w_ba, w_out, conv_weight, h0_source, h0_indices, A_log, dt_bias, scale=None, use_qk_l2norm=True):
+def _gdn_megakernel_fake(x: torch.Tensor, w_qkvz: torch.Tensor, w_ba: torch.Tensor, w_out: torch.Tensor, conv_weight: torch.Tensor, h0_source: torch.Tensor, h0_indices: torch.Tensor, A_log, dt_bias, scale=None, use_qk_l2norm=True):
     return x.new_empty((x.shape[0], QWEN38_HIDDEN), dtype=torch.bfloat16)
 
 direct_register_custom_op(op_name="cutedsl_qwen38_gdn_megakernel", op_func=cutedsl_qwen38_gdn_megakernel, mutates_args=[], fake_impl=_gdn_megakernel_fake)
