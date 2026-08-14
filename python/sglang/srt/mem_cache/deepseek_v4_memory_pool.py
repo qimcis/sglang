@@ -664,6 +664,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 max_context_len=get_server_args().context_length,
                 full_page_size=self.page_size,
                 swa_page_size=self.swa_page_size,
+                maintain_runtime_sidecars=(
+                    get_server_args().disaggregation_mode != "prefill"
+                ),
             )
             logger.info(
                 "Initialized DSV4 integrity sidecars for %d component buffers",

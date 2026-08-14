@@ -444,6 +444,7 @@ class DSV4KVIntegrityManager:
         max_context_len: int,
         full_page_size: int,
         swa_page_size: int,
+        maintain_runtime_sidecars: bool = True,
     ):
         descriptors = tuple(descriptors)
         if not descriptors:
@@ -469,6 +470,7 @@ class DSV4KVIntegrityManager:
         self.max_context_len = max_context_len
         self.full_page_size = full_page_size
         self.swa_page_size = swa_page_size
+        self.maintain_runtime_sidecars = maintain_runtime_sidecars
         self.failure_status = torch.zeros(
             request_capacity, dtype=torch.int32, device=device
         )
@@ -629,8 +631,9 @@ class DSV4KVIntegrityManager:
             DSV4IntegrityDomain.SWA: DSV4TransferGroup.SWA,
             DSV4IntegrityDomain.C128_STATE: DSV4TransferGroup.C128_STATE,
         }[domain]
-        for descriptor in self.descriptors_for_group(group):
-            self.sidecars[descriptor.identity].invalidate(pages)
+        if self.maintain_runtime_sidecars:
+            for descriptor in self.descriptors_for_group(group):
+                self.sidecars[descriptor.identity].invalidate(pages)
 
     def _ops(self):
         try:
@@ -1269,8 +1272,9 @@ class DSV4KVIntegrityManager:
 
         # Install only after every component verifies, so partial manifests can
         # never leave a request looking protected.
-        for _, sidecar, pages, values, _ in installs:
-            sidecar._install_prevalidated(pages, values)
+        if self.maintain_runtime_sidecars:
+            for _, sidecar, pages, values, _ in installs:
+                sidecar._install_prevalidated(pages, values)
         reqs = torch.full(
             (1,), request_index, dtype=torch.int64, device=self.failure_status.device
         )
