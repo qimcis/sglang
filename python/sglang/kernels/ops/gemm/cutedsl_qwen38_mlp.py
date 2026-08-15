@@ -65,12 +65,22 @@ try:
     from cutlass.cute.nvgpu import warp
     from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
+    try:
+        from sglang.kernels.ops.attention.flash_attn.cute import utils as flash_utils
+
+        _HAS_FLASH_UTILS = True
+    except ImportError:
+        flash_utils = None  # type: ignore
+        _HAS_FLASH_UTILS = False
+
     _HAS_CUTLASS = True
 except Exception as _e:  # noqa: F841
     cuda = None  # type: ignore
     cutlass = None  # type: ignore
     cute = None  # type: ignore
     cute_utils = None  # type: ignore
+    flash_utils = None  # type: ignore
+    _HAS_FLASH_UTILS = False
     Float32 = None  # type: ignore
     warp = None  # type: ignore
     from_dlpack = None  # type: ignore
@@ -156,10 +166,10 @@ def _define_bf16_mlp_kernels():
         smem_copy_atom = cute.make_copy_atom(
             warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), cutlass.BFloat16
         )
-        tiled_copy_A_gemm1 = cute_utils.make_tiled_copy_A(smem_copy_atom, tiled_mma_gemm1)
-        tiled_copy_B_gemm1 = cute_utils.make_tiled_copy_B(smem_copy_atom, tiled_mma_gemm1)
-        tiled_copy_A_gemm2 = cute_utils.make_tiled_copy_A(smem_copy_atom, tiled_mma_gemm2)
-        tiled_copy_B_gemm2 = cute_utils.make_tiled_copy_B(smem_copy_atom, tiled_mma_gemm2)
+        tiled_copy_A_gemm1 = flash_utils.make_tiled_copy_A(smem_copy_atom, tiled_mma_gemm1)
+        tiled_copy_B_gemm1 = flash_utils.make_tiled_copy_B(smem_copy_atom, tiled_mma_gemm1)
+        tiled_copy_A_gemm2 = flash_utils.make_tiled_copy_A(smem_copy_atom, tiled_mma_gemm2)
+        tiled_copy_B_gemm2 = flash_utils.make_tiled_copy_B(smem_copy_atom, tiled_mma_gemm2)
 
         # Thr MMA slices
         thr_mma_gemm1 = tiled_mma_gemm1.get_slice(tidx)
