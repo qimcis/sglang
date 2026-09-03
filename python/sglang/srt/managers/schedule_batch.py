@@ -39,8 +39,11 @@ ScheduleBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
+import math
 import re
 import sys
+import time
+import uuid
 from array import array
 from concurrent.futures import Future
 from enum import Enum, auto
@@ -761,6 +764,10 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
+        # Distinguishes a reused public request id from an earlier in-process
+        # request.  The remote-MTP adapter carries this value in every prefix
+        # and candidate binding; it never uses rid alone as a correctness key.
+        self.remote_mtp_incarnation = uuid.uuid4().hex
         self.origin_input_ids = origin_input_ids
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
@@ -817,6 +824,83 @@ class Req(ReqDllmMixin):
                 "__req__": self
             }
         self.sampling_params = sampling_params
+        gap_ms = (
+            sampling_params.custom_params.get("geospec.max_service_gap_ms")
+            if isinstance(sampling_params.custom_params, dict)
+            else None
+        )
+        completion_guard_ms = (
+            sampling_params.custom_params.get("geospec.service_completion_guard_ms")
+            if isinstance(sampling_params.custom_params, dict)
+            else None
+        )
+        service_period_ms = (
+            sampling_params.custom_params.get("geospec.service_period_ms")
+            if isinstance(sampling_params.custom_params, dict)
+            else None
+        )
+        if gap_ms is None:
+            if completion_guard_ms is not None:
+                raise ValueError(
+                    "geospec.service_completion_guard_ms requires "
+                    "geospec.max_service_gap_ms"
+                )
+            self.remote_mtp_max_service_gap_ns = None
+            self.remote_mtp_last_target_service_ns = None
+            self.remote_mtp_service_completion_guard_ns = None
+        else:
+            if isinstance(gap_ms, bool) or not isinstance(gap_ms, (int, float)):
+                raise ValueError(
+                    "geospec.max_service_gap_ms must be a positive finite number"
+                )
+            normalized_gap_ms = float(gap_ms)
+            if not math.isfinite(normalized_gap_ms) or normalized_gap_ms <= 0:
+                raise ValueError(
+                    "geospec.max_service_gap_ms must be a positive finite number"
+                )
+            if isinstance(completion_guard_ms, bool) or not isinstance(
+                completion_guard_ms, (int, float)
+            ):
+                raise ValueError(
+                    "geospec.service_completion_guard_ms must be a positive "
+                    "finite number below geospec.max_service_gap_ms"
+                )
+            normalized_guard_ms = float(completion_guard_ms)
+            if (
+                not math.isfinite(normalized_guard_ms)
+                or normalized_guard_ms <= 0
+                or normalized_guard_ms >= normalized_gap_ms
+            ):
+                raise ValueError(
+                    "geospec.service_completion_guard_ms must be a positive "
+                    "finite number below geospec.max_service_gap_ms"
+                )
+            self.remote_mtp_max_service_gap_ns = max(
+                1, int(normalized_gap_ms * 1_000_000)
+            )
+            self.remote_mtp_service_completion_guard_ns = max(
+                1, int(normalized_guard_ms * 1_000_000)
+            )
+            self.remote_mtp_last_target_service_ns = time.monotonic_ns()
+        if service_period_ms is None:
+            self.remote_mtp_service_period_ns = None
+        else:
+            if isinstance(service_period_ms, bool) or not isinstance(
+                service_period_ms, (int, float)
+            ):
+                raise ValueError(
+                    "geospec.service_period_ms must be a positive finite number"
+                )
+            normalized_period_ms = float(service_period_ms)
+            if not math.isfinite(normalized_period_ms) or normalized_period_ms <= 0:
+                raise ValueError(
+                    "geospec.service_period_ms must be a positive finite number"
+                )
+            self.remote_mtp_service_period_ns = max(
+                1, int(normalized_period_ms * 1_000_000)
+            )
+            if self.remote_mtp_last_target_service_ns is None:
+                self.remote_mtp_last_target_service_ns = time.monotonic_ns()
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
 
@@ -1973,6 +2057,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
 
+    # Exact planner ownership for an enforced REMOTE_MTP target slice. These
+    # fields are inert for every other algorithm and for observe-only advice.
+    remote_mtp_target_plan_id: Optional[str] = None
+    remote_mtp_target_plan_generation: Optional[int] = None
+    remote_mtp_target_window_id: Optional[str] = None
+    remote_mtp_candidate_ids: Optional[tuple[str, ...]] = None
+    remote_mtp_detached_decode: bool = False
+    remote_mtp_native_order: Optional[tuple[tuple[str, str], ...]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -2098,9 +2191,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
-        assert (
-            len(self.out_cache_loc) == self.extend_num_tokens
-        ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+        assert len(self.out_cache_loc) == self.extend_num_tokens, (
+            f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+        )
 
         if self.extend_input_logprob_token_ids is not None:
             new_token_ids_parts = []
@@ -3026,6 +3119,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
+            remote_mtp_target_plan_id=self.remote_mtp_target_plan_id,
+            remote_mtp_target_plan_generation=self.remote_mtp_target_plan_generation,
+            remote_mtp_target_window_id=self.remote_mtp_target_window_id,
+            remote_mtp_candidate_ids=self.remote_mtp_candidate_ids,
+            remote_mtp_detached_decode=self.remote_mtp_detached_decode,
+            remote_mtp_native_order=self.remote_mtp_native_order,
         )
 
     def maybe_evict_swa(self):

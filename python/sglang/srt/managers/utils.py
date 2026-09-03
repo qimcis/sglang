@@ -85,6 +85,14 @@ class GenerationBatchResult:
     # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).
     extra_keep_alive_refs: Optional[List[Any]] = None
 
+    # Optional opaque remote-MTP attribution.  The result processor/adapter
+    # publishes the verifier outcome asynchronously; target correctness never
+    # depends on this metadata being present or consumed.
+    remote_mtp_claim: Optional[Any] = None
+    remote_mtp_fallback_reason: Optional[str] = None
+    remote_mtp_feature_batch_id: Optional[str] = None
+    remote_mtp_request_views: Optional[Any] = None
+
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None

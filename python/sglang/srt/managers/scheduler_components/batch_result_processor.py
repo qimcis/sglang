@@ -213,6 +213,7 @@ class SchedulerBatchResultProcessor:
             self._validate_pp_skip_output_comm(batch, result)
 
             hidden_state_offset = 0
+            remote_mtp_prefill_commits = [() for _ in batch.reqs]
 
             # Check finish conditions
             logprob_pt = 0
@@ -231,6 +232,7 @@ class SchedulerBatchResultProcessor:
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
+                    remote_mtp_prefill_commits[i] = (int(next_token_id),)
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
@@ -296,6 +298,15 @@ class SchedulerBatchResultProcessor:
                         )
 
                     req.time_stats.set_last_chunked_prefill_finish_time()
+
+            # The target feature capture occurred before stop/EOS/retraction
+            # settlement.  Publish only the exact token rows that native
+            # SGLang actually committed, using a bounded process-local hook.
+            self.model_worker.on_remote_mtp_prefill_result_cpu(
+                batch,
+                result,
+                remote_mtp_prefill_commits,
+            )
 
         else:  # embedding or reward model
             if result.copy_done is not None:
@@ -602,6 +613,12 @@ class SchedulerBatchResultProcessor:
                     req.update_spec_cap_lens_histogram(cap_lens[i])
 
             predict_tokens.append(accept_tokens)
+
+        # Remote-MTP attribution is resolved only after accept_lens and the
+        # exact committed token runs are on CPU.  Other workers inherit a
+        # no-op hook.  Implementations may enqueue locally but must not perform
+        # network I/O on this result-processing path.
+        self.model_worker.on_remote_mtp_result_cpu(batch, result, predict_tokens)
 
         return predict_tokens
 

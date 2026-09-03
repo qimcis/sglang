@@ -124,6 +124,25 @@ class BaseSpecWorker(ABC):
         """
         pass
 
+    def on_remote_mtp_result_cpu(self, batch, result, committed_tokens) -> None:
+        """Publish a remote claim's CPU-resolved outcome, if applicable.
+
+        The default is deliberately a no-op.  Implementations must only offer
+        to a bounded local queue here; this output-processing thread must never
+        wait for a remote worker or network transport.
+        """
+
+        pass
+
+    def on_remote_mtp_prefill_result_cpu(self, batch, result, committed_tokens) -> None:
+        """Publish exact prefill progress after native CPU settlement.
+
+        The default is a no-op.  Remote integrations may offer only to a
+        bounded local queue; prefill processing must never wait for transport.
+        """
+
+        pass
+
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         """Hook called by the batch-result processor when a request finishes.
 

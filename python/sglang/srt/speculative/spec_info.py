@@ -39,6 +39,8 @@ class SpeculativeAlgorithm(Enum):
     EAGLE = auto()
     EAGLE3 = auto()
     FROZEN_KV_MTP = auto()
+    REMOTE_MTP = auto()
+    REMOTE_MTP_LOCAL = auto()
     STANDALONE = auto()
     NGRAM = auto()
     NONE = auto()
@@ -101,6 +103,8 @@ class SpeculativeAlgorithm(Enum):
             SpeculativeAlgorithm.EAGLE,
             SpeculativeAlgorithm.EAGLE3,
             SpeculativeAlgorithm.FROZEN_KV_MTP,
+            SpeculativeAlgorithm.REMOTE_MTP,
+            SpeculativeAlgorithm.REMOTE_MTP_LOCAL,
         )
 
     def is_eagle3(self) -> bool:
@@ -108,6 +112,15 @@ class SpeculativeAlgorithm(Enum):
 
     def is_frozen_kv_mtp(self) -> bool:
         return self == SpeculativeAlgorithm.FROZEN_KV_MTP
+
+    def is_remote_mtp(self) -> bool:
+        return self in (
+            SpeculativeAlgorithm.REMOTE_MTP,
+            SpeculativeAlgorithm.REMOTE_MTP_LOCAL,
+        )
+
+    def has_local_mtp_fallback(self) -> bool:
+        return self == SpeculativeAlgorithm.REMOTE_MTP_LOCAL
 
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
@@ -137,12 +150,12 @@ class SpeculativeAlgorithm(Enum):
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
         lives only in the verify mask), so per-decode KV sizing needs no
         per-topk page rounding; see get_alloc_len_per_decode."""
-        return not self.is_ngram()
+        return not (self.is_ngram() or self == SpeculativeAlgorithm.REMOTE_MTP)
 
     def carries_draft_hidden_states(self) -> bool:
         """Whether the disagg prefill->decode transfer carries draft hidden
         states (EAGLE-family only; STANDALONE's vanilla draft ignores them)."""
-        return self.is_eagle()
+        return self.is_eagle() and self != SpeculativeAlgorithm.REMOTE_MTP
 
     def create_future_map(
         self,
@@ -192,6 +205,7 @@ class SpeculativeAlgorithm(Enum):
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
             _handle_ngram,
+            _handle_remote_mtp,
         )
 
         # Validate for every algorithm at startup: the metrics paths read the
@@ -200,7 +214,9 @@ class SpeculativeAlgorithm(Enum):
 
         read_ragged_verify_mode()
 
-        if self.is_dflash():
+        if self.is_remote_mtp():
+            _handle_remote_mtp(server_args)
+        elif self.is_dflash():
             _handle_dflash(server_args)
         elif self.is_dspark():
             _handle_dspark(server_args)
@@ -266,6 +282,19 @@ class SpeculativeAlgorithm(Enum):
             )
 
             return FrozenKVMTPWorkerV2
+
+        if self.is_remote_mtp():
+            if self.has_local_mtp_fallback():
+                from sglang.srt.speculative.remote_mtp_local_worker_v2 import (
+                    RemoteMTPLocalWorkerV2,
+                )
+
+                return RemoteMTPLocalWorkerV2
+            from sglang.srt.speculative.remote_mtp_worker_v2 import (
+                RemoteMTPWorkerV2,
+            )
+
+            return RemoteMTPWorkerV2
 
         # EAGLE / EAGLE3 / STANDALONE / MULTI_LAYER always use the V2 worker,
         # even with overlap disabled (scheduler drives it synchronously).

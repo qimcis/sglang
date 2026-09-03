@@ -56,11 +56,20 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         assert server_args.speculative_algorithm in (
             "EAGLE",
             "DSPARK",
-        ), f"Only EAGLE and DSPARK speculative algorithms are supported for {model_arch}"
-        if server_args.speculative_algorithm == "EAGLE":
-            assert (
-                server_args.speculative_eagle_topk == 1
-            ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
+            "REMOTE_MTP",
+            "REMOTE_MTP_LOCAL",
+        ), (
+            "Only EAGLE, DSPARK, REMOTE_MTP, and REMOTE_MTP_LOCAL speculative "
+            f"algorithms are supported for {model_arch}"
+        )
+        if server_args.speculative_algorithm in (
+            "EAGLE",
+            "REMOTE_MTP",
+            "REMOTE_MTP_LOCAL",
+        ):
+            assert server_args.speculative_eagle_topk == 1, (
+                f"Only chain speculative decoding with topk == 1 is supported for {model_arch}"
+            )
 
 
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:

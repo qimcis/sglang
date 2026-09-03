@@ -489,6 +489,82 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
         )
 
 
+def _handle_remote_mtp(server_args: ServerArgs) -> None:
+    """Resolve the fixed-width external MTP verifier profile.
+
+    REMOTE_MTP owns no local draft model or draft KV. REMOTE_MTP_LOCAL retains
+    the native local NextN state as a fallback. ``num_steps`` is the number of
+    proposed tokens (K); target verification contains the always-accepted root
+    plus those K candidates.
+    """
+
+    has_local_fallback = (
+        str(server_args.speculative_algorithm).upper() == "REMOTE_MTP_LOCAL"
+    )
+
+    if server_args.pp_size != 1:
+        raise ValueError("REMOTE_MTP currently requires pp_size == 1.")
+    if server_args.enable_multi_layer_eagle:
+        raise ValueError("REMOTE_MTP is incompatible with multi-layer EAGLE.")
+    if server_args.speculative_adaptive:
+        raise ValueError(
+            "REMOTE_MTP depth is selected by the external scheduler; "
+            "--speculative-adaptive is not supported."
+        )
+    if server_args.speculative_use_rejection_sampling:
+        raise ValueError(
+            "REMOTE_MTP candidate ingress does not carry full draft "
+            "distributions required by rejection sampling."
+        )
+    if not has_local_fallback and server_args.speculative_draft_model_path is not None:
+        raise ValueError(
+            "REMOTE_MTP must not set --speculative-draft-model-path; "
+            "the target process intentionally owns no local drafter."
+        )
+
+    if server_args.speculative_num_steps is None:
+        server_args.speculative_num_steps = 3 if has_local_fallback else 2
+    depth = int(server_args.speculative_num_steps)
+    if depth not in (1, 2, 3):
+        raise ValueError(
+            "REMOTE_MTP initial qualification supports fixed depths K=1, K=2, "
+            f"or K=3; got K={depth}."
+        )
+
+    if server_args.speculative_eagle_topk not in (None, 1):
+        raise ValueError("REMOTE_MTP supports only a topk=1 linear chain.")
+    server_args.speculative_eagle_topk = 1
+
+    expected_verify_tokens = depth + 1
+    if server_args.speculative_num_draft_tokens not in (
+        None,
+        expected_verify_tokens,
+    ):
+        raise ValueError(
+            "REMOTE_MTP requires --speculative-num-draft-tokens == K + 1 "
+            f"({expected_verify_tokens}); got "
+            f"{server_args.speculative_num_draft_tokens}."
+        )
+    server_args.speculative_num_draft_tokens = expected_verify_tokens
+
+    if has_local_fallback:
+        _handle_eagle_family(server_args)
+
+    if server_args.max_running_requests is None:
+        server_args.max_running_requests = 48
+    if server_args.chunked_prefill_size != -1:
+        server_args.chunked_prefill_size = -1
+        logger.warning(
+            "Chunked prefill is disabled for the initial REMOTE_MTP feature ABI."
+        )
+    _disable_overlap_schedule_for_cpu(server_args)
+    if server_args.enable_mixed_chunk:
+        server_args.enable_mixed_chunk = False
+        logger.warning(
+            "Mixed chunked prefill is disabled for REMOTE_MTP speculative decoding."
+        )
+
+
 def _handle_eagle_family(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.overrides import (
         attention_backends_of,

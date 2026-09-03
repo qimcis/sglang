@@ -20,6 +20,7 @@ import os
 import signal
 import sys
 import time
+from copy import copy
 from array import array
 from collections import deque
 from contextlib import contextmanager, nullcontext
@@ -771,6 +772,10 @@ class Scheduler(
             self.tp_worker = TpModelWorker(**worker_kwargs)
 
     def maybe_init_draft_worker(self):
+        self.remote_mtp_scheduler_advisor = None
+        self.remote_mtp_scheduler_advice = None
+        self.remote_mtp_scheduler_seals_observed = 0
+        self.remote_mtp_scheduler_advisor_failures = 0
         if self.spec_algorithm.is_none():
             self.draft_worker = None
             self.external_corpus_manager = None
@@ -796,6 +801,16 @@ class Scheduler(
 
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+
+        if self.spec_algorithm.is_remote_mtp() and self.ps.tp_rank == 0:
+            from sglang.srt.speculative.remote_mtp_io import (
+                create_remote_mtp_scheduler_advisor,
+            )
+
+            self.remote_mtp_scheduler_advisor = create_remote_mtp_scheduler_advisor(
+                self.server_args,
+                self.ps.gpu_id,
+            )
 
         if self.spec_algorithm.is_ngram():
             from sglang.srt.speculative.external_corpus_manager import (
@@ -1838,12 +1853,20 @@ class Scheduler(
             get_waiting_queue=lambda: self.waiting_queue,
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
-            get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
-            get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
+            get_disagg_prefill_bootstrap_queue=lambda: (
+                self.disagg_prefill_bootstrap_queue
+            ),
+            get_disagg_prefill_inflight_queue=lambda: (
+                self.disagg_prefill_inflight_queue
+            ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
-            get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
-            get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
+            get_spec_total_num_accept_tokens=lambda: (
+                self.metrics_reporter.spec_total_num_accept_tokens
+            ),
+            get_spec_total_num_forward_ct=lambda: (
+                self.metrics_reporter.spec_total_num_forward_ct
+            ),
         )
 
     def init_output_streamer(self) -> None:
@@ -2640,8 +2663,56 @@ class Scheduler(
         self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
-    def _build_hisparse_decode_batch(self, reqs):
-        """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
+    def _slice_remote_mtp_relay_input(
+        self,
+        reqs,
+        source_batches: tuple[ScheduleBatch, ...],
+    ):
+        """Preserve per-request native draft state while slicing a resident batch."""
+
+        by_identity = {}
+        for source in source_batches:
+            if source.spec_info is None:
+                continue
+            for index, req in enumerate(source.reqs):
+                by_identity.setdefault(
+                    (req.rid, req.remote_mtp_incarnation),
+                    (source, index),
+                )
+
+        relay_input = None
+        for req in reqs:
+            identity = (req.rid, req.remote_mtp_incarnation)
+            if identity not in by_identity:
+                raise RuntimeError(
+                    "resident REMOTE_MTP slice lost native speculative state"
+                )
+            source, index = by_identity[identity]
+            item = copy(source.spec_info)
+            keep = torch.tensor([index], dtype=torch.int64, device=self.device)
+            item.filter_batch(
+                new_indices=keep,
+                has_been_filtered=False,
+                new_indices_cpu=[index],
+            )
+            if relay_input is None:
+                relay_input = item
+            else:
+                relay_input.merge_batch(item)
+        return relay_input
+
+    def _build_resident_decode_batch(
+        self,
+        reqs,
+        *,
+        source_batches: tuple[ScheduleBatch, ...] = (),
+    ):
+        """Rebuild scheduler tensors for requests whose target KV remains resident.
+
+        This is used by HiSparse transitions and by the initial non-overlap
+        REMOTE_MTP target slicer. It allocates no new target KV and performs no
+        forward; `prepare_for_decode` remains the sole decode allocator.
+        """
         device = self.device
 
         batch = ScheduleBatch.init_new(
@@ -2666,11 +2737,24 @@ class Scheduler(
         batch.seq_lens_sum = sum(seq_lens)
         # Stash last token into relay; resolve_forward_inputs will gather.
         last_tokens = torch.tensor(
-            [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
+            [
+                r.output_ids[-1] if r.output_ids else r.origin_input_ids[-1]
+                for r in reqs
+            ],
+            dtype=torch.int64,
+            device=device,
         )
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
-        )
+        relay_input = None
+        if self.spec_algorithm.is_remote_mtp():
+            relay_input = (
+                self._slice_remote_mtp_relay_input(reqs, source_batches)
+                if source_batches
+                else self.draft_worker.build_relay_input_from_bonus_tokens(last_tokens)
+            )
+            relay_payload = RelayPayload.from_draft_input(relay_input)
+        else:
+            relay_payload = RelayPayload(bonus_tokens=last_tokens)
+        self.future_map.stash(batch.req_pool_indices, relay_payload)
         batch.input_ids = None
 
         if batch.return_logprob:
@@ -2680,14 +2764,65 @@ class Scheduler(
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, self.model_config.vocab_size
         )
+        if relay_input is not None:
+            batch.spec_info = relay_input
         # todo hisparse, maybe other info to contain for the new batch
         return batch
+
+    def _build_hisparse_decode_batch(self, reqs):
+        """Build a batch for HiSparse requests transitioning into decode."""
+
+        return self._build_resident_decode_batch(reqs)
+
+    def _rejoin_remote_mtp_detached_decode(
+        self,
+        running_batch: ScheduleBatch,
+        last_batch: Optional[ScheduleBatch],
+    ) -> ScheduleBatch:
+        """Restore the canonical running set after one planned target slice."""
+
+        if last_batch is None or not last_batch.remote_mtp_detached_decode:
+            return running_batch
+        if self.enable_overlap:
+            raise RuntimeError(
+                "enforced REMOTE_MTP target slicing cannot run with overlap scheduling"
+            )
+        native_order = (
+            last_batch.remote_mtp_native_order or running_batch.remote_mtp_native_order
+        )
+        by_identity = {}
+        for req in (*running_batch.reqs, *last_batch.reqs):
+            identity = (req.rid, req.remote_mtp_incarnation)
+            if req.finished() or req.is_retracted or identity in by_identity:
+                continue
+            by_identity[identity] = req
+        from sglang.srt.speculative.remote_mtp_io import remote_mtp_rejoin_order
+
+        identities = remote_mtp_rejoin_order(
+            native_order or (),
+            tuple(by_identity),
+        )
+        reqs = [by_identity[identity] for identity in identities]
+        last_batch.remote_mtp_detached_decode = False
+        last_batch.remote_mtp_native_order = None
+        running_batch.remote_mtp_native_order = None
+        if not reqs:
+            return ScheduleBatch(reqs=[], batch_is_full=False)
+        return self._build_resident_decode_batch(
+            reqs,
+            source_batches=(running_batch, last_batch),
+        )
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
+
+        if self.spec_algorithm.is_remote_mtp():
+            running_batch = self._rejoin_remote_mtp_detached_decode(
+                running_batch, last_batch
+            )
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
@@ -2799,8 +2934,43 @@ class Scheduler(
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
-                running_batch = self.update_running_batch(running_batch)
-                ret = running_batch if not running_batch.is_empty() else None
+                if self.spec_algorithm.is_remote_mtp():
+                    running_batch = self._update_running_batch_state(running_batch)
+                    if not running_batch.is_empty():
+                        service_batch, service_deferred = (
+                            self.apply_remote_mtp_service_windows(running_batch)
+                        )
+                        if service_batch is None:
+                            ret = None
+                            running_batch = service_deferred
+                        else:
+                            advice = self.observe_remote_mtp_decode_seal(service_batch)
+                            ret, advisor_deferred = self.apply_remote_mtp_decode_advice(
+                                service_batch, advice
+                            )
+                            if service_deferred is None:
+                                running_batch = advisor_deferred
+                            elif advisor_deferred is service_batch:
+                                running_batch = service_deferred
+                            else:
+                                native_order = (
+                                    service_batch.remote_mtp_native_order
+                                    or tuple(
+                                        (req.rid, req.remote_mtp_incarnation)
+                                        for req in running_batch.reqs
+                                    )
+                                )
+                                running_batch = self._merge_remote_mtp_deferred_batches(
+                                    (service_deferred, advisor_deferred),
+                                    native_order=native_order,
+                                )
+                                ret.remote_mtp_detached_decode = True
+                                ret.remote_mtp_native_order = native_order
+                    else:
+                        ret = None
+                else:
+                    running_batch = self.update_running_batch(running_batch)
+                    ret = running_batch if not running_batch.is_empty() else None
             else:
                 ret = None
 
@@ -2966,9 +3136,8 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
                 ):
                     break
 
@@ -3137,8 +3306,8 @@ class Scheduler(
                 new_lora_set
             )
 
-    def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
-        """Update the current running decoding batch."""
+    def _update_running_batch_state(self, batch: ScheduleBatch) -> ScheduleBatch:
+        """Filter/retract a decode batch without allocating its next forward."""
         initial_bs = batch.batch_size()
 
         batch.filter_batch()
@@ -3223,9 +3392,234 @@ class Scheduler(
         if batch.is_empty():
             return batch
 
-        # Update batch tensors
-        batch.prepare_for_decode()
         return batch
+
+    def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+        """Update and prepare the current running decoding batch."""
+
+        batch = self._update_running_batch_state(batch)
+        if not batch.is_empty():
+            batch.prepare_for_decode()
+        return batch
+
+    def observe_remote_mtp_decode_seal(self, batch: ScheduleBatch):
+        """Publish the final filtered/retracted seal before decode allocation."""
+
+        advisor = self.remote_mtp_scheduler_advisor
+        if advisor is None or batch.is_empty():
+            return None
+        from sglang.srt.speculative.remote_mtp_io import (
+            RemoteMTPRequestView,
+            remote_mtp_output_token_count,
+        )
+
+        try:
+            seal_monotonic_ns = time.monotonic_ns()
+            requests = tuple(
+                RemoteMTPRequestView(
+                    request_id=req.rid,
+                    request_incarnation=req.remote_mtp_incarnation,
+                    prompt_token_count=len(req.origin_input_ids),
+                    output_token_count=remote_mtp_output_token_count(
+                        prompt_token_count=len(req.origin_input_ids),
+                        req_output_token_count=len(req.output_ids),
+                        kv_boundary=(
+                            int(req.kv_committed_len) if self.enable_overlap else None
+                        ),
+                    ),
+                    last_target_service_monotonic_ns=(
+                        req.remote_mtp_last_target_service_ns
+                    ),
+                    max_service_gap_ns=req.remote_mtp_max_service_gap_ns,
+                    service_completion_guard_ns=(
+                        req.remote_mtp_service_completion_guard_ns
+                    ),
+                    service_period_ns=req.remote_mtp_service_period_ns,
+                    remaining_tokens=max(
+                        0,
+                        int(req.sampling_params.max_new_tokens) - len(req.output_ids),
+                    ),
+                ).validate()
+                for index, req in enumerate(batch.reqs)
+            )
+            advice = advisor.observe_decode_seal(
+                requests,
+                seal_monotonic_ns=seal_monotonic_ns,
+            )
+            if advice is not None:
+                advice.validate()
+                if advice.requests != requests:
+                    raise ValueError(
+                        "REMOTE_MTP scheduler advice changed its observed seal"
+                    )
+                if advice.seal_monotonic_ns != seal_monotonic_ns:
+                    raise ValueError(
+                        "REMOTE_MTP scheduler advice changed its seal timestamp"
+                    )
+            self.remote_mtp_scheduler_advice = advice
+            self.remote_mtp_scheduler_seals_observed += 1
+            return advice
+        except Exception:
+            self.remote_mtp_scheduler_advisor_failures += 1
+            self.remote_mtp_scheduler_advice = None
+            logger.exception(
+                "REMOTE_MTP scheduler advisor failed; native batch is unchanged"
+            )
+            return None
+
+    def apply_remote_mtp_service_windows(
+        self, batch: ScheduleBatch
+    ) -> tuple[Optional[ScheduleBatch], ScheduleBatch | None]:
+        """Select rows whose request-level target service window is open.
+
+        This is a target-local not-before fence, not a wait for remote work.
+        Unpaced requests remain runnable immediately. If every resident row is
+        early, the scheduler keeps the batch resident and yields for at most
+        one millisecond so newly arriving work can still be admitted promptly.
+        """
+
+        if batch.is_empty():
+            return None, batch
+        from sglang.srt.speculative.remote_mtp_io import (
+            RemoteMTPRequestView,
+            remote_mtp_service_window_partition,
+        )
+
+        now = time.monotonic_ns()
+        views = tuple(
+            RemoteMTPRequestView(
+                request_id=req.rid,
+                request_incarnation=req.remote_mtp_incarnation,
+                prompt_token_count=len(req.origin_input_ids),
+                output_token_count=len(req.output_ids),
+                last_target_service_monotonic_ns=(
+                    req.remote_mtp_last_target_service_ns
+                ),
+                max_service_gap_ns=req.remote_mtp_max_service_gap_ns,
+                service_completion_guard_ns=(
+                    req.remote_mtp_service_completion_guard_ns
+                ),
+                service_period_ns=req.remote_mtp_service_period_ns,
+            ).validate()
+            for req in batch.reqs
+        )
+        eligible, deferred, next_deadline = remote_mtp_service_window_partition(
+            views,
+            now_monotonic_ns=now,
+        )
+        if not eligible:
+            if next_deadline is not None:
+                time.sleep(min(max(0, next_deadline - now) / 1_000_000_000, 0.001))
+            return None, batch
+        if not deferred:
+            return batch, None
+
+        native_order = tuple(
+            (req.rid, req.remote_mtp_incarnation) for req in batch.reqs
+        )
+        selected = self._build_resident_decode_batch(
+            [batch.reqs[index] for index in eligible],
+            source_batches=(batch,),
+        )
+        held = self._build_resident_decode_batch(
+            [batch.reqs[index] for index in deferred],
+            source_batches=(batch,),
+        )
+        selected.remote_mtp_detached_decode = True
+        selected.remote_mtp_native_order = native_order
+        held.remote_mtp_native_order = native_order
+        selected.batch_is_full = False
+        held.batch_is_full = False
+        return selected, held
+
+    def _merge_remote_mtp_deferred_batches(
+        self,
+        batches: tuple[ScheduleBatch, ...],
+        *,
+        native_order: tuple[tuple[str, str], ...],
+    ) -> ScheduleBatch:
+        """Merge nested service-window and planner deferrals exactly once."""
+
+        by_identity = {}
+        for batch in batches:
+            for req in batch.reqs:
+                identity = (req.rid, req.remote_mtp_incarnation)
+                if req.finished() or req.is_retracted or identity in by_identity:
+                    continue
+                by_identity[identity] = req
+        from sglang.srt.speculative.remote_mtp_io import remote_mtp_rejoin_order
+
+        order = remote_mtp_rejoin_order(native_order, tuple(by_identity))
+        merged = self._build_resident_decode_batch(
+            [by_identity[identity] for identity in order],
+            source_batches=batches,
+        )
+        merged.remote_mtp_native_order = native_order
+        merged.batch_is_full = False
+        return merged
+
+    def apply_remote_mtp_decode_advice(self, batch: ScheduleBatch, advice):
+        """Apply one exact non-overlap target plan or preserve native progress.
+
+        A proper subset is time-sliced for one target execution. Unselected
+        requests retain their target KV and rejoin before the next scheduling
+        cycle. Any invalid/stale advice executes the complete native batch with
+        immediate AR fallback; it never produces a partial claim.
+        """
+
+        if advice is None or not advice.enforce:
+            batch.prepare_for_decode()
+            return batch, batch
+        try:
+            if self.enable_overlap:
+                raise ValueError(
+                    "enforced REMOTE_MTP target slicing requires non-overlap mode"
+                )
+            from sglang.srt.speculative.remote_mtp_io import (
+                build_remote_mtp_decode_slice,
+            )
+
+            partition = build_remote_mtp_decode_slice(
+                advice.requests,
+                advice,
+                configured_depth=self.server_args.speculative_num_steps,
+            )
+
+            if partition.deferred_indices:
+                native_order = batch.remote_mtp_native_order or tuple(
+                    (req.rid, req.remote_mtp_incarnation) for req in batch.reqs
+                )
+                selected = self._build_resident_decode_batch(
+                    [batch.reqs[index] for index in partition.selected_indices],
+                    source_batches=(batch,),
+                )
+                deferred = self._build_resident_decode_batch(
+                    [batch.reqs[index] for index in partition.deferred_indices],
+                    source_batches=(batch,),
+                )
+                selected.remote_mtp_detached_decode = True
+                selected.remote_mtp_native_order = native_order
+                deferred.remote_mtp_native_order = native_order
+                selected.batch_is_full = False
+                deferred.batch_is_full = False
+            else:
+                selected = batch
+                deferred = batch
+
+            selected.remote_mtp_target_plan_id = partition.plan_id
+            selected.remote_mtp_target_plan_generation = partition.snapshot_generation
+            selected.remote_mtp_target_window_id = partition.window_id
+            selected.remote_mtp_candidate_ids = partition.candidate_ids
+            selected.prepare_for_decode()
+            return selected, deferred
+        except Exception:
+            self.remote_mtp_scheduler_advisor_failures += 1
+            self.remote_mtp_scheduler_advice = None
+            logger.exception(
+                "REMOTE_MTP target plan was not executable; native batch is unchanged"
+            )
+            batch.prepare_for_decode()
+            return batch, batch
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
