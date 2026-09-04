@@ -888,6 +888,17 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
+        # The DSV4 compressor planner has a uint16 query-token bound.  The
+        # ignore-EOS fast path must honor max_prefill_tokens just like the
+        # generic path below; otherwise a 16 x 4K batch reaches 65,536 tokens
+        # and fails inside plan_compress_prefill.  Keep the first-request
+        # escape hatch so one oversized request retains the existing behavior.
+        if (
+            self.rem_chunk_tokens is None
+            and self.can_run_list
+            and cand_extend_input_len >= self.rem_input_tokens
+        ):
+            return AddReqResult.OTHER
         paged_input = self.ceil_paged_tokens(cand_extend_input_len)
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).

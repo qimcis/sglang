@@ -28,6 +28,46 @@ def method_node(owner: ast.ClassDef, name: str) -> ast.FunctionDef:
 
 
 class TestRemoteMTPSchedulerSourceContract(unittest.TestCase):
+    def test_remote_only_ar_fallback_uses_int64_verifier_tokens(self):
+        owner = class_node(
+            parse("speculative/remote_mtp_worker_v2.py"),
+            "RemoteMTPWorkerV2",
+        )
+        method = method_node(owner, "_build_trivial_verify_input")
+        assignment = next(
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.keyword) and node.arg == "draft_token"
+        )
+        self.assertIsInstance(assignment.value, ast.Call)
+        assert isinstance(assignment.value, ast.Call)
+        self.assertIsInstance(assignment.value.func, ast.Attribute)
+        assert isinstance(assignment.value.func, ast.Attribute)
+        self.assertEqual(assignment.value.func.attr, "to")
+        self.assertTrue(
+            any(
+                isinstance(argument, ast.Attribute)
+                and isinstance(argument.value, ast.Name)
+                and argument.value.id == "torch"
+                and argument.attr == "int64"
+                for argument in assignment.value.args
+            )
+        )
+
+    def test_remote_only_worker_does_not_require_a_local_draft_kv_pool(self):
+        tree = parse("mem_cache/kv_cache_builder.py")
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "get_draft_kv_pool"
+        )
+        calls = {
+            node.func.attr
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        self.assertIn("has_draft_kv", calls)
+
     def test_schedule_batch_carries_exact_target_plan_ownership(self):
         owner = class_node(parse("managers/schedule_batch.py"), "ScheduleBatch")
         fields = {
@@ -166,6 +206,32 @@ class TestRemoteMTPSchedulerSourceContract(unittest.TestCase):
                 "verified_depth",
             }
             <= keywords
+        )
+
+    def test_finished_request_is_offered_to_external_state_owner(self):
+        owner = class_node(
+            parse("speculative/remote_mtp_worker_v2.py"),
+            "RemoteMTPWorkerV2",
+        )
+        method = method_node(owner, "note_request_finished")
+        string_values = {
+            node.value for node in ast.walk(method) if isinstance(node, ast.Constant)
+        }
+        self.assertIn("offer_request_finished", string_values)
+        self.assertIn("request_incarnation", {
+            keyword.arg
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            for keyword in node.keywords
+        })
+        self.assertTrue(any(isinstance(node, ast.Try) for node in ast.walk(method)))
+        self.assertTrue(
+            any(
+                isinstance(node, ast.ExceptHandler)
+                and isinstance(node.type, ast.Name)
+                and node.type.id == "Exception"
+                for node in ast.walk(method)
+            )
         )
 
     def test_hybrid_worker_keeps_local_draft_and_remote_first_branch(self):
@@ -358,6 +424,25 @@ class TestRemoteMTPSchedulerSourceContract(unittest.TestCase):
         }
         self.assertIn("remote_mtp_native_order", apply_attrs)
         self.assertIn("remote_mtp_native_order", rejoin_attrs)
+
+    def test_ignore_eos_prefill_honors_the_dsv4_planner_token_budget(self):
+        owner = class_node(parse("managers/schedule_policy.py"), "PrefillAdder")
+        method = method_node(owner, "add_one_req_ignore_eos")
+        attributes = {
+            node.attr for node in ast.walk(method) if isinstance(node, ast.Attribute)
+        }
+        self.assertIn("rem_input_tokens", attributes)
+        self.assertIn("can_run_list", attributes)
+        self.assertTrue(
+            any(
+                isinstance(node, ast.Return)
+                and isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "AddReqResult"
+                and node.value.attr == "OTHER"
+                for node in ast.walk(method)
+            )
+        )
 
 
 if __name__ == "__main__":

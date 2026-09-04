@@ -59,7 +59,7 @@ def get_draft_kv_pool(
 ):
     """Return the draft token-to-KV pool for the current draft worker,
     or None when no draft KV pool is available."""
-    if draft_worker is None or spec_algorithm.is_ngram():
+    if draft_worker is None or not spec_algorithm.has_draft_kv():
         return None
 
     # V2 workers nest the draft runner under `.draft_worker`.

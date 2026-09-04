@@ -81,6 +81,7 @@ class RemoteMTPWorkerV2(BaseSpecWorker):
         self.tree_mask_mode = default_tree_mask_mode()
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
         self.candidate_source = create_remote_mtp_candidate_source(server_args, gpu_id)
+        self._remote_request_incarnations: dict[str, str] = {}
 
         self.remote_claimed_batches = 0
         self.remote_claimed_requests = 0
@@ -90,6 +91,8 @@ class RemoteMTPWorkerV2(BaseSpecWorker):
         self.remote_outcome_batches_dropped = 0
         self.remote_feature_batches_published = 0
         self.remote_feature_batches_dropped = 0
+        self.remote_request_finishes_published = 0
+        self.remote_request_finishes_dropped = 0
 
     @property
     def war_fastpath_runner(self):
@@ -120,23 +123,46 @@ class RemoteMTPWorkerV2(BaseSpecWorker):
                     else None
                 ),
             )
-            views.append(
-                RemoteMTPRequestView(
-                    request_id=req.rid,
-                    request_incarnation=req.remote_mtp_incarnation,
-                    prompt_token_count=prompt_token_count,
-                    output_token_count=output_token_count,
-                    last_target_service_monotonic_ns=(
-                        req.remote_mtp_last_target_service_ns
-                    ),
-                    max_service_gap_ns=req.remote_mtp_max_service_gap_ns,
-                    service_completion_guard_ns=(
-                        req.remote_mtp_service_completion_guard_ns
-                    ),
-                    service_period_ns=req.remote_mtp_service_period_ns,
-                ).validate()
-            )
+            view = RemoteMTPRequestView(
+                request_id=req.rid,
+                request_incarnation=req.remote_mtp_incarnation,
+                prompt_token_count=prompt_token_count,
+                output_token_count=output_token_count,
+                last_target_service_monotonic_ns=(
+                    req.remote_mtp_last_target_service_ns
+                ),
+                max_service_gap_ns=req.remote_mtp_max_service_gap_ns,
+                service_completion_guard_ns=(
+                    req.remote_mtp_service_completion_guard_ns
+                ),
+                service_period_ns=req.remote_mtp_service_period_ns,
+            ).validate()
+            self._remote_request_incarnations[req.rid] = req.remote_mtp_incarnation
+            views.append(view)
         return tuple(views)
+
+    def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+        """Release external draft state after SGLang commits request completion."""
+
+        request_incarnation = self._remote_request_incarnations.pop(rid, None)
+        if request_incarnation is None:
+            return
+        try:
+            offer = getattr(self.candidate_source, "offer_request_finished", None)
+            if offer is None or not bool(
+                offer(
+                    request_id=rid,
+                    request_incarnation=request_incarnation,
+                    natural_stop=natural_stop,
+                )
+            ):
+                self.remote_request_finishes_dropped += 1
+                return
+        except Exception:
+            self.remote_request_finishes_dropped += 1
+            logger.exception("REMOTE_MTP request-finish publication failed")
+            return
+        self.remote_request_finishes_published += 1
 
     def build_relay_input_from_bonus_tokens(
         self,
@@ -146,7 +172,9 @@ class RemoteMTPWorkerV2(BaseSpecWorker):
 
         bs = bonus_tokens.shape[0]
         return EagleDraftInput(
-            bonus_tokens=bonus_tokens,
+            # The target sampler may return int32 tokens on DSV4, while the
+            # speculative verifier ABI requires int64 candidates.
+            bonus_tokens=bonus_tokens.to(torch.int64),
             topk_p=torch.zeros(
                 (bs, 1), dtype=torch.float32, device=bonus_tokens.device
             ),
@@ -264,7 +292,7 @@ class RemoteMTPWorkerV2(BaseSpecWorker):
             positions = batch.seq_lens.to(torch.int64)
 
         return EagleVerifyInput(
-            draft_token=draft_input.bonus_tokens,
+            draft_token=draft_input.bonus_tokens.to(torch.int64),
             custom_mask=custom_mask,
             positions=positions,
             retrieve_index=retrieve_index,
