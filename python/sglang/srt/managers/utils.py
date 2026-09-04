@@ -92,6 +92,10 @@ class GenerationBatchResult:
     remote_mtp_fallback_reason: Optional[str] = None
     remote_mtp_feature_batch_id: Optional[str] = None
     remote_mtp_request_views: Optional[Any] = None
+    remote_mtp_claim_row_indices: Optional[Any] = None
+    remote_mtp_row_sources: Optional[Any] = None
+    remote_mtp_row_fallback_reasons: Optional[Any] = None
+    remote_mtp_selected_depth: Optional[int] = None
 
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None

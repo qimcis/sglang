@@ -490,12 +490,13 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
 
 
 def _handle_remote_mtp(server_args: ServerArgs) -> None:
-    """Resolve the fixed-width external MTP verifier profile.
+    """Resolve the maximum-width external MTP verifier profile.
 
     REMOTE_MTP owns no local draft model or draft KV. REMOTE_MTP_LOCAL retains
     the native local NextN state as a fallback. ``num_steps`` is the number of
     proposed tokens (K); target verification contains the always-accepted root
-    plus those K candidates.
+    plus those K candidates. REMOTE_MTP_LOCAL may select one exact K no greater
+    than this maximum for an eager fused service window; REMOTE_MTP stays fixed.
     """
 
     has_local_fallback = (
@@ -525,10 +526,10 @@ def _handle_remote_mtp(server_args: ServerArgs) -> None:
     if server_args.speculative_num_steps is None:
         server_args.speculative_num_steps = 3 if has_local_fallback else 2
     depth = int(server_args.speculative_num_steps)
-    if depth not in (1, 2, 3):
+    if depth not in (1, 2, 3, 4):
         raise ValueError(
-            "REMOTE_MTP initial qualification supports fixed depths K=1, K=2, "
-            f"or K=3; got K={depth}."
+            "REMOTE_MTP initial qualification supports maximum depths K=1 through "
+            f"K=4; got K={depth}."
         )
 
     if server_args.speculative_eagle_topk not in (None, 1):

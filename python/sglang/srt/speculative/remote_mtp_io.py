@@ -298,9 +298,9 @@ class RemoteMTPSchedulerAdvice:
                 "scheduler advice plan and window IDs must be non-empty"
             )
         if self.enforce:
-            if not self.preferred_request_ids or self.compatible_depth is None:
+            if self.compatible_depth is None:
                 raise RemoteMTPContractError(
-                    "enforced scheduler advice requires a non-empty fixed-depth subset"
+                    "enforced scheduler advice requires a fixed batch depth"
                 )
             if self.plan_id is None:
                 raise RemoteMTPContractError(
@@ -340,6 +340,78 @@ class RemoteMTPDecodeSlice:
     window_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class RemoteMTPMixedBatchPlan:
+    """Native-order remote/local row assignment for one fused verification."""
+
+    remote_indices: tuple[int, ...]
+    local_indices: tuple[int, ...]
+    candidate_ids_by_row: tuple[str | None, ...]
+    selected_depth: int
+    plan_id: str
+    snapshot_generation: int
+    window_id: str
+
+
+def build_remote_mtp_mixed_batch_plan(
+    requests: Sequence[RemoteMTPRequestView],
+    advice: RemoteMTPSchedulerAdvice,
+    *,
+    configured_depth: int,
+) -> RemoteMTPMixedBatchPlan:
+    """Bind an enforced remote subset without deferring its local-MTP peers.
+
+    Every input row remains in the target batch.  Candidate ownership is
+    represented in native row order so the hybrid worker can replace only the
+    selected local proposals before launching one fixed-width verification.
+    """
+
+    request_tuple = tuple(request.validate() for request in requests)
+    advice.validate()
+    if not advice.enforce or advice.requests != request_tuple:
+        raise RemoteMTPContractError(
+            "mixed batching requires enforced advice for the exact current seal"
+        )
+    if (
+        isinstance(configured_depth, bool)
+        or not isinstance(configured_depth, int)
+        or configured_depth <= 0
+        or advice.compatible_depth is None
+        or advice.compatible_depth > configured_depth
+    ):
+        raise RemoteMTPContractError(
+            "mixed batch depth exceeds the configured verifier maximum"
+        )
+    request_ids = tuple(request.request_id for request in request_tuple)
+    index_by_id = {request_id: index for index, request_id in enumerate(request_ids)}
+    remote_indices = tuple(
+        index_by_id[request_id] for request_id in advice.preferred_request_ids
+    )
+    if remote_indices != tuple(sorted(remote_indices)):
+        raise RemoteMTPContractError(
+            "mixed remote rows must preserve the native seal order"
+        )
+    candidate_ids_by_row: list[str | None] = [None] * len(request_tuple)
+    for index, candidate_id in zip(remote_indices, advice.candidate_ids, strict=True):
+        candidate_ids_by_row[index] = candidate_id
+    remote_set = set(remote_indices)
+    local_indices = tuple(
+        index for index in range(len(request_tuple)) if index not in remote_set
+    )
+    assert advice.plan_id is not None
+    assert advice.snapshot_generation is not None
+    assert advice.window_id is not None
+    return RemoteMTPMixedBatchPlan(
+        remote_indices=remote_indices,
+        local_indices=local_indices,
+        candidate_ids_by_row=tuple(candidate_ids_by_row),
+        selected_depth=advice.compatible_depth,
+        plan_id=advice.plan_id,
+        snapshot_generation=advice.snapshot_generation,
+        window_id=advice.window_id,
+    )
+
+
 def build_remote_mtp_decode_slice(
     requests: Sequence[RemoteMTPRequestView],
     advice: RemoteMTPSchedulerAdvice,
@@ -353,6 +425,10 @@ def build_remote_mtp_decode_slice(
     if not advice.enforce or advice.requests != request_tuple:
         raise RemoteMTPContractError(
             "decode slicing requires enforced advice for the exact current seal"
+        )
+    if not advice.preferred_request_ids:
+        raise RemoteMTPContractError(
+            "remote-only decode slicing requires a non-empty candidate subset"
         )
     if (
         isinstance(configured_depth, bool)

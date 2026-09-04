@@ -93,7 +93,7 @@ class TestRemoteMTPArgs(unittest.TestCase):
             {"enable_multi_layer_eagle": True},
             {"speculative_adaptive": True},
             {"speculative_use_rejection_sampling": True},
-            {"speculative_num_steps": 4},
+            {"speculative_num_steps": 5},
             {"speculative_eagle_topk": 2},
             {
                 "speculative_num_steps": 2,
@@ -103,6 +103,12 @@ class TestRemoteMTPArgs(unittest.TestCase):
         for overrides in incompatible:
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):
                 _handle_remote_mtp(args(**overrides))
+
+    def test_k4_reserves_five_target_verify_tokens(self):
+        server_args = args(speculative_num_steps=4)
+        _handle_remote_mtp(server_args)
+        self.assertEqual(server_args.speculative_num_steps, 4)
+        self.assertEqual(server_args.speculative_num_draft_tokens, 5)
 
 
 if __name__ == "__main__":

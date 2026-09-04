@@ -2063,6 +2063,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     remote_mtp_target_plan_generation: Optional[int] = None
     remote_mtp_target_window_id: Optional[str] = None
     remote_mtp_candidate_ids: Optional[tuple[str, ...]] = None
+    # Exact K selected for every row in this target service window.  Mixed
+    # per-row widths are deliberately unsupported.
+    remote_mtp_selected_depth: Optional[int] = None
+    # Hybrid REMOTE_MTP_LOCAL only: one entry per native target row. ``None``
+    # selects resident local MTP; a candidate ID selects remote MTP.  This is
+    # consumed before the forward and never crosses request boundaries.
+    remote_mtp_candidate_ids_by_row: Optional[tuple[Optional[str], ...]] = None
     remote_mtp_detached_decode: bool = False
     remote_mtp_native_order: Optional[tuple[tuple[str, str], ...]] = None
 
@@ -3123,6 +3130,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             remote_mtp_target_plan_generation=self.remote_mtp_target_plan_generation,
             remote_mtp_target_window_id=self.remote_mtp_target_window_id,
             remote_mtp_candidate_ids=self.remote_mtp_candidate_ids,
+            remote_mtp_selected_depth=self.remote_mtp_selected_depth,
+            remote_mtp_candidate_ids_by_row=self.remote_mtp_candidate_ids_by_row,
             remote_mtp_detached_decode=self.remote_mtp_detached_decode,
             remote_mtp_native_order=self.remote_mtp_native_order,
         )

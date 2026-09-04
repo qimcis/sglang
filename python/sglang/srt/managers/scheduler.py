@@ -3561,12 +3561,22 @@ class Scheduler(
     def apply_remote_mtp_decode_advice(self, batch: ScheduleBatch, advice):
         """Apply one exact non-overlap target plan or preserve native progress.
 
-        A proper subset is time-sliced for one target execution. Unselected
-        requests retain their target KV and rejoin before the next scheduling
-        cycle. Any invalid/stale advice executes the complete native batch with
-        immediate AR fallback; it never produces a partial claim.
+        REMOTE_MTP time-slices a proper subset and rejoins it next cycle.
+        REMOTE_MTP_LOCAL instead keeps every row in one fixed-width target
+        verification and marks unselected rows for resident drafting. Any
+        invalid/stale advice leaves the native batch intact for immediate local
+        fallback; target progress never depends on a remote proposal.
         """
 
+        # Plan ownership is one-seal data.  The hybrid path intentionally
+        # retains the ScheduleBatch, so a later observe-only/missing decision
+        # must not replay the preceding row assignment.
+        batch.remote_mtp_target_plan_id = None
+        batch.remote_mtp_target_plan_generation = None
+        batch.remote_mtp_target_window_id = None
+        batch.remote_mtp_candidate_ids = None
+        batch.remote_mtp_selected_depth = None
+        batch.remote_mtp_candidate_ids_by_row = None
         if advice is None or not advice.enforce:
             batch.prepare_for_decode()
             return batch, batch
@@ -3575,6 +3585,28 @@ class Scheduler(
                 raise ValueError(
                     "enforced REMOTE_MTP target slicing requires non-overlap mode"
                 )
+            if self.spec_algorithm.has_local_mtp_fallback():
+                from sglang.srt.speculative.remote_mtp_io import (
+                    build_remote_mtp_mixed_batch_plan,
+                )
+
+                mixed = build_remote_mtp_mixed_batch_plan(
+                    advice.requests,
+                    advice,
+                    configured_depth=self.server_args.speculative_num_steps,
+                )
+                batch.remote_mtp_target_plan_id = mixed.plan_id
+                batch.remote_mtp_target_plan_generation = mixed.snapshot_generation
+                batch.remote_mtp_target_window_id = mixed.window_id
+                batch.remote_mtp_selected_depth = mixed.selected_depth
+                batch.remote_mtp_candidate_ids_by_row = (
+                    mixed.candidate_ids_by_row
+                )
+                batch.prepare_for_decode()
+                # All rows make progress in the same target execution.  There
+                # is no advisor-deferred resident batch to rejoin.
+                return batch, batch
+
             from sglang.srt.speculative.remote_mtp_io import (
                 build_remote_mtp_decode_slice,
             )

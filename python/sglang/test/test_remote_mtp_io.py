@@ -17,6 +17,7 @@ try:
         RemoteMTPVerificationOutcome,
         _reset_remote_mtp_candidate_source_factory_for_test,
         build_remote_mtp_decode_slice,
+        build_remote_mtp_mixed_batch_plan,
         create_remote_mtp_scheduler_advisor,
         install_remote_mtp_scheduler_advisor_factory,
         remote_mtp_linear_chain_layout,
@@ -48,6 +49,7 @@ except ModuleNotFoundError:
         module._reset_remote_mtp_candidate_source_factory_for_test
     )
     build_remote_mtp_decode_slice = module.build_remote_mtp_decode_slice
+    build_remote_mtp_mixed_batch_plan = module.build_remote_mtp_mixed_batch_plan
     create_remote_mtp_scheduler_advisor = module.create_remote_mtp_scheduler_advisor
     install_remote_mtp_scheduler_advisor_factory = (
         module.install_remote_mtp_scheduler_advisor_factory
@@ -135,6 +137,16 @@ class TestBoundedRemoteMTPMailbox(unittest.TestCase):
         self.assertEqual(partition.selected_indices, (1,))
         self.assertEqual(partition.deferred_indices, (0,))
         self.assertEqual(partition.candidate_ids, ("candidate-b",))
+        mixed = build_remote_mtp_mixed_batch_plan(
+            enforced.requests,
+            enforced,
+            configured_depth=2,
+        )
+        self.assertEqual(mixed.remote_indices, (1,))
+        self.assertEqual(mixed.local_indices, (0,))
+        self.assertEqual(mixed.candidate_ids_by_row, (None, "candidate-b"))
+        self.assertEqual(mixed.selected_depth, 2)
+        self.assertEqual(mixed.plan_id, "plan")
         with self.assertRaises(RemoteMTPContractError):
             build_remote_mtp_decode_slice(
                 enforced.requests,
@@ -219,6 +231,89 @@ class TestBoundedRemoteMTPMailbox(unittest.TestCase):
                 advice.requests,
                 advice,
                 configured_depth=2,
+            )
+        # The fused hybrid path does not defer the forced row: it runs local
+        # MTP for that row in the same target execution as the preferred row.
+        mixed = build_remote_mtp_mixed_batch_plan(
+            advice.requests,
+            advice,
+            configured_depth=2,
+        )
+        self.assertEqual(mixed.remote_indices, (1,))
+        self.assertEqual(mixed.local_indices, (0,))
+
+    def test_mixed_batch_selects_one_exact_depth_up_to_configured_maximum(self):
+        requests = (request("a"), request("b"))
+        for depth in (2, 3, 4):
+            with self.subTest(depth=depth):
+                advice = RemoteMTPSchedulerAdvice(
+                    requests=requests,
+                    preferred_request_ids=("a",),
+                    compatible_depth=depth,
+                    reason="adaptive_exact_depth",
+                    seal_monotonic_ns=100,
+                    enforce=True,
+                    plan_id=f"plan-k{depth}",
+                    snapshot_generation=depth,
+                    window_id=f"window-k{depth}",
+                    candidate_ids=(f"candidate-k{depth}",),
+                ).validate()
+                mixed = build_remote_mtp_mixed_batch_plan(
+                    requests,
+                    advice,
+                    configured_depth=4,
+                )
+                self.assertEqual(mixed.selected_depth, depth)
+                self.assertEqual(mixed.candidate_ids_by_row, (f"candidate-k{depth}", None))
+
+        with self.assertRaisesRegex(RemoteMTPContractError, "maximum"):
+            build_remote_mtp_mixed_batch_plan(
+                requests,
+                RemoteMTPSchedulerAdvice(
+                    requests=requests,
+                    preferred_request_ids=("a",),
+                    compatible_depth=4,
+                    reason="too_deep",
+                    seal_monotonic_ns=100,
+                    enforce=True,
+                    plan_id="plan",
+                    snapshot_generation=1,
+                    window_id="window",
+                    candidate_ids=("candidate",),
+                ).validate(),
+                configured_depth=3,
+            )
+
+    def test_enforced_empty_subset_selects_all_local_depth_for_hybrid_only(self):
+        requests = (request("a"), request("b"))
+        advice = RemoteMTPSchedulerAdvice(
+            requests=requests,
+            preferred_request_ids=(),
+            compatible_depth=3,
+            reason="adaptive_all_local",
+            seal_monotonic_ns=100,
+            enforce=True,
+            plan_id="plan-k3",
+            snapshot_generation=3,
+            window_id="window-k3",
+            candidate_ids=(),
+        ).validate()
+
+        mixed = build_remote_mtp_mixed_batch_plan(
+            requests,
+            advice,
+            configured_depth=4,
+        )
+
+        self.assertEqual(mixed.remote_indices, ())
+        self.assertEqual(mixed.local_indices, (0, 1))
+        self.assertEqual(mixed.candidate_ids_by_row, (None, None))
+        self.assertEqual(mixed.selected_depth, 3)
+        with self.assertRaisesRegex(RemoteMTPContractError, "non-empty"):
+            build_remote_mtp_decode_slice(
+                requests,
+                advice,
+                configured_depth=3,
             )
 
     def test_service_window_partition_keeps_unpaced_work_runnable(self):

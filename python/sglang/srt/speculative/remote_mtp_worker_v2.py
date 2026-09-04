@@ -446,6 +446,10 @@ class RemoteMTPWorkerV2(BaseSpecWorker):
         executed_source: str,
         verification_tokens: int,
         started_monotonic_ns: int,
+        row_sources: tuple[str, ...] | None = None,
+        selected_depth: int | None = None,
+        local_proposal_draft_rows: int = 0,
+        local_state_extend_rows: int = 0,
     ) -> None:
         record = getattr(self.candidate_source, "record_target_execution", None)
         if record is None:
@@ -459,6 +463,10 @@ class RemoteMTPWorkerV2(BaseSpecWorker):
                 verification_tokens=verification_tokens,
                 started_monotonic_ns=started_monotonic_ns,
                 finished_monotonic_ns=time.monotonic_ns(),
+                row_sources=row_sources,
+                selected_depth=selected_depth,
+                local_proposal_draft_rows=local_proposal_draft_rows,
+                local_state_extend_rows=local_state_extend_rows,
             )
         except Exception:
             logger.exception("REMOTE_MTP target execution telemetry failed")
@@ -594,55 +602,114 @@ class RemoteMTPWorkerV2(BaseSpecWorker):
                 raise ValueError(
                     "REMOTE_MTP result lost its pre-forward request boundaries"
                 )
-            outcomes = tuple(
-                RemoteMTPTargetSettlement(
+            row_sources = tuple(
+                getattr(result, "remote_mtp_row_sources", None)
+                or (executed_source,) * len(requests)
+            )
+            if len(row_sources) != len(requests) or any(
+                source not in {"remote_mtp", "local_mtp", "autoregressive"}
+                for source in row_sources
+            ):
+                raise ValueError("REMOTE_MTP result has invalid per-row provenance")
+            selected_depth = getattr(result, "remote_mtp_selected_depth", None)
+            if selected_depth is not None and (
+                isinstance(selected_depth, bool)
+                or not isinstance(selected_depth, int)
+                or selected_depth <= 0
+            ):
+                raise ValueError("REMOTE_MTP result has invalid selected depth")
+            if "local_mtp" in row_sources and selected_depth is None:
+                raise ValueError("local MTP result lost its selected verification depth")
+            if (
+                claim is not None
+                and selected_depth is not None
+                and claim.depth != selected_depth
+            ):
+                raise ValueError(
+                    "REMOTE_MTP claim depth differs from the selected batch depth"
+                )
+            row_fallback_reasons = tuple(
+                getattr(result, "remote_mtp_row_fallback_reasons", None)
+                or (result.remote_mtp_fallback_reason,) * len(requests)
+            )
+            if len(row_fallback_reasons) != len(requests):
+                raise ValueError(
+                    "REMOTE_MTP result has invalid per-row fallback reasons"
+                )
+            claim_row_indices = tuple(
+                getattr(result, "remote_mtp_claim_row_indices", None)
+                or (range(len(requests)) if claim is not None else ())
+            )
+            if claim is not None and len(claim_row_indices) != len(claim.requests):
+                raise ValueError("REMOTE_MTP claim row mapping changed")
+            claim_position_by_row = {
+                row_index: claim_position
+                for claim_position, row_index in enumerate(claim_row_indices)
+            }
+            if (
+                len(claim_position_by_row) != len(claim_row_indices)
+                or any(
+                    index < 0 or index >= len(requests) for index in claim_row_indices
+                )
+                or {
+                    index
+                    for index, source in enumerate(row_sources)
+                    if source == "remote_mtp"
+                }
+                != set(claim_row_indices)
+            ):
+                raise ValueError("REMOTE_MTP claim does not match row provenance")
+
+            def settlement(index: int):
+                source = row_sources[index]
+                claim_position = claim_position_by_row.get(index)
+                remote_row = source == "remote_mtp"
+                if remote_row:
+                    assert claim is not None and claim_position is not None
+                    request = claim.requests[claim_position]
+                    candidate_id = claim.candidate_ids[claim_position]
+                    prefix_digest = claim.prefix_index_digests[claim_position]
+                    candidate_tokens = claim.token_ids[claim_position]
+                    verified_depth = claim.depth
+                else:
+                    request = requests[index]
+                    candidate_id = None
+                    prefix_digest = None
+                    candidate_tokens = ()
+                    verified_depth = (
+                        selected_depth if source == "local_mtp" else 0
+                    )
+                return RemoteMTPTargetSettlement(
                     feature_batch_id=feature_batch_id,
                     phase="verify",
-                    request=(
-                        claim.requests[index] if claim is not None else requests[index]
-                    ),
-                    executed_source=executed_source,
+                    request=request,
+                    executed_source=source,
                     committed_token_ids=tuple(
                         int(token) for token in committed_tokens[index]
                     ),
-                    candidate_id=(
-                        claim.candidate_ids[index] if claim is not None else None
-                    ),
-                    prefix_index_digest=(
-                        claim.prefix_index_digests[index] if claim is not None else None
-                    ),
-                    candidate_token_ids=(
-                        claim.token_ids[index] if claim is not None else ()
-                    ),
-                    verified_depth=(
-                        claim.depth
-                        if claim is not None
-                        else (
-                            self.speculative_num_steps
-                            if executed_source == "local_mtp"
-                            else 0
-                        )
-                    ),
+                    candidate_id=candidate_id,
+                    prefix_index_digest=prefix_digest,
+                    candidate_token_ids=candidate_tokens,
+                    verified_depth=verified_depth,
                     accepted_draft_count=(
                         result.num_correct_drafts_per_req_cpu[index]
-                        if executed_source != "autoregressive"
+                        if source != "autoregressive"
                         else 0
                     ),
                     fallback_reason=(
-                        None if claim is not None else result.remote_mtp_fallback_reason
+                        None if remote_row else row_fallback_reasons[index]
                     ),
-                    plan_id=(
-                        batch.remote_mtp_target_plan_id if claim is not None else None
-                    ),
+                    plan_id=(batch.remote_mtp_target_plan_id if remote_row else None),
                     snapshot_generation=(
-                        batch.remote_mtp_target_plan_generation
-                        if claim is not None
-                        else None
+                        batch.remote_mtp_target_plan_generation if remote_row else None
                     ),
                     window_id=(
-                        batch.remote_mtp_target_window_id if claim is not None else None
+                        batch.remote_mtp_target_window_id if remote_row else None
                     ),
                 ).validate()
+
+            outcomes = tuple(
+                settlement(index)
                 for index in range(len(requests))
                 if committed_tokens[index]
             )

@@ -81,6 +81,8 @@ class TestRemoteMTPSchedulerSourceContract(unittest.TestCase):
                 "remote_mtp_target_plan_generation",
                 "remote_mtp_target_window_id",
                 "remote_mtp_candidate_ids",
+                "remote_mtp_candidate_ids_by_row",
+                "remote_mtp_selected_depth",
                 "remote_mtp_detached_decode",
             }
             <= fields
@@ -118,6 +120,27 @@ class TestRemoteMTPSchedulerSourceContract(unittest.TestCase):
         }
         self.assertIn("prepare_for_decode", calls)
         self.assertIn("build_remote_mtp_decode_slice", names)
+        self.assertIn("build_remote_mtp_mixed_batch_plan", names)
+        cleared_fields = {
+            target.attr
+            for node in apply.body
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Constant)
+            and node.value.value is None
+            for target in node.targets
+            if isinstance(target, ast.Attribute)
+        }
+        self.assertTrue(
+            {
+                "remote_mtp_target_plan_id",
+                "remote_mtp_target_plan_generation",
+                "remote_mtp_target_window_id",
+                "remote_mtp_candidate_ids",
+                "remote_mtp_candidate_ids_by_row",
+                "remote_mtp_selected_depth",
+            }
+            <= cleared_fields
+        )
 
     def test_resident_remote_batch_stashes_complete_speculative_relay(self):
         owner = class_node(parse("managers/scheduler.py"), "Scheduler")
@@ -252,8 +275,127 @@ class TestRemoteMTPSchedulerSourceContract(unittest.TestCase):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
         }
         self.assertIn("EagleDraftWorker", init_calls)
-        self.assertIn("_try_remote_verify_input", forward_calls)
+        self.assertIn("_try_remote_row_claim", forward_calls)
+        self.assertIn("_activate_batch_depth", forward_calls)
         self.assertIn("_draft_extend_for_decode", forward_calls)
+
+    def test_hybrid_mixed_rows_share_exactly_one_target_verification(self):
+        owner = class_node(
+            parse("speculative/remote_mtp_local_worker_v2.py"),
+            "RemoteMTPLocalWorkerV2",
+        )
+        forward = method_node(owner, "forward_batch_generation")
+        verify_calls = [
+            node
+            for node in ast.walk(forward)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "verify"
+        ]
+        self.assertEqual(len(verify_calls), 1)
+        calls = {
+            node.func.attr
+            for node in ast.walk(forward)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        self.assertIn("draft", calls)
+        self.assertIn("_build_local_draft_batch", calls)
+        self.assertIn("_build_mixed_verify_input", calls)
+        self.assertIn("_publish_mixed_verify", calls)
+
+        publish = method_node(owner, "_publish_mixed_verify")
+        assigned_attributes = {
+            target.attr
+            for node in ast.walk(publish)
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Attribute)
+        }
+        self.assertTrue(
+            {
+                "remote_mtp_claim_row_indices",
+                "remote_mtp_row_sources",
+                "remote_mtp_row_fallback_reasons",
+            }
+            <= assigned_attributes
+        )
+
+        local_draft = method_node(owner, "_build_local_draft_batch")
+        self.assertTrue(
+            any(
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Attribute) and target.attr == "reqs"
+                    for target in node.targets
+                )
+                for node in ast.walk(local_draft)
+            )
+        )
+        init = method_node(owner, "__init__")
+        self.assertTrue(
+            any(
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Attribute)
+                    and target.attr == "remote_local_draft_rows"
+                    for target in node.targets
+                )
+                for node in ast.walk(init)
+            )
+        )
+        initialized_attributes = {
+            target.attr
+            for node in ast.walk(init)
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Attribute)
+        }
+        self.assertTrue(
+            {
+                "local_proposal_draft_rows",
+                "local_state_extend_rows",
+            }
+            <= initialized_attributes
+        )
+
+    def test_hybrid_candidate_miss_falls_back_locally_without_waiting(self):
+        owner = class_node(
+            parse("speculative/remote_mtp_local_worker_v2.py"),
+            "RemoteMTPLocalWorkerV2",
+        )
+        claim = method_node(owner, "_try_remote_row_claim")
+        called_attributes = {
+            node.func.attr
+            for node in ast.walk(claim)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        self.assertIn("try_claim_batch", called_attributes)
+        self.assertFalse(
+            {"wait", "get", "join", "sleep"} & called_attributes,
+            "candidate lookup must not introduce a target-side wait",
+        )
+
+        forward = method_node(owner, "forward_batch_generation")
+        fallback = next(
+            node
+            for node in ast.walk(forward)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "claim"
+            and any(
+                isinstance(comparator, ast.Constant) and comparator.value is None
+                for comparator in node.test.comparators
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "forward_batch_generation"
+                for node in ast.walk(fallback)
+            )
+        )
 
     def test_hybrid_prefill_exports_the_unrotated_target_prompt(self):
         owner = class_node(
