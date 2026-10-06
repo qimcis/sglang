@@ -982,8 +982,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         merged_req = deepcopy(base_req)
         merged_req.prompt = [req.prompt for req in reqs]
         merged_req.batch_members = members
-        merged_req.extra = deepcopy(merged_req.extra)
-        merged_req.extra["dynamic_batch_seeds"] = [m.seeds[0] for m in members]
         merged_req.request_id = f"dynamic_batch::{merged_req.request_id}"
 
         return merged_req

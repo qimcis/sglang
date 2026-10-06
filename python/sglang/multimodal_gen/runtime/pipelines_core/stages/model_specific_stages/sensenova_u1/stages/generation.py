@@ -82,11 +82,10 @@ class SenseNovaU1GenerationStage(PipelineStage):
                 "SenseNova-U1 dynamic batching does not support think_mode"
             )
 
-        dynamic_seeds = batch.extra.get("dynamic_batch_seeds")
-        if dynamic_seeds is None:
+        if batch.batch_members is not None:
+            dynamic_seeds = [member.seeds for member in batch.batch_members]
+        else:
             dynamic_seeds = batch.seed if isinstance(batch.seed, list) else [batch.seed]
-        elif not isinstance(dynamic_seeds, list):
-            dynamic_seeds = [dynamic_seeds]
         seeds = []
         for seed in dynamic_seeds:
             if isinstance(seed, list):

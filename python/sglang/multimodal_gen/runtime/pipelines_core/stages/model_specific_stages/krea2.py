@@ -119,6 +119,11 @@ class Krea2BeforeDenoisingStage(PipelineStage):
 
         # Initial noise latents, packed to [B, S_img, channels*patch**2].
         seed = batch.seed if batch.seed is not None else 0
+        seeds = (
+            [member.seeds[0] for member in batch.batch_members]
+            if batch.batch_members is not None
+            else [seed + i for i in range(n)]
+        )
         lat_h, lat_w = height // vsf, width // vsf
         noise = torch.cat(
             [
@@ -129,7 +134,7 @@ class Krea2BeforeDenoisingStage(PipelineStage):
                     lat_w,
                     device=device,
                     dtype=dtype,
-                    generator=torch.Generator(device=device).manual_seed(seed + i),
+                    generator=torch.Generator(device=device).manual_seed(seeds[i]),
                 )
                 for i in range(n)
             ],
