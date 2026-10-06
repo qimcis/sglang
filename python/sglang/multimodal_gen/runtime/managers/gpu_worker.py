@@ -560,7 +560,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._fit_auto_residency_probe(req)
         return self._execute_forward_common(
             req,
-            forward_fn=lambda: self.pipeline.forward(req, self.server_args),
+            forward_fn=lambda: list(self.pipeline.forward([req], self.server_args))[0],
             log_reqs=[req],
             return_req=return_req,
             save_output_paths=lambda output_batch: self._save_output_paths(
@@ -573,7 +573,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def execute_forward_sequentially(self, batch: list[Req]) -> Iterator[OutputBatch]:
         """Yield grouped results after each request finishes its terminal stage."""
         assert self.pipeline is not None
-        results = self.pipeline.forward_batch_sequentially(batch, self.server_args)
+        results = self.pipeline.forward(batch, self.server_args, sequential=True)
         group_start_time = time.monotonic()
 
         try:
@@ -1294,7 +1294,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:
         assert self.pipeline is not None
-        results = self.pipeline.forward_batch(batch, self.server_args)
+        results = self.pipeline.forward(batch, self.server_args)
         output_batches = [self._to_output_batch(result) for result in results]
         return self._merge_expanded_output_batches(output_batches)
 

@@ -1089,26 +1089,41 @@ class ComposedPipelineBase(ABC):
     @torch.no_grad()
     def forward(
         self,
-        batch: Req,
+        batches: list[Req],
         server_args: ServerArgs,
-    ) -> OutputBatch:
-        """
-        Generate a video or image using the pipeline.
+        *,
+        sequential: bool = False,
+    ) -> Iterator[OutputBatch | Req]:
+        """Run requests through the stages and yield their results in order.
 
-        Args:
-            batch: The batch to generate from.
-            server_args: The inference arguments.
-        Returns:
-            Req: The batch with the generated video or image.
+        A group runs its stages grouped; with ``sequential``, its later stages run
+        per request or per output and each result is yielded as it completes.
         """
+        self._prepare_forward(batches, server_args)
+        expands_outputs = (
+            self.batch_plan.per_output
+            and max(1, int(batches[0].num_outputs_per_prompt or 1)) > 1
+        )
+        if len(batches) == 1 and not (sequential and expands_outputs):
+            yield self.executor.execute_with_profiling(
+                self.stages, batches[0], server_args
+            )
+        elif sequential:
+            yield from self.executor.execute_group_sequentially_with_profiling(
+                self.stages, batches, server_args, self.batch_plan
+            )
+        else:
+            yield from self.executor.execute_group_with_profiling(
+                self.stages, batches, server_args
+            )
 
+    def _prepare_forward(self, batches: list[Req], server_args: ServerArgs) -> None:
         if self.is_lora_set() and not self.is_lora_effective():
             logger.warning(
                 "LoRA adapter is set, but not effective. Please make sure the LoRA weights are merged"
             )
 
-        # Execute each stage
-        if not batch.is_warmup and not batch.suppress_logs:
+        if not batches[0].is_warmup and not batches[0].suppress_logs:
             stage_logger = (
                 logger.debug
                 if server_args.pipeline_config.task_type.is_action_gen()
@@ -1122,70 +1137,8 @@ class ComposedPipelineBase(ABC):
 
         self._install_component_residency_manager(server_args)
 
-        return self.executor.execute_with_profiling(self.stages, batch, server_args)
-
-    @torch.no_grad()
-    def forward_batch(
-        self,
-        batches: list[Req],
-        server_args: ServerArgs,
-    ):
-        if len(batches) == 1:
-            return [self.forward(batches[0], server_args)]
-
-        if self.is_lora_set() and not self.is_lora_effective():
-            logger.warning(
-                "LoRA adapter is set, but not effective. Please make sure the LoRA weights are merged"
-            )
-
-        if not batches[0].is_warmup and not batches[0].suppress_logs:
-            stage_logger = (
-                logger.debug
-                if server_args.pipeline_config.task_type.is_action_gen()
-                else logger.info
-            )
-            stage_logger(
-                "Running grouped pipeline stages: %s",
-                list(self._stage_name_mapping.keys()),
-                main_process_only=True,
-            )
-
-        self._install_component_residency_manager(server_args)
-        return self.executor.execute_group_with_profiling(
-            self.stages, batches, server_args
-        )
-
-    @torch.no_grad()
-    def forward_batch_sequentially(
-        self,
-        batches: list[Req],
-        server_args: ServerArgs,
-    ) -> Iterator[OutputBatch]:
-        """Yield grouped outputs as each terminal-stage invocation completes."""
-        if len(batches) == 1 and (
-            not self.batch_plan.per_output
-            or max(1, int(batches[0].num_outputs_per_prompt or 1)) == 1
-        ):
-            yield self.forward(batches[0], server_args)
-            return
-
-        self._install_component_residency_manager(server_args)
-        yield from self.executor.execute_group_sequentially_with_profiling(
-            self.stages,
-            batches,
-            server_args,
-            self.batch_plan,
-        )
-
     def _install_component_residency_manager(self, server_args: ServerArgs) -> None:
-        """Publish the residency manager the executor dereferences unguarded.
-
-        ``PipelineExecutor`` initializes ``component_residency_manager`` to
-        ``None``, and every ``_execute_stages`` run enters
-        ``_component_residency_request``. An entry point that reaches the
-        executor without calling this raises ``AttributeError`` on ``None``, so
-        all three forward paths must install it.
-        """
+        """Publish the residency manager the executor dereferences unguarded."""
         self.component_residency_manager = get_global_component_residency_manager(
             self, server_args
         )

@@ -22,7 +22,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyStrategy,
-    get_global_component_residency_manager,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     resolve_diffusers_pipeline_offload,
@@ -750,18 +749,10 @@ class DiffusersPipeline(ComposedPipelineBase):
         """List of stages in the pipeline."""
         return self._stages
 
-    @torch.no_grad()
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        """Execute the pipeline on the given batch."""
+    def _prepare_forward(self, batches: list[Req], server_args: ServerArgs) -> None:
         if not self.post_init_called:
             self.post_init()
-
-        self.component_residency_manager = get_global_component_residency_manager(
-            self, server_args
-        )
-        self.executor.component_residency_manager = self.component_residency_manager
-
-        return self.executor.execute_with_profiling(self.stages, batch, server_args)
+        self._install_component_residency_manager(server_args)
 
     @classmethod
     def from_pretrained(
