@@ -20,6 +20,7 @@ from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from typing import Any, Optional, Sequence, Union
 
+import msgspec
 import PIL.Image
 import torch
 
@@ -48,6 +49,13 @@ SAMPLING_PARAMS_FIELDS = {f.name for f in fields(SamplingParams)}
 
 def _align_to(value: int, alignment: int) -> int:
     return int(math.ceil(value / alignment) * alignment)
+
+
+class BatchMember(msgspec.Struct, frozen=True):
+    """One request merged into a dynamic batch."""
+
+    seeds: list[int]
+    output_paths: list[str | None]
 
 
 @dataclass
@@ -123,6 +131,8 @@ class Req:
     do_classifier_free_guidance: bool = False
 
     seeds: list[int] | None = None
+    # Requests merged into this one by dynamic batching, in prompt order.
+    batch_members: list[BatchMember] | None = None
 
     # Tracking if embeddings are already processed
     is_prompt_processed: bool = False

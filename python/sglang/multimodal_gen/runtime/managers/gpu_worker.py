@@ -1304,13 +1304,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             return
 
         dynamic_output_paths = None
-        if req.extra:
-            dynamic_output_paths = req.extra.get("dynamic_batch_output_paths")
+        if req.batch_members is not None:
+            dynamic_output_paths = [
+                path for member in req.batch_members for path in member.output_paths
+            ]
         if dynamic_output_paths is not None and (
             len(dynamic_output_paths) != len(output_batch.output)
         ):
             logger.warning(
-                "dynamic_batch_output_paths length mismatch (got=%d, expected=%d). "
+                "Dynamic batch output path count mismatch (got=%d, expected=%d). "
                 "Falling back to merged request output file naming.",
                 len(dynamic_output_paths),
                 len(output_batch.output),

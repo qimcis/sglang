@@ -64,6 +64,28 @@ class DmdDenoisingStage(DenoisingStage):
         # 2. use base method to gather
         return super()._postprocess_sp_latents(batch, latents, trajectory_tensor)
 
+    def _draw_noise(
+        self, batch: Req, shape: torch.Size, dtype: torch.dtype
+    ) -> torch.Tensor:
+        # Draw each merged request's rows from its first generator, as when run alone.
+        counts = (
+            [len(member.seeds) for member in batch.batch_members]
+            if batch.batch_members is not None
+            else [shape[0]]
+        )
+        noise, offset = [], 0
+        for count in counts:
+            noise.append(
+                torch.randn(
+                    (count, *shape[1:]),
+                    dtype=dtype,
+                    generator=batch.generator[offset],
+                    device=self.device,
+                )
+            )
+            offset += count
+        return noise[0] if len(noise) == 1 else torch.cat(noise)
+
     def forward(
         self,
         batch: Req,
@@ -190,11 +212,10 @@ class DmdDenoisingStage(DenoisingStage):
                             next_timestep = timesteps[i + 1] * torch.ones(
                                 [1], dtype=torch.long, device=pred_video.device
                             )
-                            noise = torch.randn(
-                                video_raw_latent_shape,
+                            noise = self._draw_noise(
+                                batch,
+                                shape=video_raw_latent_shape,
                                 dtype=pred_video.dtype,
-                                generator=batch.generator[0],
-                                device=self.device,
                             )
                             latents = scheduler.add_noise(
                                 pred_video.flatten(0, 1),

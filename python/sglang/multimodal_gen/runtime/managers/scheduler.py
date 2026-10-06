@@ -57,6 +57,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
     normalize_output_seeds,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    BatchMember,
     BatchMetricsWindow,
     OutputBatch,
 )
@@ -953,11 +954,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             )
 
     def _try_merge_generation_reqs(self, reqs: List[Req]) -> Req | None:
-        """Create a batched generation request from compatible requests.
-
-        Per-request seeds and output paths are stored in `extra` so downstream
-        stages can preserve request ordering.
-        """
+        """Create a batched generation request from compatible requests."""
         if len(reqs) <= 1:
             return reqs[0] if reqs else None
 
@@ -966,35 +963,27 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             if not self._can_dynamic_batch(base_req, req):
                 return None
 
-        dynamic_batch_seeds: list[int | list[int]] = []
         try:
-            for req in reqs:
-                if max(1, int(req.num_outputs_per_prompt or 1)) == 1:
-                    dynamic_batch_seeds.append(
-                        normalize_output_seeds(
-                            req.seed,
-                            num_outputs_per_prompt=1,
-                        )[0]
-                    )
-                else:
-                    dynamic_batch_seeds.append(req.seed)
+            members = [
+                BatchMember(
+                    seeds=normalize_output_seeds(
+                        req.seed, num_outputs_per_prompt=req.num_outputs_per_prompt
+                    ),
+                    output_paths=[
+                        req.output_file_path(req.num_outputs_per_prompt, idx)
+                        for idx in range(req.num_outputs_per_prompt)
+                    ],
+                )
+                for req in reqs
+            ]
         except (TypeError, ValueError):
             return None
 
         merged_req = deepcopy(base_req)
         merged_req.prompt = [req.prompt for req in reqs]
-
+        merged_req.batch_members = members
         merged_req.extra = deepcopy(merged_req.extra)
-        merged_req.extra["dynamic_batch_seeds"] = dynamic_batch_seeds
-        merged_req.return_file_paths_only = base_req.return_file_paths_only
-        if merged_req.return_file_paths_only:
-            dynamic_output_paths: list[str] = []
-            for req in reqs:
-                for output_idx in range(req.num_outputs_per_prompt):
-                    dynamic_output_paths.append(
-                        req.output_file_path(req.num_outputs_per_prompt, output_idx)
-                    )
-            merged_req.extra["dynamic_batch_output_paths"] = dynamic_output_paths
+        merged_req.extra["dynamic_batch_seeds"] = [m.seeds[0] for m in members]
         merged_req.request_id = f"dynamic_batch::{merged_req.request_id}"
 
         return merged_req
