@@ -71,6 +71,7 @@ from sglang.multimodal_gen.runtime.server_args import (
 )
 from sglang.multimodal_gen.runtime.server_warmup import (
     SchedulerWarmupMixin,
+    _is_out_of_memory,
     get_first_generation_req,
     is_warmup_req,
     should_return_warmup_result,
@@ -207,6 +208,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self._batch_metrics_enabled = server_args.enable_batching_metrics
         self._batch_metrics_window = BatchMetricsWindow()
         self._batch_admission = BatchAdmissionController(server_args, gpu_id=local_rank)
+        # A retry on one rank of a multi-GPU replica would desync its peers.
+        self._split_batch_on_oom = server_args.num_gpus // server_args.dp_size == 1
         self._poller = zmq.Poller()
         if self.receiver is not None:
             self._poller.register(self.receiver, zmq.POLLIN)
@@ -371,50 +374,64 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             if self._batch_plan.grouped:
                 return self._execute_generation_grouped(reqs)
 
-            merged_req = self._try_merge_generation_reqs(reqs)
-            if merged_req is None:
-                return self._execute_generation_sequential(reqs)
+            return self._execute_dynamic_batch(reqs)
 
-            batch_size = len(reqs)
-            try:
-                output_batch = self.worker.execute_forward([merged_req])
-                if output_batch.error:
-                    logger.error(
-                        "Dynamic batch execution returned error. Skipping sequential fallback and returning errors: %s",
-                        output_batch.error,
-                    )
-                    return self._build_dynamic_batch_error_outputs(
-                        reqs=reqs,
-                        error_msg=output_batch.error,
-                    )
+    def _execute_dynamic_batch(self, reqs: List[Req]) -> List[OutputBatch]:
+        if len(reqs) == 1:
+            return [self.worker.execute_forward(reqs)]
+        merged_req = self._try_merge_generation_reqs(reqs)
+        if merged_req is None:
+            return self._execute_generation_sequential(reqs)
 
-                split_outputs = self._split_batched_output(output_batch, reqs)
-                if split_outputs is None:
-                    logger.error(
-                        "Failed to split dynamic batched output cleanly. Skipping sequential fallback and returning errors."
+        batch_size = len(reqs)
+        try:
+            output_batch = self.worker.execute_forward([merged_req])
+            if output_batch.error:
+                if self._split_batch_on_oom and _is_out_of_memory(output_batch.error):
+                    logger.warning(
+                        "Dynamic batch of %d request(s) ran out of memory; retrying in halves",
+                        batch_size,
                     )
-                    return self._build_dynamic_batch_error_outputs(
-                        reqs=reqs,
-                        error_msg="Dynamic batching failed: could not split merged output.",
-                    )
-
-                logger.info(
-                    "Processed dynamic batch of %d/%d request(s) with max_delay=%.2fms",
-                    batch_size,
-                    self._batching_max_size,
-                    self._batching_delay_s * 1000.0,
-                )
-                return split_outputs
-            except Exception as e:
+                    half = batch_size // 2
+                    return self._execute_dynamic_batch(
+                        reqs[:half]
+                    ) + self._execute_dynamic_batch(reqs[half:])
                 logger.error(
-                    "Dynamic batching failed (%s). Skipping sequential fallback and returning errors.",
-                    e,
-                    exc_info=True,
+                    "Dynamic batch execution returned error. Skipping sequential fallback and returning errors: %s",
+                    output_batch.error,
                 )
                 return self._build_dynamic_batch_error_outputs(
                     reqs=reqs,
-                    error_msg=f"Dynamic batching failed: {e}",
+                    error_msg=output_batch.error,
                 )
+
+            split_outputs = self._split_batched_output(output_batch, reqs)
+            if split_outputs is None:
+                logger.error(
+                    "Failed to split dynamic batched output cleanly. Skipping sequential fallback and returning errors."
+                )
+                return self._build_dynamic_batch_error_outputs(
+                    reqs=reqs,
+                    error_msg="Dynamic batching failed: could not split merged output.",
+                )
+
+            logger.info(
+                "Processed dynamic batch of %d/%d request(s) with max_delay=%.2fms",
+                batch_size,
+                self._batching_max_size,
+                self._batching_delay_s * 1000.0,
+            )
+            return split_outputs
+        except Exception as e:
+            logger.error(
+                "Dynamic batching failed (%s). Skipping sequential fallback and returning errors.",
+                e,
+                exc_info=True,
+            )
+            return self._build_dynamic_batch_error_outputs(
+                reqs=reqs,
+                error_msg=f"Dynamic batching failed: {e}",
+            )
 
     def _execute_generation_grouped(
         self, reqs: List[Req]
