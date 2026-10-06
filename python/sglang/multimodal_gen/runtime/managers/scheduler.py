@@ -607,9 +607,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self, base_req: Req, candidate_req: Req
     ) -> str | None:
         """Return the first reason `candidate_req` cannot batch with `base_req`, or None."""
-        if self._can_dynamic_batch(base_req, candidate_req):
-            return None
-
         if base_req.is_warmup or candidate_req.is_warmup:
             return "warmup"
         if self._requires_sequential_multi_output(base_req, candidate_req):
@@ -638,11 +635,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         candidate_sig = self._get_cached_signature(candidate_req)
         if base_sig is None or candidate_sig is None:
             return "signature_unavailable"
-
-        return (
-            self._find_sampling_param_mismatch_field(base_req, candidate_req)
-            or "signature_mismatch"
-        )
+        if base_sig != candidate_sig:
+            return "signature_mismatch"
+        return None
 
     @staticmethod
     def _has_realtime_session(req: Req) -> bool:
@@ -665,39 +660,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         return not callable(checker) or all(checker(req) for req in reqs)
 
     def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
-        """Return whether `candidate_req` can be merged into a batch with `base_req`."""
-        if base_req.is_warmup or candidate_req.is_warmup:
-            return False
-
-        if self._requires_sequential_multi_output(base_req, candidate_req):
-            return False
-
-        if not self._pipeline_supports_dynamic_batching_for_request(
-            base_req, candidate_req
-        ):
-            return False
-
-        if self._has_realtime_session(base_req) or self._has_realtime_session(
-            candidate_req
-        ):
-            return False
-
-        if not isinstance(base_req.prompt, str) or not isinstance(
-            candidate_req.prompt, str
-        ):
-            return False
-
-        if (
-            getattr(base_req, "image_path", None) is not None
-            or getattr(candidate_req, "image_path", None) is not None
-        ):
-            return False
-        if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
-            return False
-
-        base_sig = self._get_cached_signature(base_req)
-        cand_sig = self._get_cached_signature(candidate_req)
-        return base_sig is not None and base_sig == cand_sig
+        return self._get_dynamic_batch_reject_reason(base_req, candidate_req) is None
 
     def _record_batch_dispatch_metrics(
         self,
@@ -1036,43 +999,22 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         return merged_req
 
+    # Fields whose leading dim indexes outputs; trajectory_decoded indexes steps
+    # first, and every other field is shared by all requests in the batch.
+    _PER_OUTPUT_FIELDS = (
+        "output",
+        "audio",
+        "action_pred",
+        "trajectory_latents",
+        "output_file_paths",
+        "noise_pred",
+    )
+
     @staticmethod
-    def _count_first_dim(value: Any) -> int | None:
-        if value is None:
-            return None
+    def _leading_size(value: Any) -> int | None:
         if isinstance(value, (list, tuple)):
             return len(value)
-
-        shape = getattr(value, "shape", None)
-        if shape is not None:
-            try:
-                if len(shape) > 0:
-                    return int(shape[0])
-            except Exception:
-                return None
-        return None
-
-    def _slice_batched_value(
-        self, value: Any, start: int, end: int, total_items: int
-    ) -> Any:
-        if value is None:
-            return None
-
-        if isinstance(value, (list, tuple)):
-            if len(value) == total_items:
-                sliced = value[start:end]
-                return list(sliced) if isinstance(value, list) else tuple(sliced)
-            return deepcopy(value)
-
-        value_items = self._count_first_dim(value)
-        if value_items == total_items:
-            try:
-                return value[start:end]
-            except Exception:
-                pass
-
-        # Scalar / non-batched metadata
-        return deepcopy(value)
+        return int(value.shape[0]) if value.ndim else None
 
     def _split_batched_output(
         self, output_batch: OutputBatch, reqs: List[Req]
@@ -1080,29 +1022,31 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         """Split a merged result only when outputs map one-to-one to requests."""
         per_req_counts = [req.num_outputs_per_prompt for req in reqs]
         total_items = sum(per_req_counts)
-        output_items = self._count_first_dim(output_batch.output)
-        output_path_items = self._count_first_dim(output_batch.output_file_paths)
-
-        if output_items is None and output_path_items is None:
+        if output_batch.output is None and output_batch.output_file_paths is None:
             logger.warning(
                 "Batched output has neither tensor outputs nor output_file_paths; cannot split safely."
             )
             return None
 
-        if output_items is not None and output_items != total_items:
-            logger.warning(
-                "Unexpected batched output size: got %s items, expected %s",
-                output_items,
-                total_items,
-            )
-            return None
-        if output_path_items is not None and output_path_items != total_items:
-            logger.warning(
-                "Unexpected batched output_file_paths size: got %s items, expected %s",
-                output_path_items,
-                total_items,
-            )
-            return None
+        per_output = {
+            name: getattr(output_batch, name) for name in self._PER_OUTPUT_FIELDS
+        }
+        per_step = output_batch.trajectory_decoded
+        sizes = [
+            (name, self._leading_size(value))
+            for name, value in per_output.items()
+            if value is not None
+        ]
+        sizes += [("trajectory_decoded", self._leading_size(v)) for v in per_step or ()]
+        for name, size in sizes:
+            if size != total_items:
+                logger.warning(
+                    "Unexpected batched %s size: got %s items, expected %s",
+                    name,
+                    size,
+                    total_items,
+                )
+                return None
 
         outputs: list[OutputBatch] = []
         start = 0
@@ -1115,34 +1059,18 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 else deepcopy(output_batch.metrics)
             )
             split = OutputBatch(
-                output=self._slice_batched_value(
-                    output_batch.output, start, end, total_items
-                ),
-                audio=self._slice_batched_value(
-                    output_batch.audio, start, end, total_items
+                **{
+                    name: None if value is None else value[start:end]
+                    for name, value in per_output.items()
+                },
+                trajectory_decoded=(
+                    None if per_step is None else [v[start:end] for v in per_step]
                 ),
                 audio_sample_rate=output_batch.audio_sample_rate,
                 fps=output_batch.fps,
-                action_pred=self._slice_batched_value(
-                    output_batch.action_pred, start, end, total_items
-                ),
-                trajectory_timesteps=self._slice_batched_value(
-                    output_batch.trajectory_timesteps, start, end, total_items
-                ),
-                trajectory_latents=self._slice_batched_value(
-                    output_batch.trajectory_latents, start, end, total_items
-                ),
-                trajectory_decoded=self._slice_batched_value(
-                    output_batch.trajectory_decoded, start, end, total_items
-                ),
+                trajectory_timesteps=output_batch.trajectory_timesteps,
                 error=output_batch.error,
-                output_file_paths=self._slice_batched_value(
-                    output_batch.output_file_paths, start, end, total_items
-                ),
                 metrics=metrics,
-                noise_pred=self._slice_batched_value(
-                    output_batch.noise_pred, start, end, total_items
-                ),
                 peak_memory_mb=output_batch.peak_memory_mb,
             )
             if split.metrics is not None:
@@ -1195,13 +1123,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         # If the head request itself is not eligible for dynamic batching
         # (e.g., image-conditioned i2i request), dispatch it immediately.
-        if not self._can_dynamic_batch(req, req):
+        head_reason = self._get_dynamic_batch_reject_reason(req, req)
+        if head_reason is not None:
             identity, req, head_enqueue_time = self.waiting_queue.popleft()
             reject_reasons: list[str] = []
             if self._batch_metrics_enabled:
-                reason = self._get_dynamic_batch_reject_reason(req, req)
-                if reason is not None:
-                    reject_reasons.append(f"head:{reason}")
+                reject_reasons.append(f"head:{head_reason}")
             output_count = max(1, int(req.num_outputs_per_prompt or 1))
             self._record_batch_dispatch_metrics(
                 request_count=1,
@@ -1224,21 +1151,24 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             ):
                 break
             _identity, candidate_req, _enqueue_time = self.waiting_queue[idx]
-            if isinstance(candidate_req, Req) and self._can_dynamic_batch(
-                req, candidate_req
-            ):
-                admission_reject = self._batch_admission.reject_reason_for_candidate(
+            if not isinstance(candidate_req, Req):
+                continue
+            reason = self._get_dynamic_batch_reject_reason(req, candidate_req)
+            if reason is None:
+                reason = self._batch_admission.reject_reason_for_candidate(
                     compatible_reqs, candidate_req
                 )
-                if admission_reject is None:
+                if reason is None:
                     compatible_indices.append(idx)
                     compatible_reqs.append(candidate_req)
-                elif self._batch_metrics_enabled:
-                    reject_reasons.append(admission_reject)
-            elif self._batch_metrics_enabled and isinstance(candidate_req, Req):
-                reason = self._get_dynamic_batch_reject_reason(req, candidate_req)
-                if reason is not None:
-                    reject_reasons.append(reason)
+                    continue
+            elif reason == "signature_mismatch" and self._batch_metrics_enabled:
+                reason = (
+                    self._find_sampling_param_mismatch_field(req, candidate_req)
+                    or reason
+                )
+            if self._batch_metrics_enabled:
+                reject_reasons.append(reason)
 
         batch_len = len(compatible_indices)
 
