@@ -105,6 +105,17 @@ class _SequentiallyReturnedOutputs:
     outputs: Iterator[OutputBatch]
 
 
+class _BatchBucket(msgspec.Struct):
+    """Queued requests that can run as one dynamic batch, oldest first."""
+
+    indices: list[int]
+    reqs: list[Req]
+    enqueue_time: float
+    # Set when the first request cannot batch at all; it then runs alone.
+    head_reason: str | None = None
+    reject_reasons: list[str] = []
+
+
 class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisaggMixin):
     """
     Runs the main event loop for the rank 0 worker.
@@ -1082,7 +1093,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     def get_next_batch_to_run(self) -> list[tuple[bytes | None, Any]] | None:
         """Return the next dispatchable queue item or dynamic batch.
 
-        Returns None when the head request is waiting for more compatible
+        Returns None when every batchable group is waiting for more compatible
         requests within the configured batching delay.
         """
         if not self.waiting_queue:
@@ -1106,78 +1117,94 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             identity, req, _ = self.waiting_queue.popleft()
             return [(identity, req)]
 
-        # If the head request itself is not eligible for dynamic batching
-        # (e.g., image-conditioned i2i request), dispatch it immediately.
-        head_reason = self._get_dynamic_batch_reject_reason(req, req)
-        if head_reason is not None:
-            identity, req, head_enqueue_time = self.waiting_queue.popleft()
-            reject_reasons: list[str] = []
-            if self._batch_metrics_enabled:
-                reject_reasons.append(f"head:{head_reason}")
-            output_count = max(1, int(req.num_outputs_per_prompt or 1))
-            self._record_batch_dispatch_metrics(
-                request_count=1,
-                output_count=output_count,
-                queue_wait_ms=(time.monotonic() - head_enqueue_time) * 1000.0,
-                effective_max_output_count=output_count,
-                reject_reasons=reject_reasons,
-                stop_reason=reject_reasons[0] if reject_reasons else "head_ineligible",
-            )
-            return [(identity, req)]
-
-        compatible_indices: list[int] = [0]
-        compatible_reqs: list[Req] = [req]
-        reject_reasons: list[str] = []
-        for idx in range(1, len(self.waiting_queue)):
-            if len(
-                compatible_indices
-            ) >= self._batching_max_size or self._batch_admission.batch_is_full(
-                compatible_reqs
+        now = time.monotonic()
+        for bucket in self._collect_batch_buckets():
+            if bucket.head_reason is not None:
+                return self._dispatch_unbatchable(bucket, now)
+            if (
+                self._bucket_is_full(bucket)
+                or now - bucket.enqueue_time >= self._batching_delay_s
             ):
+                return self._dispatch_bucket(bucket, now)
+        return None
+
+    def _collect_batch_buckets(self) -> list[_BatchBucket]:
+        """Group requests queued ahead of the first control item."""
+        buckets: list[_BatchBucket] = []
+        for idx, (_identity, req, enqueue_time) in enumerate(self.waiting_queue):
+            if not isinstance(req, Req):
                 break
-            _identity, candidate_req, _enqueue_time = self.waiting_queue[idx]
-            if not isinstance(candidate_req, Req):
+            head_reason = self._get_dynamic_batch_reject_reason(req, req)
+            if head_reason is None and self._join_bucket(buckets, idx=idx, req=req):
                 continue
-            reason = self._get_dynamic_batch_reject_reason(req, candidate_req)
+            buckets.append(
+                _BatchBucket(
+                    indices=[idx],
+                    reqs=[req],
+                    enqueue_time=enqueue_time,
+                    head_reason=head_reason,
+                )
+            )
+        return buckets
+
+    def _join_bucket(self, buckets: list[_BatchBucket], *, idx: int, req: Req) -> bool:
+        for bucket in buckets:
+            if bucket.head_reason is not None or self._bucket_is_full(bucket):
+                continue
+            head = bucket.reqs[0]
+            reason = self._get_dynamic_batch_reject_reason(head, req)
             if reason is None:
                 reason = self._batch_admission.reject_reason_for_candidate(
-                    compatible_reqs, candidate_req
+                    bucket.reqs, req
                 )
                 if reason is None:
-                    compatible_indices.append(idx)
-                    compatible_reqs.append(candidate_req)
-                    continue
+                    bucket.indices.append(idx)
+                    bucket.reqs.append(req)
+                    return True
             elif reason == "signature_mismatch" and self._batch_metrics_enabled:
-                reason = (
-                    self._find_sampling_param_mismatch_field(req, candidate_req)
-                    or reason
-                )
+                reason = self._find_sampling_param_mismatch_field(head, req) or reason
             if self._batch_metrics_enabled:
-                reject_reasons.append(reason)
+                bucket.reject_reasons.append(reason)
+        return False
 
-        batch_len = len(compatible_indices)
+    def _bucket_is_full(self, bucket: _BatchBucket) -> bool:
+        return len(
+            bucket.reqs
+        ) >= self._batching_max_size or self._batch_admission.batch_is_full(bucket.reqs)
 
-        oldest_wait_s = time.monotonic() - enqueue_time
-
-        should_wait_for_more = (
-            batch_len < self._batching_max_size
-            and not self._batch_admission.batch_is_full(compatible_reqs)
-            and oldest_wait_s < self._batching_delay_s
+    def _dispatch_unbatchable(
+        self, bucket: _BatchBucket, now: float
+    ) -> list[tuple[bytes | None, Any]]:
+        identity, req, enqueue_time = self.waiting_queue[bucket.indices[0]]
+        del self.waiting_queue[bucket.indices[0]]
+        reject_reasons: list[str] = []
+        if self._batch_metrics_enabled:
+            reject_reasons.append(f"head:{bucket.head_reason}")
+        output_count = max(1, int(req.num_outputs_per_prompt or 1))
+        self._record_batch_dispatch_metrics(
+            request_count=1,
+            output_count=output_count,
+            queue_wait_ms=(now - enqueue_time) * 1000.0,
+            effective_max_output_count=output_count,
+            reject_reasons=reject_reasons,
+            stop_reason=reject_reasons[0] if reject_reasons else "head_ineligible",
         )
-        if should_wait_for_more:
-            return None
+        return [(identity, req)]
 
-        batch_items: list[tuple[bytes | None, Any]] = [None] * batch_len
-        for pos, idx in enumerate(reversed(compatible_indices)):
-            item_identity, item_req, _ = self.waiting_queue[idx]
-            batch_items[batch_len - 1 - pos] = (item_identity, item_req)
+    def _dispatch_bucket(
+        self, bucket: _BatchBucket, now: float
+    ) -> list[tuple[bytes | None, Any]]:
+        batch_items = [self.waiting_queue[idx][:2] for idx in bucket.indices]
+        for idx in reversed(bucket.indices):
             del self.waiting_queue[idx]
-        stop_reason = self._batch_admission.limit_reason_for_batch(compatible_reqs)
+        batch_len = len(bucket.reqs)
+        oldest_wait_s = now - bucket.enqueue_time
+        stop_reason = self._batch_admission.limit_reason_for_batch(bucket.reqs)
         if stop_reason is None:
             if batch_len >= self._batching_max_size:
                 stop_reason = "max_size"
-            elif reject_reasons:
-                stop_reason = reject_reasons[0]
+            elif bucket.reject_reasons:
+                stop_reason = bucket.reject_reasons[0]
             elif oldest_wait_s >= self._batching_delay_s:
                 stop_reason = "delay"
             else:
@@ -1185,13 +1212,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self._record_batch_dispatch_metrics(
             request_count=batch_len,
             output_count=sum(
-                max(1, int(req.num_outputs_per_prompt or 1)) for req in compatible_reqs
+                max(1, int(req.num_outputs_per_prompt or 1)) for req in bucket.reqs
             ),
             queue_wait_ms=oldest_wait_s * 1000.0,
             effective_max_output_count=self._batch_admission.max_admissible_batch_size(
-                compatible_reqs[0]
+                bucket.reqs[0]
             ),
-            reject_reasons=reject_reasons,
+            reject_reasons=bucket.reject_reasons,
             stop_reason=stop_reason,
         )
         return batch_items
