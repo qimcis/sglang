@@ -13,9 +13,17 @@ import json
 import os
 from dataclasses import dataclass
 from difflib import get_close_matches
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
+from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
+    EXTRAPOLATED_VRAM_RESERVE_FRACTION,
+    GIB_BYTES,
+    MAX_VRAM_RESERVE_FRACTION,
+    MIN_VRAM_RESERVE_BYTES,
+    WarmupMemoryRecord,
+    estimate_default_workload_peak_bytes,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -156,7 +164,12 @@ class BatchingRule:
 class BatchAdmissionController:
     """Applies configured caps before adding requests to a batch."""
 
-    def __init__(self, server_args: ServerArgs, gpu_id: int):
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        gpu_id: int,
+        warmup_records: Callable[[], list[WarmupMemoryRecord]] | None = None,
+    ):
         self._mode = getattr(server_args, "batching_mode", "dynamic")
         self._user_max_batch_size = max(1, int(server_args.batching_max_size))
         self._max_cost = server_args.batching_max_cost
@@ -165,6 +178,12 @@ class BatchAdmissionController:
         self._device_memory_gb = self._get_device_memory_gb(gpu_id)
         self._rules = load_batching_config(server_args.batching_config)
         self._pipeline_config = server_args.pipeline_config
+        self._warmup_records = warmup_records
+        self._memory_budget_bytes = (
+            None
+            if warmup_records is None or self._device_memory_gb is None
+            else _memory_budget_bytes(self._device_memory_gb * BYTES_PER_GB)
+        )
 
         if self.enabled:
             logger.info(
@@ -189,7 +208,7 @@ class BatchAdmissionController:
         return limit.reject_reason(
             batch_size=self._effective_batch_size(proposed),
             batch_cost=self.estimate_batch_cost(proposed),
-        )
+        ) or self._memory_reject_reason(proposed)
 
     def batch_is_full(self, reqs: list[Req]) -> bool:
         """Return whether another roughly similar request would exceed the cap."""
@@ -201,7 +220,9 @@ class BatchAdmissionController:
             return True
 
         next_cost = self.estimate_batch_cost(reqs + [reqs[0]])
-        return limit.max_cost is not None and next_cost > limit.max_cost
+        if limit.max_cost is not None and next_cost > limit.max_cost:
+            return True
+        return self._memory_reject_reason(reqs + [reqs[0]]) is not None
 
     def limit_reason_for_batch(self, reqs: list[Req]) -> str | None:
         if not self.enabled or not reqs:
@@ -212,7 +233,9 @@ class BatchAdmissionController:
             return limit.cap_reason or f"config_cap:{limit.max_batch_size}"
 
         next_cost = self.estimate_batch_cost(reqs + [reqs[0]])
-        return limit.stop_reason_for_next_cost(next_cost)
+        return limit.stop_reason_for_next_cost(next_cost) or self._memory_reject_reason(
+            reqs + [reqs[0]]
+        )
 
     def max_admissible_batch_size(self, req: Req) -> int:
         return self.limit_for(req).max_batch_size
@@ -241,6 +264,27 @@ class BatchAdmissionController:
             cap_reason=cap_reason,
         )
 
+    def _memory_reject_reason(self, reqs: list[Req]) -> str | None:
+        """Reject a batch whose peak, extrapolated from warmup, exceeds the budget."""
+        if self._memory_budget_bytes is None:
+            return None
+        records = self._warmup_records()
+        if not records:
+            return None
+        req = reqs[0]
+        units = (
+            self._effective_batch_size(reqs)
+            * max(1, int(req.width or 0))
+            * max(1, int(req.height or 0))
+            * max(1, int(req.num_frames or 1))
+        )
+        peak = estimate_default_workload_peak_bytes(records=records, target_units=units)
+        if peak is not None and peak <= self._memory_budget_bytes:
+            return None
+        if peak is None:
+            return "memory_budget:unknown"
+        return f"memory_budget:{peak / GIB_BYTES:.1f}>{self._memory_budget_bytes / GIB_BYTES:.1f}GiB"
+
     def estimate_batch_cost(self, reqs: list[Req]) -> float:
         return sum(
             float(self._pipeline_config.estimate_request_cost(req)) for req in reqs
@@ -268,6 +312,14 @@ class BatchAdmissionController:
             return current_platform.get_device_total_memory(gpu_id) / BYTES_PER_GB
         except Exception:
             return None
+
+
+def _memory_budget_bytes(total_bytes: float) -> int:
+    reserve = min(
+        max(EXTRAPOLATED_VRAM_RESERVE_FRACTION * total_bytes, MIN_VRAM_RESERVE_BYTES),
+        MAX_VRAM_RESERVE_FRACTION * total_bytes,
+    )
+    return int(total_bytes - reserve)
 
 
 def load_batching_config(path: str | None) -> list[BatchingRule]:

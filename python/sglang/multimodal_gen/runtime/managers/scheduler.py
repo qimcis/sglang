@@ -207,9 +207,18 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self._batching_delay_s = server_args.batching_delay_ms / 1000.0
         self._batch_metrics_enabled = server_args.enable_batching_metrics
         self._batch_metrics_window = BatchMetricsWindow()
-        self._batch_admission = BatchAdmissionController(server_args, gpu_id=local_rank)
-        # A retry on one rank of a multi-GPU replica would desync its peers.
-        self._split_batch_on_oom = server_args.num_gpus // server_args.dp_size == 1
+        # Ranks batch independently, so a choice from rank-local memory state
+        # would desync the peers of a multi-GPU replica.
+        self._single_gpu_replica = server_args.num_gpus // server_args.dp_size == 1
+        self._batch_admission = BatchAdmissionController(
+            server_args,
+            gpu_id=local_rank,
+            warmup_records=(
+                (lambda: worker.warmup_memory_records)
+                if self._single_gpu_replica
+                else None
+            ),
+        )
         self._poller = zmq.Poller()
         if self.receiver is not None:
             self._poller.register(self.receiver, zmq.POLLIN)
@@ -387,7 +396,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         try:
             output_batch = self.worker.execute_forward([merged_req])
             if output_batch.error:
-                if self._split_batch_on_oom and _is_out_of_memory(output_batch.error):
+                if self._single_gpu_replica and _is_out_of_memory(output_batch.error):
                     logger.warning(
                         "Dynamic batch of %d request(s) ran out of memory; retrying in halves",
                         batch_size,
