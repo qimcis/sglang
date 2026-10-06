@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.models.dits.glm_image import GlmImageKVCache
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
+    StageBatchPolicy,
     StageParallelismType,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
@@ -252,6 +253,8 @@ class GlmImageAR(PipelineStage):
         vision_language_encoder ([`GlmImageForConditionalGeneration`]):
             The AR model that generates image tokens from text prompts.
     """
+
+    batch_policy = StageBatchPolicy.GROUPED
 
     def __init__(
         self,
@@ -656,9 +659,9 @@ class GlmImageAR(PipelineStage):
         return self.generate_and_assign_prior_tokens(batches, server_args)
 
     def iter_sequential_requests(
-        self, batch: Req, server_args: ServerArgs
+        self, batch: Req, server_args: ServerArgs, per_output: bool
     ) -> Iterator[Req]:
-        if not server_args.pipeline_config.supports_sequential_multi_output_inference():
+        if not per_output:
             return iter((batch,))
 
         output_count = _num_outputs_per_prompt(batch)
@@ -882,6 +885,12 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         scheduler ([`SchedulerMixin`]):
             A scheduler to be used in combination with `transformer` to denoise the encoded image latents.
     """
+
+    batch_policy = (
+        StageBatchPolicy.PER_OUTPUT
+        if current_platform.is_npu()
+        else StageBatchPolicy.PER_REQUEST
+    )
 
     def __init__(
         self,

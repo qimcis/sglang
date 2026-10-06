@@ -1573,7 +1573,7 @@ class SchedulerDisaggMixin:
         start_time = time.monotonic()
         with self._disagg_trace_dispatch(req):
             if (
-                self.server_args.pipeline_config.supports_sequential_multi_output_inference()
+                self._batch_plan.per_output
                 and max(1, int(req.num_outputs_per_prompt or 1)) > 1
             ):
                 output_reqs = _expand_glm_distributed_outputs(req)

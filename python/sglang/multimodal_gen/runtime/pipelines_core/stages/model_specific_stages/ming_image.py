@@ -26,7 +26,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.encoders.ming_image import ming_position_ids
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    PipelineStage,
+    StageBatchPolicy,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
@@ -37,6 +40,7 @@ from sglang.multimodal_gen.runtime.utils.vision import load_image
 
 class MingImageEncodingStage(TextEncodingStage):
     deduplicated_output_fields = ()
+    batch_policy = StageBatchPolicy.PER_OUTPUT
 
     def __init__(self, text_encoders, tokenizers):
         super().__init__(text_encoders, tokenizers)

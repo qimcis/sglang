@@ -151,9 +151,6 @@ class Pi05PipelineConfig(PipelineConfig):
     def supports_dynamic_batching(self):
         return True
 
-    def supports_native_grouped_requests(self):
-        return True
-
     def supports_openpi_endpoint(self) -> bool:
         return True
 

@@ -9,6 +9,7 @@ This module defines the base class for pipelines that are composed of multiple s
 
 import os
 from abc import ABC, abstractmethod
+from functools import cached_property
 from typing import Any, Callable, ClassVar, Iterator, Literal, cast
 
 import torch
@@ -57,6 +58,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     TextEncodingStage,
     TimestepPreparationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineBatchPlan
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
     ProgressiveDenoisingStage,
     ProgressiveDenoisingStageRouter,
@@ -255,6 +257,10 @@ class ComposedPipelineBase(ABC):
         List of stages in the pipeline.
         """
         return self._stages
+
+    @cached_property
+    def batch_plan(self) -> PipelineBatchPlan:
+        return PipelineBatchPlan.from_stages(self.stages)
 
     @abstractmethod
     def create_pipeline_stages(self, server_args: ServerArgs):
@@ -1157,7 +1163,7 @@ class ComposedPipelineBase(ABC):
     ) -> Iterator[OutputBatch]:
         """Yield grouped outputs as each terminal-stage invocation completes."""
         if len(batches) == 1 and (
-            not server_args.pipeline_config.supports_sequential_multi_output_inference()
+            not self.batch_plan.per_output
             or max(1, int(batches[0].num_outputs_per_prompt or 1)) == 1
         ):
             yield self.forward(batches[0], server_args)
@@ -1168,6 +1174,7 @@ class ComposedPipelineBase(ABC):
             self.stages,
             batches,
             server_args,
+            self.batch_plan,
         )
 
     def _install_component_residency_manager(self, server_args: ServerArgs) -> None:

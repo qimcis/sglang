@@ -164,6 +164,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             server_args=server_args,
         )
         self.worker = worker
+        self._batch_plan = worker.pipeline.batch_plan
         self.metrics = worker.metrics
         self.gpu_id = gpu_id
         self._show_warmup_progress = gpu_id == 0
@@ -344,7 +345,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         ):
             if (
                 len(reqs) == 1
-                and self.server_args.pipeline_config.supports_sequential_multi_output_inference()
+                and self._batch_plan.per_output
                 and max(1, int(req.num_outputs_per_prompt or 1)) > 1
             ):
                 return _SequentiallyReturnedOutputs(
@@ -356,7 +357,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     return self._execute_forward_with_deferred_save(reqs)
                 return self.worker.execute_forward(reqs)
 
-            if self.server_args.pipeline_config.supports_native_grouped_requests():
+            if self._batch_plan.grouped:
                 return self._execute_generation_grouped(reqs)
 
             merged_req = self._try_merge_generation_reqs(reqs)
@@ -408,7 +409,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self, reqs: List[Req]
     ) -> List[OutputBatch] | _SequentiallyReturnedOutputs:
         batch_size = len(reqs)
-        if self.server_args.pipeline_config.supports_sequential_dit_inference():
+        if self._batch_plan.sequential_requests:
             return _SequentiallyReturnedOutputs(
                 self._iter_grouped_outputs_sequentially(reqs)
             )
@@ -505,9 +506,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         except Exception:
             return None
 
-        exclude_num_outputs = (
-            self.server_args.pipeline_config.supports_sequential_dit_inference()
-        )
+        exclude_num_outputs = self._batch_plan.sequential_requests
         return [
             (f.name, self._freeze_signature_value(getattr(sp, f.name, None)))
             for f in sp_fields
@@ -645,10 +644,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         return bool(req.realtime_session_id) or req.session is not None
 
     def _requires_sequential_multi_output(self, *reqs: Req) -> bool:
-        pipeline_config = self.server_args.pipeline_config
         return (
-            pipeline_config.supports_sequential_multi_output_inference()
-            and not pipeline_config.supports_sequential_dit_inference()
+            self._batch_plan.per_output
+            and not self._batch_plan.sequential_requests
             and any(max(1, int(req.num_outputs_per_prompt or 1)) > 1 for req in reqs)
         )
 

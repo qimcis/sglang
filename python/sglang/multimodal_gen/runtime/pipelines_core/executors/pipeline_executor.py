@@ -30,7 +30,10 @@ from sglang.multimodal_gen.runtime.utils.profiler import (
 
 if TYPE_CHECKING:
     # Only for type checkers; avoids runtime circular import
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+        PipelineBatchPlan,
+        PipelineStage,
+    )
 
 logger = init_logger(__name__)
 
@@ -175,14 +178,16 @@ class PipelineExecutor(ABC):
         stages: List["PipelineStage"],
         batches: list[Req],
         server_args: ServerArgs,
+        batch_plan: "PipelineBatchPlan",
     ):
-        """Run the AR stage as a group, then yield each completed DiT request."""
+        """Run the grouped stages, then yield each completed sequential request."""
         with self.profile_execution(batches[0], dump_rank=0):
             with current_platform.inference_mode():
                 yield from self.execute_group_sequentially(
                     stages,
                     batches,
                     server_args,
+                    batch_plan,
                 )
 
     @staticmethod
@@ -263,14 +268,18 @@ class PipelineExecutor(ABC):
         stages: List["PipelineStage"],
         batches: list[Req],
         server_args: ServerArgs,
+        batch_plan: "PipelineBatchPlan",
     ):
-        """Yield outputs after batched AR and sequential DiT/VAE inference."""
-        batches = self.execute_group(stages[:1], batches, server_args)
+        """Yield outputs after the grouped stages and the sequential stages."""
+        split = batch_plan.sequential_from
+        batches = self.execute_group(stages[:split], batches, server_args)
 
-        remaining_stages = stages[1:]
+        remaining_stages = stages[split:]
         sequential_start_time = time.monotonic()
         for parent_batch in batches:
-            for batch in stages[0].iter_sequential_requests(parent_batch, server_args):
+            for batch in stages[split - 1].iter_sequential_requests(
+                parent_batch, server_args, per_output=batch_plan.per_output
+            ):
                 if batch.metrics is not None:
                     batch.metrics.record_stage(
                         "PipelineExecutor.sequential_wait",

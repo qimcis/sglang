@@ -580,7 +580,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             for req in batch:
                 output_count = (
                     max(1, int(req.num_outputs_per_prompt or 1))
-                    if self.server_args.pipeline_config.supports_sequential_multi_output_inference()
+                    if self.pipeline.batch_plan.per_output
                     else 1
                 )
                 output_batch = self._execute_forward_common(

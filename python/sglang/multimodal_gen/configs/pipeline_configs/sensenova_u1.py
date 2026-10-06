@@ -106,9 +106,6 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
     def supports_disaggregation(self) -> bool:
         return False
 
-    def supports_sequential_multi_output_inference(self):
-        return True
-
     def validate_server_args(self, server_args) -> None:
         if server_args.num_gpus != 1:
             raise ValueError(

@@ -20,7 +20,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    PipelineStage,
+    StageBatchPolicy,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
@@ -54,6 +57,8 @@ class SenseNovaU1GenerationOptions:
 
 
 class SenseNovaU1GenerationStage(PipelineStage):
+    batch_policy = StageBatchPolicy.PER_OUTPUT
+
     def __init__(self, model: torch.nn.Module, tokenizer: Any):
         super().__init__()
         self.model = model

@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from enum import Enum, auto
 
+import msgspec
 import torch
 from tqdm.auto import tqdm
 
@@ -47,6 +48,50 @@ class StageParallelismType(Enum):
     CFG_PARALLEL = auto()
     # executed on main rank only and send result to other ranks
     MAIN_RANK_ONLY_AND_SEND_TO_OTHERS = auto()
+
+
+class StageBatchPolicy(Enum):
+    # runs once on a request, which may be a merged dynamic batch
+    MERGED = auto()
+    # runs once over a list of requests
+    GROUPED = auto()
+    # this and later stages run once per request
+    PER_REQUEST = auto()
+    # this and later stages run once per requested output
+    PER_OUTPUT = auto()
+
+
+class PipelineBatchPlan(msgspec.Struct, frozen=True):
+    """How a pipeline batches requests, derived from its stage policies."""
+
+    grouped: bool
+    sequential_from: int | None
+    per_output: bool
+
+    @classmethod
+    def from_stages(cls, stages: list["PipelineStage"]) -> "PipelineBatchPlan":
+        policies = [stage.batch_policy for stage in stages]
+        sequential_from = next(
+            (
+                idx
+                for idx, policy in enumerate(policies)
+                if policy in (StageBatchPolicy.PER_REQUEST, StageBatchPolicy.PER_OUTPUT)
+            ),
+            None,
+        )
+        if sequential_from == 0:
+            raise ValueError("The first stage cannot run per request or per output")
+        return cls(
+            grouped=StageBatchPolicy.GROUPED in policies,
+            sequential_from=sequential_from,
+            per_output=sequential_from is not None
+            and policies[sequential_from] is StageBatchPolicy.PER_OUTPUT,
+        )
+
+    @property
+    def sequential_requests(self) -> bool:
+        """A grouped prefix feeds stages that return each request as it finishes."""
+        return self.grouped and self.sequential_from is not None
 
 
 class StageVerificationError(Exception):
@@ -93,6 +138,7 @@ class PipelineStage(StageDedupMixin, ABC):
     # calling super().__init__() still see a consistent explicit-range gate.
     _current_use_nvtx: bool = False
     _current_batch_is_warmup: bool = False
+    batch_policy: StageBatchPolicy = StageBatchPolicy.MERGED
     _component_residency_manager = None
     _registered_stage_name: str | None = None
     _profile_stage_name: str | None = None
@@ -173,10 +219,10 @@ class PipelineStage(StageDedupMixin, ABC):
         pass
 
     def iter_sequential_requests(
-        self, batch: Req, server_args: ServerArgs
+        self, batch: Req, server_args: ServerArgs, per_output: bool
     ) -> Iterator[Req]:
         """Expand one post-stage request into sequential downstream requests."""
-        del server_args
+        del server_args, per_output
         return iter((batch,))
 
     def set_component_residency_manager(self, manager) -> None:

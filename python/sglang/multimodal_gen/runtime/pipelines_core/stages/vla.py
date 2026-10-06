@@ -14,7 +14,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    PipelineStage,
+    StageBatchPolicy,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.vla.observation import (
     collate_vla_observation_batches,
@@ -154,6 +157,8 @@ class VLAObservationPreprocessStage(PipelineStage):
 
 
 class VLAPrefixEncodingStage(PipelineStage):
+    batch_policy = StageBatchPolicy.GROUPED
+
     def __init__(
         self,
         policy_model: Any,
@@ -348,6 +353,8 @@ class VLAPrefixEncodingStage(PipelineStage):
 
 
 class VLAActionDenoisingStage(PipelineStage):
+    batch_policy = StageBatchPolicy.GROUPED
+
     def __init__(self, policy_model: Any):
         super().__init__()
         self.policy_model = policy_model

@@ -82,9 +82,9 @@ class InputValidationStage(PipelineStage):
         return load_image(image)
 
     def iter_sequential_requests(
-        self, batch: Req, server_args: ServerArgs
+        self, batch: Req, server_args: ServerArgs, per_output: bool
     ) -> Iterator[Req]:
-        if not server_args.pipeline_config.supports_sequential_multi_output_inference():
+        if not per_output:
             return iter((batch,))
 
         num_outputs = max(1, int(batch.num_outputs_per_prompt or 1))
