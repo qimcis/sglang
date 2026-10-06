@@ -159,6 +159,7 @@ class BatchAdmissionController:
     def __init__(self, server_args: ServerArgs, gpu_id: int):
         self._mode = getattr(server_args, "batching_mode", "dynamic")
         self._user_max_batch_size = max(1, int(server_args.batching_max_size))
+        self._max_cost = server_args.batching_max_cost
         self._model_path = server_args.model_path
         self._offload = server_args.has_layerwise_offload_components()
         self._device_memory_gb = self._get_device_memory_gb(gpu_id)
@@ -167,8 +168,9 @@ class BatchAdmissionController:
 
         if self.enabled:
             logger.info(
-                "Batch admission enabled: user_max=%d, device_memory=%.1fGiB, rules=%d",
+                "Batch admission enabled: user_max=%d, max_cost=%s, device_memory=%.1fGiB, rules=%d",
                 self._user_max_batch_size,
+                self._max_cost,
                 self._device_memory_gb or 0.0,
                 len(self._rules),
             )
@@ -219,7 +221,9 @@ class BatchAdmissionController:
         """Return the effective admission limit for the request's model and shape."""
         rules = self._matching_rules(req)
         if not rules:
-            return AdmissionLimit(max_batch_size=self._user_max_batch_size)
+            return AdmissionLimit(
+                max_batch_size=self._user_max_batch_size, max_cost=self._max_cost
+            )
 
         config_cap = min(rule.max_batch_size for rule in rules)
         max_batch_size = min(self._user_max_batch_size, config_cap)
@@ -229,6 +233,8 @@ class BatchAdmissionController:
             else None
         )
         costs = [rule.max_cost for rule in rules if rule.max_cost is not None]
+        if self._max_cost is not None:
+            costs.append(self._max_cost)
         return AdmissionLimit(
             max_batch_size=max(1, max_batch_size),
             max_cost=min(costs) if costs else None,

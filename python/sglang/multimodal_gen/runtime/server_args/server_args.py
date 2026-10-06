@@ -545,6 +545,7 @@ class ServerArgs(DisaggServerArgsMixin):
     batching_mode: str = "dynamic"
     batching_max_size: int = 1
     batching_delay_ms: float = 0.0
+    batching_max_cost: float | None = None
     batching_config: str | None = None
     enable_batching_metrics: bool = False
     async_output_save: bool = False
@@ -2870,6 +2871,16 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Maximum time (in ms) to wait for forming a larger batch before dispatch.",
         )
         parser.add_argument(
+            "--batching-max-cost",
+            type=float,
+            default=ServerArgs.batching_max_cost,
+            help=(
+                "Maximum summed request cost per dynamic batch. The default cost is "
+                "latent tokens x frames x outputs, so this caps batches by work "
+                "rather than request count. Unset means no cost cap."
+            ),
+        )
+        parser.add_argument(
             "--batching-config",
             type=str,
             default=ServerArgs.batching_config,
@@ -3967,6 +3978,8 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
+        if self.batching_max_cost is not None and self.batching_max_cost <= 0:
+            raise ValueError("batching_max_cost must be > 0")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""
