@@ -18,6 +18,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 import torch
 
@@ -41,6 +42,7 @@ def sana_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Ten
 
 @dataclass
 class SanaPipelineConfig(SpatialImagePipelineConfig):
+    dynamic_batching: ClassVar[bool] = True
     task_type: ModelTaskType = ModelTaskType.T2I
 
     # should_use_guidance=False disables *embedded* guidance (timestep-conditioned

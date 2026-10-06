@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, ClassVar, List, Optional
 
 import PIL
 import torch
@@ -37,6 +37,7 @@ def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tenso
 class FluxPipelineConfig(ImagePipelineConfig):
     """Configuration for the FLUX pipeline."""
 
+    dynamic_batching: ClassVar[bool] = True
     embedded_cfg_scale: float = 3.5
 
     task_type: ModelTaskType = ModelTaskType.T2I

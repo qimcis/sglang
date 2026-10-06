@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 import torch
 
@@ -66,6 +67,7 @@ class WanI2VCommonConfig(PipelineConfig):
 class WanT2V480PConfig(PipelineConfig):
     """Base configuration for Wan T2V 1.3B pipeline architecture."""
 
+    dynamic_batching: ClassVar[bool] = True
     task_type: ModelTaskType = ModelTaskType.T2V
     # WanConfig-specific parameters with defaults
     # DiT
@@ -129,6 +131,7 @@ class WanT2V480PConfig(PipelineConfig):
 class TurboWanT2V480PConfig(WanT2V480PConfig):
     """Base configuration for Wan T2V 1.3B pipeline architecture."""
 
+    dynamic_batching: ClassVar[bool] = False
     flow_shift: float | None = 8.0
     dmd_denoising_steps: list[int] | None = field(
         default_factory=lambda: [988, 932, 852, 608]
@@ -306,6 +309,7 @@ class Wan2_2_I2V_A14B_Config(WanI2V720PConfig):
 # =============================================
 @dataclass
 class SelfForcingWanT2V480PConfig(WanT2V480PConfig):
+    dynamic_batching: ClassVar[bool] = False
     is_causal: bool = True
     flow_shift: float | None = 5.0
     dmd_denoising_steps: list[int] | None = field(

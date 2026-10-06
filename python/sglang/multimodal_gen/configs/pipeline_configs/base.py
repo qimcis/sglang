@@ -137,6 +137,8 @@ class PipelineConfig:
     # Default task; supported_task_types is a model capability, not a user knob.
     task_type: ModelTaskType = ModelTaskType.I2I
     supported_task_types: ClassVar[tuple[ModelTaskType, ...] | None] = None
+    # True when merged dynamic batches are known to match single-request outputs.
+    dynamic_batching: ClassVar[bool] = False
     skip_input_image_preprocess: bool = False
     # False when changing component placement after a calibration request is
     # known to alter the pipeline's numerical path.
@@ -448,11 +450,11 @@ class PipelineConfig:
         return False
 
     def supports_dynamic_batching(self):
-        """Return whether this pipeline can opt in to dynamic batching.
+        """Return whether this pipeline opted in to dynamic batching.
 
         The scheduler still checks each request before merging it into a batch.
         """
-        return all(
+        return self.dynamic_batching and all(
             task in (ModelTaskType.T2I, ModelTaskType.T2V)
             for task in self.get_supported_task_types()
         )

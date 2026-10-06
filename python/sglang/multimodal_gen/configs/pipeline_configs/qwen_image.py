@@ -2,7 +2,7 @@
 
 import math
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, ClassVar
 
 import torch
 
@@ -158,6 +158,7 @@ def _pack_latents(latents, batch_size, num_channels_latents, height, width):
 class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig):
     """Configuration for the QwenImage pipeline."""
 
+    dynamic_batching: ClassVar[bool] = True
     should_use_guidance: bool = False
     task_type: ModelTaskType = ModelTaskType.T2I
 

@@ -1,7 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import math
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, ClassVar
 
 import torch
 import torch.distributed as dist
@@ -59,6 +59,7 @@ def zimage_postprocess_text(
 
 @dataclass
 class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
+    dynamic_batching: ClassVar[bool] = True
     should_use_guidance: bool = False
     task_type: ModelTaskType = ModelTaskType.T2I
     dit_config: DiTConfig = field(default_factory=ZImageDitConfig)
